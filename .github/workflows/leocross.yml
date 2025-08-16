@@ -1,16 +1,11 @@
 name: LeoCross Ticket
 
 on:
-  workflow_dispatch: {}         # run manually
-  schedule:                     # run near 4:10pm ET (handles DST with two entries)
-    - cron: '10 20 * * 1-5'     # 20:10 UTC ≈ 4:10pm ET during DST
-    - cron: '10 21 * * 1-5'     # 21:10 UTC ≈ 4:10pm ET during Standard Time
+  workflow_dispatch: {}   # run manually from the Actions tab
 
 jobs:
   leocross:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
 
     steps:
       - name: Checkout
@@ -20,66 +15,21 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            pip install requests python-dotenv
-          fi
+          pip install requests
 
-      - name: Acquire GammaWizard token
-        id: token
-        shell: bash
+      - name: Run leocross_ticket.py
         env:
-          GW_TOKEN_SEC: ${{ secrets.GW_TOKEN }}
-          GW_EMAIL:     ${{ secrets.GW_EMAIL }}
-          GW_PASSWORD:  ${{ secrets.GW_PASSWORD }}
+          # Add this secret in: Repo → Settings → Secrets and variables → Actions → New repository secret
+          GW_TOKEN: ${{ secrets.GW_TOKEN }}
         run: |
-          set -euo pipefail
-          if [ -n "${GW_TOKEN_SEC:-}" ]; then
-            echo "GW_TOKEN=${GW_TOKEN_SEC}" >> "$GITHUB_ENV"
-            echo "source=secret" >> "$GITHUB_OUTPUT"
-          elif [ -n "${GW_EMAIL:-}" ] && [ -n "${GW_PASSWORD:-}" ]; then
-            RESP=$(curl -s -X POST 'https://gandalf.gammawizard.com/goauth/authenticateFireUser' \
-              -d "email=${GW_EMAIL}" -d "password=${GW_PASSWORD}")
-            TOK=$(python - <<'PY' <<<"$RESP"
-import sys, json
-print(json.load(sys.stdin).get("token",""))
-PY
-)
-            if [ -z "$TOK" ]; then
-              echo "Failed to get token; response was:"; echo "$RESP"; exit 1
-            fi
-            echo "GW_TOKEN=$TOK" >> "$GITHUB_ENV"
-            echo "source=auth" >> "$GITHUB_OUTPUT"
-          else
-            echo "Set either secret GW_TOKEN or GW_EMAIL + GW_PASSWORD" >&2
-            exit 1
-          fi
+          python leocross_ticket.py | tee ticket_output.txt
 
-      - name: Run LeoCross ticket
-        env:
-          GW_TOKEN: ${{ env.GW_TOKEN }}
-        run: |
-          python leocross_ticket.py --json > ticket.json
-          echo '### LeoCross ticket' >> $GITHUB_STEP_SUMMARY
-          python - <<'PY' >> $GITHUB_STEP_SUMMARY
-import json
-t=json.load(open('ticket.json'))
-lp,sp,sc,lc=[leg['strike'] for leg in t['legs']]
-print(f"- Date: {t['signal_date']}  → Exp: {t['expiry']}")
-print(f"- Side: {t['side']}  Qty: {t['qty']}  Width: {t['width']}")
-print(f"- Strikes: P {lp}/{sp}  C {sc}/{lc}")
-print(f"- Cat1: {t['probs']['Cat1']:.3f}  Cat2: {t['probs']['Cat2']:.3f}")
-print(f"- Worst-case day loss: ${t['worst_case']['day']:,}")
-PY
-
-      - name: Upload ticket artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: leocross-ticket-${{ github.run_id }}
-          path: ticket.json
+          name: leocross-ticket
+          path: ticket_output.txt
