@@ -2,8 +2,30 @@
 import os, json, datetime as dt, sys, requests
 from dataclasses import dataclass
 
-LEOCROSS_URL = "https://gandalf.gammawizard.com/rapi/GetLeoCross"
-GW_TOKEN     = os.getenv("GW_TOKEN")  # paste your JWT into this env var
+GW_EMAIL    = os.getenv("GW_EMAIL")
+GW_PASSWORD = os.getenv("GW_PASSWORD")
+GW_TOKEN_ENV= os.getenv("GW_TOKEN")
+
+def gw_token() -> str:
+    # 1) CI path: use the pre-issued JWT from env/secret
+    if GW_TOKEN_ENV:
+        return GW_TOKEN_ENV
+
+    # 2) Local fallback: do the login flow if you provided creds
+    if GW_EMAIL and GW_PASSWORD:
+        r = requests.post(
+            "https://gandalf.gammawizard.com/goauth/authenticateFireUser",
+            data={"email": GW_EMAIL, "password": GW_PASSWORD},
+            timeout=10
+        )
+        r.raise_for_status()
+        tok = r.json().get("token")
+        if not tok:
+            raise SystemExit("Auth returned no token. Check GW_EMAIL/GW_PASSWORD.")
+        return tok
+
+    # 3) Otherwise, stop with a clear message
+    raise SystemExit("No GW_TOKEN set. In GitHub, add it under Settings → Secrets → Actions → GW_TOKEN")
 
 # sizing you asked for
 WIDE = 5
