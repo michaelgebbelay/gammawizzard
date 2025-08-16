@@ -21,9 +21,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Run leocross_ticket2.py
+      - name: Check GW_TOKEN is present
         env:
-          # Add this secret in: Repo → Settings → Secrets and variables → Actions → New repository secret
+          GW_TOKEN: ${{ secrets.GW_TOKEN }}
+        run: |
+          if [ -z "${GW_TOKEN}" ]; then
+            echo "GW_TOKEN is EMPTY. Add it under: Repo → Settings → Secrets and variables → Actions → New repository secret."
+            exit 1
+          else
+            echo "GW_TOKEN is set"
+          fi
+
+      - name: Run leocross_ticket.py
+        env:
           GW_TOKEN: ${{ secrets.GW_TOKEN }}
         run: |
           python leocross_ticket.py | tee ticket_output.txt
