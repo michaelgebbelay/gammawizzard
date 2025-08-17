@@ -34,33 +34,28 @@ jobs:
         run: |
           set -euo pipefail
           TOK=""
+          SRC=""
+
+          # Try login if creds provided
           if [[ -n "${GW_EMAIL:-}" && -n "${GW_PASSWORD:-}" ]]; then
-            # Fetch a fresh 7-day token via API login
             TOK=$(python - <<'PY'
-import os, sys, json, requests
+import os, requests, json
 email=os.environ.get("GW_EMAIL"); pw=os.environ.get("GW_PASSWORD")
 r=requests.post(
-    "https://gandalf.gammawizard.com/goauth/authenticateFireUser",
-    data={"email": email, "password": pw}, timeout=15
+  "https://gandalf.gammawizard.com/goauth/authenticateFireUser",
+  data={"email": email, "password": pw}, timeout=15
 )
 r.raise_for_status()
-obj=r.json()
-tok=obj.get("token","")
-if not tok:
-    print("NO_TOKEN")  # detected below
-else:
-    print(tok)
+print(r.json().get("token",""))
 PY
 )
-            if [[ "$TOK" == "NO_TOKEN" || -z "$TOK" ]]; then
-              echo "Login returned no token; will try GW_TOKEN secret (if present)."
-              TOK=""
-            fi
+            if [[ -n "$TOK" ]]; then SRC="login"; fi
           fi
 
-          # Fallback to a pre-supplied JWT secret if login unavailable
+          # Fallback to a pre-supplied JWT secret
           if [[ -z "$TOK" && -n "${GW_TOKEN_S:-}" ]]; then
             TOK="$GW_TOKEN_S"
+            SRC="secret"
           fi
 
           if [[ -z "$TOK" ]]; then
@@ -68,10 +63,9 @@ PY
             exit 1
           fi
 
-          # Mask and export for later steps
           echo "::add-mask::$TOK"
           echo "GW_TOKEN=$TOK" >> "$GITHUB_ENV"
-          echo "source=$( [[ -n "${GW_EMAIL:-}" && -n "${GW_PASSWORD:-}" ]] && echo login || echo secret )" >> "$GITHUB_OUTPUT"
+          echo "source=$SRC" >> "$GITHUB_OUTPUT"
 
       - name: Run leocross_ticket.py
         env:
@@ -87,10 +81,8 @@ PY
 
       - name: Summary
         run: |
-          {
-            echo "### LeoCross ticket"
-            echo
-            echo '```text'
-            cat ticket_output.txt
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          echo "### LeoCross ticket" >> "$GITHUB_STEP_SUMMARY"
+          echo >> "$GITHUB_STEP_SUMMARY"
+          echo '```text' >> "$GITHUB_STEP_SUMMARY"
+          cat ticket_output.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
