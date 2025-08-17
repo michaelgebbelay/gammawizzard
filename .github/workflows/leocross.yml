@@ -24,20 +24,58 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Ensure GW_TOKEN is present
+      - name: Acquire GammaWizard JWT (login) or fall back to GW_TOKEN
+        id: jwtauth
         env:
-          GW_TOKEN: ${{ secrets.GW_TOKEN }}
+          GW_EMAIL:    ${{ secrets.GW_EMAIL }}
+          GW_PASSWORD: ${{ secrets.GW_PASSWORD }}
+          GW_TOKEN_S:  ${{ secrets.GW_TOKEN }}
+        shell: bash
         run: |
-          if [ -z "${GW_TOKEN}" ]; then
-            echo "GW_TOKEN is EMPTY. Add it under: Repo → Settings → Secrets and variables → Actions → New repository secret."
-            exit 1
-          else
-            echo "GW_TOKEN is set"
+          set -euo pipefail
+          TOK=""
+          if [[ -n "${GW_EMAIL:-}" && -n "${GW_PASSWORD:-}" ]]; then
+            # Fetch a fresh 7-day token via API login
+            TOK=$(python - <<'PY'
+import os, sys, json, requests
+email=os.environ.get("GW_EMAIL"); pw=os.environ.get("GW_PASSWORD")
+r=requests.post(
+    "https://gandalf.gammawizard.com/goauth/authenticateFireUser",
+    data={"email": email, "password": pw}, timeout=15
+)
+r.raise_for_status()
+obj=r.json()
+tok=obj.get("token","")
+if not tok:
+    print("NO_TOKEN")  # detected below
+else:
+    print(tok)
+PY
+)
+            if [[ "$TOK" == "NO_TOKEN" || -z "$TOK" ]]; then
+              echo "Login returned no token; will try GW_TOKEN secret (if present)."
+              TOK=""
+            fi
           fi
+
+          # Fallback to a pre-supplied JWT secret if login unavailable
+          if [[ -z "$TOK" && -n "${GW_TOKEN_S:-}" ]]; then
+            TOK="$GW_TOKEN_S"
+          fi
+
+          if [[ -z "$TOK" ]]; then
+            echo "ERROR: Provide GW_EMAIL + GW_PASSWORD secrets, or GW_TOKEN." >&2
+            exit 1
+          fi
+
+          # Mask and export for later steps
+          echo "::add-mask::$TOK"
+          echo "GW_TOKEN=$TOK" >> "$GITHUB_ENV"
+          echo "source=$( [[ -n "${GW_EMAIL:-}" && -n "${GW_PASSWORD:-}" ]] && echo login || echo secret )" >> "$GITHUB_OUTPUT"
 
       - name: Run leocross_ticket.py
         env:
-          GW_TOKEN: ${{ secrets.GW_TOKEN }}
+          GW_TOKEN: ${{ env.GW_TOKEN }}
         run: |
           python leocross_ticket.py | tee ticket_output.txt
 
@@ -47,10 +85,10 @@ jobs:
           name: leocross-ticket-${{ github.run_id }}
           path: ticket_output.txt
 
-      - name: Add job summary
+      - name: Summary
         run: |
           {
-            echo "### LeoCross ticket output"
+            echo "### LeoCross ticket"
             echo
             echo '```text'
             cat ticket_output.txt
