@@ -21,7 +21,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Check GW_TOKEN is present
+      - name: Check GW_TOKEN secret
         env:
           GW_TOKEN: ${{ secrets.GW_TOKEN }}
         run: |
@@ -32,14 +32,61 @@ jobs:
             echo "GW_TOKEN is set"
           fi
 
+      - name: Locate leocross_ticket.py
+        id: findscript
+        run: |
+          set -e
+          SCRIPT_PATH="$(git ls-files | grep -E '(^|/)leocross_ticket\.py$' | head -n 1 || true)"
+          if [ -z "$SCRIPT_PATH" ]; then
+            echo "Could not find leocross_ticket.py in repo." >&2
+            echo "Searched files:"; git ls-files | sed -n '1,200p'
+            exit 1
+          fi
+          echo "Found script at: $SCRIPT_PATH"
+          echo "script=$SCRIPT_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Test LeoCross endpoint with token
+        env:
+          GW_TOKEN: ${{ secrets.GW_TOKEN }}
+        run: |
+          set -e
+          URL="https://gandalf.gammawizard.com/rapi/GetLeoCross"
+          echo "GET $URL"
+          HTTP_CODE=$(curl -sS -o resp.json -w "%{http_code}" -H "Authorization: Bearer $GW_TOKEN" "$URL" || echo "curl_failed")
+          echo "HTTP: $HTTP_CODE"
+          echo "Body (first 400 bytes):"
+          head -c 400 resp.json || true
+          echo
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "Non-200 from LeoCross. Token may be expired or invalid." >&2
+            exit 1
+          fi
+          # quick schema check
+          grep -q '"Trade"' resp.json || { echo "Response missing 'Trade' key"; exit 1; }
+
       - name: Run leocross_ticket.py
         env:
           GW_TOKEN: ${{ secrets.GW_TOKEN }}
         run: |
-          python leocross_ticket.py | tee ticket_output.txt
+          set -e
+          python "${{ steps.findscript.outputs.script }}" | tee ticket_output.txt
 
-      - name: Upload artifact
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: leocross-ticket
-          path: ticket_output.txt
+          name: leocross-artifacts-${{ github.run_id }}
+          path: |
+            resp.json
+            ticket_output.txt
+
+      - name: Summary
+        run: |
+          {
+            echo "### LeoCross ticket"
+            echo
+            echo '**Script:** ${{ steps.findscript.outputs.script }}'
+            echo
+            echo '```text'
+            sed -n '1,200p' ticket_output.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
