@@ -1,7 +1,7 @@
-name: LeoCross Debug
+name: LeoCross Ticket
 
 on:
-  workflow_dispatch: {}   # run manually from Actions
+  workflow_dispatch: {}   # run manually from the Actions tab
 
 jobs:
   leocross:
@@ -21,92 +21,25 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Repo layout
-        run: |
-          pwd
-          python --version
-          echo "Searching for leocross_ticket.py ..."
-          find . -maxdepth 3 -type f -name 'leocross_ticket.py' -print
-          ls -la
-
-      - name: Acquire GammaWizard JWT (login or fallback to GW_TOKEN)
-        id: jwtauth
+      - name: Check GW_TOKEN is present
         env:
-          GW_EMAIL:    ${{ secrets.GW_EMAIL }}
-          GW_PASSWORD: ${{ secrets.GW_PASSWORD }}
-          GW_TOKEN_S:  ${{ secrets.GW_TOKEN }}
-        shell: bash
+          GW_TOKEN: ${{ secrets.GW_TOKEN }}
         run: |
-          set -euo pipefail
-          TOK=""
-          SRC=""
-
-          if [[ -n "${GW_EMAIL:-}" && -n "${GW_PASSWORD:-}" ]]; then
-            TOK=$(python - <<'PY'
-import os, requests
-r=requests.post(
-  "https://gandalf.gammawizard.com/goauth/authenticateFireUser",
-  data={"email": os.environ["GW_EMAIL"], "password": os.environ["GW_PASSWORD"]},
-  timeout=15
-)
-r.raise_for_status()
-print(r.json().get("token",""))
-PY
-)
-            if [[ -n "$TOK" ]]; then SRC="login"; fi
-          fi
-          if [[ -z "$TOK" && -n "${GW_TOKEN_S:-}" ]]; then TOK="$GW_TOKEN_S"; SRC="secret"; fi
-          if [[ -z "$TOK" ]]; then echo "No token. Set GW_EMAIL+GW_PASSWORD or GW_TOKEN secret." >&2; exit 1; fi
-
-          echo "::add-mask::$TOK"
-          echo "GW_TOKEN=$TOK" >> "$GITHUB_ENV"
-          echo "source=$SRC" >> "$GITHUB_OUTPUT"
-          echo "JWT source: $SRC"
-
-      - name: Test LeoCross endpoint
-        env:
-          GW_TOKEN: ${{ env.GW_TOKEN }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          URL="https://gandalf.gammawizard.com/rapi/GetLeoCross"
-          echo "GET $URL"
-          CODE=$(curl -sS -o resp.json -w "%{http_code}" -H "Authorization: Bearer $GW_TOKEN" "$URL" || echo "curl_failed")
-          echo "HTTP: $CODE"
-          echo "Body (first 400 bytes):"
-          head -c 400 resp.json || true
-          echo
-          if [[ "$CODE" != "200" ]]; then
-            echo "Non-200 from LeoCross. See resp.json in artifacts." >&2
+          if [ -z "${GW_TOKEN}" ]; then
+            echo "GW_TOKEN is EMPTY. Add it under: Repo → Settings → Secrets and variables → Actions → New repository secret."
             exit 1
-          fi
-
-          # quick presence check for expected keys
-          if ! grep -q '"Trade"' resp.json; then
-            echo "Response missing 'Trade' key. See resp.json." >&2
-            exit 1
-          fi
-
-      - name: Run leocross_ticket.py (JSON first, then fallback)
-        env:
-          GW_TOKEN: ${{ env.GW_TOKEN }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if python leocross_ticket.py --json > ticket.json 2> script_err.txt; then
-            echo "Script produced ticket.json:"
-            cat ticket.json
           else
-            echo "leocross_ticket.py --json failed; falling back to plain output"
-            python leocross_ticket.py | tee ticket_output.txt
+            echo "GW_TOKEN is set"
           fi
 
-      - name: Upload artifacts
+      - name: Run leocross_ticket.py
+        env:
+          GW_TOKEN: ${{ secrets.GW_TOKEN }}
+        run: |
+          python leocross_ticket.py | tee ticket_output.txt
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: leocross-debug-${{ github.run_id }}
-          path: |
-            resp.json
-            ticket.json
-            ticket_output.txt
-            script_err.txt
+          name: leocross-ticket
+          path: ticket_output.txt
