@@ -1,23 +1,5 @@
-name: Schwab Probe
-
-on:
-  workflow_dispatch:
-
-jobs:
-  probe:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install --quiet schwab-py google-api-python-client google-auth google-auth-httplib2
-
-      - name: Schwab account hash + quote -> Sheet (tab: schwab)
+      - name: Schwab probe → Sheet (tab: schwab)
+        if: success()
         env:
           SCHWAB_APP_KEY: ${{ secrets.SCHWAB_APP_KEY }}
           SCHWAB_APP_SECRET: ${{ secrets.SCHWAB_APP_SECRET }}
@@ -25,78 +7,65 @@ jobs:
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         run: |
+          python -m pip install --quiet schwab-py
           python - << 'PY'
-          import os, json, re
+          import os, json
           from datetime import datetime, timezone
           from google.oauth2 import service_account
           from googleapiclient.discovery import build
-          from googleapiclient.errors import HttpError
           from schwab.auth import client_from_token_file
 
-          # Rehydrate Schwab token file for schwab-py
-          with open("schwab_token.json","w") as f:
-            f.write(os.environ["SCHWAB_TOKEN_JSON"])
+          # Rehydrate token for schwab-py
+          open("schwab_token.json","w").write(os.environ["SCHWAB_TOKEN_JSON"])
 
-          # Create Schwab client (access token auto-refresh during this run)
+          # Schwab client (access token auto-refresh during this run)
           c = client_from_token_file(
-                api_key=os.environ["SCHWAB_APP_KEY"],
-                app_secret=os.environ["SCHWAB_APP_SECRET"],
-                token_path="schwab_token.json")
+              api_key=os.environ["SCHWAB_APP_KEY"],
+              app_secret=os.environ["SCHWAB_APP_SECRET"],
+              token_path="schwab_token.json")
 
-          # 1) Account hash
-          r = c.get_account_numbers()
-          r.raise_for_status()
-          acct_map = r.json()  # list of {accountNumber, hashValue}
-          if not acct_map:
-            raise SystemExit("No accounts returned by Schwab API")
-          acct_hash = acct_map[0]["hashValue"]
-          acct_last4 = acct_map[0]["accountNumber"][-4:]
+          # 1) Account hash (needed for orders)
+          r = c.get_account_numbers(); r.raise_for_status()
+          m = r.json()
+          acct_hash  = m[0]["hashValue"]
+          acct_last4 = m[0]["accountNumber"][-4:]
 
-          # 2) Quote (SPX; fallback to SPY if unavailable)
-          symbol = "SPX"
-          q = c.get_quote(symbol)
-          if q.status_code != 200 or symbol not in q.json():
-            symbol = "SPY"
-            q = c.get_quote(symbol)
-            q.raise_for_status()
-          qj = q.json()
-          last = qj.get(symbol, {}).get("quote", {}).get("lastPrice", "")
+          # 2) Quote
+          sym = "SPX"
+          q = c.get_quote(sym)
+          if q.status_code != 200 or sym not in q.json():
+              sym = "SPY"; q = c.get_quote(sym)
+          q.raise_for_status()
+          last = q.json().get(sym, {}).get("quote", {}).get("lastPrice", "")
 
-          # 3) Sheets auth
+          # 3) Append to Google Sheet (tab: schwab). Create tab if missing.
           sa = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
-          creds = service_account.Credentials.from_service_account_info(
-              sa, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+          creds = service_account.Credentials.from_service_account_info(sa, scopes=["https://www.googleapis.com/auth/spreadsheets"])
           sheets = build("sheets","v4",credentials=creds)
-          sheet_id = os.environ["GSHEET_ID"]
-          tab = "schwab"
+          sheet_id = os.environ["GSHEET_ID"]; tab = "schwab"
 
-          # Ensure tab exists
           meta = sheets.spreadsheets().get(spreadsheetId=sheet_id).execute()
-          titles = [s["properties"]["title"] for s in meta.get("sheets",[])]
-          if tab not in titles:
-            sheets.spreadsheets().batchUpdate(
-              spreadsheetId=sheet_id,
-              body={"requests":[{"addSheet":{"properties":{"title":tab}}}]}
-            ).execute()
+          if tab not in [s["properties"]["title"] for s in meta.get("sheets",[])]:
+              sheets.spreadsheets().batchUpdate(
+                spreadsheetId=sheet_id,
+                body={"requests":[{"addSheet":{"properties":{"title":tab}}}]}
+              ).execute()
 
-          # Headers (write once if row 1 empty)
-          headers = [["ts","source","account_hash","account_last4","quote_symbol","last_price"]]
+          hdr = [["ts","source","account_hash","account_last4","symbol","last_price"]]
           got = sheets.spreadsheets().values().get(
             spreadsheetId=sheet_id, range=f"{tab}!1:1").execute().get("values", [])
           if not got:
             sheets.spreadsheets().values().update(
               spreadsheetId=sheet_id, range=f"{tab}!1:1",
-              valueInputOption="USER_ENTERED", body={"values": headers}
+              valueInputOption="USER_ENTERED", body={"values": hdr}
             ).execute()
 
-          # Append the probe row
           now = datetime.now(timezone.utc).isoformat()
-          row = [[now, "SCHWAB_PROBE", acct_hash, acct_last4, symbol, last]]
+          row = [[now,"SCHWAB_PROBE",acct_hash,acct_last4,sym,last]]
           sheets.spreadsheets().values().append(
             spreadsheetId=sheet_id, range=f"{tab}!A1",
-            valueInputOption="USER_ENTERED",
-            insertDataOption="INSERT_ROWS",
+            valueInputOption="USER_ENTERED", insertDataOption="INSERT_ROWS",
             body={"values": row}
           ).execute()
-          print("probe: ok")
+          print("schwab probe: ok")
           PY
