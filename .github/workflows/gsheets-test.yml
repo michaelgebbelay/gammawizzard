@@ -1,0 +1,50 @@
+name: GSheets Smoke
+on:
+  workflow_dispatch: {}
+
+jobs:
+  write:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Google client libs
+        run: |
+          python -m pip install --quiet --upgrade pip
+          pip install --quiet google-api-python-client google-auth google-auth-httplib2
+
+      - name: Append a row to leocross tab
+        env:
+          GSHEET_ID: ${{ secrets.GSHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          python - << 'PY'
+          import os, json
+          from datetime import datetime, timezone
+          from google.oauth2 import service_account
+          from googleapiclient.discovery import build
+
+          svc_info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
+          scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+          creds = service_account.Credentials.from_service_account_info(svc_info, scopes=scopes)
+
+          sheet_id = os.environ["GSHEET_ID"]
+          sheets = build("sheets", "v4", credentials=creds)
+
+          now = datetime.now(timezone.utc).isoformat()
+          values = [[now, "GitHub Actions ping"]]
+
+          sheets.spreadsheets().values().append(
+              spreadsheetId=sheet_id,
+              range="leocross!A1",
+              valueInputOption="RAW",
+              insertDataOption="INSERT_ROWS",
+              body={"values": values}
+          ).execute()
+          print("ok")
+          PY
