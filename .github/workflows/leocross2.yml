@@ -53,7 +53,9 @@ jobs:
           set -e
           URL="https://gandalf.gammawizard.com/rapi/GetLeoCross"
           echo "GET $URL"
-          HTTP_CODE=$(curl -sS -o resp.json -w "%{http_code}" -H "Authorization: Bearer $GW_TOKEN")
+          # Use --fail-with-body but don't let set -e kill the step before we read the code
+          HTTP_CODE=$(curl -sS --fail-with-body -o resp.json -w '%{http_code}' \
+            -H "Authorization: Bearer $GW_TOKEN" "$URL" || true)
           echo "HTTP: $HTTP_CODE"
           echo "Body (first 400 bytes):"
           head -c 400 resp.json || true
