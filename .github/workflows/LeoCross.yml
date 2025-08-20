@@ -187,7 +187,7 @@ jobs:
               svc.spreadsheets().values().update(
                 spreadsheetId=sheet_id,
                 range=f"{tab}!1:1",
-                valueInputOption="RAW",
+                valueInputOption="USER_ENTERED",
                 body={"values":[headers]}
               ).execute()
 
@@ -195,7 +195,7 @@ jobs:
           svc.spreadsheets().values().append(
             spreadsheetId=sheet_id,
             range=f"{tab}!A1",
-            valueInputOption="RAW",
+            valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
             body={"values":[row]}
           ).execute()
