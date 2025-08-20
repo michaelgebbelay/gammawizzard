@@ -1,0 +1,35 @@
+name: Smoke Schwab
+on:
+  workflow_dispatch:
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Call get_account_numbers
+        env:
+          SCHWAB_APP_KEY: ${{ secrets.SCHWAB_APP_KEY }}
+          SCHWAB_APP_SECRET: ${{ secrets.SCHWAB_APP_SECRET }}
+          SCHWAB_TOKEN_JSON: ${{ secrets.SCHWAB_TOKEN_JSON }}
+        run: |
+          set -e
+          python -m pip install --quiet schwab-py
+          printf "%s" "${SCHWAB_TOKEN_JSON}" > schwab_token.json
+          python - <<'PY'
+          import os
+          from schwab.auth import client_from_token_file
+          c = client_from_token_file(
+              api_key=os.environ["SCHWAB_APP_KEY"],
+              app_secret=os.environ["SCHWAB_APP_SECRET"],
+              token_path="schwab_token.json")
+          r = c.get_account_numbers()
+          print("HTTP", r.status_code)
+          print("BODY", r.text[:400])
+          r.raise_for_status()
+          arr = r.json()
+          assert isinstance(arr, list) and arr, "No accounts returned"
+          print("✅ schwab-smoke OK; hash =", arr[0]["hashValue"])
+          PY
