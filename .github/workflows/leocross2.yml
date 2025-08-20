@@ -1,92 +1,70 @@
-name: LeoCross Ticket
+name: LeoCross Append Probe
 
 on:
-  workflow_dispatch: {}   # run manually from the Actions tab
+  workflow_dispatch: {}
 
 jobs:
-  leocross:
+  probe:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      - name: Install deps
+      - name: Install Google libs
         run: |
           python -m pip install --upgrade pip
-          pip install requests
+          pip install --quiet google-api-python-client google-auth google-auth-httplib2
 
-      - name: Check GW_TOKEN secret
+      - name: Show SA and tabs, then append
         env:
-          GW_TOKEN: ${{ secrets.GW_TOKEN }}
+          GSHEET_ID: ${{ secrets.GSHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         run: |
-          if [ -z "${GW_TOKEN}" ]; then
-            echo "GW_TOKEN is EMPTY. Add it under: Repo → Settings → Secrets and variables → Actions → New repository secret."
-            exit 1
-          else
-            echo "GW_TOKEN is set"
-          fi
+          python - << 'PY'
+          import os, json, sys
+          from datetime import datetime, timezone
+          from google.oauth2 import service_account
+          from googleapiclient.discovery import build
+          from googleapiclient.errors import HttpError
 
-      - name: Locate leocross_ticket.py
-        id: findscript
-        run: |
-          set -e
-          SCRIPT_PATH="$(git ls-files | grep -E '(^|/)leocross_ticket\.py$' | head -n 1 || true)"
-          if [ -z "$SCRIPT_PATH" ]; then
-            echo "Could not find leocross_ticket.py in repo." >&2
-            echo "Searched files:"; git ls-files | sed -n '1,200p'
-            exit 1
-          fi
-          echo "Found script at: $SCRIPT_PATH"
-          echo "script=$SCRIPT_PATH" >> "$GITHUB_OUTPUT"
+          # Auth
+          info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
+          print("service_account_email:", info.get("client_email","?"))
+          creds = service_account.Credentials.from_service_account_info(
+              info, scopes=["https://www.googleapis.com/auth/spreadsheets"]
+          )
+          svc = build("sheets","v4",credentials=creds)
 
-      - name: Test LeoCross endpoint with token
-        env:
-          GW_TOKEN: ${{ secrets.GW_TOKEN }}
-        run: |
-          set -e
-          URL="https://gandalf.gammawizard.com/rapi/GetLeoCross"
-          echo "GET $URL"
-          HTTP_CODE=$(curl -sS -o resp.json -w "%{http_code}" -H "Authorization: Bearer $GW_TOKEN" "$URL" || echo "curl_failed")
-          echo "HTTP: $HTTP_CODE"
-          echo "Body (first 400 bytes):"
-          head -c 400 resp.json || true
-          echo
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "Non-200 from LeoCross. Token may be expired or invalid." >&2
-            exit 1
-          fi
-          # quick schema check
-          grep -q '"Trade"' resp.json || { echo "Response missing 'Trade' key"; exit 1; }
+          # Metadata
+          sheet_id = os.environ["GSHEET_ID"].strip()
+          meta = svc.spreadsheets().get(spreadsheetId=sheet_id).execute()
+          titles = [s["properties"]["title"] for s in meta.get("sheets",[])]
+          print("tabs:", titles)
 
-      - name: Run leocross_ticket.py
-        env:
-          GW_TOKEN: ${{ secrets.GW_TOKEN }}
-        run: |
-          set -e
-          python "${{ steps.findscript.outputs.script }}" | tee ticket_output.txt
+          tab = "leocross"
+          if tab not in titles:
+              print("ERROR: tab not found:", tab)
+              sys.exit(1)
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: leocross-artifacts-${{ github.run_id }}
-          path: |
-            resp.json
-            ticket_output.txt
-
-      - name: Summary
-        run: |
-          {
-            echo "### LeoCross ticket"
-            echo
-            echo '**Script:** ${{ steps.findscript.outputs.script }}'
-            echo
-            echo '```text'
-            sed -n '1,200p' ticket_output.txt
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          # Append
+          now = datetime.now(timezone.utc).isoformat()
+          body = {"values": [[now, "probe"]]}
+          try:
+              svc.spreadsheets().values().append(
+                  spreadsheetId=sheet_id,
+                  range=f"{tab}!A1",
+                  valueInputOption="RAW",
+                  insertDataOption="INSERT_ROWS",
+                  body=body
+              ).execute()
+              print("append: ok")
+          except HttpError as e:
+              print("append: http error", e)
+              try:
+                  print("details:", e.error_details or e.content)
+              except Exception:
+                  pass
+              sys.exit(1)
+          PY
