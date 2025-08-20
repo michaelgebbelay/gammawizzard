@@ -1,8 +1,0 @@
-name: Smoke
-on:
-  workflow_dispatch:
-jobs:
-  n:
-    runs-on: ubuntu-latest
-    steps:
-      - run: echo ok
