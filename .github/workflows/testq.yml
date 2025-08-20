@@ -1,8 +1,49 @@
-name: Smoke
+name: LeoCross Smoke
 on:
   workflow_dispatch:
 jobs:
-  n:
+  smoke:
     runs-on: ubuntu-latest
     steps:
-      - run: echo ok
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Append to leocross
+        env:
+          GSHEET_ID: ${{ secrets.GSHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          python -m pip install --quiet google-api-python-client google-auth google-auth-httplib2
+          python - <<'PY'
+          import os, json
+          from datetime import datetime, timezone
+          from google.oauth2 import service_account
+          from googleapiclient.discovery import build
+
+          sid = os.environ["GSHEET_ID"]
+          sa  = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
+          creds = service_account.Credentials.from_service_account_info(
+              sa, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+          sheets = build("sheets","v4",credentials=creds)
+          tab = "leocross"
+
+          # seed header once
+          got = sheets.spreadsheets().values().get(
+              spreadsheetId=sid, range=f"{tab}!1:1").execute().get("values", [])
+          if not got:
+              sheets.spreadsheets().values().update(
+                  spreadsheetId=sid, range=f"{tab}!1:1",
+                  valueInputOption="USER_ENTERED",
+                  body={"values":[["ts","source","note"]]}
+              ).execute()
+
+          # append a smoke row
+          now = datetime.now(timezone.utc).isoformat()
+          sheets.spreadsheets().values().append(
+              spreadsheetId=sid, range=f"{tab}!A1",
+              valueInputOption="USER_ENTERED", insertDataOption="INSERT_ROWS",
+              body={"values":[[now,"SMOKE","ok"]]}
+          ).execute()
+          print("leocross-smoke: ok")
+          PY
