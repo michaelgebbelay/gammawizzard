@@ -1,0 +1,58 @@
+name: LeoCross Smoke
+on:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Check secrets
+        env:
+          GSHEET_ID: ${{ secrets.GSHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -e
+          [ -n "${GSHEET_ID}" ] || { echo "GSHEET_ID is EMPTY"; exit 1; }
+          [ -n "${GOOGLE_SERVICE_ACCOUNT_JSON}" ] || { echo "GOOGLE_SERVICE_ACCOUNT_JSON is EMPTY"; exit 1; }
+          echo "Secrets present."
+
+      - name: Append a SMOKE row to Sheet (tab: leocross)
+        env:
+          GSHEET_ID: ${{ secrets.GSHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          python -m pip install --quiet google-api-python-client google-auth google-auth-httplib2
+          python - << 'PY'
+          import os, json
+          from datetime import datetime, timezone
+          from google.oauth2 import service_account
+          from googleapiclient.discovery import build
+
+          sa = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
+          creds = service_account.Credentials.from_service_account_info(sa, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+          sheets = build("sheets","v4",credentials=creds)
+          sid = os.environ["GSHEET_ID"]; tab = "leocross"
+
+          # seed header if empty
+          hdr = [["ts","source","note"]]
+          got = sheets.spreadsheets().values().get(spreadsheetId=sid, range=f"{tab}!1:1").execute().get("values", [])
+          if not got:
+              sheets.spreadsheets().values().update(
+                spreadsheetId=sid, range=f"{tab}!1:1",
+                valueInputOption="USER_ENTERED", body={"values": hdr}
+              ).execute()
+
+          # append smoke row
+          ts = datetime.now(timezone.utc).isoformat()
+          sheets.spreadsheets().values().append(
+            spreadsheetId=sid, range=f"{tab}!A1",
+            valueInputOption="USER_ENTERED", insertDataOption="INSERT_ROWS",
+            body={"values": [[ts,"SMOKE","hello"]]}
+          ).execute()
+          print("leocross-smoke: ok")
+          PY
