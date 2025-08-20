@@ -1,4 +1,4 @@
-name: LeoCross Ticket
+name: gammawiz Ticket
 
 on:
   workflow_dispatch:
