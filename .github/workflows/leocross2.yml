@@ -53,16 +53,12 @@ jobs:
           set -e
           URL="https://gandalf.gammawizard.com/rapi/GetLeoCross"
           echo "GET $URL"
-          HTTP_CODE=$(curl -sS -o resp.json -w "%{http_code}" -H "Authorization: Bearer $GW_TOKEN" "$URL" || echo "curl_failed")
+          HTTP_CODE=$(curl -sS -o resp.json -w "%{http_code}" -H "Authorization: Bearer $GW_TOKEN" "$URL")
           echo "HTTP: $HTTP_CODE"
           echo "Body (first 400 bytes):"
           head -c 400 resp.json || true
           echo
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "Non-200 from LeoCross. Token may be expired or invalid." >&2
-            exit 1
-          fi
-          grep -q '"Trade"' resp.json || { echo "Response missing 'Trade' key"; exit 1; }
+          [ "$HTTP_CODE" = "200" ] || { echo "Non-200 from LeoCross"; exit 1; }
 
       - name: Run leocross_ticket.py
         env:
@@ -84,179 +80,187 @@ jobs:
           from datetime import datetime, timezone
           from google.oauth2 import service_account
           from googleapiclient.discovery import build
+          from googleapiclient.errors import HttpError
 
-          # ---------- helpers ----------
-          def deep_get(d, keys_lc):
-            """depth-first search for any of keys_lc (lowercased)"""
-            stack=[d]
-            while stack:
-              cur=stack.pop()
-              if isinstance(cur, dict):
-                for k,v in cur.items():
-                  if str(k).lower() in keys_lc:
-                    return v
-                stack.extend(cur.values())
-              elif isinstance(cur, list):
-                stack.extend(cur)
-            return None
-
+          # -------- utils --------
           def read_json(path):
-            try:
-              with open(path,'r',encoding='utf-8',errors='ignore') as f:
-                return json.load(f)
-            except Exception:
-              return None
+              try:
+                  with open(path,'r',encoding='utf-8',errors='ignore') as f:
+                      return json.load(f)
+              except Exception:
+                  return {}
 
           def read_text(path):
-            try:
-              with open(path,'r',encoding='utf-8',errors='ignore') as f:
-                return f.read()
-            except Exception:
-              return ""
+              try:
+                  with open(path,'r',encoding='utf-8',errors='ignore') as f:
+                      return f.read()
+              except Exception:
+                  return ""
 
           def first_nonempty_line(text):
-            for ln in text.splitlines():
-              s=ln.strip()
-              if s:
-                return s
-            return ""
+              for ln in text.splitlines():
+                  s=ln.strip()
+                  if s:
+                      return s
+              return ""
 
           def rx(pattern, text, flags=re.I):
-            m=re.search(pattern, text, flags)
-            return m.group(1) if m else ""
+              m=re.search(pattern, text, flags)
+              return m.group(1) if m else ""
 
-          # ---------- inputs ----------
-          api = read_json("resp.json") or {}
-          out_txt = read_text("ticket_output.txt")
+          def flatten(obj, prefix="", out=None):
+              if out is None: out={}
+              if isinstance(obj, dict):
+                  for k,v in obj.items():
+                      flatten(v, f"{prefix}.{k}" if prefix else str(k), out)
+              elif isinstance(obj, list):
+                  for i,v in enumerate(obj):
+                      flatten(v, f"{prefix}[{i}]" if prefix else f"[{i}]", out)
+              else:
+                  out[prefix]=obj
+              return out
 
-          # ---------- fields from API (best effort) ----------
-          # try to accommodate various shapes
-          trade = deep_get(api, {"trade","signal","ticket"})
-          root = trade if isinstance(trade, (dict,list)) else api
+          def pick_any(flat, substrs):
+              for k,v in flat.items():
+                  lk=k.lower()
+                  if any(s in lk for s in substrs):
+                      return v
+              return ""
 
-          def g(key):
-            return deep_get(root, {key.lower()})
+          # -------- inputs --------
+          api = read_json("resp.json")
+          txt = read_text("ticket_output.txt")
+          flat = flatten(api)
 
-          expiry = g("expiry") or rx(r'"?expiry"?\s*[:=]\s*"([^"]+)"', json.dumps(root))
-          side   = g("side")   or rx(r'"?side"?\s*[:=]\s*"([^"]+)"',   json.dumps(root))
-          qty    = g("qty")    or g("quantity") or rx(r'qty\s*=?\s*(\d+)', out_txt)
-          width  = g("width")  or rx(r'width\s*=?\s*([0-9.]+)', out_txt)
+          # -------- extract (API first, fallback to text) --------
+          underlying = pick_any(flat, ["underlying","symbol","ticker"])
 
-          inner_put  = g("inner_put")  or rx(r'inner[_\s]?put\s*[:=]\s*([0-9.]+)', out_txt)
-          inner_call = g("inner_call") or rx(r'inner[_\s]?call\s*[:=]\s*([0-9.]+)', out_txt)
+          signal_date = pick_any(flat, ["signal_date","signal.date"]) \
+                        or rx(r'"?signal_date"?\s*[:=]\s*"([^"]+)"', txt) \
+                        or rx(r'\b(\d{4}-\d{2}-\d{2})\b', txt)
 
-          # strikes (from text sample like: "Strikes  P 6425/6430  C 6470/6475")
-          strikes_put  = rx(r'Strikes?\s+P\s+(\d+(?:\.\d+)?\s*/\s*\d+(?:\.\d+)?)', out_txt)
-          strikes_call = rx(r'Strikes?\s+.*?C\s+(\d+(?:\.\d+)?\s*/\s*\d+(?:\.\d+)?)', out_txt)
+          expiry = pick_any(flat, ["expiry","expiration","expdate"]) \
+                   or rx(r'(?i)\bexp(iry|iration|date)?\b[:=]?\s*([A-Za-z]{3}\s+\d{1,2}\s+\d{4}|\d{4}-\d{2}-\d{2})', txt) or ""
 
-          # worst-case day loss
-          worst_day_loss = g("worst_day_loss") or rx(r'Worst[–-]case(?:\s+day)?\s+loss:\s*\$?([0-9,.-]+)', out_txt)
+          dte = pick_any(flat, ["dte"])
+          side = pick_any(flat, ["side","position_side"]) or rx(r'(?i)\b(short|long)\b', txt)
 
-          # probabilities
-          probs_cat1 = deep_get(root, {"cat1","prob_cat1","p_cat1"}) or rx(r'Cat1\s*=\s*([0-9.]+)', out_txt)
-          probs_cat2 = deep_get(root, {"cat2","prob_cat2","p_cat2"}) or rx(r'Cat2\s*=\s*([0-9.]+)', out_txt)
+          qty = pick_any(flat, ["qty","quantity"]) or rx(r'(?i)\bqty\b[:=]?\s*(\d+)', txt)
+          width = pick_any(flat, ["width"]) or rx(r'(?i)\bwidth\b[:=]?\s*([0-9.]+)', txt)
 
-          # premium/credit/debit if present
-          premium = deep_get(root, {"premium"}) or rx(r'premium\s*[:=]\s*\$?([0-9.]+)', out_txt)
-          credit  = deep_get(root, {"credit"})  or rx(r'credit\s*[:=]\s*\$?([0-9.]+)',  out_txt)
-          debit   = deep_get(root, {"debit"})   or rx(r'debit\s*[:=]\s*\$?([0-9.]+)',   out_txt)
+          inner_put  = pick_any(flat, ["inner_put"])  or rx(r'(?i)inner[_\s]?put[:=]\s*([0-9.]+)', txt)
+          inner_call = pick_any(flat, ["inner_call"]) or rx(r'(?i)inner[_\s]?call[:=]\s*([0-9.]+)', txt)
 
-          # signal date
-          signal_date = g("signal_date") or rx(r'"?signal_date"?\s*[:=]\s*"([^"]+)"', json.dumps(root)) \
-                        or rx(r'\b(\d{4}-\d{2}-\d{2})\b', out_txt)
+          # Strikes like: "Strikes  P 6425/6430  C 6470/6475"
+          strikes_put  = rx(r'(?i)Strikes?\s+P\s+(\d+(?:\.\d+)?\s*/\s*\d+(?:\.\d+)?)', txt)
+          strikes_call = rx(r'(?i)Strikes?.*?C\s+(\d+(?:\.\d+)?\s*/\s*\d+(?:\.\d+)?)', txt)
+          put_spread  = rx(r'(?i)\bP\s+(\d+(?:\.\d+)?\s*/\s*\d+(?:\.\d+)?)', txt) or strikes_put
+          call_spread = rx(r'(?i)\bC\s+(\d+(?:\.\d+)?\s*/\s*\d+(?:\.\d+)?)', txt) or strikes_call
 
-          # OCC legs from text block:
-          occ_buy_put  = rx(r'BUY\s+([A-Z0-9_\.]+P[0-9]+)', out_txt)
-          occ_sell_put = rx(r'SELL\s+([A-Z0-9_\.]+P[0-9]+)', out_txt)
-          # find the first two occurrences per side more robustly
-          def rxall(p,t):
-            return re.findall(p, t, flags=re.I)
-          buy_legs  = rxall(r'BUY\s+([A-Z0-9_\.]+[CP][0-9]+)', out_txt)
-          sell_legs = rxall(r'SELL\s+([A-Z0-9_\.]+[CP][0-9]+)', out_txt)
-          # map buys/sells by option type if possible
+          max_loss = pick_any(flat, ["max_loss","worst_day_loss","worstcase"])
+          max_profit = pick_any(flat, ["max_profit"])
+          prob_profit = pick_any(flat, ["prob_profit","probability_profit"])
+          probs_cat1 = pick_any(flat, ["cat1","prob_cat1","p_cat1"]) or rx(r'(?i)Cat1\s*=\s*([0-9.]+)', txt)
+          probs_cat2 = pick_any(flat, ["cat2","prob_cat2","p_cat2"]) or rx(r'(?i)Cat2\s*=\s*([0-9.]+)', txt)
+
+          premium = pick_any(flat, ["premium"]) or rx(r'(?i)\bpremium\b[:=]\s*\$?([0-9.]+)', txt)
+          credit  = pick_any(flat, ["credit"])  or rx(r'(?i)\bcredit\b[:=]\s*\$?([0-9.]+)', txt)
+          debit   = pick_any(flat, ["debit"])   or rx(r'(?i)\bdebit\b[:=]\s*\$?([0-9.]+)', txt)
+
+          # OCC legs from text: capture first matches
+          def rxall(p,t): return re.findall(p,t,flags=re.I)
+          buy_legs  = rxall(r'BUY\s+([A-Z0-9_\.]+[CP][0-9]+)', txt)
+          sell_legs = rxall(r'SELL\s+([A-Z0-9_\.]+[CP][0-9]+)', txt)
           def pick(legs, opt):
-            for sym in legs:
-              if re.search(opt, sym, re.I): return sym
-            return legs[0] if legs else ""
-          occ_buy_put  = pick(buy_legs,  r'P') or occ_buy_put
-          occ_buy_call = pick(buy_legs,  r'C')
-          occ_sell_put = pick(sell_legs, r'P') or occ_sell_put
-          occ_sell_call= pick(sell_legs, r'C')
+              for sym in legs:
+                  if re.search(opt, sym, re.I): return sym
+              return legs[0] if legs else ""
+          occ_buy_put   = pick(buy_legs,  r'P')
+          occ_buy_call  = pick(buy_legs,  r'C')
+          occ_sell_put  = pick(sell_legs, r'P')
+          occ_sell_call = pick(sell_legs, r'C')
 
-          # put/call spreads (width or strikes)
-          put_spread  = rx(r'P\s+(\d+(?:\.\d+)?\s*/\s*\d+(?:\.\d+)?)', out_txt) or strikes_put
-          call_spread = rx(r'C\s+(\d+(?:\.\d+)?\s*/\s*\d+(?:\.\d+)?)', out_txt) or strikes_call
+          summary = first_nonempty_line(txt)
+          api_flat = json.dumps(api, separators=(',',':'))[:40000] if api else ""
 
-          # fallback summary
-          raw_first_line = first_nonempty_line(out_txt)
-
-          # ---------- sheet write ----------
+          # -------- Sheets auth --------
           info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
           creds = service_account.Credentials.from_service_account_info(
               info, scopes=["https://www.googleapis.com/auth/spreadsheets"]
           )
           svc = build("sheets","v4",credentials=creds)
-
-          headers = [
-            "ts","run_id","actor",
-            "signal_date","expiry","side",
-            "qty","width",
-            "inner_put","inner_call",
-            "strikes_put","strikes_call","put_spread","call_spread",
-            "probs_cat1","probs_cat2",
-            "worst_day_loss",
-            "premium","credit","debit",
-            "occ_buy_put","occ_sell_put","occ_sell_call","occ_buy_call",
-            "notes","raw_first_line"
-          ]
-
-          row = [
-            datetime.now(timezone.utc).isoformat(),
-            os.environ.get("GITHUB_RUN_ID",""),
-            os.environ.get("GITHUB_ACTOR",""),
-            str(signal_date or ""),
-            str(expiry or ""),
-            str(side or ""),
-            str(qty or ""),
-            str(width or ""),
-            str(inner_put or ""),
-            str(inner_call or ""),
-            str(strikes_put or ""),
-            str(strikes_call or ""),
-            str(put_spread or ""),
-            str(call_spread or ""),
-            str(probs_cat1 or ""),
-            str(probs_cat2 or ""),
-            str(worst_day_loss or ""),
-            str(premium or ""),
-            str(credit or ""),
-            str(debit or ""),
-            str(occ_buy_put or ""),
-            str(occ_sell_put or ""),
-            str(occ_sell_call or ""),
-            str(occ_buy_call or ""),
-            "",  # notes (freeform later)
-            str(raw_first_line or "")
-          ]
-
           sheet_id = os.environ["GSHEET_ID"]
           tab = "leocross"
 
-          # idempotent header write (row 1)
-          svc.spreadsheets().values().update(
-            spreadsheetId=sheet_id,
-            range=f"{tab}!1:1",
-            valueInputOption="RAW",
-            body={"values":[headers]}
-          ).execute()
+          # Headers we'll use (only write if row 1 is empty)
+          headers = [
+              "ts","run_id","actor","underlying",
+              "signal_date","expiry","dte","side",
+              "qty","width","inner_put","inner_call",
+              "strikes_put","strikes_call","put_spread","call_spread",
+              "premium","credit","debit",
+              "max_loss","max_profit","prob_profit","probs_cat1","probs_cat2",
+              "occ_buy_put","occ_sell_put","occ_sell_call","occ_buy_call",
+              "summary","api_flat"
+          ]
 
-          # append data row
+          row = [
+              datetime.now(timezone.utc).isoformat(),
+              os.environ.get("GITHUB_RUN_ID",""),
+              os.environ.get("GITHUB_ACTOR",""),
+              str(underlying or ""),
+              str(signal_date or ""),
+              str(expiry or ""),
+              str(dte or ""),
+              str(side or ""),
+              str(qty or ""),
+              str(width or ""),
+              str(inner_put or ""),
+              str(inner_call or ""),
+              str(strikes_put or ""),
+              str(strikes_call or ""),
+              str(put_spread or ""),
+              str(call_spread or ""),
+              str(premium or ""),
+              str(credit or ""),
+              str(debit or ""),
+              str(max_loss or ""),
+              str(max_profit or ""),
+              str(prob_profit or ""),
+              str(probs_cat1 or ""),
+              str(probs_cat2 or ""),
+              str(occ_buy_put or ""),
+              str(occ_sell_put or ""),
+              str(occ_sell_call or ""),
+              str(occ_buy_call or ""),
+              str(summary or ""),
+              str(api_flat or "")
+          ]
+
+          # Only seed headers if first row is empty
+          try:
+              got = svc.spreadsheets().values().get(
+                  spreadsheetId=sheet_id, range=f"{tab}!1:1"
+              ).execute().get("values", [])
+              first_row = got[0] if got else []
+              if not first_row:
+                  svc.spreadsheets().values().update(
+                      spreadsheetId=sheet_id,
+                      range=f"{tab}!1:1",
+                      valueInputOption="RAW",
+                      body={"values":[headers]}
+                  ).execute()
+          except HttpError as e:
+              # don't fail run if header write is blocked
+              print("Header write skipped:", e)
+
+          # Append the data row
           svc.spreadsheets().values().append(
-            spreadsheetId=sheet_id,
-            range=f"{tab}!A1",
-            valueInputOption="RAW",
-            insertDataOption="INSERT_ROWS",
-            body={"values":[row]}
+              spreadsheetId=sheet_id,
+              range=f"{tab}!A1",
+              valueInputOption="RAW",
+              insertDataOption="INSERT_ROWS",
+              body={"values":[row]}
           ).execute()
 
           print("append: ok")
