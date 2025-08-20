@@ -99,7 +99,6 @@ jobs:
           api = read_json("resp.json")
           txt = read_text("ticket_output.txt")
 
-          # Parse ticket line: "YYYY-MM-DD -> YYYY-MM-DD : SIDE qty=10 width=5"
           m1 = re.search(r'(\d{4}-\d{2}-\d{2})\s*(?:->|\u2192)\s*(\d{4}-\d{2}-\d{2})\s*:\s*([A-Z_]+)\s*qty\s*=\s*(\d+)\s*width\s*=\s*([0-9.]+)', txt)
           signal_date = m1.group(1) if m1 else ""
           expiry      = m1.group(2) if m1 else ""
@@ -107,7 +106,6 @@ jobs:
           qty         = m1.group(4) if m1 else ""
           width       = m1.group(5) if m1 else ""
 
-          # Strikes: "Strikes  P 6385/6390  C 6440/6445"
           mS = re.search(r'Strikes?\s+P\s+(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)\s+C\s+(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)', txt, re.I)
           p_low  = mS.group(1) if mS else ""
           p_high = mS.group(2) if mS else ""
@@ -116,14 +114,12 @@ jobs:
           strikes_put  = f"{p_low}/{p_high}" if p_low and p_high else ""
           strikes_call = f"{c_low}/{c_high}" if c_low and c_high else ""
 
-          # Probs and worst-day loss
           mP = re.search(r'Probs.*?Cat1\s*=\s*([0-9.]+)\s+Cat2\s*=\s*([0-9.]+)', txt, re.I)
           cat1 = mP.group(1) if mP else ""
           cat2 = mP.group(2) if mP else ""
           mW = re.search(r'Worst[^A-Za-z0-9]+case(?:\s+day)?\s+loss:\s*\$?([0-9,.-]+)', txt, re.I)
           worst_day_loss = (mW.group(1).replace(',','') if mW else "")
 
-          # OCC legs
           legs = re.findall(r'\b(BUY|SELL)\s+([A-Z0-9_.]+[CP]\d+)', txt, re.I)
           def pick(leg_list, instr, pc):
               for instr_, sym in leg_list:
@@ -135,7 +131,6 @@ jobs:
           occ_sell_call = pick(legs, "SELL", r'C')
           occ_buy_call  = pick(legs, "BUY",  r'C')
 
-          # Trade snapshot from API (use last entry if list)
           trade = {}
           if isinstance(api.get("Trade"), list) and api["Trade"]:
               trade = api["Trade"][-1]
@@ -173,14 +168,12 @@ jobs:
             summary
           ]
 
-          # Sheets auth
           si = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
           creds = service_account.Credentials.from_service_account_info(si, scopes=["https://www.googleapis.com/auth/spreadsheets"])
           svc = build("sheets","v4",credentials=creds)
           sheet_id = os.environ["GSHEET_ID"]
           tab = "leocross"
 
-          # Seed headers only if row 1 empty
           got = svc.spreadsheets().values().get(spreadsheetId=sheet_id, range=f"{tab}!1:1").execute().get("values", [])
           if not got:
               svc.spreadsheets().values().update(
@@ -190,7 +183,6 @@ jobs:
                 body={"values":[headers]}
               ).execute()
 
-          # Append data
           svc.spreadsheets().values().append(
             spreadsheetId=sheet_id,
             range=f"{tab}!A1",
@@ -200,14 +192,6 @@ jobs:
           ).execute()
           print("append: ok")
           PY
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: leocross-artifacts-${{ github.run_id }}
-          path: |
-            resp.json
-            ticket_output.txt
 
       - name: Summary
         run: |
@@ -237,22 +221,18 @@ jobs:
           from googleapiclient.discovery import build
           from schwab.auth import client_from_token_file
 
-          # Rehydrate token for schwab-py
           open("schwab_token.json","w").write(os.environ["SCHWAB_TOKEN_JSON"])
 
-          # Schwab client
           c = client_from_token_file(
               api_key=os.environ["SCHWAB_APP_KEY"],
               app_secret=os.environ["SCHWAB_APP_SECRET"],
               token_path="schwab_token.json")
 
-          # 1) Account hash
           r = c.get_account_numbers(); r.raise_for_status()
           m = r.json()
           acct_hash  = m[0]["hashValue"]
           acct_last4 = m[0]["accountNumber"][-4:]
 
-          # 2) Quote
           sym = "SPX"
           q = c.get_quote(sym)
           if q.status_code != 200 or sym not in q.json():
@@ -260,13 +240,11 @@ jobs:
           q.raise_for_status()
           last = q.json().get(sym, {}).get("quote", {}).get("lastPrice", "")
 
-          # 3) Append to Google Sheet (tab: schwab)
           sa = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
           creds = service_account.Credentials.from_service_account_info(sa, scopes=["https://www.googleapis.com/auth/spreadsheets"])
           sheets = build("sheets","v4",credentials=creds)
           sheet_id = os.environ["GSHEET_ID"]; tab = "schwab"
 
-          # Ensure tab exists
           meta = sheets.spreadsheets().get(spreadsheetId=sheet_id).execute()
           titles = [s["properties"]["title"] for s in meta.get("sheets",[])]
           if tab not in titles:
@@ -275,7 +253,6 @@ jobs:
                 body={"requests":[{"addSheet":{"properties":{"title":tab}}}]}
               ).execute()
 
-          # Headers once
           hdr = [["ts","source","account_hash","account_last4","symbol","last_price"]]
           got = sheets.spreadsheets().values().get(
             spreadsheetId=sheet_id, range=f"{tab}!1:1").execute().get("values", [])
@@ -285,7 +262,6 @@ jobs:
               valueInputOption="USER_ENTERED", body={"values": hdr}
             ).execute()
 
-          # Append
           now = datetime.now(timezone.utc).isoformat()
           row = [[now,"SCHWAB_PROBE",acct_hash,acct_last4,sym,last]]
           sheets.spreadsheets().values().append(
