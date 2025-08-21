@@ -1,6 +1,8 @@
+---
+# yamllint disable rule:line-length
 name: Schwab Probe
 
-on:
+'on':
   workflow_dispatch:
   workflow_run:
     workflows: ["LeoCross Ticket"]   # must match the 'name:' in leocross.yml
@@ -25,7 +27,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install --quiet schwab-py google-api-python-client google-auth google-auth-httplib2
 
-      - name: Account hash + quote -> Sheet (tab: schwab)
+      - name: "Account hash + quote -> Sheet (tab: schwab)"
         env:
           SCHWAB_APP_KEY: ${{ secrets.SCHWAB_APP_KEY }}
           SCHWAB_APP_SECRET: ${{ secrets.SCHWAB_APP_SECRET }}
