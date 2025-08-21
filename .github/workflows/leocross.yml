@@ -4,52 +4,53 @@ name: LeoCross Ticket
 on:
   workflow_dispatch:
   schedule:
-    - cron: "12 20 * * 1-5"   # 4:12 PM ET during DST
-    - cron: "12 21 * * 1-5"   # 4:12 PM ET during Standard Time
+    - cron: "12 23 * * 1-5"  # 23:12 UTC = 4:12 PM PT in DST
+    - cron: "12 0 * * 2-6"   # 00:12 UTC = 4:12 PM PT in Standard Time (next UTC day)
+
+concurrency:
+  group: leocross-ticket
+  cancel-in-progress: true
 
 jobs:
   leocross:
     runs-on: ubuntu-latest
     steps:
-      # Gate: only proceed if it's around 16:12 in New York
-      - name: Gate near 16:12 ET (±10m)
+      - name: Gate to 16:12 PT (Mon–Fri) — FAIL if not match
         id: gate
         shell: bash
         run: |
-          ET_NOW="$(TZ=America/New_York date +%H%M)"
-          echo "New York time: ${ET_NOW:0:2}:${ET_NOW:2:2}"
-          if [ "$ET_NOW" -ge 1602 ] && [ "$ET_NOW" -le 1622 ]; then
+          PT_TIME="$(TZ=America/Los_Angeles date +%H:%M)"
+          PT_DOW="$(TZ=America/Los_Angeles date +%u)"   # 1=Mon ... 7=Sun
+          echo "Los Angeles time now: $PT_TIME (DOW=$PT_DOW)"
+          if [ "$PT_TIME" = "16:12" ] && [ "$PT_DOW" -ge 1 ] && [ "$PT_DOW" -le 5 ]; then
             echo "ok=true" >> "$GITHUB_OUTPUT"
+            exit 0
           else
             echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "Not 16:12 PT on a weekday — failing to prevent downstream triggers."
+            exit 1
           fi
 
       - uses: actions/checkout@v4
-        if: steps.gate.outputs.ok == 'true'
 
       - uses: actions/setup-python@v5
-        if: steps.gate.outputs.ok == 'true'
         with:
           python-version: "3.11"
 
       - name: Install deps
-        if: steps.gate.outputs.ok == 'true'
         run: |
           python -m pip install --upgrade pip
           pip install --quiet requests google-api-python-client google-auth google-auth-httplib2
 
       - name: Run leocross → Google Sheet (A2)
-        if: steps.gate.outputs.ok == 'true'
         env:
           GW_TOKEN: ${{ secrets.GW_TOKEN }}
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          # Optional overrides; blanks are ignored by the script (defaults 3/1)
+          # Sizing defaults now 4 (credit) / 2 (debit); blanks ignored
           LEO_SIZE_CREDIT: ${{ vars.LEO_SIZE_CREDIT }}
           LEO_SIZE_DEBIT: ${{ vars.LEO_SIZE_DEBIT }}
+          # Optional: force side detection if needed: CREDIT or DEBIT
+          LEO_FORCE_SIDE: ${{ vars.LEO_FORCE_SIDE }}
         run: |
           python scripts/leocross_to_sheet.py
-
-      - name: Skipped (outside 16:12 ET ±10m)
-        if: steps.gate.outputs.ok != 'true'
-        run: echo "Skipping because it is not near 16:12 in New York."
