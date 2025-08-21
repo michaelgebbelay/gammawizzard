@@ -1,6 +1,8 @@
+---
+# yamllint disable rule:line-length
 name: Schwab Probe
 
-on:
+'on':
   workflow_dispatch:
   workflow_run:
     workflows: ["LeoCross Ticket"]   # must match the 'name:' in leocross.yml
