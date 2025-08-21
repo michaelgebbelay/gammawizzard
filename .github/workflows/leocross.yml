@@ -1,7 +1,7 @@
 ---
 # yamllint disable rule:line-length
 name: LeoCross Ticket
-'on':
+on:
   workflow_dispatch:
 jobs:
   leocross:
@@ -59,13 +59,12 @@ jobs:
           set -e
           python "${{ steps.findscript.outputs.script }}" | tee ticket_output.txt
 
-      - name: "Append (from A2 down) to Google Sheet (tab: leocross)"
+      - name: "Append to Google Sheet (tab: leocross)"
         env:
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          # Optional knobs (defaults: 3 credit / 1 debit)
-          LEO_SIZE_CREDIT: ${{ vars.LEO_SIZE_CREDIT }}
-          LEO_SIZE_DEBIT: ${{ vars.LEO_SIZE_DEBIT }}
+          LEO_SIZE_CREDIT: ${{ vars.LEO_SIZE_CREDIT }}   # optional override; default 3
+          LEO_SIZE_DEBIT: ${{ vars.LEO_SIZE_DEBIT }}    # optional override; default 1
         run: |
           python - << 'PY'
           import os, json, re
@@ -75,16 +74,12 @@ jobs:
 
           def read_json(p):
               try:
-                  with open(p,'r',encoding='utf-8',errors='ignore') as f:
-                      return json.load(f)
-              except Exception:
-                  return {}
+                  with open(p,'r',encoding='utf-8',errors='ignore') as f: return json.load(f)
+              except Exception: return {}
           def read_text(p):
               try:
-                  with open(p,'r',encoding='utf-8',errors='ignore') as f:
-                      return f.read()
-              except Exception:
-                  return ""
+                  with open(p,'r',encoding='utf-8',errors='ignore') as f: return f.read()
+              except Exception: return ""
           def to_int(x):
               try: return int(float(str(x).strip()))
               except Exception: return None
@@ -92,7 +87,7 @@ jobs:
           api = read_json("resp.json")
           txt = read_text("ticket_output.txt")
 
-          # Parse the ticket line
+          # Parse core line
           m1 = re.search(r'(\d{4}-\d{2}-\d{2})\s*(?:->|\u2192)\s*(\d{4}-\d{2}-\d{2})\s*:\s*([A-Z_]+)\s*qty\s*=\s*(\d+)\s*width\s*=\s*([0-9.]+)', txt)
           signal_date = m1.group(1) if m1 else ""
           expiry      = m1.group(2) if m1 else ""
@@ -138,16 +133,16 @@ jobs:
 
           summary = next((ln.strip() for ln in txt.splitlines() if ln.strip()), "")
 
-          # Sizing rule: 3 credit, 1 debit (overridable via repo variables)
+          # Sizing: 3 credit, 1 debit (overridable via repo variables)
           s_up = side.upper()
           credit = (s_up.startswith("SHORT") or "CREDIT" in s_up)
           debit  = (s_up.startswith("LONG")  or "DEBIT"  in s_up) or not credit
-          size_credit = to_int(os.environ.get("LEO_SIZE_CREDIT") or 3) or 3
-          size_debit  = to_int(os.environ.get("LEO_SIZE_DEBIT")  or 1) or 1
-          qty_exec = size_credit if credit else size_debit
+          def _env_int(k, dflt):
+              try: return int(os.environ.get(k) or dflt)
+              except: return dflt
+          qty_exec = _env_int("LEO_SIZE_CREDIT",3) if credit else _env_int("LEO_SIZE_DEBIT",1)
           credit_or_debit = "credit" if credit else "debit"
 
-          # Header + row (appends below header at A2+)
           headers = [
             "ts","signal_date","expiry","side","credit_or_debit","orig_qty","qty_exec","width",
             "put_spread","call_spread",
@@ -166,14 +161,15 @@ jobs:
             summary
           ]
 
-          # Sheets write: header to row 1 if empty; then append (first append lands at row 2)
+          # Sheets: force header on row 1, then append (A2+)
           sa = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
           creds = service_account.Credentials.from_service_account_info(sa, scopes=["https://www.googleapis.com/auth/spreadsheets"])
           s = build("sheets","v4",credentials=creds)
           sid = os.environ["GSHEET_ID"]; tab = "leocross"
 
           got = s.spreadsheets().values().get(spreadsheetId=sid, range=f"{tab}!1:1").execute().get("values", [])
-          if not got:
+          need_header = (not got) or (got[0] != headers)
+          if need_header:
               s.spreadsheets().values().update(
                 spreadsheetId=sid, range=f"{tab}!1:1",
                 valueInputOption="USER_ENTERED", body={"values":[headers]}
