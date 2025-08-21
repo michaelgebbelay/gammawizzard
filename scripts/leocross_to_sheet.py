@@ -16,6 +16,18 @@ HEADERS = [
     "summary"
 ]
 
+def env_int(name: str, default: int) -> int:
+    s = os.environ.get(name, None)
+    if s is None:
+        return default
+    s = str(s).strip()
+    if s == "":
+        return default
+    try:
+        return int(float(s))
+    except Exception:
+        return default
+
 def env_or_die(name: str) -> str:
     val = os.environ.get(name)
     if not val:
@@ -41,8 +53,8 @@ def main():
     gw_token   = env_or_die("GW_TOKEN")
     sheet_id   = env_or_die("GSHEET_ID")
     sa_json    = env_or_die("GOOGLE_SERVICE_ACCOUNT_JSON")
-    size_credit = int(os.environ.get("LEO_SIZE_CREDIT", "3"))
-    size_debit  = int(os.environ.get("LEO_SIZE_DEBIT",  "1"))
+    size_credit = env_int("LEO_SIZE_CREDIT", 3)
+    size_debit  = env_int("LEO_SIZE_DEBIT", 1)
 
     # 1) Fetch LeoCross JSON
     url = "https://gandalf.gammawizard.com/rapi/GetLeoCross"
