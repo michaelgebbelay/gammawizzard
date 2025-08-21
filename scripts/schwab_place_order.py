@@ -108,12 +108,21 @@ def main():
         j = idx.get(col, -1)
         return leo_row2[j] if 0 <= j < len(leo_row2) else ""
 
-    # Legs (must be SPXW-only)
+    # Legs must be SPXW-only (accept UI forms like ".SPXW..." and underscore variants)
     raw_legs = [g("occ_buy_put"), g("occ_sell_put"), g("occ_sell_call"), g("occ_buy_call")]
     if not all(raw_legs):
         print("Row 2 missing one or more leg symbols; nothing to place."); sys.exit(0)
-    if not all((x or "").upper().startswith("SPXW") for x in raw_legs):
-        print("Non-SPXW leg detected; enforcing SPXW-only → skip."); sys.exit(0)
+    
+    def is_spxw_raw(s: str) -> bool:
+        s = (s or "").strip().upper()
+        if s.startswith("."):  # UI format begins with a dot
+            s = s[1:]
+        s = s.replace("_", "")
+        return s.startswith("SPXW")
+    
+    bad = [x for x in raw_legs if not is_spxw_raw(x)]
+    if bad:
+        print(f"Non-SPXW leg(s) detected: {bad}; enforcing SPXW-only → skip."); sys.exit(0)
 
     # De-dupe: if these raw legs already logged as placed, skip
     all_rows = s.spreadsheets().values().get(spreadsheetId=sheet_id, range=f"{SCHWAB_TAB}!A1:Z100000").execute().get("values", [])
