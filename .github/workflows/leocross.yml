@@ -1,6 +1,8 @@
 name: LeoCross Ticket
 on:
   workflow_dispatch:
+  schedule:
+  - cron: "12 21 * * 1-5"   # run at 21:12 UTC (16:12 EST), Monday–Friday
 
 jobs:
   leocross:
