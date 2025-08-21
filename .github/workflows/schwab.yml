@@ -7,11 +7,30 @@ on:
     workflows: ["LeoCross Ticket"]
     types: [completed]
 
+concurrency:
+  group: schwab-place
+  cancel-in-progress: true
+
 jobs:
   place:
+    # Only run if upstream concluded success OR manual dispatch
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     steps:
+      # Extra safety: only at 16:12 ET or 13:12 ET, Mon–Fri
+      - name: Gate to 16:12 ET or 13:12 ET (Mon–Fri) — FAIL if not match
+        id: gate
+        shell: bash
+        run: |
+          ET_TIME="$(TZ=America/New_York date +%H:%M)"
+          ET_DOW="$(TZ=America/New_York date +%u)"
+          echo "New York time now: $ET_TIME (DOW=$ET_DOW)"
+          if { [ "$ET_TIME" = "16:12" ] || [ "$ET_TIME" = "13:12" ]; } && [ "$ET_DOW" -ge 1 ] && [ "$ET_DOW" -le 5 ]; then
+            exit 0
+          else
+            echo "Not an allowed ET time — failing to avoid misfires."
+            exit 1
+          fi
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
@@ -27,7 +46,16 @@ jobs:
           SCHWAB_TOKEN_JSON: ${{ secrets.SCHWAB_TOKEN_JSON }}
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          SCHWAB_PLACE: ${{ vars.SCHWAB_PLACE }}      # must be "place" to submit
-          NET_PRICE: ${{ vars.NET_PRICE }}            # optional; default 0.05
+          SCHWAB_PLACE: ${{ vars.SCHWAB_PLACE }}   # must be "place"
+          # Optional ladder knobs; blanks are fine (script defaults)
+          NET_PRICE: ${{ vars.NET_PRICE }}
+          TICK: ${{ vars.TICK }}
+          REPRICE_DELAY_SEC: ${{ vars.REPRICE_DELAY_SEC }}
+          MAX_REPRICE_STEPS: ${{ vars.MAX_REPRICE_STEPS }}
+          STICKY_MID_STEPS: ${{ vars.STICKY_MID_STEPS }}
+          OFFSET_CREDIT: ${{ vars.OFFSET_CREDIT }}
+          OFFSET_DEBIT: ${{ vars.OFFSET_DEBIT }}
+          MIN_CREDIT_START: ${{ vars.MIN_CREDIT_START }}
+          MAX_DEBIT_START: ${{ vars.MAX_DEBIT_START }}
         run: |
           python scripts/schwab_place_order.py
