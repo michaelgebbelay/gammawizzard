@@ -221,8 +221,11 @@ jobs:
 
           # job summary
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
-            f.write("### Schwab order (SPX only)\n\n```
-"+json.dumps(order, indent=2)+"\n```\n")
+            f.write(
+              "### Schwab order (SPX only)\n\n```"
+              + json.dumps(order, indent=2)
+              + "\n```\n"
+            )
             f.write(f"- account_last4: {acct_last4}\n")
             f.write(f"- quote: SPX = {last}\n")
             f.write(f"- read leocross row: 2\n")
@@ -230,4 +233,3 @@ jobs:
             f.write(f"- order_id: {order_id}\n")
             f.write(f"- http_status: {place_http if place_http is not None else preview_http}\n")
           PY
-
