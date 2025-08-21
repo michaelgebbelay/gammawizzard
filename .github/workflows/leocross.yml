@@ -55,16 +55,16 @@ jobs:
         env:
           GW_TOKEN: ${{ secrets.GW_TOKEN }}
         run: |
-          set -e
+          set -e -o pipefail
           python "${{ steps.findscript.outputs.script }}" | tee ticket_output.txt
 
-      - name: Insert into Google Sheet at row 2 (tab: leocross)
+      - name: "Insert into Google Sheet at row 2 (tab: leocross)"
         env:
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           # Optional overrides; defaults are 3 (credit) / 1 (debit)
           LEO_SIZE_CREDIT: ${{ vars.LEO_SIZE_CREDIT }}
-          LEO_SIZE_DEBIT:  ${{ vars.LEO_SIZE_DEBIT }}
+          LEO_SIZE_DEBIT: ${{ vars.LEO_SIZE_DEBIT }}
         run: |
           python - << 'PY'
           import os, json, re
@@ -137,9 +137,9 @@ jobs:
           s_up = side.upper()
           credit = (s_up.startswith("SHORT") or "CREDIT" in s_up)
           debit  = (s_up.startswith("LONG")  or "DEBIT"  in s_up) or not credit
-          def _env_int(k, dflt): 
-              try: return int(os.environ.get(k) or dflt)
-              except: return dflt
+          def _env_int(k, dflt):
+            try: return int(os.environ.get(k) or dflt)
+            except: return dflt
           qty_exec = _env_int("LEO_SIZE_CREDIT",3) if credit else _env_int("LEO_SIZE_DEBIT",1)
           credit_or_debit = "credit" if credit else "debit"
 
