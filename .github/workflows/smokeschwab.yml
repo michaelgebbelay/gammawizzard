@@ -1,35 +1,89 @@
-name: Smoke Schwab
+name: Schwab Smoke
 on:
   workflow_dispatch:
 jobs:
-  smoke:
+  probe:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Call get_account_numbers
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install --quiet schwab-py google-api-python-client google-auth google-auth-httplib2
+
+      - name: Account hash + SPX last -> Sheet (tab: schwab)
         env:
           SCHWAB_APP_KEY: ${{ secrets.SCHWAB_APP_KEY }}
           SCHWAB_APP_SECRET: ${{ secrets.SCHWAB_APP_SECRET }}
           SCHWAB_TOKEN_JSON: ${{ secrets.SCHWAB_TOKEN_JSON }}
+          GSHEET_ID: ${{ secrets.GSHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         run: |
-          set -e
-          python -m pip install --quiet schwab-py
-          printf "%s" "${SCHWAB_TOKEN_JSON}" > schwab_token.json
           python - <<'PY'
-          import os
+          import os, json
+          from datetime import datetime, timezone
+          from google.oauth2 import service_account
+          from googleapiclient.discovery import build
           from schwab.auth import client_from_token_file
+
+          # Rehydrate Schwab token file
+          open("schwab_token.json","w").write(os.environ["SCHWAB_TOKEN_JSON"])
+
+          # Schwab client
           c = client_from_token_file(
               api_key=os.environ["SCHWAB_APP_KEY"],
               app_secret=os.environ["SCHWAB_APP_SECRET"],
               token_path="schwab_token.json")
-          r = c.get_account_numbers()
-          print("HTTP", r.status_code)
-          print("BODY", r.text[:400])
-          r.raise_for_status()
-          arr = r.json()
-          assert isinstance(arr, list) and arr, "No accounts returned"
-          print("✅ schwab-smoke OK; hash =", arr[0]["hashValue"])
+
+          # 1) Account hash
+          r = c.get_account_numbers(); r.raise_for_status()
+          m = r.json()
+          acct_hash  = m[0]["hashValue"]
+          acct_last4 = m[0]["accountNumber"][-4:]
+
+          # 2) Quote (prefer SPX; fallback to SPY)
+          sym = "SPX"
+          q = c.get_quote(sym)
+          if q.status_code != 200 or sym not in q.json():
+              sym = "SPY"; q = c.get_quote(sym)
+          q.raise_for_status()
+          last = q.json().get(sym, {}).get("quote", {}).get("lastPrice", "")
+
+          # 3) Append to Google Sheet (tab: schwab)
+          sa = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
+          creds = service_account.Credentials.from_service_account_info(
+              sa, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+          sheets = build("sheets","v4",credentials=creds)
+          sid = os.environ["GSHEET_ID"]; tab = "schwab"
+
+          # Ensure tab exists
+          meta = sheets.spreadsheets().get(spreadsheetId=sid).execute()
+          titles = [s["properties"]["title"] for s in meta.get("sheets",[])]
+          if tab not in titles:
+              sheets.spreadsheets().batchUpdate(
+                spreadsheetId=sid,
+                body={"requests":[{"addSheet":{"properties":{"title":tab}}}]}
+              ).execute()
+
+          # Headers once
+          hdr = [["ts","source","account_hash","account_last4","symbol","last_price"]]
+          got = sheets.spreadsheets().values().get(
+            spreadsheetId=sid, range=f"{tab}!1:1").execute().get("values", [])
+          if not got:
+            sheets.spreadsheets().values().update(
+              spreadsheetId=sid, range=f"{tab}!1:1",
+              valueInputOption="USER_ENTERED", body={"values": hdr}
+            ).execute()
+
+          # Append row
+          now = datetime.now(timezone.utc).isoformat()
+          sheets.spreadsheets().values().append(
+            spreadsheetId=sid, range=f"{tab}!A1",
+            valueInputOption="USER_ENTERED", insertDataOption="INSERT_ROWS",
+            body={"values": [[now,"SCHWAB_PROBE",acct_hash,acct_last4,sym,last]]}
+          ).execute()
+          print("schwab probe: ok")
           PY
