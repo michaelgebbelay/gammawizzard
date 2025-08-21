@@ -5,7 +5,7 @@ name: Schwab Probe
 'on':
   workflow_dispatch:
   workflow_run:
-    workflows: ["LeoCross Ticket"]   # must match the 'name:' in leocross.yml
+    workflows: ["LeoCross Ticket"]   # must match name in leocross.yml
     types: [completed]
 
 concurrency:
@@ -14,7 +14,6 @@ concurrency:
 
 jobs:
   probe:
-    # Auto-run only when LeoCross succeeded; always allow manual runs
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     steps:
@@ -27,75 +26,149 @@ jobs:
           python -m pip install --upgrade pip
           pip install --quiet schwab-py google-api-python-client google-auth google-auth-httplib2
 
-      - name: "Account hash + quote -> Sheet (tab: schwab)"
+      - name: Schwab -> Sheet (append from A2) and PREVIEW order
         env:
           SCHWAB_APP_KEY: ${{ secrets.SCHWAB_APP_KEY }}
           SCHWAB_APP_SECRET: ${{ secrets.SCHWAB_APP_SECRET }}
           SCHWAB_TOKEN_JSON: ${{ secrets.SCHWAB_TOKEN_JSON }}
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          # Order controls (optional)
+          NET_PRICE: ${{ vars.NET_PRICE }}         # e.g., 0.10; defaults to 0.05
+          SCHWAB_PLACE: ${{ vars.SCHWAB_PLACE }}   # set to 'place' to actually place; otherwise preview
         run: |
           python - << 'PY'
-          import os, json
+          import os, json, sys
           from datetime import datetime, timezone
           from google.oauth2 import service_account
           from googleapiclient.discovery import build
           from schwab.auth import client_from_token_file
 
+          # --- Schwab client ---
           open("schwab_token.json","w").write(os.environ["SCHWAB_TOKEN_JSON"])
           c = client_from_token_file(
               api_key=os.environ["SCHWAB_APP_KEY"],
               app_secret=os.environ["SCHWAB_APP_SECRET"],
               token_path="schwab_token.json")
 
+          # --- Account info ---
           r = c.get_account_numbers(); r.raise_for_status()
           acct = r.json()[0]
           acct_hash  = acct["hashValue"]
           acct_last4 = acct["accountNumber"][-4:]
+          print("ACCT", acct_last4, acct_hash[:12]+"...")
 
-          sym = "SPX"
-          q = c.get_quote(sym)
-          if q.status_code != 200 or sym not in q.json():
-              sym = "SPY"; q = c.get_quote(sym)
-          q.raise_for_status()
-          last = q.json().get(sym, {}).get("quote", {}).get("lastPrice", "")
+          # --- Quote (prefer SPX; fall back to SPY) ---
+          def first_quote():
+              for sym in ["$SPX.X","SPX","SPX.X","$SPX","SPY"]:
+                  q = c.get_quote(sym)
+                  if q.status_code == 200 and sym in q.json():
+                      last = q.json()[sym].get("quote",{}).get("lastPrice")
+                      if last is not None:
+                          return sym, last
+              return "SPY", None
+          sym, last = first_quote()
+          print("QUOTE", sym, last)
 
+          # --- Sheets client ---
           sa = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
           creds = service_account.Credentials.from_service_account_info(sa, scopes=["https://www.googleapis.com/auth/spreadsheets"])
           s = build("sheets","v4",credentials=creds)
-          sid = os.environ["GSHEET_ID"]; tab = "schwab"
+          sid = os.environ["GSHEET_ID"]; tab_schwab = "schwab"; tab_leo = "leocross"
 
-          meta = s.spreadsheets().get(spreadsheetId=sid).execute()
-          titles = [sh["properties"]["title"] for sh in meta.get("sheets",[])]
-          if tab not in titles:
-              s.spreadsheets().batchUpdate(spreadsheetId=sid, body={"requests":[{"addSheet":{"properties":{"title":tab}}}]}).execute()
-
+          # Ensure schwab header exists (row 1), then append (first append lands at row 2)
           hdr = [["ts","source","account_hash","account_last4","symbol","last_price"]]
-          got = s.spreadsheets().values().get(spreadsheetId=sid, range=f"{tab}!1:1").execute().get("values", [])
+          got = s.spreadsheets().values().get(spreadsheetId=sid, range=f"{tab_schwab}!1:1").execute().get("values", [])
           if not got:
-              s.spreadsheets().values().update(spreadsheetId=sid, range=f"{tab}!1:1", valueInputOption="USER_ENTERED", body={"values": hdr}).execute()
-
+              s.spreadsheets().values().update(
+                spreadsheetId=sid, range=f"{tab_schwab}!1:1",
+                valueInputOption="USER_ENTERED", body={"values": hdr}
+              ).execute()
           now = datetime.now(timezone.utc).isoformat()
-          s.spreadsheets().values().append(spreadsheetId=sid, range=f"{tab}!A1", valueInputOption="USER_ENTERED", insertDataOption="INSERT_ROWS", body={"values": [[now,"SCHWAB_PROBE",acct_hash,acct_last4,sym,last]]}).execute()
+          s.spreadsheets().values().append(
+            spreadsheetId=sid, range=f"{tab_schwab}!A1",
+            valueInputOption="USER_ENTERED", insertDataOption="INSERT_ROWS",
+            body={"values": [[now,"SCHWAB_PROBE",acct_hash,acct_last4,sym,last]]}
+          ).execute()
           print("schwab: append ok")
-          PY
 
-      - name: Verify last row (schwab)
-        env:
-          GSHEET_ID: ${{ secrets.GSHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-        run: |
-          python - << 'PY'
-          import os, json
-          from google.oauth2 import service_account
-          from googleapiclient.discovery import build
-          sa = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
-          creds = service_account.Credentials.from_service_account_info(sa, scopes=["https://www.googleapis.com/auth/spreadsheets"])
-          s = build("sheets","v4",credentials=creds)
-          sid = os.environ["GSHEET_ID"]; tab="schwab"
-          vals = s.spreadsheets().values().get(spreadsheetId=sid, range=f"{tab}!A1:Z10000").execute().get("values", [])
-          last = vals[-1] if vals else []
-          print("LAST_ROW", last)
+          # --- Build order from latest leocross row ---
+          vals = s.spreadsheets().values().get(spreadsheetId=sid, range=f"{tab_leo}!A1:Z10000").execute().get("values", [])
+          if len(vals) < 2:
+              print("No leocross rows yet; skipping order preview.")
+              sys.exit(0)
+          header, *rows = vals
+          row = rows[-1]
+          def get(col):
+              try:
+                  i = header.index(col)
+                  return row[i] if i < len(row) else ""
+              except ValueError:
+                  return ""
+          side = (get("side") or "").upper()
+          credit_or_debit = (get("credit_or_debit") or "").lower()
+          qty_exec = int(get("qty_exec") or "1")
+
+          legs_spec = [
+            ("occ_buy_put","BUY_TO_OPEN"),
+            ("occ_sell_put","SELL_TO_OPEN"),
+            ("occ_sell_call","SELL_TO_OPEN"),
+            ("occ_buy_call","BUY_TO_OPEN"),
+          ]
+          legs = []
+          for col, instr in legs_spec:
+              symb = get(col)
+              if symb:
+                  legs.append({"instruction": instr, "quantity": qty_exec,
+                               "instrument": {"symbol": symb, "assetType": "OPTION"}})
+          if len(legs) < 4:
+              print("Not enough legs in sheet to build an iron condor; skipping order.")
+              sys.exit(0)
+
+          is_credit = (credit_or_debit == "credit") or side.startswith("SHORT")
+          order_type = "NET_CREDIT" if is_credit else "NET_DEBIT"
+          limit = os.environ.get("NET_PRICE") or "0.05"
+
+          order = {
+            "orderType": order_type,
+            "session": "NORMAL",
+            "price": str(limit),
+            "duration": "DAY",
+            "orderStrategyType": "SINGLE",
+            "complexOrderStrategyType": "IRON_CONDOR",
+            "orderLegCollection": legs
+          }
+
+          print("ORDER_JSON:", json.dumps(order, indent=2))
+
+          # --- Preview (default) or place (explicit toggle) ---
+          place_flag = (os.environ.get("SCHWAB_PLACE","").lower() == "place")
+          try:
+              # preview
+              try:
+                  resp = c.preview_order(acct_hash, order)  # if schwab-py exposes it
+              except AttributeError:
+                  import httpx
+                  url = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/preview"
+                  resp = c.session.post(url, json=order)
+              print("PREVIEW_HTTP", resp.status_code)
+              print("PREVIEW_BODY", resp.text[:800])
+              if place_flag:
+                  pr = getattr(resp, "json", lambda: {})()
+                  # If preview yields a suggested price/route, we could adapt here.
+                  # Place the same order:
+                  ok = c.place_order(acct_hash, order)
+                  print("PLACE_HTTP", ok.status_code)
+                  print("PLACE_BODY", ok.text[:800])
+          except Exception as e:
+              print("ORDER_ERROR", e)
+              # We still want the probe row even if preview fails.
+
+          # Summarize to job summary
+          from textwrap import indent as _indent
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
-            f.write("### Schwab last row\n\n```\n"+ "|".join(last) + "\n```\n")
+              f.write("### Schwab order preview\n\n")
+              f.write("```\n"+json.dumps(order, indent=2)+"\n```\n")
+              f.write(f"- account_last4: {acct_last4}\n\n")
+              f.write(f"- quote: {sym} = {last}\n\n")
           PY
