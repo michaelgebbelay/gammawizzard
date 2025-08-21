@@ -1,6 +1,6 @@
 # scripts/leocross_to_sheet.py
-import os, json, re, subprocess, sys
-from datetime import datetime, timezone
+import os, json, sys
+from datetime import datetime, timezone, date
 import requests
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -16,26 +16,7 @@ HEADERS = [
     "summary"
 ]
 
-# --- robust env parsing (empty/missing -> default) ---
-def env_str(name: str, default: str = "") -> str:
-    val = os.environ.get(name, None)
-    if val is None:
-        return default
-    val = str(val).strip()
-    return val if val != "" else default
-
-def env_int(name: str, default: int) -> int:
-    s = os.environ.get(name, None)
-    if s is None:
-        return default
-    s = str(s).strip()
-    if s == "":
-        return default
-    try:
-        return int(float(s))
-    except Exception:
-        return default
-
+# ---------- robust env helpers ----------
 def env_or_die(name: str) -> str:
     v = os.environ.get(name)
     if not v:
@@ -43,16 +24,34 @@ def env_or_die(name: str) -> str:
         sys.exit(1)
     return v
 
-def find_ticket_script() -> str:
-    for root, _, files in os.walk(".", topdown=True):
-        if "leocross_ticket.py" in files:
-            return os.path.join(root, "leocross_ticket.py")
-    print("leocross_ticket.py not found in repo", file=sys.stderr)
-    sys.exit(1)
+def env_str(name: str, default: str = "") -> str:
+    v = os.environ.get(name, None)
+    if v is None: return default
+    v = str(v).strip()
+    return v if v != "" else default
+
+def env_int(name: str, default: int) -> int:
+    s = os.environ.get(name, None)
+    if s is None: return default
+    s = str(s).strip()
+    if s == "": return default
+    try:
+        return int(float(s))
+    except Exception:
+        return default
+
+# ---------- utils ----------
+def yymmdd(iso: str) -> str:
+    # iso like '2025-08-21' -> '250821'
+    try:
+        d = date.fromisoformat(iso)
+        return f"{d:%y%m%d}"
+    except Exception:
+        return ""
 
 def to_int(x):
     try:
-        return int(float(str(x).strip()))
+        return int(round(float(x)))
     except Exception:
         return None
 
@@ -61,9 +60,10 @@ def main():
     sheet_id   = env_or_die("GSHEET_ID")
     sa_json    = env_or_die("GOOGLE_SERVICE_ACCOUNT_JSON")
 
-    # sizing defaults: 3 for credit, 1 for debit
-    size_credit = env_int("LEO_SIZE_CREDIT", 3)
-    size_debit  = env_int("LEO_SIZE_DEBIT", 1)
+    # Defaults you asked for
+    width       = env_int("LEO_WIDTH", 5)         # strike width; default 5
+    size_credit = env_int("LEO_SIZE_CREDIT", 3)   # 3 for credit
+    size_debit  = env_int("LEO_SIZE_DEBIT", 1)    # 1 for debit
 
     # 1) Fetch LeoCross JSON
     url = "https://gandalf.gammawizard.com/rapi/GetLeoCross"
@@ -73,69 +73,66 @@ def main():
         sys.exit(1)
     api = r.json()
 
-    # 2) Run your ticket generator script
-    script = find_ticket_script()
-    cp = subprocess.run([sys.executable, script], capture_output=True, text=True)
-    if cp.returncode != 0:
-        print(cp.stdout)
-        print(cp.stderr, file=sys.stderr)
-        print("leocross_ticket.py failed", file=sys.stderr)
-        sys.exit(1)
-    txt = cp.stdout
-
-    # 3) Parse output
-    m1 = re.search(r'(\d{4}-\d{2}-\d{2})\s*(?:->|\u2192)\s*(\d{4}-\d{2}-\d{2})\s*:\s*([A-Z_]+)\s*qty\s*=\s*(\d+)\s*width\s*=\s*([0-9.]+)', txt)
-    signal_date = m1.group(1) if m1 else ""
-    expiry      = m1.group(2) if m1 else ""
-    side        = (m1.group(3) if m1 else "") or ""
-    orig_qty    = to_int(m1.group(4)) if m1 else None
-    width       = m1.group(5) if m1 else ""
-
-    mS = re.search(r'Strikes?\s+P\s+(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)\s+C\s+(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)', txt, re.I)
-    p_low  = mS.group(1) if mS else ""; p_high = mS.group(2) if mS else ""
-    c_low  = mS.group(3) if mS else ""; c_high = mS.group(4) if mS else ""
-    put_spread  = f"{p_low}/{p_high}" if p_low and p_high else ""
-    call_spread = f"{c_low}/{c_high}" if c_low and c_high else ""
-
-    mP = re.search(r'Probs.*?Cat1\s*=\s*([0-9.]+)\s+Cat2\s*=\s*([0-9.]+)', txt, re.I)
-    cat1 = mP.group(1) if mP else ""
-    cat2 = mP.group(2) if mP else ""
-    mW = re.search(r'Worst[^A-Za-z0-9]+case(?:\s+day)?\s+loss:\s*\$?([0-9,.-]+)', txt, re.I)
-    worst_day_loss = (mW.group(1).replace(',','') if mW else "")
-
-    legs = re.findall(r'\b(BUY|SELL)\s+([A-Z0-9_.]+[CP]\d+)', txt, re.I)
-    def pick(leg_list, instr, pc):
-        for instr_, sym in leg_list:
-            if instr_.upper()==instr and re.search(pc, sym, re.I): return sym
-        return ""
-    occ_buy_put   = pick(legs,"BUY", r'P')
-    occ_sell_put  = pick(legs,"SELL",r'P')
-    occ_sell_call = pick(legs,"SELL",r'C')
-    occ_buy_call  = pick(legs,"BUY", r'C')
-
-    # Trade snapshot (from API)
+    # 2) Pull the latest Trade block
     trade = {}
     if isinstance(api.get("Trade"), list) and api["Trade"]:
         trade = api["Trade"][-1]
     elif isinstance(api.get("Trade"), dict):
         trade = api["Trade"]
+    if not trade:
+        print("No Trade block in API response", file=sys.stderr)
+        sys.exit(1)
+
+    signal_date = str(trade.get("Date",""))
+    expiry      = str(trade.get("TDate",""))
+    side        = "SHORT_IRON_CONDOR"       # LeoCross generates this structure
+    credit      = True                      # SHORT_* => credit
+    credit_or_debit = "credit" if credit else "debit"
+    qty_exec    = size_credit if credit else size_debit
+
+    # Inner strikes from API
+    inner_put  = to_int(trade.get("Limit", ""))   # e.g., 6370
+    inner_call = to_int(trade.get("CLimit",""))   # e.g., 6425
+    if inner_put is None or inner_call is None:
+        print("Missing Limit/CLimit in Trade; cannot build strikes.", file=sys.stderr)
+        # Write a row that will cause Schwab step to skip
+        inner_put = inner_call = 0
+
+    # Build spreads using width
+    p1 = inner_put - width; p2 = inner_put
+    c1 = inner_call;        c2 = inner_call + width
+    put_spread  = f"{p1}/{p2}" if inner_put else ""
+    call_spread = f"{c1}/{c2}" if inner_call else ""
+
+    # Make SPXW UI leg symbols that Schwab converter already understands
+    # .SPXWYYMMDDP6365 / .SPXWYYMMDDP6370 / .SPXWYYMMDDC6425 / .SPXWYYMMDDC6430
+    exp6 = yymmdd(expiry)
+    occ_buy_put   = f".SPXW{exp6}P{p1}" if exp6 and p1 else ""
+    occ_sell_put  = f".SPXW{exp6}P{p2}" if exp6 and p2 else ""
+    occ_sell_call = f".SPXW{exp6}C{c1}" if exp6 and c1 else ""
+    occ_buy_call  = f".SPXW{exp6}C{c2}" if exp6 and c2 else ""
+
+    # Stats
     spx  = str(trade.get("SPX",""))
     vix  = str(trade.get("VIX",""))
-    rv5  = str(trade.get("RV5","")); rv10 = str(trade.get("RV10","")); rv20 = str(trade.get("RV20",""))
+    rv5  = str(trade.get("RV5",""))
+    rv10 = str(trade.get("RV10",""))
+    rv20 = str(trade.get("RV20",""))
     dte  = str(trade.get("M",""))
-    summary = next((ln.strip() for ln in txt.splitlines() if ln.strip()), "")
+    cat1 = str(trade.get("Cat1",""))
+    cat2 = str(trade.get("Cat2",""))
 
-    # Sizing: 3 credit, 1 debit
-    s_up = side.upper()
-    credit = (s_up.startswith("SHORT") or "CREDIT" in s_up)
-    qty_exec = size_credit if credit else size_debit
-    credit_or_debit = "credit" if credit else "debit"
+    # Worst-day loss (approx; width * 100 * qty_exec). If you want blank, set LEO_WDL=blank
+    worst_day_loss = str(width * 100 * qty_exec)
 
-    # 4) Sheets write at A2
+    summary = f"{signal_date} → {expiry} : {side} qty={qty_exec} width={width} (API-derived)"
+
+    # 3) Sheets write at A2
     sa_info = json.loads(sa_json)
     creds = service_account.Credentials.from_service_account_info(sa_info, scopes=["https://www.googleapis.com/auth/spreadsheets"])
     svc = build("sheets","v4",credentials=creds)
 
+    # Ensure header
     got = svc.spreadsheets().values().get(spreadsheetId=sheet_id, range=f"{LEO_TAB}!1:1").execute().get("values", [])
     if not got or got[0] != HEADERS:
         svc.spreadsheets().values().update(
@@ -143,15 +140,10 @@ def main():
             valueInputOption="USER_ENTERED", body={"values":[HEADERS]}
         ).execute()
 
+    # Get sheetId to insert at row 2
     meta = svc.spreadsheets().get(spreadsheetId=sheet_id).execute()
-    sheet_id_num = None
-    for sh in meta.get("sheets", []):
-        if sh["properties"]["title"] == LEO_TAB:
-            sheet_id_num = sh["properties"]["sheetId"]; break
-    if sheet_id_num is None:
-        print(f"Tab '{LEO_TAB}' not found.", file=sys.stderr); sys.exit(1)
+    sheet_id_num = next(sh["properties"]["sheetId"] for sh in meta["sheets"] if sh["properties"]["title"] == LEO_TAB)
 
-    # Insert a blank row at row 2
     svc.spreadsheets().batchUpdate(
         spreadsheetId=sheet_id,
         body={"requests":[{"insertDimension":{
@@ -162,7 +154,7 @@ def main():
 
     row = [
         datetime.now(timezone.utc).isoformat(),
-        signal_date, expiry, side, credit_or_debit, (orig_qty if orig_qty is not None else ""), qty_exec, width,
+        signal_date, expiry, side, credit_or_debit, "", qty_exec, str(width),
         put_spread, call_spread,
         occ_buy_put, occ_sell_put, occ_sell_call, occ_buy_call,
         cat1, cat2, worst_day_loss,
@@ -175,6 +167,7 @@ def main():
     ).execute()
 
     print(f"leocross: inserted at A2 (qty_exec={qty_exec}, {credit_or_debit})")
+    print("legs", occ_buy_put, occ_sell_put, occ_sell_call, occ_buy_call)
 
 if __name__ == "__main__":
     main()
