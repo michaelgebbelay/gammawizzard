@@ -1,8 +1,7 @@
----
-# yamllint disable rule:line-length
 name: LeoCross Ticket
 on:
   workflow_dispatch:
+
 jobs:
   leocross:
     runs-on: ubuntu-latest
@@ -59,12 +58,13 @@ jobs:
           set -e
           python "${{ steps.findscript.outputs.script }}" | tee ticket_output.txt
 
-      - name: "Append to Google Sheet (tab: leocross)"
+      - name: Insert into Google Sheet at row 2 (tab: leocross)
         env:
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          LEO_SIZE_CREDIT: ${{ vars.LEO_SIZE_CREDIT }}   # optional override; default 3
-          LEO_SIZE_DEBIT: ${{ vars.LEO_SIZE_DEBIT }}    # optional override; default 1
+          # Optional overrides; defaults are 3 (credit) / 1 (debit)
+          LEO_SIZE_CREDIT: ${{ vars.LEO_SIZE_CREDIT }}
+          LEO_SIZE_DEBIT:  ${{ vars.LEO_SIZE_DEBIT }}
         run: |
           python - << 'PY'
           import os, json, re
@@ -137,7 +137,7 @@ jobs:
           s_up = side.upper()
           credit = (s_up.startswith("SHORT") or "CREDIT" in s_up)
           debit  = (s_up.startswith("LONG")  or "DEBIT"  in s_up) or not credit
-          def _env_int(k, dflt):
+          def _env_int(k, dflt): 
               try: return int(os.environ.get(k) or dflt)
               except: return dflt
           qty_exec = _env_int("LEO_SIZE_CREDIT",3) if credit else _env_int("LEO_SIZE_DEBIT",1)
@@ -161,43 +161,40 @@ jobs:
             summary
           ]
 
-          # Sheets: force header on row 1, then append (A2+)
+          # Sheets: ensure header row, then INSERT a new row 2 and write A2
           sa = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
           creds = service_account.Credentials.from_service_account_info(sa, scopes=["https://www.googleapis.com/auth/spreadsheets"])
           s = build("sheets","v4",credentials=creds)
           sid = os.environ["GSHEET_ID"]; tab = "leocross"
 
+          # header
           got = s.spreadsheets().values().get(spreadsheetId=sid, range=f"{tab}!1:1").execute().get("values", [])
-          need_header = (not got) or (got[0] != headers)
-          if need_header:
+          if not got or got[0] != headers:
               s.spreadsheets().values().update(
                 spreadsheetId=sid, range=f"{tab}!1:1",
                 valueInputOption="USER_ENTERED", body={"values":[headers]}
               ).execute()
 
-          s.spreadsheets().values().append(
-            spreadsheetId=sid, range=f"{tab}!A1",
-            valueInputOption="USER_ENTERED", insertDataOption="INSERT_ROWS",
+          # sheetId to insert at row 2
+          meta = s.spreadsheets().get(spreadsheetId=sid).execute()
+          sheet_id = None
+          for sh in meta.get("sheets", []):
+              if sh["properties"]["title"] == tab:
+                  sheet_id = sh["properties"]["sheetId"]; break
+
+          s.spreadsheets().batchUpdate(
+            spreadsheetId=sid,
+            body={"requests":[{"insertDimension":{
+              "range":{"sheetId":sheet_id,"dimension":"ROWS","startIndex":1,"endIndex":2},
+              "inheritFromBefore": False
+            }}]}
+          ).execute()
+
+          s.spreadsheets().values().update(
+            spreadsheetId=sid, range=f"{tab}!A2",
+            valueInputOption="USER_ENTERED",
             body={"values":[row]}
           ).execute()
-          print(f"leocross: append ok (qty_exec={qty_exec}, {credit_or_debit})")
-          PY
 
-      - name: Verify last row (leocross)
-        env:
-          GSHEET_ID: ${{ secrets.GSHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-        run: |
-          python - << 'PY'
-          import os, json
-          from google.oauth2 import service_account
-          from googleapiclient.discovery import build
-          sa = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
-          creds = service_account.Credentials.from_service_account_info(sa, scopes=["https://www.googleapis.com/auth/spreadsheets"])
-          s = build("sheets","v4",credentials=creds)
-          sid = os.environ["GSHEET_ID"]; tab="leocross"
-          vals = s.spreadsheets().values().get(spreadsheetId=sid, range=f"{tab}!A1:Z10000").execute().get("values", [])
-          last = vals[-1] if vals else []
-          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
-            f.write("### LeoCross last row\n\n```\n"+ "|".join(last) + "\n```\n")
+          print(f"leocross: inserted at row 2 (qty_exec={qty_exec}, {credit_or_debit})")
           PY
