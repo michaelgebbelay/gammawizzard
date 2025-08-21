@@ -3,7 +3,7 @@ name: Schwab Probe
 on:
   workflow_dispatch:
   workflow_run:
-    workflows: ["LeoCross Ticket"]   # must match your leocross.yml name
+    workflows: ["LeoCross Ticket"]   # must match name in leocross.yml
     types: [completed]
 
 concurrency:
@@ -31,8 +31,9 @@ jobs:
           SCHWAB_TOKEN_JSON: ${{ secrets.SCHWAB_TOKEN_JSON }}
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          NET_PRICE: ${{ vars.NET_PRICE }}        # optional, default 0.05
-          SCHWAB_PLACE: ${{ vars.SCHWAB_PLACE }}  # set to 'place' to actually submit
+          NET_PRICE: ${{ vars.NET_PRICE }}            # optional, default 0.05
+          SCHWAB_PLACE_VAR: ${{ vars.SCHWAB_PLACE }}  # accept var OR secret
+          SCHWAB_PLACE_SEC: ${{ secrets.SCHWAB_PLACE }}
         run: |
           python - << 'PY'
           import os, json, sys
@@ -40,6 +41,12 @@ jobs:
           from google.oauth2 import service_account
           from googleapiclient.discovery import build
           from schwab.auth import client_from_token_file
+
+          # --- resolve place mode (var or secret) ---
+          _mode = (os.environ.get("SCHWAB_PLACE_VAR") or os.environ.get("SCHWAB_PLACE_SEC") or "").lower()
+          place_flag = (_mode == "place")
+          mode_out = "PLACE" if place_flag else "PREVIEW"
+          print("MODE", mode_out)
 
           # --- Schwab session ---
           open("schwab_token.json","w").write(os.environ["SCHWAB_TOKEN_JSON"])
@@ -54,10 +61,9 @@ jobs:
           acct_hash  = acct["hashValue"]
           acct_last4 = acct["accountNumber"][-4:]
 
-          # Quote: SPX ONLY (no SPY fallback)
-          # Try a few SPX identifiers that Schwab accepts; if none work, we'll still proceed with order.
+          # SPX quote ONLY (no fallback)
           def spx_quote():
-              for sym in ["$SPX.X", "SPX", "SPX.X", "$SPX"]:
+              for sym in ["$SPX.X","SPX","SPX.X","$SPX"]:
                   q = c.get_quote(sym)
                   if q.status_code == 200 and sym in q.json():
                       last = q.json()[sym].get("quote",{}).get("lastPrice")
@@ -66,13 +72,13 @@ jobs:
               return "SPX", None
           sym, last = spx_quote()
 
-          # Sheets client
+          # Sheets
           sa = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
           creds = service_account.Credentials.from_service_account_info(sa, scopes=["https://www.googleapis.com/auth/spreadsheets"])
           s = build("sheets","v4",credentials=creds)
           sid = os.environ["GSHEET_ID"]; tab_schwab = "schwab"; tab_leo = "leocross"
 
-          # ---- Ensure schwab header, then insert a blank row at 2 and write probe at A2 ----
+          # Ensure SCHWAB header, then INSERT at row 2 and write probe row at A2
           header_schwab = [
             "ts","source","account_hash","account_last4","symbol","last_price",
             "signal_date","order_mode","side","qty_exec","order_type","limit_price",
@@ -91,100 +97,99 @@ jobs:
               if sh["properties"]["title"] == tab_schwab:
                   sheet_id = sh["properties"]["sheetId"]; break
 
-          # Insert a blank row 2, then write probe row to A2 (SPX only)
-          s.spreadsheets().batchUpdate(
-            spreadsheetId=sid,
-            body={"requests":[{"insertDimension":{
-              "range":{"sheetId":sheet_id,"dimension":"ROWS","startIndex":1,"endIndex":2},
-              "inheritFromBefore": False
-            }}]}
-          ).execute()
+          def top_insert():
+              s.spreadsheets().batchUpdate(
+                spreadsheetId=sid,
+                body={"requests":[{"insertDimension":{
+                  "range":{"sheetId":sheet_id,"dimension":"ROWS","startIndex":1,"endIndex":2},
+                  "inheritFromBefore": False
+                }}]}
+              ).execute()
+
+          # probe row -> top
+          top_insert()
           now = datetime.now(timezone.utc).isoformat()
           s.spreadsheets().values().update(
             spreadsheetId=sid, range=f"{tab_schwab}!A2",
             valueInputOption="USER_ENTERED",
-            body={"values":[[now,"SCHWAB_PROBE",acct_hash,acct_last4,sym,(last if last is not None else ""), "", "", "", "", "", "", "", "", "", "", "", ""]]}
+            body={"values":[[now,"SCHWAB_PROBE",acct_hash,acct_last4,"SPX",(last if last is not None else ""), "", "", "", "", "", "", "", "", "", "", "", ""]]}
           ).execute()
           print("schwab: inserted probe at A2 (SPX only)")
 
-          # ---- Read leocross row 2 only (latest) ----
-          two_rows = s.spreadsheets().values().get(spreadsheetId=sid, range=f"{tab_leo}!A1:Z2").execute().get("values", [])
-          if len(two_rows) < 2:
+          # Read LEO row 2 (latest)
+          two = s.spreadsheets().values().get(spreadsheetId=sid, range=f"{tab_leo}!A1:Z2").execute().get("values", [])
+          if len(two) < 2:
               print("No leocross row 2; skipping order.")
               sys.exit(0)
-          leo_header = two_rows[0]
-          leo_row2   = two_rows[1]
-          map_idx = {name:i for i,name in enumerate(leo_header)}
+          leo_header, leo_row2 = two[0], two[1]
+          idx = {n:i for i,n in enumerate(leo_header)}
           def g(col):
-              i = map_idx.get(col, -1)
-              return leo_row2[i] if 0 <= i < len(leo_row2) else ""
+              j = idx.get(col, -1)
+              return leo_row2[j] if 0 <= j < len(leo_row2) else ""
 
-          # Require all four SPX/SPXW legs (strict)
-          occ_buy_put   = g("occ_buy_put")
-          occ_sell_put  = g("occ_sell_put")
-          occ_sell_call = g("occ_sell_call")
-          occ_buy_call  = g("occ_buy_call")
-          legs_vals = [occ_buy_put, occ_sell_put, occ_sell_call, occ_buy_call]
-          if not all(legs_vals):
+          # legs must all be SPX (SPX, SPXW, SPXQ...)
+          legs = [g("occ_buy_put"), g("occ_sell_put"), g("occ_sell_call"), g("occ_buy_call")]
+          if not all(legs):
               print("Row 2 missing one or more leg symbols; skipping order.")
               sys.exit(0)
-          def is_spx_leg(x): 
-              x = (x or "").upper()
-              return x.startswith("SPX")  # matches SPX, SPXW, SPXQ...
-          if not all(map(is_spx_leg, legs_vals)):
-              print("Non-SPX leg detected; skipping (SPX-only policy).")
+          def is_spx(s): return (s or "").upper().startswith("SPX")
+          if not all(map(is_spx, legs)):
+              print("Non-SPX leg detected; skipping (SPX-only).")
               sys.exit(0)
 
-          # --- Idempotency: if we already logged an order for these exact legs, skip ---
+          # idempotency: skip if already logged for same 4 legs
           all_rows = s.spreadsheets().values().get(spreadsheetId=sid, range=f"{tab_schwab}!A1:Z100000").execute().get("values", [])
-          idx = {name:i for i,name in enumerate(all_rows[0])} if all_rows else {}
-          def cell(r, col):
-              j = idx.get(col, -1)
-              return (r[j] if 0 <= j < len(r) else "").upper()
-          sig = [v.upper() for v in legs_vals]
+          h = all_rows[0] if all_rows else []
+          hidx = {n:i for i,n in enumerate(h)}
+          def cell(r,c):
+              j = hidx.get(c,-1)
+              return (r[j] if 0<=j<len(r) else "").upper()
+          sig = [x.upper() for x in legs]
           for r in all_rows[1:]:
               if cell(r,"source") in ("SCHWAB_ORDER","SCHWAB_PLACED"):
-                  if [cell(r,"occ_buy_put"), cell(r,"occ_sell_put"), cell(r,"occ_sell_call"), cell(r,"occ_buy_call")] == sig:
+                  if [cell(r,"occ_buy_put"),cell(r,"occ_sell_put"),cell(r,"occ_sell_call"),cell(r,"occ_buy_call")] == sig:
                       print("Duplicate SPX legs already placed/logged; skipping.")
                       sys.exit(0)
 
-          # --- Build order from row 2 ---
+          # build order
           qty_exec = int((g("qty_exec") or "1"))
           side = (g("side") or "").upper()
           credit_or_debit = (g("credit_or_debit") or "").lower()
           is_credit = (credit_or_debit == "credit") or side.startswith("SHORT")
           order_type = "NET_CREDIT" if is_credit else "NET_DEBIT"
-          limit = os.environ.get("NET_PRICE") or "0.05"
+          limit = float(os.environ.get("NET_PRICE") or "0.05")  # numeric, not string
 
           order = {
             "orderType": order_type,
             "session": "NORMAL",
-            "price": str(limit),
+            "price": limit,
             "duration": "DAY",
             "orderStrategyType": "SINGLE",
             "complexOrderStrategyType": "IRON_CONDOR",
             "orderLegCollection": [
-              {"instruction":"BUY_TO_OPEN","quantity":qty_exec,"instrument":{"symbol":occ_buy_put,"assetType":"OPTION"}},
-              {"instruction":"SELL_TO_OPEN","quantity":qty_exec,"instrument":{"symbol":occ_sell_put,"assetType":"OPTION"}},
-              {"instruction":"SELL_TO_OPEN","quantity":qty_exec,"instrument":{"symbol":occ_sell_call,"assetType":"OPTION"}},
-              {"instruction":"BUY_TO_OPEN","quantity":qty_exec,"instrument":{"symbol":occ_buy_call,"assetType":"OPTION"}}
+              {"instruction":"BUY_TO_OPEN","quantity":qty_exec,"instrument":{"symbol":legs[0],"assetType":"OPTION"}},
+              {"instruction":"SELL_TO_OPEN","quantity":qty_exec,"instrument":{"symbol":legs[1],"assetType":"OPTION"}},
+              {"instruction":"SELL_TO_OPEN","quantity":qty_exec,"instrument":{"symbol":legs[2],"assetType":"OPTION"}},
+              {"instruction":"BUY_TO_OPEN","quantity":qty_exec,"instrument":{"symbol":legs[3],"assetType":"OPTION"}}
             ]
           }
 
-          place_flag = (os.environ.get("SCHWAB_PLACE","").lower() == "place")
-
-          # Preview, then optionally place
-          preview_http = None; place_http = None; order_id = ""
+          # preview then optional place
+          preview_http = None; place_http = None; order_id = ""; status_detail = ""
           try:
               try:
-                  resp = c.preview_order(acct_hash, order)  # if supported by schwab-py
+                  resp = c.preview_order(acct_hash, order)   # if available in schwab-py
               except AttributeError:
                   import httpx
                   url = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/preview"
                   resp = c.session.post(url, json=order)
               preview_http = resp.status_code
+              try:
+                  status_detail = resp.text[:800]
+              except Exception:
+                  status_detail = ""
               print("PREVIEW_HTTP", preview_http)
-              # Avoid dumping full HTML/XML; enough to see code
+              print("PREVIEW_BODY", status_detail)
 
               if place_flag:
                   ok = c.place_order(acct_hash, order)
@@ -196,17 +201,11 @@ jobs:
                   except Exception:
                       order_id = ""
           except Exception as e:
+              status_detail = f"EXCEPTION: {e}"
               print("ORDER_ERROR", e)
 
-          # Log an order row (top) for dedupe
-          mode = "PLACE" if place_flag else "PREVIEW"
-          s.spreadsheets().batchUpdate(
-            spreadsheetId=sid,
-            body={"requests":[{"insertDimension":{
-              "range":{"sheetId":sheet_id,"dimension":"ROWS","startIndex":1,"endIndex":2},
-              "inheritFromBefore": False
-            }}]}
-          ).execute()
+          # log order row at top for dedupe
+          top_insert()
           s.spreadsheets().values().update(
             spreadsheetId=sid, range=f"{tab_schwab}!A2",
             valueInputOption="USER_ENTERED",
@@ -214,18 +213,21 @@ jobs:
               datetime.now(timezone.utc).isoformat(),
               "SCHWAB_ORDER",
               acct_hash, acct_last4, "SPX", (last if last is not None else ""),
-              g("signal_date"), mode, side, qty_exec, order_type, str(limit),
-              occ_buy_put, occ_sell_put, occ_sell_call, occ_buy_call,
+              g("signal_date"), mode_out, side, qty_exec, order_type, limit,
+              legs[0], legs[1], legs[2], legs[3],
               order_id, (place_http if place_http is not None else preview_http)
             ]]}
           ).execute()
 
-          # Summary
+          # job summary
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
-            f.write("### Schwab order (SPX only)\n\n```\n"+json.dumps(order, indent=2)+"\n```\n")
+            f.write("### Schwab order (SPX only)\n\n```
+"+json.dumps(order, indent=2)+"\n```\n")
             f.write(f"- account_last4: {acct_last4}\n")
             f.write(f"- quote: SPX = {last}\n")
             f.write(f"- read leocross row: 2\n")
-            f.write(f"- mode: {mode}\n")
+            f.write(f"- mode: {mode_out}\n")
             f.write(f"- order_id: {order_id}\n")
+            f.write(f"- http_status: {place_http if place_http is not None else preview_http}\n")
           PY
+
