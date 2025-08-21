@@ -1,27 +1,54 @@
 name: LeoCross Ticket
+
 on:
   workflow_dispatch:
   schedule:
-  - cron: "12 21 * * 1-5"   # run at 21:12 UTC (16:12 EST), Monday–Friday
+    - cron: "12 20 * * 1-5"   # 4:12 PM ET during DST
+    - cron: "12 21 * * 1-5"   # 4:12 PM ET during Standard Time
 
 jobs:
   leocross:
     runs-on: ubuntu-latest
     steps:
+      # Gate: only proceed if it's 16:12 in New York
+      - name: Gate to exactly 16:12 ET
+        id: gate
+        shell: bash
+        run: |
+          ET_NOW="$(TZ=America/New_York date +%H:%M)"
+          echo "New York time: $ET_NOW"
+          if [ "$ET_NOW" = "16:12" ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.gate.outputs.ok == 'true'
+
       - uses: actions/setup-python@v5
+        if: steps.gate.outputs.ok == 'true'
         with:
           python-version: "3.11"
+
       - name: Install deps
+        if: steps.gate.outputs.ok == 'true'
         run: |
           python -m pip install --upgrade pip
           pip install --quiet requests google-api-python-client google-auth google-auth-httplib2
+
       - name: Run leocross → Google Sheet (A2)
+        if: steps.gate.outputs.ok == 'true'
         env:
           GW_TOKEN: ${{ secrets.GW_TOKEN }}
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          LEO_SIZE_CREDIT: ${{ vars.LEO_SIZE_CREDIT }}   # optional; defaults 3
-          LEO_SIZE_DEBIT:  ${{ vars.LEO_SIZE_DEBIT }}    # optional; defaults 1
+          # Optional overrides; blanks are ignored by the script (defaults 3/1)
+          LEO_SIZE_CREDIT: ${{ vars.LEO_SIZE_CREDIT }}
+          LEO_SIZE_DEBIT:  ${{ vars.LEO_SIZE_DEBIT }}
         run: |
           python scripts/leocross_to_sheet.py
+
+      - name: Skipped (not 16:12 ET)
+        if: steps.gate.outputs.ok != 'true'
+        run: echo "Skipping because it is not 16:12 in New York."
