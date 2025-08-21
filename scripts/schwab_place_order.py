@@ -14,63 +14,94 @@ SCHWAB_HEADERS = [
     "occ_buy_put","occ_sell_put","occ_sell_call","occ_buy_call","order_id","status"
 ]
 
+# --------- helpers ---------
 def env_or_die(name: str) -> str:
-    val = os.environ.get(name)
-    if not val:
+    v = os.environ.get(name)
+    if not v:
         print(f"Missing required env: {name}", file=sys.stderr)
         sys.exit(1)
-    return val
+    return v
+
+def env_str(name: str, default: str = "") -> str:
+    v = os.environ.get(name, None)
+    if v is None: return default
+    v = str(v).strip()
+    return v if v != "" else default
 
 def to_schwab_opt(sym: str) -> str:
-    """Convert UI/OCC variations to Schwab 21-char OCC: ROOT(6) + YYMMDD + C/P + STRIKE(8)"""
+    """
+    Convert various UI/OCC variants to Schwab 21-char OCC/OSI:
+      ROOT padded to 6 chars + YYMMDD + C/P + STRIKE(8, mills)
+    Accepts:
+      .SPXW250821P6365
+      SPXW_250821P06365000
+      'SPXW  250821P06365000'
+      SPX250821P6365
+      SPX  250821P06365000
+    """
     raw = (sym or "").strip().upper()
-    if raw.startswith("."): raw = raw[1:]      # handle UI dot prefix
+    if raw.startswith("."): raw = raw[1:]       # strip UI dot
     raw = raw.replace("_","")
-    # Already OCC shape without padding root
+
+    # Already OCC-like without padded root (ROOT<=6 + YYMMDD + C/P + 8-digit)
     m = re.match(r'^([A-Z.$^]{1,6})(\d{6})([CP])(\d{8})$', raw)
     if m:
         root, ymd, cp, strike8 = m.groups()
-        if root != "SPXW": raise ValueError(f"Non-SPXW root: {root}")
         return f"{root:<6}{ymd}{cp}{strike8}"
-    # UI shape like SPXW250821P6365(.ddd)
+
+    # UI-like with non-padded strike (e.g., SPXW250821P6365 or SPX250821C6425.5)
     m = re.match(r'^([A-Z.$^]{1,6})(\d{6})([CP])(\d{1,5})(?:\.(\d{1,3}))?$', raw)
     if m:
         root, ymd, cp, i, frac = m.groups()
-        if root != "SPXW": raise ValueError(f"Non-SPXW root: {root}")
         mills = int(i)*1000 + (int(frac.ljust(3,'0')) if frac else 0)
         strike8 = f"{mills:08d}"
         return f"{root:<6}{ymd}{cp}{strike8}"
-    # Already left-padded to 6 root chars
+
+    # Already padded 6-char root
     m = re.match(r'^(.{6})(\d{6})([CP])(\d{8})$', sym or "")
     if m:
         root6, ymd, cp, strike8 = m.groups()
-        if not root6.strip().upper().startswith("SPXW"): raise ValueError(f"Non-SPXW root: {root6}")
         return f"{root6}{ymd}{cp}{strike8}"
+
     raise ValueError(f"Cannot parse option symbol: {sym}")
 
 def main():
-    # Toggle must be 'place' to actually submit
-    place_toggle = (os.environ.get("SCHWAB_PLACE","") or os.environ.get("SCHWAB_PLACE_VAR","") or os.environ.get("SCHWAB_PLACE_SEC","")).lower()
+    # Must be 'place' (var/secret) to submit
+    place_toggle = (env_str("SCHWAB_PLACE") or env_str("SCHWAB_PLACE_VAR") or env_str("SCHWAB_PLACE_SEC")).lower()
     if place_toggle != "place":
         print("SCHWAB_PLACE not 'place' → skipping order placement.")
         sys.exit(0)
 
-    app_key    = env_or_die("SCHWAB_APP_KEY")
-    app_secret = env_or_die("SCHWAB_APP_SECRET")
-    token_json = env_or_die("SCHWAB_TOKEN_JSON")
-    sheet_id   = env_or_die("GSHEET_ID")
-    sa_json    = env_or_die("GOOGLE_SERVICE_ACCOUNT_JSON")
-    limit_price = str(os.environ.get("NET_PRICE") or "0.05")
+    app_key     = env_or_die("SCHWAB_APP_KEY")
+    app_secret  = env_or_die("SCHWAB_APP_SECRET")
+    token_json  = env_or_die("SCHWAB_TOKEN_JSON")
+    sheet_id    = env_or_die("GSHEET_ID")
+    sa_json     = env_or_die("GOOGLE_SERVICE_ACCOUNT_JSON")
+    limit_price = env_str("NET_PRICE", "0.05")  # default 0.05
 
-    # Rehydrate Schwab token
+    # Schwab client
     with open("schwab_token.json","w") as f: f.write(token_json)
     c = client_from_token_file(api_key=app_key, app_secret=app_secret, token_path="schwab_token.json")
 
-    # Account info
+    # Account
     r = c.get_account_numbers(); r.raise_for_status()
     acct = r.json()[0]
     acct_hash  = acct["hashValue"]
     acct_last4 = acct["accountNumber"][-4:]
+
+    # Optional: SPX index last for logging
+    def spx_last():
+        for sym in ["$SPX.X","SPX","SPX.X","$SPX"]:
+            try:
+                q = c.get_quote(sym)
+                if q.status_code == 200 and sym in q.json():
+                    last = q.json()[sym].get("quote",{}).get("lastPrice")
+                    if last is not None: return last
+            except Exception:
+                pass
+        return ""
+
+    last_px = spx_last()
 
     # Sheets client
     sa_info = json.loads(sa_json)
@@ -98,7 +129,7 @@ def main():
             }}]}
         ).execute()
 
-    # Read leocross header + row 2 (latest)
+    # Read leocross header + row 2
     two = s.spreadsheets().values().get(spreadsheetId=sheet_id, range=f"{LEO_TAB}!A1:Z2").execute().get("values", [])
     if len(two) < 2:
         print("No leocross row 2; nothing to place."); sys.exit(0)
@@ -108,42 +139,60 @@ def main():
         j = idx.get(col, -1)
         return leo_row2[j] if 0 <= j < len(leo_row2) else ""
 
-    # Legs must be SPXW-only (accept UI forms like ".SPXW..." and underscore variants)
+    # Legs — execute exactly what's on the sheet
     raw_legs = [g("occ_buy_put"), g("occ_sell_put"), g("occ_sell_call"), g("occ_buy_call")]
     if not all(raw_legs):
-        print("Row 2 missing one or more leg symbols; nothing to place."); sys.exit(0)
-    
-    def is_spxw_raw(s: str) -> bool:
-        s = (s or "").strip().upper()
-        if s.startswith("."):  # UI format begins with a dot
-            s = s[1:]
-        s = s.replace("_", "")
-        return s.startswith("SPXW")
-    
-    bad = [x for x in raw_legs if not is_spxw_raw(x)]
-    if bad:
-        print(f"Non-SPXW leg(s) detected: {bad}; enforcing SPXW-only → skip."); sys.exit(0)
+        # still log a row so you can see why it skipped
+        top_insert()
+        s.spreadsheets().values().update(
+            spreadsheetId=sheet_id, range=f"{SCHWAB_TAB}!A2",
+            valueInputOption="USER_ENTERED",
+            body={"values":[[
+                datetime.now(timezone.utc).isoformat(),
+                "SCHWAB_ERROR",
+                acct_hash, acct_last4, "", last_px,
+                g("signal_date"), "PLACE", g("side"), g("qty_exec"), "", limit_price,
+                raw_legs[0] or "", raw_legs[1] or "", raw_legs[2] or "", raw_legs[3] or "",
+                "", "MISSING_LEGS"
+            ]]}
+        ).execute()
+        sys.exit(0)
 
-    # De-dupe: if these raw legs already logged as placed, skip
+    # Dedupe: skip if already logged for same raw legs (case-insensitive)
     all_rows = s.spreadsheets().values().get(spreadsheetId=sheet_id, range=f"{SCHWAB_TAB}!A1:Z100000").execute().get("values", [])
     if all_rows:
         h, data = all_rows[0], all_rows[1:]
         hidx = {n:i for i,n in enumerate(h)}
         def cell(r,c):
-            j = hidx.get(c,-1)
-            return (r[j] if 0<=j<len(r) else "").upper()
+            j = hidx.get(c,-1); return (r[j] if 0<=j<len(r) else "").upper()
         sig = [x.upper() for x in raw_legs]
         for r in data:
             if cell(r,"source") in ("SCHWAB_PLACED","SCHWAB_ORDER"):
                 if [cell(r,"occ_buy_put"),cell(r,"occ_sell_put"),cell(r,"occ_sell_call"),cell(r,"occ_buy_call")] == sig:
-                    print("Duplicate legs already logged; skip placing."); sys.exit(0)
+                    print("Duplicate legs already logged; skip placing.")
+                    sys.exit(0)
 
-    # Convert symbols to 21-char OCC
+    # Convert to Schwab 21-char OCC
     try:
         leg_syms = [to_schwab_opt(x) for x in raw_legs]
     except Exception as e:
-        print(f"Symbol conversion error: {e}", file=sys.stderr); sys.exit(1)
+        # Log conversion error row, then stop
+        top_insert()
+        s.spreadsheets().values().update(
+            spreadsheetId=sheet_id, range=f"{SCHWAB_TAB}!A2",
+            valueInputOption="USER_ENTERED",
+            body={"values":[[
+                datetime.now(timezone.utc).isoformat(),
+                "SCHWAB_ERROR",
+                acct_hash, acct_last4, "", last_px,
+                g("signal_date"), "PLACE", g("side"), g("qty_exec"), "", limit_price,
+                raw_legs[0], raw_legs[1], raw_legs[2], raw_legs[3],
+                "", f"SYMBOL_ERR: {str(e)[:180]}"
+            ]]}
+        ).execute()
+        sys.exit(1)
 
+    # Build order from sheet fields
     qty_exec = int((g("qty_exec") or "1"))
     side = (g("side") or "").upper()
     credit_or_debit = (g("credit_or_debit") or "").lower()
@@ -153,7 +202,7 @@ def main():
     order = {
         "orderType": order_type,
         "session": "NORMAL",
-        "price": str(limit_price),              # Schwab accepts string for price
+        "price": str(limit_price),
         "duration": "DAY",
         "orderStrategyType": "SINGLE",
         "complexOrderStrategyType": "IRON_CONDOR",
@@ -165,6 +214,7 @@ def main():
         ]
     }
 
+    # Place ONLY
     place_http = None; order_id = ""
     try:
         ok = c.place_order(acct_hash, order)
@@ -176,25 +226,34 @@ def main():
             order_id = ""
         print("PLACE_HTTP", place_http)
     except Exception as e:
+        # network or API exception
+        place_http = ""
         print("ORDER_ERROR", e)
 
-    # Log the placed order row at top for dedupe
+    # Log result at top for dedupe (2xx = PLACED; else ERROR)
+    src = "SCHWAB_PLACED" if (place_http and isinstance(place_http,int) and 200 <= place_http < 300) else "SCHWAB_ERROR"
+    # Derive a human symbol label from first leg's root (purely cosmetic)
+    try:
+        root_label = (raw_legs[0].lstrip(".").replace("_","")[:6]).rstrip()
+        # strip digits off
+        root_label = re.match(r'^[A-Z.$^]+', root_label).group(0)
+    except Exception:
+        root_label = ""
     top_insert()
     s.spreadsheets().values().update(
         spreadsheetId=sheet_id, range=f"{SCHWAB_TAB}!A2",
         valueInputOption="USER_ENTERED",
         body={"values":[[
             datetime.now(timezone.utc).isoformat(),
-            "SCHWAB_PLACED",
-            acct_hash, acct_last4, "SPXW", "",
+            src,
+            acct_hash, acct_last4, root_label, last_px,
             g("signal_date"), "PLACE", side, qty_exec, order_type, str(limit_price),
             raw_legs[0], raw_legs[1], raw_legs[2], raw_legs[3],
-            order_id, (place_http if place_http is not None else "")
+            order_id, (place_http if place_http != "" else "EXC")
         ]]}
     ).execute()
 
-    # Summary to stdout (Actions will capture)
-    print("ORDER_JSON", json.dumps(order))
+    # Also print useful bits to logs
     print("LEGS_FORMATTED", leg_syms)
     print("ORDER_ID", order_id)
 
