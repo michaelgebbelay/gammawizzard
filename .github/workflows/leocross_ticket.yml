@@ -1,0 +1,274 @@
+name: LeoCross Ticket
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  leocross:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps (requests + Google Sheets client)
+        run: |
+          python -m pip install --upgrade pip
+          pip install --quiet requests google-api-python-client google-auth google-auth-httplib2
+
+      - name: Check required secrets
+        env:
+          GW_TOKEN: ${{ secrets.GW_TOKEN }}
+          GSHEET_ID: ${{ secrets.GSHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -e
+          [ -n "${GW_TOKEN}" ] || { echo "GW_TOKEN is EMPTY"; exit 1; }
+          [ -n "${GSHEET_ID}" ] || { echo "GSHEET_ID is EMPTY"; exit 1; }
+          [ -n "${GOOGLE_SERVICE_ACCOUNT_JSON}" ] || { echo "GOOGLE_SERVICE_ACCOUNT_JSON is EMPTY"; exit 1; }
+          echo "All required secrets are set."
+
+      - name: Locate leocross_ticket.py
+        id: findscript
+        run: |
+          set -e
+          SCRIPT_PATH="$(git ls-files | grep -E '(^|/)leocross_ticket\.py$' | head -n 1 || true)"
+          if [ -z "$SCRIPT_PATH" ]; then
+            echo "Could not find leocross_ticket.py in repo." >&2
+            echo "Searched files:"; git ls-files | sed -n '1,200p'
+            exit 1
+          fi
+          echo "Found script at: $SCRIPT_PATH"
+          echo "script=$SCRIPT_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Test LeoCross endpoint with token
+        env:
+          GW_TOKEN: ${{ secrets.GW_TOKEN }}
+        run: |
+          set -e
+          URL="https://gandalf.gammawizard.com/rapi/GetLeoCross"
+          echo "GET $URL"
+          HTTP_CODE=$(curl -sS -o resp.json -w "%{http_code}" -H "Authorization: Bearer $GW_TOKEN" "$URL")
+          echo "HTTP: $HTTP_CODE"
+          echo "Body (first 400 bytes):"
+          head -c 400 resp.json || true
+          echo
+          [ "$HTTP_CODE" = "200" ] || { echo "Non-200 from LeoCross"; exit 1; }
+
+      - name: Run leocross_ticket.py
+        env:
+          GW_TOKEN: ${{ secrets.GW_TOKEN }}
+        run: |
+          set -e
+          python "${{ steps.findscript.outputs.script }}" | tee ticket_output.txt
+
+      - name: Parse & Append to Google Sheet (leocross)
+        if: success()
+        env:
+          GSHEET_ID: ${{ secrets.GSHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_ACTOR: ${{ github.actor }}
+        run: |
+          python - << 'PY'
+          import os, json, re, math
+          from datetime import datetime, timezone
+          from google.oauth2 import service_account
+          from googleapiclient.discovery import build
+
+          # ---------- helpers ----------
+          def read_json(path):
+              try:
+                  with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                      return json.load(f)
+              except Exception:
+                  return {}
+
+          def read_text(path):
+              try:
+                  with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                      return f.read()
+              except Exception:
+                  return ""
+
+          def first_line(text):
+              for ln in text.splitlines():
+                  s = ln.strip()
+                  if s: return s
+              return ""
+
+          def to_num(s):
+              try:
+                  s = str(s).replace(',', '').replace('$','').strip()
+                  if s == "" or s is None: return ""
+                  return float(s)
+              except Exception:
+                  return s
+
+          # ---------- load inputs ----------
+          api = read_json("resp.json")
+          txt = read_text("ticket_output.txt")
+
+          # ---------- parse ticket_output.txt ----------
+          # line like: 2025-08-19 -> 2025-08-20 : SHORT_IRON_CONDOR qty=10 width=5
+          m1 = re.search(r'(\d{4}-\d{2}-\d{2})\s*(?:\u2192|->)\s*(\d{4}-\d{2}-\d{2})\s*:\s*([A-Z_]+)\s*qty\s*=\s*(\d+)\s*width\s*=\s*([0-9.]+)', txt)
+          signal_date = m1.group(1) if m1 else ""
+          expiry      = m1.group(2) if m1 else ""
+          side        = m1.group(3) if m1 else ""
+          qty         = m1.group(4) if m1 else ""
+          width       = m1.group(5) if m1 else ""
+
+          # Strikes line: Strikes  P 6385/6390  C 6440/6445
+          mS = re.search(r'Strikes?\s+P\s+(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)\s+C\s+(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)', txt, re.I)
+          p_low  = mS.group(1) if mS else ""
+          p_high = mS.group(2) if mS else ""
+          c_low  = mS.group(3) if mS else ""
+          c_high = mS.group(4) if mS else ""
+          strikes_put  = f"{p_low}/{p_high}" if p_low and p_high else ""
+          strikes_call = f"{c_low}/{c_high}" if c_low and c_high else ""
+
+          # Probs: Probs    Cat1=0.393  Cat2=0.607
+          mP = re.search(r'Probs.*?Cat1\s*=\s*([0-9.]+)\s+Cat2\s*=\s*([0-9.]+)', txt, re.I)
+          cat1 = mP.group(1) if mP else ""
+          cat2 = mP.group(2) if mP else ""
+
+          # Worst-case day loss: $3,000  (be generous on dash chars)
+          mW = re.search(r'Worst[^A-Za-z0-9]+case(?:\s+day)?\s+loss:\s*\$?([0-9,.-]+)', txt, re.I)
+          worst_day_loss = to_num(mW.group(1)) if mW else ""
+
+          # OCC legs (first 4)
+          legs = re.findall(r'\b(BUY|SELL)\s+([A-Z0-9_.]+[CP]\d+)', txt, re.I)
+          # normalize order: buyP, sellP, sellC, buyC if present
+          def pick(leg_list, instr, pc):
+              for instr_, sym in leg_list:
+                  if instr_.upper() == instr and re.search(pc, sym, re.I):
+                      return sym
+              return ""
+          occ_buy_put   = pick(legs, "BUY",  r'P')
+          occ_sell_put  = pick(legs, "SELL", r'P')
+          occ_sell_call = pick(legs, "SELL", r'C')
+          occ_buy_call  = pick(legs, "BUY",  r'C')
+
+          # inner strikes (from text if present)
+          inner_put  = re.search(r'inner[_\s]?put[:=]\s*([0-9.]+)', txt, re.I)
+          inner_call = re.search(r'inner[_\s]?call[:=]\s*([0-9.]+)', txt, re.I)
+          inner_put  = inner_put.group(1) if inner_put else (p_high or "")
+          inner_call = inner_call.group(1) if inner_call else (c_low  or "")
+
+          # ---------- parse resp.json (Trade block) ----------
+          trade = {}
+          if isinstance(api.get("Trade"), list) and api["Trade"]:
+              trade = api["Trade"][-1]  # last entry usually current
+          elif isinstance(api.get("Trade"), dict):
+              trade = api["Trade"]
+
+          # pull common stats if available
+          t_date   = trade.get("Date", "")
+          t_tdate  = trade.get("TDate", "")
+          t_spx    = trade.get("SPX", "")
+          t_r      = trade.get("R", "")
+          t_vix    = trade.get("VIX", "")
+          t_rv     = trade.get("RV", "")
+          t_rv5    = trade.get("RV5", "")
+          t_rv10   = trade.get("RV10", "")
+          t_rv20   = trade.get("RV20", "")
+          t_m      = trade.get("M", "")
+          t_limit  = trade.get("Limit", "")
+          t_climit = trade.get("CLimit", "")
+          t_limp   = trade.get("LImp", "")
+          t_rimp   = trade.get("RImp", "")
+          t_lret   = trade.get("LReturn", "")
+          t_rret   = trade.get("RReturn", "")
+          t_forward= trade.get("Forward", "")
+          t_vixone = trade.get("VixOne", "")
+          t_fp     = trade.get("FP", "")
+          t_cat1   = trade.get("Cat1", "")
+          t_cat2   = trade.get("Cat2", "")
+
+          # ---------- construct row ----------
+          headers = [
+              "ts","run_id","actor",
+              "signal_date","expiry","side","qty","width",
+              "strikes_put","strikes_call","inner_put","inner_call",
+              "occ_buy_put","occ_sell_put","occ_sell_call","occ_buy_call",
+              "cat1","cat2","worst_day_loss",
+              "trade_date","trade_target_date",
+              "SPX","R","VIX","RV","RV5","RV10","RV20","M",
+              "Limit","CLimit","LImp","RImp","LReturn","RReturn",
+              "Forward","VixOne","FP",
+              "summary","api_flat"
+          ]
+
+          summary = first_line(txt)
+          api_flat = json.dumps(api, separators=(',',':'))[:40000] if api else ""
+
+          row = [
+              datetime.now(timezone.utc).isoformat(),
+              os.environ.get("GITHUB_RUN_ID",""),
+              os.environ.get("GITHUB_ACTOR",""),
+              str(signal_date), str(expiry), str(side), str(qty), str(width),
+              str(strikes_put), str(strikes_call), str(inner_put), str(inner_call),
+              str(occ_buy_put), str(occ_sell_put), str(occ_sell_call), str(occ_buy_call),
+              str(cat1 or t_cat1), str(cat2 or t_cat2), str(worst_day_loss),
+              str(t_date), str(t_tdate),
+              str(t_spx), str(t_r), str(t_vix), str(t_rv), str(t_rv5), str(t_rv10), str(t_rv20), str(t_m),
+              str(t_limit), str(t_climit), str(t_limp), str(t_rimp), str(t_lret), str(t_rret),
+              str(t_forward), str(t_vixone), str(t_fp),
+              summary, api_flat
+          ]
+
+          # ---------- Sheets write ----------
+          info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
+          creds = service_account.Credentials.from_service_account_info(
+              info, scopes=["https://www.googleapis.com/auth/spreadsheets"]
+          )
+          svc = build("sheets", "v4", credentials=creds)
+          sheet_id = os.environ["GSHEET_ID"]
+          tab = "leocross"
+
+          # Write headers once if row 1 empty
+          got = svc.spreadsheets().values().get(spreadsheetId=sheet_id, range=f"{tab}!1:1").execute().get("values", [])
+          first_row = got[0] if got else []
+          if not first_row:
+              svc.spreadsheets().values().update(
+                  spreadsheetId=sheet_id,
+                  range=f"{tab}!1:1",
+                  valueInputOption="RAW",
+                  body={"values":[headers]}
+              ).execute()
+
+          # Append the row
+          svc.spreadsheets().values().append(
+              spreadsheetId=sheet_id,
+              range=f"{tab}!A1",
+              valueInputOption="RAW",
+              insertDataOption="INSERT_ROWS",
+              body={"values":[row]}
+          ).execute()
+          print("append: ok")
+          PY
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: leocross-artifacts-${{ github.run_id }}
+          path: |
+            resp.json
+            ticket_output.txt
+
+      - name: Summary
+        run: |
+          {
+            echo "### LeoCross ticket"
+            echo
+            echo '**Script:** ${{ steps.findscript.outputs.script }}'
+            echo
+            echo '```text'
+            sed -n '1,200p' ticket_output.txt || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
