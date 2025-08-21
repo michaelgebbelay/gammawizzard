@@ -57,12 +57,10 @@ jobs:
           set -e
           python "${{ steps.findscript.outputs.script }}" | tee ticket_output.txt
 
-      - name: "Append to Google Sheet (tab: leocross)"
+      - name: "Insert into Google Sheet at row 4 (tab: leocross)"
         env:
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
-          GITHUB_ACTOR: ${{ github.actor }}
         run: |
           python - << 'PY'
           import os, json, re
@@ -70,22 +68,20 @@ jobs:
           from google.oauth2 import service_account
           from googleapiclient.discovery import build
 
+          # ---------- utilities ----------
           def read_json(p):
               try:
-                  with open(p,'r',encoding='utf-8',errors='ignore') as f:
-                      return json.load(f)
-              except Exception:
-                  return {}
+                  with open(p,'r',encoding='utf-8',errors='ignore') as f: return json.load(f)
+              except Exception: return {}
           def read_text(p):
               try:
-                  with open(p,'r',encoding='utf-8',errors='ignore') as f:
-                      return f.read()
-              except Exception:
-                  return ""
+                  with open(p,'r',encoding='utf-8',errors='ignore') as f: return f.read()
+              except Exception: return ""
 
           api = read_json("resp.json")
           txt = read_text("ticket_output.txt")
 
+          # ---------- parse ticket_output.txt ----------
           m1 = re.search(r'(\d{4}-\d{2}-\d{2})\s*(?:->|\u2192)\s*(\d{4}-\d{2}-\d{2})\s*:\s*([A-Z_]+)\s*qty\s*=\s*(\d+)\s*width\s*=\s*([0-9.]+)', txt)
           signal_date = m1.group(1) if m1 else ""
           expiry      = m1.group(2) if m1 else ""
@@ -94,12 +90,10 @@ jobs:
           width       = m1.group(5) if m1 else ""
 
           mS = re.search(r'Strikes?\s+P\s+(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)\s+C\s+(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)', txt, re.I)
-          p_low  = mS.group(1) if mS else ""
-          p_high = mS.group(2) if mS else ""
-          c_low  = mS.group(3) if mS else ""
-          c_high = mS.group(4) if mS else ""
-          strikes_put  = f"{p_low}/{p_high}" if p_low and p_high else ""
-          strikes_call = f"{c_low}/{c_high}" if c_low and c_high else ""
+          p_low  = mS.group(1) if mS else ""; p_high = mS.group(2) if mS else ""
+          c_low  = mS.group(3) if mS else ""; c_high = mS.group(4) if mS else ""
+          put_spread  = f"{p_low}/{p_high}" if p_low and p_high else ""
+          call_spread = f"{c_low}/{c_high}" if c_low and c_high else ""
 
           mP = re.search(r'Probs.*?Cat1\s*=\s*([0-9.]+)\s+Cat2\s*=\s*([0-9.]+)', txt, re.I)
           cat1 = mP.group(1) if mP else ""
@@ -110,67 +104,117 @@ jobs:
           legs = re.findall(r'\b(BUY|SELL)\s+([A-Z0-9_.]+[CP]\d+)', txt, re.I)
           def pick(leg_list, instr, pc):
               for instr_, sym in leg_list:
-                  if instr_.upper() == instr and re.search(pc, sym, re.I):
-                      return sym
+                  if instr_.upper()==instr and re.search(pc, sym, re.I): return sym
               return ""
-          occ_buy_put   = pick(legs, "BUY",  r'P')
-          occ_sell_put  = pick(legs, "SELL", r'P')
-          occ_sell_call = pick(legs, "SELL", r'C')
-          occ_buy_call  = pick(legs, "BUY",  r'C')
+          occ_buy_put   = pick(legs,"BUY",r'P')
+          occ_sell_put  = pick(legs,"SELL",r'P')
+          occ_sell_call = pick(legs,"SELL",r'C')
+          occ_buy_call  = pick(legs,"BUY",r'C')
 
+          # ---------- parse API Trade snapshot ----------
           trade = {}
           if isinstance(api.get("Trade"), list) and api["Trade"]:
               trade = api["Trade"][-1]
           elif isinstance(api.get("Trade"), dict):
               trade = api["Trade"]
 
-          headers = [
-              "ts","run_id","actor",
-              "signal_date","expiry","side","qty","width",
-              "strikes_put","strikes_call",
-              "occ_buy_put","occ_sell_put","occ_sell_call","occ_buy_call",
-              "cat1","cat2","worst_day_loss",
-              "trade_date","trade_target_date",
-              "SPX","R","VIX","RV","RV5","RV10","RV20","M",
-              "Limit","CLimit","LImp","RImp","LReturn","RReturn",
-              "Forward","VixOne","FP","summary"
-          ]
+          spx  = str(trade.get("SPX",""))
+          vix  = str(trade.get("VIX",""))
+          rv5  = str(trade.get("RV5",""))
+          rv10 = str(trade.get("RV10",""))
+          rv20 = str(trade.get("RV20",""))
+          dte  = str(trade.get("M",""))
 
           summary = next((ln.strip() for ln in txt.splitlines() if ln.strip()), "")
 
-          row = [
-              datetime.now(timezone.utc).isoformat(),
-              os.environ.get("GITHUB_RUN_ID",""),
-              os.environ.get("GITHUB_ACTOR",""),
-              signal_date, expiry, side, qty, width,
-              strikes_put, strikes_call,
-              occ_buy_put, occ_sell_put, occ_sell_call, occ_buy_call,
-              cat1 or str(trade.get("Cat1","")), cat2 or str(trade.get("Cat2","")), worst_day_loss,
-              str(trade.get("Date","")), str(trade.get("TDate","")),
-              str(trade.get("SPX","")), str(trade.get("R","")), str(trade.get("VIX","")), str(trade.get("RV","")), str(trade.get("RV5","")), str(trade.get("RV10","")), str(trade.get("RV20","")), str(trade.get("M","")),
-              str(trade.get("Limit","")), str(trade.get("CLimit","")), str(trade.get("LImp","")), str(trade.get("RImp","")), str(trade.get("LReturn","")), str(trade.get("RReturn","")),
-              str(trade.get("Forward","")), str(trade.get("VixOne","")), str(trade.get("FP","")),
-              summary
+          # ---------- header + row (trimmed set) ----------
+          headers = [
+            "ts","signal_date","expiry","side","qty","width",
+            "put_spread","call_spread",
+            "occ_buy_put","occ_sell_put","occ_sell_call","occ_buy_call",
+            "cat1","cat2","worst_day_loss",
+            "spx","vix","rv20","rv10","rv5","dte",
+            "summary"
           ]
 
+          row = [
+            datetime.now(timezone.utc).isoformat(),
+            signal_date, expiry, side, qty, width,
+            put_spread, call_spread,
+            occ_buy_put, occ_sell_put, occ_sell_call, occ_buy_call,
+            cat1, cat2, worst_day_loss,
+            spx, vix, rv20, rv10, rv5, dte,
+            summary
+          ]
+
+          # ---------- Sheets auth ----------
           sa = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
           creds = service_account.Credentials.from_service_account_info(sa, scopes=["https://www.googleapis.com/auth/spreadsheets"])
           sheets = build("sheets","v4",credentials=creds)
-          sid = os.environ["GSHEET_ID"]; tab = "leocross"
+          sid = os.environ["GSHEET_ID"]
+          tab = "leocross"
 
+          # Ensure tab exists, get numeric sheetId (for insert)
+          meta = sheets.spreadsheets().get(spreadsheetId=sid).execute()
+          sheet = None
+          for s in meta.get("sheets", []):
+              if s["properties"]["title"] == tab:
+                  sheet = s
+                  break
+          if sheet is None:
+              sheets.spreadsheets().batchUpdate(
+                spreadsheetId=sid,
+                body={"requests":[{"addSheet":{"properties":{"title":tab}}}]}
+              ).execute()
+              meta = sheets.spreadsheets().get(spreadsheetId=sid).execute()
+              for s in meta.get("sheets", []):
+                  if s["properties"]["title"] == tab:
+                      sheet = s; break
+          sheet_id = sheet["properties"]["sheetId"]
+
+          # Seed header on row 1 if empty
           got = sheets.spreadsheets().values().get(spreadsheetId=sid, range=f"{tab}!1:1").execute().get("values", [])
           if not got:
               sheets.spreadsheets().values().update(
-                  spreadsheetId=sid, range=f"{tab}!1:1",
-                  valueInputOption="USER_ENTERED",
-                  body={"values":[headers]}
+                spreadsheetId=sid, range=f"{tab}!1:1",
+                valueInputOption="USER_ENTERED", body={"values":[headers]}
               ).execute()
 
-          sheets.spreadsheets().values().append(
-              spreadsheetId=sid, range=f"{tab}!A1",
-              valueInputOption="USER_ENTERED",
-              insertDataOption="INSERT_ROWS",
-              body={"values":[row]}
+          # Insert a new row at index 3 (0-based) -> this becomes spreadsheet row 4
+          sheets.spreadsheets().batchUpdate(
+            spreadsheetId=sid,
+            body={"requests":[{"insertDimension":{
+              "range":{"sheetId":sheet_id,"dimension":"ROWS","startIndex":3,"endIndex":4},
+              "inheritFromBefore": False
+            }}]}
           ).execute()
-          print("leocross: append ok")
+
+          # Write the row to A4
+          sheets.spreadsheets().values().update(
+            spreadsheetId=sid, range=f"{tab}!A4",
+            valueInputOption="USER_ENTERED",
+            body={"values":[row]}
+          ).execute()
+
+          print("leocross: inserted at row 4")
+          PY
+
+      - name: Verify row 4 (leocross)
+        env:
+          GSHEET_ID: ${{ secrets.GSHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          python - << 'PY'
+          import os, json
+          from google.oauth2 import service_account
+          from googleapiclient.discovery import build
+          sa = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
+          creds = service_account.Credentials.from_service_account_info(sa, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+          s = build("sheets","v4",credentials=creds)
+          sid = os.environ["GSHEET_ID"]; tab="leocross"
+          vals = s.spreadsheets().values().get(spreadsheetId=sid, range=f"{tab}!A4:Z4").execute().get("values", [])
+          row4 = vals[0] if vals else []
+          print("ROW4", row4)
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+            f.write("### LeoCross row 4\n\n```\n"+ "|".join(row4) + "\n```\n")
           PY
