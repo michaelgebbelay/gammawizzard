@@ -1,6 +1,7 @@
 # scripts/leocross_to_sheet.py
 import os, json, sys
 from datetime import datetime, timezone, date
+from zoneinfo import ZoneInfo
 import requests
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -75,12 +76,18 @@ def main():
 
     # 2) Pull the latest Trade block
     trade = {}
-    if isinstance(api.get("Trade"), list) and api["Trade"]:
-        trade = api["Trade"][-1]
-    elif isinstance(api.get("Trade"), dict):
-        trade = api["Trade"]
+    trades = api.get("Trade")
+    today_et = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    if isinstance(trades, list) and trades:
+        for t in reversed(trades):
+            if str(t.get("Date")) == today_et:
+                trade = t
+                break
+    elif isinstance(trades, dict):
+        if str(trades.get("Date")) == today_et:
+            trade = trades
     if not trade:
-        print("No Trade block in API response", file=sys.stderr)
+        print(f"No Trade block for {today_et} in API response", file=sys.stderr)
         sys.exit(1)
 
     signal_date = str(trade.get("Date",""))

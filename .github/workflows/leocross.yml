@@ -1,3 +1,4 @@
+---  # yamllint disable rule:line-length rule:truthy
 name: LeoCross Ticket
 
 on:
@@ -10,14 +11,14 @@ jobs:
   leocross:
     runs-on: ubuntu-latest
     steps:
-      # Gate: only proceed if it's 16:12 in New York
-      - name: Gate to exactly 16:12 ET
+      # Gate: only proceed if it's around 16:12 in New York
+      - name: Gate near 16:12 ET (±10m)
         id: gate
         shell: bash
         run: |
-          ET_NOW="$(TZ=America/New_York date +%H:%M)"
-          echo "New York time: $ET_NOW"
-          if [ "$ET_NOW" = "16:12" ]; then
+          ET_NOW="$(TZ=America/New_York date +%H%M)"
+          echo "New York time: ${ET_NOW:0:2}:${ET_NOW:2:2}"
+          if [ "$ET_NOW" -ge 1602 ] && [ "$ET_NOW" -le 1622 ]; then
             echo "ok=true" >> "$GITHUB_OUTPUT"
           else
             echo "ok=false" >> "$GITHUB_OUTPUT"
@@ -45,10 +46,10 @@ jobs:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           # Optional overrides; blanks are ignored by the script (defaults 3/1)
           LEO_SIZE_CREDIT: ${{ vars.LEO_SIZE_CREDIT }}
-          LEO_SIZE_DEBIT:  ${{ vars.LEO_SIZE_DEBIT }}
+          LEO_SIZE_DEBIT: ${{ vars.LEO_SIZE_DEBIT }}
         run: |
           python scripts/leocross_to_sheet.py
 
-      - name: Skipped (not 16:12 ET)
+      - name: Skipped (outside 16:12 ET ±10m)
         if: steps.gate.outputs.ok != 'true'
-        run: echo "Skipping because it is not 16:12 in New York."
+        run: echo "Skipping because it is not near 16:12 in New York."
