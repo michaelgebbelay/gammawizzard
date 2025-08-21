@@ -16,6 +16,14 @@ HEADERS = [
     "summary"
 ]
 
+# --- robust env parsing (empty/missing -> default) ---
+def env_str(name: str, default: str = "") -> str:
+    val = os.environ.get(name, None)
+    if val is None:
+        return default
+    val = str(val).strip()
+    return val if val != "" else default
+
 def env_int(name: str, default: int) -> int:
     s = os.environ.get(name, None)
     if s is None:
@@ -29,14 +37,13 @@ def env_int(name: str, default: int) -> int:
         return default
 
 def env_or_die(name: str) -> str:
-    val = os.environ.get(name)
-    if not val:
+    v = os.environ.get(name)
+    if not v:
         print(f"Missing required env: {name}", file=sys.stderr)
         sys.exit(1)
-    return val
+    return v
 
 def find_ticket_script() -> str:
-    # Look for leocross_ticket.py in repo
     for root, _, files in os.walk(".", topdown=True):
         if "leocross_ticket.py" in files:
             return os.path.join(root, "leocross_ticket.py")
@@ -53,6 +60,8 @@ def main():
     gw_token   = env_or_die("GW_TOKEN")
     sheet_id   = env_or_die("GSHEET_ID")
     sa_json    = env_or_die("GOOGLE_SERVICE_ACCOUNT_JSON")
+
+    # sizing defaults: 3 for credit, 1 for debit
     size_credit = env_int("LEO_SIZE_CREDIT", 3)
     size_debit  = env_int("LEO_SIZE_DEBIT", 1)
 
@@ -64,7 +73,7 @@ def main():
         sys.exit(1)
     api = r.json()
 
-    # 2) Run your ticket generator
+    # 2) Run your ticket generator script
     script = find_ticket_script()
     cp = subprocess.run([sys.executable, script], capture_output=True, text=True)
     if cp.returncode != 0:
@@ -74,7 +83,7 @@ def main():
         sys.exit(1)
     txt = cp.stdout
 
-    # 3) Parse fields from the script output
+    # 3) Parse output
     m1 = re.search(r'(\d{4}-\d{2}-\d{2})\s*(?:->|\u2192)\s*(\d{4}-\d{2}-\d{2})\s*:\s*([A-Z_]+)\s*qty\s*=\s*(\d+)\s*width\s*=\s*([0-9.]+)', txt)
     signal_date = m1.group(1) if m1 else ""
     expiry      = m1.group(2) if m1 else ""
@@ -110,20 +119,19 @@ def main():
         trade = api["Trade"][-1]
     elif isinstance(api.get("Trade"), dict):
         trade = api["Trade"]
-
     spx  = str(trade.get("SPX",""))
     vix  = str(trade.get("VIX",""))
     rv5  = str(trade.get("RV5","")); rv10 = str(trade.get("RV10","")); rv20 = str(trade.get("RV20",""))
     dte  = str(trade.get("M",""))
     summary = next((ln.strip() for ln in txt.splitlines() if ln.strip()), "")
 
-    # Sizing: 3 credit, 1 debit (override via env)
+    # Sizing: 3 credit, 1 debit
     s_up = side.upper()
     credit = (s_up.startswith("SHORT") or "CREDIT" in s_up)
     qty_exec = size_credit if credit else size_debit
     credit_or_debit = "credit" if credit else "debit"
 
-    # 4) Sheets: ensure header, insert at row 2, write row
+    # 4) Sheets write at A2
     sa_info = json.loads(sa_json)
     creds = service_account.Credentials.from_service_account_info(sa_info, scopes=["https://www.googleapis.com/auth/spreadsheets"])
     svc = build("sheets","v4",credentials=creds)
