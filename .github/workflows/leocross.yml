@@ -1,11 +1,15 @@
----  # yamllint disable rule:line-length rule:truthy
+---  # yamllint disable rule:line-length rule:truthy rule:colons
 name: LeoCross Ticket
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "12 23 * * 1-5"  # 23:12 UTC = 4:12 PM PT in DST
-    - cron: "12 0 * * 2-6"   # 00:12 UTC = 4:12 PM PT in Standard Time (next UTC day)
+    # 4:12 PM ET (normal close) — two entries to cover DST / Standard Time
+    - cron: "12 20 * * 1-5"  # 20:12 UTC = 16:12 ET during DST
+    - cron: "12 21 * * 1-5"  # 21:12 UTC = 16:12 ET during Standard Time
+    # 1:12 PM ET (early close) — two entries to cover DST / Standard Time
+    - cron: "12 17 * * 1-5"  # 17:12 UTC = 13:12 ET during DST
+    - cron: "12 18 * * 1-5"  # 18:12 UTC = 13:12 ET during Standard Time
 
 concurrency:
   group: leocross-ticket
@@ -15,19 +19,19 @@ jobs:
   leocross:
     runs-on: ubuntu-latest
     steps:
-      - name: Gate to 16:12 PT (Mon–Fri) — FAIL if not match
+      - name: Gate to 16:12 ET or 13:12 ET (Mon–Fri) — FAIL if not match
         id: gate
         shell: bash
         run: |
-          PT_TIME="$(TZ=America/Los_Angeles date +%H:%M)"
-          PT_DOW="$(TZ=America/Los_Angeles date +%u)"   # 1=Mon ... 7=Sun
-          echo "Los Angeles time now: $PT_TIME (DOW=$PT_DOW)"
-          if [ "$PT_TIME" = "16:12" ] && [ "$PT_DOW" -ge 1 ] && [ "$PT_DOW" -le 5 ]; then
+          ET_TIME="$(TZ=America/New_York date +%H:%M)"
+          ET_DOW="$(TZ=America/New_York date +%u)"   # 1=Mon ... 7=Sun
+          echo "New York time now: $ET_TIME (DOW=$ET_DOW)"
+          if { [ "$ET_TIME" = "16:12" ] || [ "$ET_TIME" = "13:12" ]; } && [ "$ET_DOW" -ge 1 ] && [ "$ET_DOW" -le 5 ]; then
             echo "ok=true" >> "$GITHUB_OUTPUT"
             exit 0
           else
             echo "ok=false" >> "$GITHUB_OUTPUT"
-            echo "Not 16:12 PT on a weekday — failing to prevent downstream triggers."
+            echo "Not an allowed ET time (16:12 or 13:12) on a weekday — failing to block downstream."
             exit 1
           fi
 
@@ -47,10 +51,10 @@ jobs:
           GW_TOKEN: ${{ secrets.GW_TOKEN }}
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          # Sizing defaults now 4 (credit) / 2 (debit); blanks ignored
+          # Sizing defaults now 4 (credit) / 2 (debit); blanks ignored by the script
           LEO_SIZE_CREDIT: ${{ vars.LEO_SIZE_CREDIT }}
-          LEO_SIZE_DEBIT: ${{ vars.LEO_SIZE_DEBIT }}
-          # Optional: force side detection if needed: CREDIT or DEBIT
-          LEO_FORCE_SIDE: ${{ vars.LEO_FORCE_SIDE }}
+          LEO_SIZE_DEBIT:  ${{ vars.LEO_SIZE_DEBIT }}
+          # Optional override for side on odd days: CREDIT or DEBIT
+          LEO_FORCE_SIDE:  ${{ vars.LEO_FORCE_SIDE }}
         run: |
           python scripts/leocross_to_sheet.py
