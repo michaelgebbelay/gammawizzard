@@ -19,8 +19,7 @@ HEADERS = [
 def env_or_die(name: str) -> str:
     v = os.environ.get(name)
     if not v:
-        print(f"Missing required env: {name}", file=sys.stderr)
-        sys.exit(1)
+        print(f"Missing required env: {name}", file=sys.stderr); sys.exit(1)
     return v
 
 def env_str(name: str, default: str = "") -> str:
@@ -34,28 +33,27 @@ def env_int(name: str, default: int) -> int:
     if s is None: return default
     s = str(s).strip()
     if s == "": return default
-    try:
-        return int(float(s))
-    except Exception:
-        return default
+    try: return int(float(s))
+    except: return default
 
 def yymmdd(iso: str) -> str:
     try:
         d = date.fromisoformat(iso)
         return f"{d:%y%m%d}"
-    except Exception:
-        return ""
+    except: return ""
 
 def to_int(x):
-    try:
-        return int(round(float(x)))
-    except Exception:
-        return None
+    try: return int(round(float(x)))
+    except: return None
 
-def find_ticket_script():
-    for root, _, files in os.walk(".", topdown=True):
-        if "leocross_ticket.py" in files:
-            return os.path.join(root, "leocross_ticket.py")
+def extract_strike(sym: str):
+    """Robust strike parser for '.SPXW250822P6315' or 'SPXW_250822P06315000'."""
+    if not sym: return None
+    t = sym.strip().upper().lstrip(".").replace("_","")
+    m = re.search(r'[PC](\d{6,8})$', t)  # OSI mills
+    if m: return int(m.group(1)) / 1000.0
+    m = re.search(r'[PC](\d+(?:\.\d+)?)$', t)  # plain
+    if m: return float(m.group(1))
     return None
 
 def parse_ticket_output(txt: str):
@@ -78,35 +76,47 @@ def parse_ticket_output(txt: str):
     summary = next((ln.strip() for ln in txt.splitlines() if ln.strip()), "")
     return {
         "signal_date": signal_date, "expiry": expiry, "side": side, "width": width, "orig_qty": orig_qty,
-        "put_spread": f"{p1}/{p2}" if p1 and p2 else "",
-        "call_spread": f"{c1}/{c2}" if c1 and c2 else "",
-        "occ_buy_put": occ_buy_put, "occ_sell_put": occ_sell_put, "occ_sell_call": occ_sell_call, "occ_buy_call": occ_buy_call,
+        "p1": p1, "p2": p2, "c1": c1, "c2": c2,
+        "occ_buy_put": occ_buy_put, "occ_sell_put": occ_sell_put,
+        "occ_sell_call": occ_sell_call, "occ_buy_call": occ_buy_call,
         "summary": summary
     }
+
+def orient_pairs_for_side(bp, sp, sc, bc, is_credit):
+    """Given four leg symbols (buyP,sellP,sellC,buyC), ensure the pair
+    orientation matches credit/debit rules by swapping within each pair if needed."""
+    # Extract strikes (None-safe)
+    bps = extract_strike(bp); sps = extract_strike(sp); scs = extract_strike(sc); bcs = extract_strike(bc)
+    # Puts
+    if bps is not None and sps is not None:
+        if is_credit and bps > sps:    bp, sp = sp, bp   # want buy lower < sell higher
+        if not is_credit and bps < sps: bp, sp = sp, bp  # want buy higher > sell lower
+    # Calls
+    if scs is not None and bcs is not None:
+        if is_credit and scs > bcs:    sc, bc = bc, sc   # want sell lower < buy higher
+        if not is_credit and bcs > scs: sc, bc = bc, sc  # want buy lower < sell higher
+    return bp, sp, sc, bc
 
 def main():
     gw_token   = env_or_die("GW_TOKEN")
     sheet_id   = env_or_die("GSHEET_ID")
     sa_json    = env_or_die("GOOGLE_SERVICE_ACCOUNT_JSON")
 
-    # sizing defaults (sheet-level; Schwab may override with %BP)
+    # sizing defaults used for display only (Schwab can override via %BP)
     size_credit = env_int("LEO_SIZE_CREDIT", 4)
     size_debit  = env_int("LEO_SIZE_DEBIT",  2)
     width_env   = env_int("LEO_WIDTH", 5)
 
-    # optional overrides
-    force_side  = env_str("LEO_FORCE_SIDE", "").upper()  # "CREDIT" or "DEBIT"
+    force_side  = env_str("LEO_FORCE_SIDE", "").upper()      # "CREDIT"/"DEBIT"
     tie_side    = env_str("LEO_TIE_SIDE", "CREDIT").upper()  # when Cat1 == Cat2
 
-    # 1) API fetch
+    # 1) Fetch API
     url = "https://gandalf.gammawizard.com/rapi/GetLeoCross"
     r = requests.get(url, headers={"Authorization": f"Bearer {gw_token}"}, timeout=30)
     if r.status_code != 200:
-        print(f"LeoCross GET failed: {r.status_code} {r.text[:400]}", file=sys.stderr)
-        sys.exit(1)
+        print(f"LeoCross GET failed: {r.status_code} {r.text[:400]}", file=sys.stderr); sys.exit(1)
     api = r.json()
 
-    # Trade block
     trade = {}
     if isinstance(api.get("Trade"), list) and api["Trade"]:
         trade = api["Trade"][-1]
@@ -122,83 +132,83 @@ def main():
     dte  = str(trade.get("M",""))
     cat1 = str(trade.get("Cat1","")); cat2 = str(trade.get("Cat2",""))
 
-    # 2) Prefer ticket legs if present (but we will compute side from Cat-rule)
-    side_from_ticket = None; summary = ""
+    # 2) Ticket parse (optional)
     put_spread = call_spread = ""
     occ_buy_put = occ_sell_put = occ_sell_call = occ_buy_call = ""
-    width = str(width_env); orig_qty = ""
+    width = str(width_env); orig_qty = ""; summary = ""
 
-    ticket = find_ticket_script()
+    ticket = None
+    for root, _, files in os.walk(".", topdown=True):
+        if "leocross_ticket.py" in files:
+            ticket = os.path.join(root, "leocross_ticket.py")
+            break
     if ticket:
         cp = subprocess.run([sys.executable, ticket], capture_output=True, text=True)
         if cp.returncode == 0:
             parsed = parse_ticket_output(cp.stdout)
             if parsed:
-                side_from_ticket = parsed["side"]  # informative only; not authoritative
-                summary     = parsed["summary"] or summary
-                put_spread  = parsed["put_spread"] or put_spread
-                call_spread = parsed["call_spread"] or call_spread
-                occ_buy_put   = parsed["occ_buy_put"] or occ_buy_put
-                occ_sell_put  = parsed["occ_sell_put"] or occ_sell_put
+                summary   = parsed["summary"] or summary
+                width     = parsed["width"] or width
+                orig_qty  = parsed["orig_qty"] or orig_qty
+                # spreads if present
+                if parsed["p1"] and parsed["p2"]:
+                    put_spread  = f'{min(parsed["p1"],parsed["p2"])}/{max(parsed["p1"],parsed["p2"])}'
+                if parsed["c1"] and parsed["c2"]:
+                    call_spread = f'{min(parsed["c1"],parsed["c2"])}/{max(parsed["c1"],parsed["c2"])}'
+                occ_buy_put   = parsed["occ_buy_put"]   or occ_buy_put
+                occ_sell_put  = parsed["occ_sell_put"]  or occ_sell_put
                 occ_sell_call = parsed["occ_sell_call"] or occ_sell_call
-                occ_buy_call  = parsed["occ_buy_call"] or occ_buy_call
-                width       = parsed["width"] or width
-                orig_qty    = parsed["orig_qty"] or orig_qty
+                occ_buy_call  = parsed["occ_buy_call"]  or occ_buy_call
 
-    # 3) If no legs yet, derive from API (Limit/CLimit + width)
+    # 3) If legs missing, derive from API inner (Limit/CLimit) + width
     if not (occ_buy_put and occ_sell_put and occ_sell_call and occ_buy_call):
-        try:
-            inner_put  = to_int(trade.get("Limit",""))
-            inner_call = to_int(trade.get("CLimit",""))
-            w = to_int(width) or width_env
-            if inner_put is None or inner_call is None:
-                raise ValueError("Missing Limit/CLimit for leg derivation.")
-            p1, p2 = inner_put - w, inner_put
-            c1, c2 = inner_call, inner_call + w
-            put_spread, call_spread = f"{p1}/{p2}", f"{c1}/{c2}"
-            exp6 = yymmdd(expiry)
-            occ_buy_put   = f".SPXW{exp6}P{p1}"
-            occ_sell_put  = f".SPXW{exp6}P{p2}"
-            occ_sell_call = f".SPXW{exp6}C{c1}"
-            occ_buy_call  = f".SPXW{exp6}C{c2}"
-            summary = summary or f"{signal_date} → {expiry} : AUTO legs width={w}"
-            width = str(w)
-        except Exception as e:
-            print(f"Leg derivation failed: {e}", file=sys.stderr)
-            sys.exit(1)
+        w = to_int(width) or width_env
+        inner_put  = to_int(trade.get("Limit",""))
+        inner_call = to_int(trade.get("CLimit",""))
+        if inner_put is None or inner_call is None:
+            print("Missing Limit/CLimit for leg derivation.", file=sys.stderr); sys.exit(1)
+        p_low, p_high = inner_put - w, inner_put
+        c_low, c_high = inner_call, inner_call + w
+        put_spread  = f"{p_low}/{p_high}"
+        call_spread = f"{c_low}/{c_high}"
+        exp6 = yymmdd(expiry)
+        # provisional credit-style assignment; we’ll re-orient after Cat decision
+        occ_buy_put   = f".SPXW{exp6}P{p_low}"
+        occ_sell_put  = f".SPXW{exp6}P{p_high}"
+        occ_sell_call = f".SPXW{exp6}C{c_low}"
+        occ_buy_call  = f".SPXW{exp6}C{c_high}"
+        width = str(w)
+        summary = summary or f"{signal_date} → {expiry} : AUTO legs width={w}"
 
-    # 4) Decide CREDIT/DEBIT from Cat-rule (force_side overrides)
+    # 4) Decide CREDIT/DEBIT from Cat-rule (+ override)
     credit = True
     try:
-        c1 = float(cat1); c2 = float(cat2)
-        if c1 > c2:
-            credit = False    # DEBIT
-        elif c1 < c2:
-            credit = True     # CREDIT
-        else:
-            credit = (tie_side == "CREDIT")
-    except Exception:
-        # fallback if cats are missing: use ticket hint, else default CREDIT
-        if side_from_ticket:
-            credit = side_from_ticket.upper().startswith("SHORT")
-        else:
-            credit = True
+        c1, c2 = float(cat1), float(cat2)
+        if c1 > c2: credit = False   # DEBIT
+        elif c1 < c2: credit = True  # CREDIT
+        else: credit = (tie_side == "CREDIT")
+    except:
+        credit = True
+    if env_str("LEO_FORCE_SIDE","").upper() in ("CREDIT","DEBIT"):
+        credit = (env_str("LEO_FORCE_SIDE").upper()=="CREDIT")
 
-    if force_side in ("CREDIT","DEBIT"):
-        credit = (force_side == "CREDIT")
+    # 5) Re-orient pairs to match side rules
+    occ_buy_put, occ_sell_put, occ_sell_call, occ_buy_call = orient_pairs_for_side(
+        occ_buy_put, occ_sell_put, occ_sell_call, occ_buy_call, credit
+    )
 
     side = "SHORT_IRON_CONDOR" if credit else "LONG_IRON_CONDOR"
     credit_or_debit = "credit" if credit else "debit"
-    qty_exec = (env_int("LEO_SIZE_CREDIT", 4) if credit else env_int("LEO_SIZE_DEBIT", 2))
+    qty_exec = size_credit if credit else size_debit
 
-    # Worst-case per-condor: width*100 for credit; for debit we don't have the price here → leave approx blank/width*100 if you prefer
+    # Worst-case per condor (approx) for display
     try:
-        w = to_int(width) or 0
-        worst_day_loss = str(w * 100 * qty_exec) if credit else ""  # debit risk is debit paid; not known here
-    except Exception:
+        w = int(float(width))
+        worst_day_loss = str(w * 100 * qty_exec) if credit else ""  # debit risk is the debit paid
+    except:
         worst_day_loss = ""
 
-    # 5) Sheets append A2 (top-insert then write)
+    # 6) Write to Sheets (headers, top insert, then A2)
     sa_info = json.loads(sa_json)
     creds = service_account.Credentials.from_service_account_info(sa_info, scopes=["https://www.googleapis.com/auth/spreadsheets"])
     svc = build("sheets","v4",credentials=creds)
