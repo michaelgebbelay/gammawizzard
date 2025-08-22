@@ -16,7 +16,8 @@ concurrency:
 jobs:
   place:
     # Only run if upstream concluded success OR manual dispatch
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success')
+            && !(github.event_name == 'workflow_run' && vars.BYPASS_TIME_GATE == '1') }}
     runs-on: ubuntu-latest
 
     steps:
