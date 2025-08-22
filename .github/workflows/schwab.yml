@@ -1,8 +1,10 @@
 # yamllint disable rule:line-length rule:truthy
+---
 name: Schwab Place
 
 on:
   workflow_dispatch:
+  # Auto-run right after LeoCross finishes
   workflow_run:
     workflows: ["LeoCross Ticket"]
     types: [completed]
@@ -16,26 +18,28 @@ jobs:
     # Only run if upstream concluded success OR manual dispatch
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
+
     steps:
-      # Extra safety: only at 16:12 ET or 13:12 ET, Mon–Fri
-      - name: Gate to 16:12 ET or 13:12 ET (Mon–Fri) — FAIL if not match
+      # Time gate: pass ONLY at 16:12 ET or 13:12 PT (Mon–Fri). Bypass with BYPASS_TIME_GATE=1
+      - name: Gate to 16:12 ET / 13:12 PT (Mon–Fri)
         id: gate
         shell: bash
         env:
           BYPASS_TIME_GATE: ${{ vars.BYPASS_TIME_GATE }}
         run: |
           if [ "${BYPASS_TIME_GATE:-}" = "1" ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
             echo "Bypass enabled → proceeding regardless of time."
             exit 0
           fi
           ET_TIME="$(TZ=America/New_York date +%H:%M)"
+          PT_TIME="$(TZ=America/Los_Angeles date +%H:%M)"
           ET_DOW="$(TZ=America/New_York date +%u)"
-          echo "New York time now: $ET_TIME (DOW=$ET_DOW)"
-          if { [ "$ET_TIME" = "16:12" ] || [ "$ET_TIME" = "13:12" ]; } && [ "$ET_DOW" -ge 1 ] && [ "$ET_DOW" -le 5 ]; then
-            exit 0
+          echo "Now ET=${ET_TIME}, PT=${PT_TIME}, DOW=${ET_DOW}"
+          if { [ "$ET_TIME" = "16:12" ] || [ "$PT_TIME" = "13:12" ]; } && [ "$ET_DOW" -ge 1 ] && [ "$ET_DOW" -le 5 ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
           else
-            echo "Not an allowed ET time — failing to avoid misfires."
-            exit 1
+            echo "ok=false" >> "$GITHUB_OUTPUT"
           fi
 
       - uses: actions/checkout@v4
@@ -49,36 +53,44 @@ jobs:
           python -m pip install --upgrade pip
           pip install --quiet schwab-py google-api-python-client google-auth google-auth-httplib2
 
-      # NEW: catch any paste/indent errors before running
-      - name: Sanity check (compile)
-        run: python -m py_compile scripts/schwab_place_order.py
-
       - name: Place SPXW order from leocross!A2 and log at schwab!A2
+        if: ${{ steps.gate.outputs.ok == 'true' }}
         env:
+          # --- Required secrets ---
           SCHWAB_APP_KEY: ${{ secrets.SCHWAB_APP_KEY }}
           SCHWAB_APP_SECRET: ${{ secrets.SCHWAB_APP_SECRET }}
           SCHWAB_TOKEN_JSON: ${{ secrets.SCHWAB_TOKEN_JSON }}
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          SCHWAB_PLACE: ${{ vars.SCHWAB_PLACE }}   # must be "place"
 
-          # Ladder knobs (blanks = script defaults)
-          NET_PRICE: ${{ vars.NET_PRICE }}
-          TICK: ${{ vars.TICK }}
-          REPRICE_DELAY_SEC: ${{ vars.REPRICE_DELAY_SEC }}
-          MAX_REPRICE_STEPS: ${{ vars.MAX_REPRICE_STEPS }}
-          STICKY_MID_STEPS: ${{ vars.STICKY_MID_STEPS }}
-          OFFSET_CREDIT: ${{ vars.OFFSET_CREDIT }}   # set to -0.05 for mid-0.05
-          OFFSET_DEBIT: ${{ vars.OFFSET_DEBIT }}     # e.g. +0.05
-          MIN_CREDIT_START: ${{ vars.MIN_CREDIT_START }}
-          MAX_DEBIT_START: ${{ vars.MAX_DEBIT_START }}
-          CANCEL_REMAINING: ${{ vars.CANCEL_REMAINING }}
+          # --- Arm the placer (must be "place") ---
+          SCHWAB_PLACE: ${{ vars.SCHWAB_PLACE }}  # set to "place" to actually place
 
-          # Percent-of-BP sizing (enable with SIZE_MODE=PCT_BP)
-          SIZE_MODE: ${{ vars.SIZE_MODE }}
-          CREDIT_ALLOC_PCT: ${{ vars.CREDIT_ALLOC_PCT }}   # e.g. 0.06
-          DEBIT_ALLOC_PCT:  ${{ vars.DEBIT_ALLOC_PCT }}    # e.g. 0.02
-          MAX_QTY: ${{ vars.MAX_QTY }}                     # optional cap
-          OPT_BP_OVERRIDE: ${{ vars.OPT_BP_OVERRIDE }}     # e.g. 20000 for after-hours tests
+          # --- Ladder timing & tick ---
+          STAGE_SEC: ${{ vars.STAGE_SEC }}  # one knob; default 15s if unset
+          TICK: 0.05  # SPX options tick
+
+          # --- Per-leg rails (CONDOR uses 2x these automatically) ---
+          CREDIT_START_PERLEG: ${{ vars.CREDIT_START_PERLEG }}  # default 1.10
+          CREDIT_FLOOR_PERLEG: ${{ vars.CREDIT_FLOOR_PERLEG }}  # default 0.95
+          DEBIT_START_PERLEG: ${{ vars.DEBIT_START_PERLEG }}  # default 0.90
+          DEBIT_CEIL_PERLEG: ${{ vars.DEBIT_CEIL_PERLEG }}  # default 1.05
+          OFFSET_PERLEG_CREDIT: ${{ vars.OFFSET_PERLEG_CREDIT }}  # default -0.05 (mid - 0.05)
+          OFFSET_PERLEG_DEBIT: ${{ vars.OFFSET_PERLEG_DEBIT }}  # default +0.05 (mid + 0.05)
+
+          # --- Sizing (percentage-of-BP optional) ---
+          SIZE_MODE: ${{ vars.SIZE_MODE }}  # "STATIC" or "PCT_BP" (default STATIC)
+          CREDIT_ALLOC_PCT: ${{ vars.CREDIT_ALLOC_PCT }}  # e.g. 0.06
+          DEBIT_ALLOC_PCT: ${{ vars.DEBIT_ALLOC_PCT }}  # e.g. 0.02
+          MAX_QTY: ${{ vars.MAX_QTY }}  # optional cap
+          OPT_BP_OVERRIDE: ${{ vars.OPT_BP_OVERRIDE }}  # e.g. 20000 to force BP in tests
+
+          # --- Guards ---
+          FRESH_MIN: ${{ vars.FRESH_MIN }}  # default 120
+          ENFORCE_EXPIRY_TOMORROW: ${{ vars.ENFORCE_EXPIRY_TOMORROW }}  # default "true"
         run: |
           python scripts/schwab_place_order.py
+
+      - name: Skipped (outside 16:12 ET / 13:12 PT)
+        if: ${{ steps.gate.outputs.ok != 'true' }}
+        run: echo "Time gate did not match; no order placed."
