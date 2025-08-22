@@ -1,44 +1,21 @@
----  # yamllint disable rule:line-length rule:truthy rule:colons
+---  # yamllint disable rule:line-length rule:truthy
 name: LeoCross Ticket
 
 on:
   workflow_dispatch:
+  # Run at 16:12 ET across DST by scheduling both 20:12Z (EDT) and 21:12Z (EST)
   schedule:
-    # 4:12 PM ET (normal close) — two entries to cover DST / Standard Time
-    - cron: "12 20 * * 1-5"  # 20:12 UTC = 16:12 ET during DST
-    - cron: "12 21 * * 1-5"  # 21:12 UTC = 16:12 ET during Standard Time
-    # 1:12 PM ET (early close) — two entries to cover DST / Standard Time
-    - cron: "12 17 * * 1-5"  # 17:12 UTC = 13:12 ET during DST
-    - cron: "12 18 * * 1-5"  # 18:12 UTC = 13:12 ET during Standard Time
+    - cron: "12 20 * * 1-5"
+    - cron: "12 21 * * 1-5"
 
 concurrency:
-  group: leocross-ticket
+  group: leocross-append
   cancel-in-progress: true
 
 jobs:
   leocross:
     runs-on: ubuntu-latest
     steps:
-      - name: Gate to 16:12 ET or 13:12 ET (Mon–Fri) — FAIL if not match
-        id: gate
-        shell: bash
-        env:
-          BYPASS_TIME_GATE: ${{ vars.BYPASS_TIME_GATE }}
-        run: |
-          if [ "${BYPASS_TIME_GATE:-}" = "1" ]; then
-            echo "Bypass enabled → proceeding regardless of time."
-            exit 0
-          fi
-          ET_TIME="$(TZ=America/New_York date +%H:%M)"
-          ET_DOW="$(TZ=America/New_York date +%u)"   # 1=Mon ... 7=Sun
-          echo "New York time now: $ET_TIME (DOW=$ET_DOW)"
-          if { [ "$ET_TIME" = "16:12" ] || [ "$ET_TIME" = "13:12" ]; } && [ "$ET_DOW" -ge 1 ] && [ "$ET_DOW" -le 5 ]; then
-            exit 0
-          else
-            echo "Not an allowed ET time — failing to block downstream."
-            exit 1
-          fi
-
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
@@ -50,15 +27,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install --quiet requests google-api-python-client google-auth google-auth-httplib2
 
-      - name: Run leocross → Google Sheet (A2)
+      - name: Run leocross → Google Sheet (write A2, set header)
         env:
           GW_TOKEN: ${{ secrets.GW_TOKEN }}
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          # Sizing defaults now 4 (credit) / 2 (debit); blanks ignored by the script
-          LEO_SIZE_CREDIT: ${{ vars.LEO_SIZE_CREDIT }}
-          LEO_SIZE_DEBIT:  ${{ vars.LEO_SIZE_DEBIT }}
-          # Optional override for side on odd days: CREDIT or DEBIT
-          LEO_FORCE_SIDE:  ${{ vars.LEO_FORCE_SIDE }}
+
+          # Sizing defaults (now 4 for credit, 2 for debit)
+          LEO_SIZE_CREDIT: ${{ vars.LEO_SIZE_CREDIT }}   # optional; default 4
+          LEO_SIZE_DEBIT: ${{ vars.LEO_SIZE_DEBIT }}    # optional; default 2
+
+          # Tie-breaker if Cat1 == Cat2 (optional)
+          LEO_TIE_SIDE: ${{ vars.LEO_TIE_SIDE }}      # "CREDIT" or "DEBIT" (default CREDIT)
+
+          # Internal derivation width if legs need to be built (not written to sheet)
+          LEO_WIDTH: ${{ vars.LEO_WIDTH }}         # optional; default 5
         run: |
           python scripts/leocross_to_sheet.py
