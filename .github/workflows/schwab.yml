@@ -1,4 +1,4 @@
----  # yamllint disable rule:line-length rule:truthy
+# yamllint disable rule:line-length rule:truthy
 name: Schwab Place
 
 on:
@@ -37,14 +37,22 @@ jobs:
             echo "Not an allowed ET time — failing to avoid misfires."
             exit 1
           fi
+
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install --quiet schwab-py google-api-python-client google-auth google-auth-httplib2
+
+      # NEW: catch any paste/indent errors before running
+      - name: Sanity check (compile)
+        run: python -m py_compile scripts/schwab_place_order.py
+
       - name: Place SPXW order from leocross!A2 and log at schwab!A2
         env:
           SCHWAB_APP_KEY: ${{ secrets.SCHWAB_APP_KEY }}
@@ -53,22 +61,24 @@ jobs:
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           SCHWAB_PLACE: ${{ vars.SCHWAB_PLACE }}   # must be "place"
-          # Optional ladder knobs; blanks are fine (script defaults)
+
+          # Ladder knobs (blanks = script defaults)
           NET_PRICE: ${{ vars.NET_PRICE }}
           TICK: ${{ vars.TICK }}
           REPRICE_DELAY_SEC: ${{ vars.REPRICE_DELAY_SEC }}
           MAX_REPRICE_STEPS: ${{ vars.MAX_REPRICE_STEPS }}
           STICKY_MID_STEPS: ${{ vars.STICKY_MID_STEPS }}
-          OFFSET_CREDIT: ${{ vars.OFFSET_CREDIT }}
-          OFFSET_DEBIT: ${{ vars.OFFSET_DEBIT }}
+          OFFSET_CREDIT: ${{ vars.OFFSET_CREDIT }}   # set to -0.05 for mid-0.05
+          OFFSET_DEBIT: ${{ vars.OFFSET_DEBIT }}     # e.g. +0.05
           MIN_CREDIT_START: ${{ vars.MIN_CREDIT_START }}
           MAX_DEBIT_START: ${{ vars.MAX_DEBIT_START }}
           CANCEL_REMAINING: ${{ vars.CANCEL_REMAINING }}
-          # Percent-of-BP sizing
+
+          # Percent-of-BP sizing (enable with SIZE_MODE=PCT_BP)
           SIZE_MODE: ${{ vars.SIZE_MODE }}
-          CREDIT_ALLOC_PCT: ${{ vars.CREDIT_ALLOC_PCT }}
-          DEBIT_ALLOC_PCT: ${{ vars.DEBIT_ALLOC_PCT }}
-          MAX_QTY: ${{ vars.MAX_QTY }}
-          OPT_BP_OVERRIDE: ${{ vars.OPT_BP_OVERRIDE }}
+          CREDIT_ALLOC_PCT: ${{ vars.CREDIT_ALLOC_PCT }}   # e.g. 0.06
+          DEBIT_ALLOC_PCT:  ${{ vars.DEBIT_ALLOC_PCT }}    # e.g. 0.02
+          MAX_QTY: ${{ vars.MAX_QTY }}                     # optional cap
+          OPT_BP_OVERRIDE: ${{ vars.OPT_BP_OVERRIDE }}     # e.g. 20000 for after-hours tests
         run: |
           python scripts/schwab_place_order.py
