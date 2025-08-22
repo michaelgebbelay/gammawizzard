@@ -21,7 +21,13 @@ jobs:
       - name: Gate to 16:12 ET or 13:12 ET (Mon–Fri) — FAIL if not match
         id: gate
         shell: bash
+        env:
+          BYPASS_TIME_GATE: ${{ vars.BYPASS_TIME_GATE }}
         run: |
+          if [ "${BYPASS_TIME_GATE:-}" = "1" ]; then
+            echo "Bypass enabled → proceeding regardless of time."
+            exit 0
+          fi
           ET_TIME="$(TZ=America/New_York date +%H:%M)"
           ET_DOW="$(TZ=America/New_York date +%u)"
           echo "New York time now: $ET_TIME (DOW=$ET_DOW)"
