@@ -63,5 +63,12 @@ jobs:
           OFFSET_DEBIT: ${{ vars.OFFSET_DEBIT }}
           MIN_CREDIT_START: ${{ vars.MIN_CREDIT_START }}
           MAX_DEBIT_START: ${{ vars.MAX_DEBIT_START }}
+          CANCEL_REMAINING: ${{ vars.CANCEL_REMAINING }}
+          # Percent-of-BP sizing
+          SIZE_MODE: ${{ vars.SIZE_MODE }}
+          CREDIT_ALLOC_PCT: ${{ vars.CREDIT_ALLOC_PCT }}
+          DEBIT_ALLOC_PCT: ${{ vars.DEBIT_ALLOC_PCT }}
+          MAX_QTY: ${{ vars.MAX_QTY }}
+          OPT_BP_OVERRIDE: ${{ vars.OPT_BP_OVERRIDE }}
         run: |
           python scripts/schwab_place_order.py
