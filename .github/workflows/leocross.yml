@@ -22,16 +22,20 @@ jobs:
       - name: Gate to 16:12 ET or 13:12 ET (Mon–Fri) — FAIL if not match
         id: gate
         shell: bash
+        env:
+          BYPASS_TIME_GATE: ${{ vars.BYPASS_TIME_GATE }}
         run: |
+          if [ "${BYPASS_TIME_GATE:-}" = "1" ]; then
+            echo "Bypass enabled → proceeding regardless of time."
+            exit 0
+          fi
           ET_TIME="$(TZ=America/New_York date +%H:%M)"
           ET_DOW="$(TZ=America/New_York date +%u)"   # 1=Mon ... 7=Sun
           echo "New York time now: $ET_TIME (DOW=$ET_DOW)"
           if { [ "$ET_TIME" = "16:12" ] || [ "$ET_TIME" = "13:12" ]; } && [ "$ET_DOW" -ge 1 ] && [ "$ET_DOW" -le 5 ]; then
-            echo "ok=true" >> "$GITHUB_OUTPUT"
             exit 0
           else
-            echo "ok=false" >> "$GITHUB_OUTPUT"
-            echo "Not an allowed ET time (16:12 or 13:12) on a weekday — failing to block downstream."
+            echo "Not an allowed ET time — failing to block downstream."
             exit 1
           fi
 
