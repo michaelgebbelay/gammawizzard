@@ -1,4 +1,21 @@
-# scripts/schwab_place_order.py
+"""Place staged Schwab option orders.
+
+Environment variables (defaults in parentheses):
+    ORDER_STYLE: complex order strategy type ("CONDOR")
+    STAGE1_SEC: seconds to wait after initial order (15)
+    STAGE2_SEC: seconds to wait before second stage (15)
+    STAGE3_SEC: seconds to wait before third stage (10)
+    STAGE4_CANCEL_SEC: seconds to wait before canceling (15)
+    CREDIT_START_PERLEG: starting credit per vertical (1.10)
+    CREDIT_FLOOR_PERLEG: lowest credit per vertical (0.95)
+    DEBIT_START_PERLEG: starting debit per vertical (0.90)
+    DEBIT_CEIL_PERLEG: highest debit per vertical (1.05)
+    OFFSET_PERLEG_CREDIT: credit offset per vertical for stage2 (-0.05)
+    OFFSET_PERLEG_DEBIT: debit offset per vertical for stage2 (0.05)
+    CATCHUP_OFFSET_PERLEG_CREDIT: credit offset per vertical for stage3 (-0.10)
+    CATCHUP_OFFSET_PERLEG_DEBIT: debit offset per vertical for stage3 (0.10)
+"""
+
 import os, re, json, sys, time
 from datetime import datetime, timezone, date, timedelta
 from google.oauth2 import service_account
@@ -149,12 +166,22 @@ def main():
     DELAY_SEC = env_int("REPRICE_DELAY_SEC", 30)
     MAX_REPRICE_STEPS = env_int("MAX_REPRICE_STEPS", 8)
     STICKY_MID_STEPS = env_int("STICKY_MID_STEPS", 2)
-    OFFSET_CREDIT = env_float("OFFSET_CREDIT", -0.05)
-    OFFSET_DEBIT  = env_float("OFFSET_DEBIT",  0.05)
-    MIN_CREDIT_START = env_float("MIN_CREDIT_START", 2.10)
-    MAX_DEBIT_START  = env_float("MAX_DEBIT_START",  1.90)
     CANCEL_REMAINING = env_str("CANCEL_REMAINING","true").lower()=="true"
     FALLBACK_PRICE = env_float("NET_PRICE", 0.05)
+
+    ORDER_STYLE = env_str("ORDER_STYLE", "CONDOR").upper()
+    STAGE1_SEC = env_int("STAGE1_SEC", 15)
+    STAGE2_SEC = env_int("STAGE2_SEC", 15)
+    STAGE3_SEC = env_int("STAGE3_SEC", 10)
+    STAGE4_CANCEL_SEC = env_int("STAGE4_CANCEL_SEC", 15)
+    CREDIT_START_PERLEG = env_float("CREDIT_START_PERLEG", 1.10)
+    CREDIT_FLOOR_PERLEG = env_float("CREDIT_FLOOR_PERLEG", 0.95)
+    DEBIT_START_PERLEG = env_float("DEBIT_START_PERLEG", 0.90)
+    DEBIT_CEIL_PERLEG = env_float("DEBIT_CEIL_PERLEG", 1.05)
+    OFFSET_PERLEG_CREDIT = env_float("OFFSET_PERLEG_CREDIT", -0.05)
+    OFFSET_PERLEG_DEBIT = env_float("OFFSET_PERLEG_DEBIT", 0.05)
+    CATCHUP_OFFSET_PERLEG_CREDIT = env_float("CATCHUP_OFFSET_PERLEG_CREDIT", -0.10)
+    CATCHUP_OFFSET_PERLEG_DEBIT = env_float("CATCHUP_OFFSET_PERLEG_DEBIT", 0.10)
 
     # sizing
     SIZE_MODE = env_str("SIZE_MODE","STATIC").upper()
@@ -290,7 +317,10 @@ def main():
     # mid & start
     mid, _, _ = compute_mid(c, leg_syms)
     start_price = FALLBACK_PRICE if mid is None else mid
-    start_price = max(start_price, MIN_CREDIT_START) if is_credit else min(start_price, MAX_DEBIT_START)
+    if is_credit:
+        start_price = max(start_price, CREDIT_START_PERLEG*2)
+    else:
+        start_price = min(start_price, DEBIT_START_PERLEG*2)
     start_price = round_to_tick(start_price, TICK)
 
     # qty sizing
@@ -334,7 +364,7 @@ def main():
         return {
             "orderType": order_type, "session":"NORMAL", "price": f"{price:.2f}",
             "duration":"DAY", "orderStrategyType":"SINGLE",
-            "complexOrderStrategyType":"IRON_CONDOR",
+            "complexOrderStrategyType":f"IRON_{ORDER_STYLE}",
             "orderLegCollection":[
                 {"instruction":"BUY_TO_OPEN","quantity":qty_exec,"instrument":{"symbol":leg_syms[0],"assetType":"OPTION"}},
                 {"instruction":"SELL_TO_OPEN","quantity":qty_exec,"instrument":{"symbol":leg_syms[1],"assetType":"OPTION"}},
@@ -380,16 +410,32 @@ def main():
         return (r.status_code, new_id, f"{new_price:.2f}")
 
     # ladder
+    stage_delays=[STAGE1_SEC, STAGE2_SEC, STAGE3_SEC]
+    offset_perleg = OFFSET_PERLEG_CREDIT if is_credit else OFFSET_PERLEG_DEBIT
+    catchup_perleg = CATCHUP_OFFSET_PERLEG_CREDIT if is_credit else CATCHUP_OFFSET_PERLEG_DEBIT
+    floor_price = CREDIT_FLOOR_PERLEG*2 if is_credit else None
+    ceil_price = DEBIT_CEIL_PERLEG*2 if not is_credit else None
+
     filled=False; current_id=order_id; price_used=order["price"]
     for step in range(MAX_REPRICE_STEPS):
-        time.sleep(DELAY_SEC)
+        delay = stage_delays[step] if step < len(stage_delays) else DELAY_SEC
+        time.sleep(delay)
         sc,st=get_order_status(current_id)
         if st and str(st).upper()=="FILLED": filled=True; print("ORDER_STATUS FILLED"); break
         if st and str(st).upper() in ("CANCELED","REJECTED"): print(f"ORDER_STATUS {st}"); break
         mid,_,_=compute_mid(c, [*leg_syms])
         if mid is None: print("QUOTE_MISS step", step+1); continue
-        target = mid if step < STICKY_MID_STEPS else mid + (OFFSET_CREDIT if is_credit else OFFSET_DEBIT)
+        if step < STICKY_MID_STEPS:
+            target = mid
+        elif step == STICKY_MID_STEPS:
+            target = mid + offset_perleg*2
+        else:
+            target = mid + catchup_perleg*2
         target = round_to_tick(target, TICK)
+        if floor_price is not None:
+            target = max(target, floor_price)
+        if ceil_price is not None:
+            target = min(target, ceil_price)
         if target != float(price_used):
             rh,new_id,new_price=replace_price(current_id, target)
             if isinstance(rh,int) and 200<=rh<400:
@@ -397,6 +443,7 @@ def main():
 
     final_status=None
     if not filled and CANCEL_REMAINING and current_id:
+        time.sleep(STAGE4_CANCEL_SEC)
         try:
             url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{current_id}"
             r=c.session.delete(url); print("CANCEL_HTTP", r.status_code)
@@ -420,7 +467,7 @@ def main():
             ("SCHWAB_PLACED" if filled else "SCHWAB_ERROR"),
             acct_hash,acct_last4,root_label,last_px,
             sig,"PLACE",
-            ("SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"),
+            (f"SHORT_IRON_{ORDER_STYLE}" if is_credit else f"LONG_IRON_{ORDER_STYLE}"),
             qty_exec, ("NET_CREDIT" if is_credit else "NET_DEBIT"), price_used,
             raw_legs[0],raw_legs[1],raw_legs[2],raw_legs[3],
             current_id, str(final_status)
