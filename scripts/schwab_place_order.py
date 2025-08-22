@@ -5,6 +5,8 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from schwab.auth import client_from_token_file
 
+__VERSION__ = "2025-08-22a"
+
 LEO_TAB = "leocross"
 SCHWAB_TAB = "schwab"
 
@@ -75,8 +77,7 @@ def to_schwab_opt(sym: str) -> str:
     raise ValueError(f"Cannot parse option symbol: {sym}")
 
 def strike_from_osi(osi: str) -> float:
-    # last 8 digits are 1/1000 of a dollar
-    return int(osi[-8:]) / 1000.0
+    return int(osi[-8:]) / 1000.0  # last 8 digits are 1/1000 of a dollar
 
 # ---------- quotes / mids ----------
 def parse_bid_ask(qobj: dict):
@@ -85,8 +86,7 @@ def parse_bid_ask(qobj: dict):
     d = qobj.get("quote", qobj)
     for bk in ("bidPrice", "bid", "bidPriceInDouble"):
         for ak in ("askPrice", "ask", "askPriceInDouble"):
-            b = d.get(bk)
-            a = d.get(ak)
+            b = d.get(bk); a = d.get(ak)
             if isinstance(b, (int, float)) and isinstance(a, (int, float)):
                 return (float(b), float(a))
     return (None, None)
@@ -119,7 +119,6 @@ def compute_mid(c, legs_osi: list):
 
 # ---------- account buying power ----------
 def get_option_buying_power(c, acct_hash: str):
-    # Try main account endpoint
     url = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}"
     r = c.session.get(url)
     if r.status_code != 200:
@@ -179,6 +178,8 @@ def parse_iso(ts_str: str):
 
 # ---------- main ----------
 def main():
+    print(f"schwab_place_order.py version {__VERSION__}")
+
     # placement toggle
     place_toggle = (env_str("SCHWAB_PLACE") or env_str("SCHWAB_PLACE_VAR") or env_str("SCHWAB_PLACE_SEC")).lower()
     if place_toggle != "place":
