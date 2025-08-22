@@ -1,39 +1,22 @@
-"""Place staged Schwab option orders.
-
-Environment variables (defaults in parentheses):
-    ORDER_STYLE: complex order strategy type ("CONDOR")
-    STAGE1_SEC: seconds to wait after initial order (15)
-    STAGE2_SEC: seconds to wait before second stage (15)
-    STAGE3_SEC: seconds to wait before third stage (10)
-    STAGE4_CANCEL_SEC: seconds to wait before canceling (15)
-    CREDIT_START_PERLEG: starting credit per vertical (1.10)
-    CREDIT_FLOOR_PERLEG: lowest credit per vertical (0.95)
-    DEBIT_START_PERLEG: starting debit per vertical (0.90)
-    DEBIT_CEIL_PERLEG: highest debit per vertical (1.05)
-    OFFSET_PERLEG_CREDIT: credit offset per vertical for stage2 (-0.05)
-    OFFSET_PERLEG_DEBIT: debit offset per vertical for stage2 (0.05)
-    CATCHUP_OFFSET_PERLEG_CREDIT: credit offset per vertical for stage3 (-0.10)
-    CATCHUP_OFFSET_PERLEG_DEBIT: debit offset per vertical for stage3 (0.10)
-"""
-
-import os, re, json, sys, time
+# scripts/schwab_place_order.py
+import os, re, json, sys, time, math
 from datetime import datetime, timezone, date, timedelta
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from schwab.auth import client_from_token_file
 
-__VERSION__ = "2025-08-22c"
+__VERSION__ = "2025-08-22h"
 
 LEO_TAB = "leocross"
 SCHWAB_TAB = "schwab"
 
 SCHWAB_HEADERS = [
-    "ts","source","account_hash","account_last4","symbol","last_price",
+    "ts","source","symbol","last_price",
     "signal_date","order_mode","side","qty_exec","order_type","limit_price",
-    "occ_buy_put","occ_sell_put","occ_sell_call","occ_buy_call","order_id","status"
+    "occ_buy_put","occ_sell_put","occ_sell_call","occ_buy_call",
+    "order_id","status"
 ]
 
-# ---------- ENV helpers ----------
 def env_or_die(name: str) -> str:
     v = os.environ.get(name)
     if not v:
@@ -61,7 +44,6 @@ def env_int(name: str, default: int) -> int:
         return int(float(s))
     except: return default
 
-# ---------- OSI helpers ----------
 def to_schwab_opt(sym: str) -> str:
     raw = (sym or "").strip().upper()
     if raw.startswith("."): raw = raw[1:]
@@ -84,7 +66,6 @@ def to_schwab_opt(sym: str) -> str:
 def strike_from_osi(osi: str) -> float:
     return int(osi[-8:]) / 1000.0
 
-# ---------- quotes / mids ----------
 def parse_bid_ask(qobj: dict):
     if not qobj: return (None,None)
     d = qobj.get("quote", qobj)
@@ -101,11 +82,7 @@ def fetch_bid_ask(c, symbol: str):
     j=r.json(); d=j.get(symbol) or next(iter(j.values()),{})
     return parse_bid_ask(d)
 
-def round_to_tick(x: float, tick: float)->float:
-    if tick<=0: return x
-    return round(round(x/tick)*tick + 1e-9, 2)
-
-def compute_mid(c, legs_osi: list):
+def compute_mid_condor(c, legs_osi: list):
     (bp, sp, sc, bc) = legs_osi
     bp_bid, bp_ask = fetch_bid_ask(c, bp)
     sp_bid, sp_ask = fetch_bid_ask(c, sp)
@@ -116,7 +93,6 @@ def compute_mid(c, legs_osi: list):
     net_ask=(sp_ask+sc_ask)-(bp_bid+bc_bid)
     return ((net_bid+net_ask)/2.0, net_bid, net_ask)
 
-# ---------- Sheets helpers ----------
 def ensure_header_and_get_sheetid(svc, spreadsheet_id: str, tab: str, header: list):
     got = svc.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=f"{tab}!1:1").execute().get("values",[])
     if not got or got[0] != header:
@@ -140,20 +116,29 @@ def parse_iso(ts_str: str):
     try: return datetime.fromisoformat(ts_str.replace("Z","+00:00"))
     except: return None
 
-# ---------- trading-day helper ----------
 def next_trading_day(d: date) -> date:
-    """Return the next weekday (Mon–Fri). Holidays are not handled."""
     nd = d + timedelta(days=1)
-    while nd.weekday() >= 5:  # 5=Sat, 6=Sun
+    while nd.weekday() >= 5:
         nd += timedelta(days=1)
     return nd
 
-# ---------- main ----------
+# snap to NEXT valid 0.05
+def ceil_to_tick(x: float, tick: float)->float:
+    if x is None: return None
+    return round(math.ceil((x + 1e-12)/tick)*tick, 2)
+
+def clamp_and_snap(x: float, lo: float, hi: float, tick: float)->float:
+    if x is None: return None
+    y = max(lo, min(hi, x))
+    y = ceil_to_tick(y, tick)
+    return max(lo, min(hi, y))
+
 def main():
     print(f"schwab_place_order.py version {__VERSION__}")
 
-    if (env_str("SCHWAB_PLACE") or env_str("SCHWAB_PLACE_VAR") or env_str("SCHWAB_PLACE_SEC")).lower()!="place":
-        print("SCHWAB_PLACE not 'place' → skipping order placement."); sys.exit(0)
+    ORDER_STYLE = env_str("ORDER_STYLE","CONDOR").upper()
+    if ORDER_STYLE != "CONDOR":
+        print("Only CONDOR supported in this build."); sys.exit(0)
 
     app_key    = env_or_die("SCHWAB_APP_KEY")
     app_secret = env_or_die("SCHWAB_APP_SECRET")
@@ -161,48 +146,44 @@ def main():
     sheet_id   = env_or_die("GSHEET_ID")
     sa_json    = env_or_die("GOOGLE_SERVICE_ACCOUNT_JSON")
 
-    # ladder/pricing
+    # single stage duration for all rungs
+    STAGE_SEC = env_int("STAGE_SEC", 15)
     TICK = env_float("TICK", 0.05)
-    DELAY_SEC = env_int("REPRICE_DELAY_SEC", 30)
-    MAX_REPRICE_STEPS = env_int("MAX_REPRICE_STEPS", 8)
-    STICKY_MID_STEPS = env_int("STICKY_MID_STEPS", 2)
-    CANCEL_REMAINING = env_str("CANCEL_REMAINING","true").lower()=="true"
-    FALLBACK_PRICE = env_float("NET_PRICE", 0.05)
 
-    ORDER_STYLE = env_str("ORDER_STYLE", "CONDOR").upper()
-    STAGE1_SEC = env_int("STAGE1_SEC", 15)
-    STAGE2_SEC = env_int("STAGE2_SEC", 15)
-    STAGE3_SEC = env_int("STAGE3_SEC", 10)
-    STAGE4_CANCEL_SEC = env_int("STAGE4_CANCEL_SEC", 15)
-    CREDIT_START_PERLEG = env_float("CREDIT_START_PERLEG", 1.10)
-    CREDIT_FLOOR_PERLEG = env_float("CREDIT_FLOOR_PERLEG", 0.95)
-    DEBIT_START_PERLEG = env_float("DEBIT_START_PERLEG", 0.90)
-    DEBIT_CEIL_PERLEG = env_float("DEBIT_CEIL_PERLEG", 1.05)
-    OFFSET_PERLEG_CREDIT = env_float("OFFSET_PERLEG_CREDIT", -0.05)
-    OFFSET_PERLEG_DEBIT = env_float("OFFSET_PERLEG_DEBIT", 0.05)
-    CATCHUP_OFFSET_PERLEG_CREDIT = env_float("CATCHUP_OFFSET_PERLEG_CREDIT", -0.10)
-    CATCHUP_OFFSET_PERLEG_DEBIT = env_float("CATCHUP_OFFSET_PERLEG_DEBIT", 0.10)
+    # per‑leg rails (CONDOR uses 2x)
+    CREDIT_START_PER = env_float("CREDIT_START_PERLEG", 1.10)
+    CREDIT_FLOOR_PER = env_float("CREDIT_FLOOR_PERLEG", 0.95)
+    DEBIT_START_PER  = env_float("DEBIT_START_PERLEG",  0.90)
+    DEBIT_CEIL_PER   = env_float("DEBIT_CEIL_PERLEG",   1.05)
+    OFFSET_PER_CRED  = env_float("OFFSET_PERLEG_CREDIT", -0.05)
+    OFFSET_PER_DEB   = env_float("OFFSET_PERLEG_DEBIT",  +0.05)
 
-    # sizing
+    CREDIT_START = 2*CREDIT_START_PER
+    CREDIT_FLOOR = 2*CREDIT_FLOOR_PER
+    DEBIT_START  = 2*DEBIT_START_PER
+    DEBIT_CEIL   = 2*DEBIT_CEIL_PER
+    OFFSET_CREDIT = 2*OFFSET_PER_CRED
+    OFFSET_DEBIT  = 2*OFFSET_PER_DEB
+
     SIZE_MODE = env_str("SIZE_MODE","STATIC").upper()
     CREDIT_ALLOC_PCT = env_float("CREDIT_ALLOC_PCT", 0.06)
     DEBIT_ALLOC_PCT  = env_float("DEBIT_ALLOC_PCT",  0.02)
     MAX_QTY = env_int("MAX_QTY", 999)
     OPT_BP_OVERRIDE = env_float("OPT_BP_OVERRIDE", -1.0)
 
-    # guards
     FRESH_MIN = env_int("FRESH_MIN", 120)
-    ENFORCE_TOMORROW = env_str("ENFORCE_EXPIRY_TOMORROW","true").lower()=="true"  # semantics: next trading day
+    ENFORCE_TOMORROW = env_str("ENFORCE_EXPIRY_TOMORROW","true").lower()=="true"
 
-    # Schwab client
+    if (env_str("SCHWAB_PLACE") or env_str("SCHWAB_PLACE_VAR") or env_str("SCHWAB_PLACE_SEC")).lower()!="place":
+        print("SCHWAB_PLACE not 'place' → skipping."); sys.exit(0)
+
     with open("schwab_token.json","w") as f: f.write(token_json)
     c = client_from_token_file(api_key=app_key, app_secret=app_secret, token_path="schwab_token.json")
 
-    # account
+    # we still fetch the account hash to place orders, but we do NOT log it
     r=c.get_account_numbers(); r.raise_for_status()
-    acct=r.json()[0]; acct_hash=acct["hashValue"]; acct_last4=acct["accountNumber"][-4:]
+    acct=r.json()[0]; acct_hash=acct["hashValue"]
 
-    # SPX last (for log)
     def spx_last():
         for sym in ["$SPX.X","SPX","SPX.X","$SPX"]:
             try:
@@ -214,24 +195,15 @@ def main():
         return ""
     last_px=spx_last()
 
-    # Sheets
     sa_info=json.loads(sa_json)
     creds=service_account.Credentials.from_service_account_info(sa_info, scopes=["https://www.googleapis.com/auth/spreadsheets"])
     s=build("sheets","v4",credentials=creds)
     sheet_id_num=ensure_header_and_get_sheetid(s, sheet_id, SCHWAB_TAB, SCHWAB_HEADERS)
 
-    # read signal row
-    two=s.spreadsheets().values().get(spreadsheetId=sheet_id, range=f"{LEO_TAB}!A1:Z2").execute().get("values",[])
+    two=s.spreadsheets().values().get(spreadsheetId=sheet_id, range=f"{LEO_TAB}!A1:AG2").execute().get("values",[])
     if len(two)<2: print("No leocross row 2; nothing to place."); sys.exit(0)
     h,r2=two[0],two[1]; idx={n:i for i,n in enumerate(h)}
     def g(col): j=idx.get(col,-1); return r2[j] if 0<=j<len(r2) else ""
-
-    # guards: freshness + next-trading-day
-    ts=parse_iso(g("ts"))
-    age_min=(datetime.now(timezone.utc)-ts).total_seconds()/60.0 if ts else None
-    sig=g("signal_date"); exp=g("expiry")
-    try: sig_d=date.fromisoformat(sig) if sig else None; exp_d=date.fromisoformat(exp) if exp else None
-    except: sig_d=exp_d=None
 
     def bail(msg):
         top_insert(s, sheet_id, sheet_id_num)
@@ -240,27 +212,29 @@ def main():
             valueInputOption="USER_ENTERED",
             body={"values":[[
                 datetime.now(timezone.utc).isoformat(),
-                "SCHWAB_ERROR",
-                acct_hash,acct_last4,"",last_px,
-                sig,"PLACE",g("side"),g("qty_exec"),"","",
+                "SCHWAB_ERROR","",last_px,
+                g("signal_date"),"PLACE",g("side"),g("qty_exec"),"","",
                 g("occ_buy_put"),g("occ_sell_put"),g("occ_sell_call"),g("occ_buy_call"),
                 "",msg
             ]]}
         ).execute()
         print(msg); sys.exit(0)
 
-    if age_min is None or age_min>FRESH_MIN:
-        bail(f"STALE_OR_NO_TS age_min={age_min}")
+    ts = parse_iso(g("ts")); age_min=(datetime.now(timezone.utc)-ts).total_seconds()/60.0 if ts else None
+    try:
+        sig_d=date.fromisoformat(g("signal_date")) if g("signal_date") else None
+        exp_d=date.fromisoformat(g("expiry")) if g("expiry") else None
+    except:
+        sig_d=exp_d=None
+    if age_min is None or age_min>FRESH_MIN: bail(f"STALE_OR_NO_TS age_min={age_min}")
     if ENFORCE_TOMORROW and sig_d and exp_d:
         expected = next_trading_day(sig_d)
-        if exp_d != expected:
-            bail(f"DATE_MISMATCH sig={sig} exp={exp} (expected next trading day {expected})")
+        if exp_d != expected: bail(f"DATE_MISMATCH sig={g('signal_date')} exp={g('expiry')} (expected {expected})")
 
-    # legs
     raw_legs=[g("occ_buy_put"), g("occ_sell_put"), g("occ_sell_call"), g("occ_buy_call")]
     if not all(raw_legs): bail("MISSING_LEGS")
 
-    # dedupe by legs
+    # dedupe
     all_rows=s.spreadsheets().values().get(spreadsheetId=sheet_id, range=f"{SCHWAB_TAB}!A1:Z100000").execute().get("values",[])
     if all_rows:
         hh,data=all_rows[0],all_rows[1:]; hidx={n:i for i,n in enumerate(hh)}
@@ -269,21 +243,18 @@ def main():
         for r in data:
             if cell(r,"source") in ("SCHWAB_PLACED","SCHWAB_ORDER"):
                 if [cell(r,"occ_buy_put"),cell(r,"occ_sell_put"),cell(r,"occ_sell_call"),cell(r,"occ_buy_call")]==sig_legs:
-                    print("Duplicate legs already logged; skip placing."); sys.exit(0)
+                    print("Duplicate legs already logged; skip."); sys.exit(0)
 
-    # convert to OSI & compute width
-    def to_osi_list():
-        return [to_schwab_opt(x) for x in raw_legs]
+    # OSI + width
     try:
-        leg_syms = to_osi_list()
+        leg_syms = [to_schwab_opt(x) for x in raw_legs]
     except Exception as e:
         bail(f"SYMBOL_ERR: {str(e)[:180]}")
-
     put_w  = abs(strike_from_osi(leg_syms[1]) - strike_from_osi(leg_syms[0]))
     call_w = abs(strike_from_osi(leg_syms[3]) - strike_from_osi(leg_syms[2]))
     width = round(min(put_w, call_w), 3)
 
-    # Decide side (Cat rule fallback)
+    # side
     cod=(g("credit_or_debit") or "").lower()
     side_sheet=(g("side") or "").upper()
     if cod in ("credit","debit"):
@@ -291,37 +262,59 @@ def main():
     else:
         try:
             c1=float(g("cat1")); c2=float(g("cat2"))
-            is_credit=(c1 < c2)    # Cat1>Cat2 → debit; Cat1<Cat2 → credit
+            is_credit=(c1 < c2)
         except:
             is_credit=side_sheet.startswith("SHORT")
     order_type="NET_CREDIT" if is_credit else "NET_DEBIT"
 
-    # Ensure orientation matches side rules (swap within pairs if needed)
-    def fix_orientation(leg_syms_local):
-        bpS = strike_from_osi(leg_syms_local[0]); spS = strike_from_osi(leg_syms_local[1])
-        scS = strike_from_osi(leg_syms_local[2]); bcS = strike_from_osi(leg_syms_local[3])
+    # ensure orientation (swap in-pair if needed)
+    def fix_orientation(legs):
+        bp, sp, sc, bc = legs
+        bpS = strike_from_osi(bp); spS = strike_from_osi(sp)
+        scS = strike_from_osi(sc); bcS = strike_from_osi(bc)
         if is_credit:
-            # credit: buyP < sellP ; sellC < buyC
-            if bpS > spS: leg_syms_local[0], leg_syms_local[1] = leg_syms_local[1], leg_syms_local[0]
-            if scS > bcS: leg_syms_local[2], leg_syms_local[3] = leg_syms_local[3], leg_syms_local[2]
+            if bpS > spS: bp, sp = sp, bp
+            if scS > bcS: sc, bc = bc, sc
         else:
-            # debit: buyP > sellP ; buyC < sellC
-            if bpS < spS: leg_syms_local[0], leg_syms_local[1] = leg_syms_local[1], leg_syms_local[0]
-            if strike_from_osi(leg_syms_local[3]) > strike_from_osi(leg_syms_local[2]):
-                # buyC(3) should be lower than sellC(2)
-                leg_syms_local[2], leg_syms_local[3] = leg_syms_local[3], leg_syms_local[2]
-        return leg_syms_local
-
+            if bpS < spS: bp, sp = sp, bp
+            if bcS > scS: sc, bc = bc, sc
+        return [bp, sp, sc, bc]
     leg_syms = fix_orientation(leg_syms)
 
-    # mid & start
-    mid, _, _ = compute_mid(c, leg_syms)
-    start_price = FALLBACK_PRICE if mid is None else mid
+    # recs condor‑level
+    def fnum(x):
+        try: return float(x)
+        except: return None
+    rec_put=fnum(g("rec_put")); rec_call=fnum(g("rec_call"))
+    rec_condor=fnum(g("rec_condor")) if g("rec_condor")!="" else (None if (rec_put is None or rec_call is None) else (rec_put+rec_call))
+
+    # mid
+    mid, _, _ = compute_mid_condor(c, leg_syms)
+
+    # rung prices (clamped & snapped to next 0.05)
     if is_credit:
-        start_price = max(start_price, CREDIT_START_PERLEG*2)
+        start_price = clamp_and_snap(CREDIT_START, CREDIT_FLOOR, CREDIT_START, TICK)
+        rec_price   = clamp_and_snap(rec_condor if rec_condor is not None else mid, CREDIT_FLOOR, CREDIT_START, TICK)
+        stage3_base = (None if mid is None else (mid + OFFSET_CREDIT))
+        stage3_price= clamp_and_snap(stage3_base, CREDIT_FLOOR, CREDIT_START, TICK)
     else:
-        start_price = min(start_price, DEBIT_START_PERLEG*2)
-    start_price = round_to_tick(start_price, TICK)
+        start_price = clamp_and_snap(DEBIT_START, 0.01, DEBIT_CEIL, TICK)
+        rec_price   = clamp_and_snap(rec_condor if rec_condor is not None else mid, 0.01, DEBIT_CEIL, TICK)
+        stage3_base = (None if mid is None else (mid + OFFSET_DEBIT))
+        stage3_price= clamp_and_snap(stage3_base, 0.01, DEBIT_CEIL, TICK)
+
+    def build_order(price: float, q: int):
+        return {
+            "orderType": order_type, "session":"NORMAL", "price": f"{price:.2f}",
+            "duration":"DAY", "orderStrategyType":"SINGLE",
+            "complexOrderStrategyType":"IRON_CONDOR",
+            "orderLegCollection":[
+                {"instruction":"BUY_TO_OPEN","quantity":q,"instrument":{"symbol":leg_syms[0],"assetType":"OPTION"}},
+                {"instruction":"SELL_TO_OPEN","quantity":q,"instrument":{"symbol":leg_syms[1],"assetType":"OPTION"}},
+                {"instruction":"SELL_TO_OPEN","quantity":q,"instrument":{"symbol":leg_syms[2],"assetType":"OPTION"}},
+                {"instruction":"BUY_TO_OPEN","quantity":q,"instrument":{"symbol":leg_syms[3],"assetType":"OPTION"}},
+            ]
+        }
 
     # qty sizing
     qty_sheet = int((g("qty_exec") or "1"))
@@ -333,7 +326,7 @@ def main():
                 url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}"
                 rr=c.session.get(url)
                 if rr.status_code==200:
-                    j=rr.json(); 
+                    j=rr.json()
                     if isinstance(j,list): j=j[0]
                     sa=j.get("securitiesAccount") or j
                     cands=[]
@@ -347,60 +340,35 @@ def main():
                         if isinstance(v,(int,float)): cands.append(float(v))
                     bp = max(cands) if cands else None
             except: bp=None
-        if bp is None:
-            print("WARN: could not fetch option buying power; using sheet qty.")
-        else:
+        if bp is not None:
             alloc = CREDIT_ALLOC_PCT if is_credit else DEBIT_ALLOC_PCT
             budget = max(bp*alloc, 0.0)
             per_risk = max((width*100 - start_price*100) if is_credit else (start_price*100), 1.0)
             qty_exec = max(1, int(budget // per_risk))
             if MAX_QTY>0: qty_exec=min(qty_exec, MAX_QTY)
-            print(f"SIZING mode=PCT_BP bp={bp:.2f} alloc={alloc:.4f} budget={budget:.2f} width={width} start={start_price:.2f} per_risk={per_risk:.2f} qty={qty_exec}")
-    else:
-        print(f"SIZING mode=STATIC qty_sheet={qty_sheet}")
+            print(f"SIZING PCT_BP bp={bp:.2f} alloc={alloc:.4f} budget={budget:.2f} width={width} start={start_price:.2f} per_risk={per_risk:.2f} qty={qty_exec}")
+        else:
+            print("WARN: could not fetch option buying power; using sheet qty.")
 
-    # order builder
-    def build_order(price: float):
-        return {
-            "orderType": order_type, "session":"NORMAL", "price": f"{price:.2f}",
-            "duration":"DAY", "orderStrategyType":"SINGLE",
-            "complexOrderStrategyType":f"IRON_{ORDER_STYLE}",
-            "orderLegCollection":[
-                {"instruction":"BUY_TO_OPEN","quantity":qty_exec,"instrument":{"symbol":leg_syms[0],"assetType":"OPTION"}},
-                {"instruction":"SELL_TO_OPEN","quantity":qty_exec,"instrument":{"symbol":leg_syms[1],"assetType":"OPTION"}},
-                {"instruction":"SELL_TO_OPEN","quantity":qty_exec,"instrument":{"symbol":leg_syms[2],"assetType":"OPTION"}},
-                {"instruction":"BUY_TO_OPEN","quantity":qty_exec,"instrument":{"symbol":leg_syms[3],"assetType":"OPTION"}},
-            ]
-        }
-
-    # place initial
-    order=build_order(start_price)
-    order_id=""; status_code=None
-    try:
-        ok=c.place_order(acct_hash, order)
-        status_code=ok.status_code
+    # Stage helpers
+    def place(order_price: float):
+        order = build_order(order_price, qty_exec)
+        r = c.place_order(acct_hash, order)
+        oid = ""
         try:
-            j=ok.json(); order_id=str(j.get("orderId") or j.get("order_id") or "")
-        except: order_id = ok.headers.get("Location","").rstrip("/").split("/")[-1]
-        print("PLACE_HTTP", status_code, "ORDER_ID", order_id, "PRICE", order["price"])
-    except Exception as e:
-        bail(f"ORDER_ERROR: {e}")
-    if not (isinstance(status_code,int) and 200<=status_code<300): bail(f"PLACE_HTTP_{status_code}")
+            j=r.json(); oid = str(j.get("orderId") or j.get("order_id") or "")
+        except:
+            oid = r.headers.get("Location","").rstrip("/").split("/")[-1]
+        print("PLACE_HTTP", r.status_code, "ORDER_ID", oid, "PRICE", order["price"])
+        return (r.status_code, oid, order["price"])
 
-    # helpers
-    def get_order_status(oid:str):
-        try:
-            url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
-            r=c.session.get(url)
-            if r.status_code!=200: return (r.status_code,None)
-            j=r.json(); return (r.status_code, (j.get("status") or j.get("orderStatus")))
-        except: return (None,None)
-    def replace_price(oid:str, new_price:float):
-        new_price=round_to_tick(new_price, TICK)
-        new_order=build_order(new_price)
-        url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
-        r=c.session.put(url, json=new_order)
-        new_id=oid
+    def replace(oid: str, new_price: float):
+        new_price = clamp_and_snap(new_price, CREDIT_FLOOR if is_credit else 0.01,
+                                   CREDIT_START if is_credit else DEBIT_CEIL, TICK)
+        order = build_order(new_price, qty_exec)
+        url = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
+        r = c.session.put(url, json=order)
+        new_id = oid
         try:
             j=r.json(); new_id=str(j.get("orderId") or j.get("order_id") or oid)
         except:
@@ -409,51 +377,44 @@ def main():
         print("REPLACE_HTTP", r.status_code, "ORDER_ID", new_id, "PRICE", f"{new_price:.2f}")
         return (r.status_code, new_id, f"{new_price:.2f}")
 
-    # ladder
-    stage_delays=[STAGE1_SEC, STAGE2_SEC, STAGE3_SEC]
-    offset_perleg = OFFSET_PERLEG_CREDIT if is_credit else OFFSET_PERLEG_DEBIT
-    catchup_perleg = CATCHUP_OFFSET_PERLEG_CREDIT if is_credit else CATCHUP_OFFSET_PERLEG_DEBIT
-    floor_price = CREDIT_FLOOR_PERLEG*2 if is_credit else None
-    ceil_price = DEBIT_CEIL_PERLEG*2 if not is_credit else None
-
-    filled=False; current_id=order_id; price_used=order["price"]
-    for step in range(MAX_REPRICE_STEPS):
-        delay = stage_delays[step] if step < len(stage_delays) else DELAY_SEC
-        time.sleep(delay)
-        sc,st=get_order_status(current_id)
-        if st and str(st).upper()=="FILLED": filled=True; print("ORDER_STATUS FILLED"); break
-        if st and str(st).upper() in ("CANCELED","REJECTED"): print(f"ORDER_STATUS {st}"); break
-        mid,_,_=compute_mid(c, [*leg_syms])
-        if mid is None: print("QUOTE_MISS step", step+1); continue
-        if step < STICKY_MID_STEPS:
-            target = mid
-        elif step == STICKY_MID_STEPS:
-            target = mid + offset_perleg*2
-        else:
-            target = mid + catchup_perleg*2
-        target = round_to_tick(target, TICK)
-        if floor_price is not None:
-            target = max(target, floor_price)
-        if ceil_price is not None:
-            target = min(target, ceil_price)
-        if target != float(price_used):
-            rh,new_id,new_price=replace_price(current_id, target)
-            if isinstance(rh,int) and 200<=rh<400:
-                current_id=new_id; price_used=new_price
-
-    final_status=None
-    if not filled and CANCEL_REMAINING and current_id:
-        time.sleep(STAGE4_CANCEL_SEC)
+    def status(oid: str):
         try:
-            url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{current_id}"
-            r=c.session.delete(url); print("CANCEL_HTTP", r.status_code)
-            final_status=f"CANCELED_AFTER_{MAX_REPRICE_STEPS}"
-        except Exception as e:
-            print("CANCEL_ERROR", e); final_status="CANCEL_ERROR"
-    else:
-        sc,st=get_order_status(current_id); final_status=st or status_code
+            url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
+            r=c.session.get(url)
+            if r.status_code!=200: return (r.status_code,None)
+            j=r.json(); return (r.status_code, (j.get("status") or j.get("orderStatus")))
+        except: return (None,None)
 
-    # log
+    # 3 equal stages (no cancel at end)
+    sc, oid, price_used = place(start_price)
+    filled=False
+
+    end1 = time.time() + STAGE_SEC
+    while time.time() < end1:
+        rc, st = status(oid)
+        if st and str(st).upper()=="FILLED": filled=True; break
+        time.sleep(1)
+
+    if not filled:
+        rc, oid, price_used = replace(oid, rec_price)
+        end2 = time.time() + STAGE_SEC
+        while time.time() < end2:
+            rc, st = status(oid)
+            if st and str(st).upper()=="FILLED": filled=True; break
+            time.sleep(1)
+
+    if not filled:
+        rc, oid, price_used = replace(oid, stage3_price)
+        end3 = time.time() + STAGE_SEC
+        while time.time() < end3:
+            rc, st = status(oid)
+            if st and str(st).upper()=="FILLED": filled=True; break
+            time.sleep(1)
+
+    rc, st = status(oid)
+    final_status = st or sc
+
+    # log (no acct columns)
     try:
         root_label=(raw_legs[0].lstrip(".").replace("_","")[:6]).rstrip()
         root_label=re.match(r'^[A-Z.$^]+', root_label).group(0)
@@ -464,17 +425,18 @@ def main():
         valueInputOption="USER_ENTERED",
         body={"values":[[
             datetime.now(timezone.utc).isoformat(),
-            ("SCHWAB_PLACED" if filled else "SCHWAB_ERROR"),
-            acct_hash,acct_last4,root_label,last_px,
-            sig,"PLACE",
-            (f"SHORT_IRON_{ORDER_STYLE}" if is_credit else f"LONG_IRON_{ORDER_STYLE}"),
-            qty_exec, ("NET_CREDIT" if is_credit else "NET_DEBIT"), price_used,
+            ("SCHWAB_PLACED" if filled else "SCHWAB_ORDER"),
+            root_label,last_px,
+            g("signal_date"),"PLACE",
+            ("SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"),
+            int((g("qty_exec") or "1")),
+            ("NET_CREDIT" if is_credit else "NET_DEBIT"), price_used,
             raw_legs[0],raw_legs[1],raw_legs[2],raw_legs[3],
-            current_id, str(final_status)
+            oid, str(final_status)
         ]]}
     ).execute()
 
-    print("FINAL_STATUS", final_status, "ORDER_ID", current_id, "PRICE_USED", price_used)
+    print("FINAL_STATUS", final_status, "ORDER_ID", oid, "PRICE_USED", price_used)
 
 if __name__ == "__main__":
     main()
