@@ -4,7 +4,7 @@ name: LeoCross Ticket
 
 on:
   workflow_dispatch:
-  # Fire at 1:12 ET and 4:12 ET across DST (Mon–Fri)
+  # Fire at 1:10 ET on holiday and 4:10 ET regular days across DST (Mon–Fri)
   schedule:
     - cron: "10 17 * * 1-5"  # 1:10pm EDT
     - cron: "10 18 * * 1-5"  # 1:10pm EST
