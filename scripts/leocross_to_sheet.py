@@ -5,7 +5,7 @@ import requests
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-__VERSION__ = "2025-08-26f"
+__VERSION__ = "2025-08-26j"
 
 LEO_TAB = "leocross"
 
@@ -40,17 +40,16 @@ def env_int(name: str, default: int) -> int:
     try: return int(float(s))
     except: return default
 
-# -------------------- utils --------------------
+# -------------------- tiny utils --------------------
 def yymmdd(iso: str) -> str:
     try:
         dt = datetime.fromisoformat(iso.replace("Z","+00:00"))
         return f"{dt.date():%y%m%d}"
     except:
         try:
-            d = date.fromisoformat(iso[:10])
+            d = date.fromisoformat((iso or "")[:10])
             return f"{d:%y%m%d}"
-        except:
-            return ""
+        except: return ""
 
 def to_int(x):
     try: return int(round(float(x)))
@@ -65,7 +64,7 @@ def extract_strike(sym: str):
     if m: return float(m.group(1))
     return None
 
-# -------------------- ticket parsing (optional) --------------------
+# -------------------- optional ticket parser --------------------
 def parse_ticket_output(txt: str):
     m1 = re.search(r'(\d{4}-\d{2}-\d{2})\s*(?:->|\u2192)\s*(\d{4}-\d{2}-\d{2})\s*:\s*([A-Z_]+)\s*qty\s*=\s*(\d+)\s*width\s*=\s*([0-9.]+)', txt)
     if not m1: return None
@@ -98,7 +97,6 @@ def orient_pairs_for_side(bp, sp, sc, bc, is_credit):
 
 # -------------------- flexible "Trade" extractor --------------------
 def _lower_dict(d): return {str(k).lower(): v for k,v in d.items()}
-
 def _pick(m, *keys):
     for k in keys:
         v = m.get(k.lower())
@@ -106,208 +104,120 @@ def _pick(m, *keys):
     return None
 
 def _normalize_trade_like(d):
-    """Create a Trade-like dict from any mapping with roughly matching keys."""
+    """Map any 'trade-like' JSON into our expected fields."""
     m = _lower_dict(d)
     t = {
-        "Date": _pick(m,"date","signal_date","sigdate","sig_date"),
-        "TDate": _pick(m,"tdate","expiry","expiration","exp","expiry_date","exp_date"),
-        "SPX": _pick(m,"spx","underlying","spot","under"),
+        "Date": _pick(m,"date","signal_date","sigdate"),
+        "TDate": _pick(m,"tdate","expiry","expiration","exp","expiry_date"),
+        "SPX": _pick(m,"spx","underlying","spot"),
         "VIX": _pick(m,"vix"),
         "RV5": _pick(m,"rv5"), "RV10": _pick(m,"rv10"), "RV20": _pick(m,"rv20"),
-        "Cat1": _pick(m,"cat1","cat_1","category1"),
-        "Cat2": _pick(m,"cat2","cat_2","category2"),
-        "Put": _pick(m,"put","rec_put","put_rec","putRec"),
-        "Call": _pick(m,"call","rec_call","call_rec","callRec"),
-        "Limit": _pick(m,"limit","limit_put","put_limit","p_limit","putStrike","put_strike"),
-        "CLimit": _pick(m,"climit","limit_call","call_limit","c_limit","callStrike","call_strike"),
+        "Cat1": _pick(m,"cat1"), "Cat2": _pick(m,"cat2"),
+        "Put": _pick(m,"put","rec_put","put_rec"),
+        "Call": _pick(m,"call","rec_call","call_rec"),
+        "Limit": _pick(m,"limit","limit_put","put_limit","p_limit","putstrike"),
+        "CLimit": _pick(m,"climit","limit_call","call_limit","c_limit","callstrike"),
     }
     if not any(t.values()): return None
     return t
 
 def extract_trade_from_any(j):
-    # 1) exact schema
+    # exact schema
     if isinstance(j, dict) and "Trade" in j:
         tr = j["Trade"]
         if isinstance(tr, list) and tr: return tr[-1]
         if isinstance(tr, dict): return tr
-    # 2) map already contains trade-like fields
+    # flat/nested map
     if isinstance(j, dict):
         t = _normalize_trade_like(j)
         if t: return t
-        # 3) nested dicts & common containers
-        for k,v in j.items():
-            if isinstance(v, (dict, list)):
+        for v in j.values():
+            if isinstance(v,(dict,list)):
                 t = extract_trade_from_any(v)
                 if t: return t
-    # 4) arrays
+    # arrays → prefer last
     if isinstance(j, list):
-        # prefer last trade‑like row
         for item in reversed(j):
             t = extract_trade_from_any(item)
             if t: return t
     return {}
 
-# -------------------- API fetchers --------------------
+# -------------------- GammaWizard auth + fetch --------------------
 def _sanitize_token(t: str) -> str:
     t = (t or "").strip().strip('"').strip("'")
     if t.lower().startswith("bearer "):
         t = t.split(None, 1)[1].strip()
     return t
 
-def _parse_var2_text(text: str) -> dict:
-    """Best-effort parse when var2 returns text/plain instead of JSON."""
-    s = text.strip()
-    if not s: return {}
-    # 1) key[:=]value pairs across text
-    fields = ("Date","TDate","SPX","VIX","RV5","RV10","RV20","Cat1","Cat2","Put","Call","Limit","CLimit","expiry","expiration","exp")
-    got = {}
-    for m in re.finditer(r'(?mi)\b([A-Za-z][A-Za-z0-9_]*)\b\s*[:=]\s*([^\s,;|<>"]+)', s):
-        k = m.group(1); v = m.group(2)
-        if k in fields or k.lower() in [f.lower() for f in fields]:
-            got[k] = v
-    if got: return got
-    # 2) CSV (first row)
+def gw_authenticate(base: str, email: str, password: str) -> str:
+    """POST /goauth/authenticateFireUser → returns JWT token or dies."""
+    url = base.rstrip("/") + "/goauth/authenticateFireUser"
     try:
-        rdr = csv.DictReader(io.StringIO(s))
-        row = next(rdr, None)
-        if isinstance(row, dict) and row: return row
-    except: pass
-    # 3) JSON5-like with single quotes → quick fix
-    if s.startswith("{") and s.endswith("}"):
-        try:
-            js = s.replace("'", '"')
-            return json.loads(js)
-        except: pass
-    return {}
+        r = requests.post(url, data={"email": email, "password": password}, timeout=30)
+    except Exception as e:
+        print(f"AUTH_HTTP_ERROR: {e}", file=sys.stderr); sys.exit(1)
+    if r.status_code != 200:
+        print(f"AUTH_FAIL HTTP {r.status_code} body={r.text[:200]}", file=sys.stderr); sys.exit(1)
+    try:
+        j = r.json()
+    except:
+        print(f"AUTH_NON_JSON body={r.text[:200]}", file=sys.stderr); sys.exit(1)
+    tok = (j or {}).get("token")
+    if not tok:
+        print(f"AUTH_NO_TOKEN payload={str(j)[:200]}", file=sys.stderr); sys.exit(1)
+    return _sanitize_token(tok)
 
-def _json_path(obj, path: str):
-    """Very small dot-path: e.g., 'data.0.trade'"""
-    cur = obj
-    for part in path.split("."):
-        if part == "": continue
-        if isinstance(cur, list):
-            try:
-                idx = int(part)
-                cur = cur[idx]
-                continue
-            except: return None
-        if isinstance(cur, dict):
-            if part in cur:
-                cur = cur[part]
-                continue
-            # try case-insensitive
-            low = {k.lower(): k for k in cur.keys()}
-            k = low.get(part.lower())
-            cur = cur[k] if k else None
-            if cur is None: return None
-            continue
-        return None
-    return cur
-
-def fetch_leocross(gw_url: str, gw_token: str, gw_header_mode: str = "AUTO",
-                   gw_var2_token: str = "", json_path: str = "", dump_path: str = "", debug: bool = False):
-    token = _sanitize_token(gw_token)
-    var2_tok = _sanitize_token(gw_var2_token or token)
-    ua = f"leocross_to_sheet/{__VERSION__}"
-
-    raw = ""; ct = ""
-    # Path 1: var2 with token in query
-    if "/var2" in gw_url or gw_header_mode.upper() == "URL_TOKEN":
-        url = gw_url
-        if "token=" not in url:
-            sep = "&" if ("?" in url) else "?"
-            url = f"{url}{sep}token={var2_tok}"
-        r = requests.get(url, headers={"Accept":"application/json, text/plain", "User-Agent":ua}, timeout=30)
-        raw = r.text; ct = (r.headers.get("content-type") or "")
-        if dump_path:
-            try:
-                with open(dump_path, "w", encoding="utf-8") as f: f.write(raw)
-                if debug: print(f"[var2] saved raw payload to {dump_path} (len={len(raw)}, ct={ct})")
-            except Exception as e:
-                if debug: print(f"[var2] failed to write dump: {e}")
-        if r.status_code != 200:
-            print(f"var2 GET failed: HTTP {r.status_code} body={raw[:200]}", file=sys.stderr); sys.exit(1)
-        # Try JSON
-        j = None
-        try:
-            j = r.json()
-        except:
-            pass
-        if j is None:
-            # Try text heuristics
-            parsed = _parse_var2_text(raw)
-            if parsed:
-                j = parsed
-        # Apply optional JSON path
-        if j is not None and json_path:
-            at = _json_path(j, json_path)
-            if at is not None:
-                j = at
-        return j, raw, ct
-
-    # Path 2: legacy GetLeoCross with headers
-    tries = [
-        {"Authorization": f"Bearer {token}", "Accept": "application/json", "User-Agent": ua},
-        {"x-api-key": token, "Accept": "application/json", "User-Agent": ua},
-        {"Authorization": token, "Accept": "application/json", "User-Agent": ua},
-    ] if gw_header_mode.upper() == "AUTO" else (
-        [{"Authorization": f"Bearer {token}", "Accept": "application/json", "User-Agent": ua}] if gw_header_mode.upper()=="AUTH_BEARER" else
-        [{"x-api-key": token, "Accept": "application/json", "User-Agent": ua}] if gw_header_mode.upper()=="XAPIKEY" else
-        [{"Authorization": token, "Accept": "application/json", "User-Agent": ua}]
-    )
-    last = None
-    for hdr in tries:
-        r = requests.get(gw_url, headers=hdr, timeout=30); last = r
-        raw = r.text; ct = (r.headers.get("content-type") or "")
-        if dump_path:
-            try:
-                with open(dump_path, "w", encoding="utf-8") as f: f.write(raw)
-                if debug: print(f"[legacy] saved raw payload to {dump_path} (len={len(raw)}, ct={ct})")
-            except Exception as e:
-                if debug: print(f"[legacy] failed to write dump: {e}")
-        if r.status_code == 200:
-            try: return r.json(), raw, ct
-            except: print("Legacy endpoint returned non-JSON.", file=sys.stderr); sys.exit(1)
-        if r.status_code not in (401,403): break
-    print(f"LeoCross GET failed: {last.status_code} {raw[:200]}", file=sys.stderr); sys.exit(1)
+def gw_get_json(base: str, endpoint: str, token: str):
+    url = base.rstrip("/") + "/" + endpoint.lstrip("/")
+    hdr = {"Accept":"application/json", "Authorization": f"Bearer {token}"}
+    r = requests.get(url, headers=hdr, timeout=30)
+    if r.status_code != 200:
+        print(f"GET_FAIL {endpoint} HTTP {r.status_code} body={r.text[:200]}", file=sys.stderr); sys.exit(1)
+    try:
+        return r.json()
+    except:
+        print(f"GET_NON_JSON {endpoint} body={r.text[:200]}", file=sys.stderr); sys.exit(1)
 
 # -------------------- main --------------------
 def main():
-    gw_token   = env_or_die("GW_TOKEN")      # harmless in URL_TOKEN mode
+    # --- Required Google bits ---
     sheet_id   = env_or_die("GSHEET_ID")
     sa_json    = env_or_die("GOOGLE_SERVICE_ACCOUNT_JSON")
 
-    # Optional config
-    size_credit = env_int("LEO_SIZE_CREDIT", 4)
-    size_debit  = env_int("LEO_SIZE_DEBIT",  2)
-    width_env   = env_int("LEO_WIDTH", 5)
-    tie_side    = env_str("LEO_TIE_SIDE", "CREDIT").upper()  # tie-breaker only
-    gw_url      = env_str("GW_URL", "https://gandalf.gammawizard.com/rapi/GetLeoCross")
-    gw_header   = env_str("GW_HEADER", "AUTO")               # AUTH_BEARER | XAPIKEY | AUTH_RAW | AUTO | URL_TOKEN
-    gw_var2_tok = env_str("GW_VAR2_TOKEN", "")               # optional; falls back to GW_TOKEN
-    gw_json_path= env_str("GW_VAR2_JSON_PATH", "")           # optional JSON path, e.g. "data.0"
-    dump_path   = env_str("GW_PAYLOAD_PATH", "gw_last_payload.txt")
-    debug_on    = env_str("GW_DEBUG", "0").lower() in ("1","true","yes","on")
+    # --- Auth modes ---
+    # AUTO: prefer static GW_TOKEN if set; else login with email/password
+    auth_mode  = env_str("GW_AUTH_MODE","AUTO").upper()    # AUTO | TOKEN | LOGIN
+    base       = env_str("GW_BASE","https://gandalf.gammawizard.com")
+    endpoint   = env_str("GW_ENDPOINT","/rapi/GetLeoCross")
 
-    # 1) Fetch
-    api, raw, ct = fetch_leocross(gw_url, gw_token, gw_header, gw_var2_tok, gw_json_path, dump_path, debug_on)
+    static_tok = _sanitize_token(env_str("GW_TOKEN",""))
+    email      = env_str("GW_AUTH_EMAIL","")
+    password   = env_str("GW_AUTH_PASSWORD","")
 
-    # 2) Build Trade dict, regardless of shape
-    trade = extract_trade_from_any(api if api is not None else {})
-    if not trade and raw:
-        # last-ditch try to parse text payload directly
-        trade = extract_trade_from_any(_parse_var2_text(raw))
+    if auth_mode == "TOKEN":
+        if not static_tok:
+            print("GW_AUTH_MODE=TOKEN but GW_TOKEN is empty.", file=sys.stderr); sys.exit(1)
+        token = static_tok
+    elif auth_mode == "LOGIN":
+        if not (email and password):
+            print("GW_AUTH_MODE=LOGIN but GW_AUTH_EMAIL/PASSWORD missing.", file=sys.stderr); sys.exit(1)
+        token = gw_authenticate(base, email, password)
+    else:  # AUTO
+        token = static_tok if static_tok else gw_authenticate(base, email, password)
 
+    # --- Fetch GW data (LeoCross) ---
+    api = gw_get_json(base, endpoint, token)
+
+    # --- Extract a Trade-like record ---
+    trade = extract_trade_from_any(api)
     if not trade:
         print("No Trade-like data in response.", file=sys.stderr)
-        snippet = (raw or "")[:400].replace("\n","\\n")
-        print(f"--- payload snippet (first 400 chars) ---\n{snippet}\n--- end snippet ---", file=sys.stderr)
-        print(f"(content-type: {ct or 'unknown'} ; dump: {dump_path})", file=sys.stderr)
+        snippet = (json.dumps(api) if not isinstance(api,str) else api)[:400]
+        print(f"payload(first 400): {snippet}", file=sys.stderr)
         sys.exit(1)
 
-    # Normalize fields to strings
+    # --- Normalize & numbers ---
     def s(x): return "" if x is None else str(x)
-
     signal_date = s(trade.get("Date",""))
     expiry      = s(trade.get("TDate",""))
     spx  = s(trade.get("SPX","")); vix = s(trade.get("VIX",""))
@@ -321,7 +231,7 @@ def main():
     rec_call = fnum(trade.get("Call", None))
     rec_condor = (rec_put + rec_call) if (rec_put is not None and rec_call is not None) else None
 
-    # 3) Optional: parse ticket for explicit legs
+    # --- Optional ticket (explicit legs) ---
     put_spread = call_spread = ""
     occ_buy_put = occ_sell_put = occ_sell_call = occ_buy_call = ""
     summary = ""
@@ -329,8 +239,7 @@ def main():
     ticket = None
     for root, _, files in os.walk(".", topdown=True):
         if "leocross_ticket.py" in files:
-            ticket = os.path.join(root, "leocross_ticket.py")
-            break
+            ticket = os.path.join(root, "leocross_ticket.py"); break
     if ticket:
         cp = subprocess.run([sys.executable, ticket], capture_output=True, text=True)
         if cp.returncode == 0:
@@ -346,16 +255,14 @@ def main():
                 occ_sell_call = parsed["occ_sell_call"] or occ_sell_call
                 occ_buy_call  = parsed["occ_buy_call"]  or occ_buy_call
 
-    # 4) If legs missing, derive from Limit/CLimit + width_env (internal only)
+    # --- If legs missing, derive from Limit/CLimit + width_env ---
+    width_env   = env_int("LEO_WIDTH", 5)
     if not (occ_buy_put and occ_sell_put and occ_sell_call and occ_buy_call):
         w = width_env
         inner_put  = to_int(trade.get("Limit",""))
         inner_call = to_int(trade.get("CLimit",""))
         if inner_put is None or inner_call is None:
-            print("Missing Limit/CLimit for leg derivation.", file=sys.stderr)
-            snippet = (raw or "")[:200].replace("\n","\\n")
-            print(f"payload(first 200): {snippet}", file=sys.stderr)
-            sys.exit(1)
+            print("Missing Limit/CLimit for leg derivation.", file=sys.stderr); sys.exit(1)
         p_low, p_high = inner_put - w, inner_put
         c_low, c_high = inner_call, inner_call + w
         put_spread  = f"{p_low}/{p_high}"
@@ -367,26 +274,26 @@ def main():
         occ_buy_call  = f".SPXW{exp6}C{c_high}"
         summary = summary or f"{signal_date} → {expiry} : AUTO legs width={w}"
 
-    # 5) Decide CREDIT/DEBIT (Cat rule + tie)
+    # --- Credit/Debit decision (Cat rule + tie) ---
+    tie_side = env_str("LEO_TIE_SIDE", "CREDIT").upper()
     credit = True
     try:
         c1, c2 = float(cat1), float(cat2)
         if c1 > c2: credit = False
         elif c1 < c2: credit = True
         else: credit = (tie_side == "CREDIT")
-    except:
-        credit = True
+    except: credit = True
 
-    # 6) Re-orient legs to match side
+    # --- Orient to side ---
     occ_buy_put, occ_sell_put, occ_sell_call, occ_buy_call = orient_pairs_for_side(
         occ_buy_put, occ_sell_put, occ_sell_call, occ_buy_call, credit
     )
 
     side = "SHORT_IRON_CONDOR" if credit else "LONG_IRON_CONDOR"
     credit_or_debit = "credit" if credit else "debit"
-    qty_exec = size_credit if credit else size_debit
+    qty_exec = env_int("LEO_SIZE_CREDIT", 4) if credit else env_int("LEO_SIZE_DEBIT", 2)
 
-    # 7) Sheets write (headers, top insert, write A2)
+    # --- Write Google Sheet ---
     sa_info = json.loads(sa_json)
     creds = service_account.Credentials.from_service_account_info(sa_info, scopes=["https://www.googleapis.com/auth/spreadsheets"])
     svc = build("sheets","v4",credentials=creds)
