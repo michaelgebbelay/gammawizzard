@@ -1,5 +1,5 @@
+# .github/workflows/schwab-place.yml
 # yamllint disable rule:line-length rule:truthy
----
 name: Schwab Place
 
 on:
@@ -13,12 +13,15 @@ concurrency:
   group: schwab-place
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   place:
     # Only run if upstream concluded success OR manual dispatch
-    if: ${{ (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success')
-            && !(github.event_name == 'workflow_run' && vars.BYPASS_TIME_GATE == '1') }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 8
 
     steps:
       # Time gate: pass ONLY at 16:12 ET or 13:12 PT (Mon–Fri). Bypass with BYPASS_TIME_GATE=1
@@ -58,37 +61,43 @@ jobs:
         if: ${{ steps.gate.outputs.ok == 'true' }}
         env:
           # --- Required secrets ---
-          SCHWAB_APP_KEY: ${{ secrets.SCHWAB_APP_KEY }}
+          SCHWAB_APP_KEY:    ${{ secrets.SCHWAB_APP_KEY }}
           SCHWAB_APP_SECRET: ${{ secrets.SCHWAB_APP_SECRET }}
           SCHWAB_TOKEN_JSON: ${{ secrets.SCHWAB_TOKEN_JSON }}
-          GSHEET_ID: ${{ secrets.GSHEET_ID }}
+          GSHEET_ID:         ${{ secrets.GSHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+
+          # --- Optional: choose account explicitly ---
+          SCHWAB_ACCT_HASH: ${{ vars.SCHWAB_ACCT_HASH }}
 
           # --- Arm the placer (must be "place") ---
           SCHWAB_PLACE: ${{ vars.SCHWAB_PLACE }}  # set to "place" to actually place
 
           # --- Ladder timing & tick ---
-          STAGE_SEC: ${{ vars.STAGE_SEC }}  # one knob; default 15s if unset
+          STAGE_SEC: ${{ vars.STAGE_SEC }}  # default 15 if unset
           TICK: 0.05  # SPX options tick
 
-          # --- Per-leg rails (CONDOR uses 2x these automatically) ---
-          CREDIT_START_PERLEG: ${{ vars.CREDIT_START_PERLEG }}  # default 1.10
-          CREDIT_FLOOR_PERLEG: ${{ vars.CREDIT_FLOOR_PERLEG }}  # default 0.95
-          DEBIT_START_PERLEG: ${{ vars.DEBIT_START_PERLEG }}  # default 0.90
-          DEBIT_CEIL_PERLEG: ${{ vars.DEBIT_CEIL_PERLEG }}  # default 1.05
-          OFFSET_PERLEG_CREDIT: ${{ vars.OFFSET_PERLEG_CREDIT }}  # default -0.05 (mid - 0.05)
-          OFFSET_PERLEG_DEBIT: ${{ vars.OFFSET_PERLEG_DEBIT }}  # default +0.05 (mid + 0.05)
+          # --- Per-leg rails (CONDOR uses 2x automatically) ---
+          CREDIT_START_PERLEG:   ${{ vars.CREDIT_START_PERLEG }}   # default 1.10
+          CREDIT_FLOOR_PERLEG:   ${{ vars.CREDIT_FLOOR_PERLEG }}   # default 0.95
+          DEBIT_START_PERLEG:    ${{ vars.DEBIT_START_PERLEG }}    # default 0.90
+          DEBIT_CEIL_PERLEG:     ${{ vars.DEBIT_CEIL_PERLEG }}     # default 1.05
+          OFFSET_PERLEG_CREDIT:  ${{ vars.OFFSET_PERLEG_CREDIT }}  # default -0.05
+          OFFSET_PERLEG_DEBIT:   ${{ vars.OFFSET_PERLEG_DEBIT }}   # default +0.05
 
           # --- Sizing (percentage-of-BP optional) ---
-          SIZE_MODE: ${{ vars.SIZE_MODE }}  # "STATIC" or "PCT_BP" (default STATIC)
-          CREDIT_ALLOC_PCT: ${{ vars.CREDIT_ALLOC_PCT }}  # e.g. 0.06
-          DEBIT_ALLOC_PCT: ${{ vars.DEBIT_ALLOC_PCT }}  # e.g. 0.02
-          MAX_QTY: ${{ vars.MAX_QTY }}  # optional cap
-          OPT_BP_OVERRIDE: ${{ vars.OPT_BP_OVERRIDE }}  # e.g. 20000 to force BP in tests
+          SIZE_MODE:        ${{ vars.SIZE_MODE }}        # "STATIC" or "PCT_BP" (default STATIC)
+          CREDIT_ALLOC_PCT: ${{ vars.CREDIT_ALLOC_PCT }} # e.g., 0.06
+          DEBIT_ALLOC_PCT:  ${{ vars.DEBIT_ALLOC_PCT }}  # e.g., 0.02
+          MAX_QTY:          ${{ vars.MAX_QTY }}          # optional cap
+          MIN_QTY:          ${{ vars.MIN_QTY }}          # optional floor (default 1)
+          OPT_BP_OVERRIDE:  ${{ vars.OPT_BP_OVERRIDE }}  # e.g., 20000 to force BP in tests
 
           # --- Guards ---
           FRESH_MIN: ${{ vars.FRESH_MIN }}  # default 120
           ENFORCE_EXPIRY_TOMORROW: ${{ vars.ENFORCE_EXPIRY_TOMORROW }}  # default "true"
+          MAX_LEG_SPREAD: ${{ vars.MAX_LEG_SPREAD }}  # default 0.70
+          CANCEL_IF_UNFILLED: ${{ vars.CANCEL_IF_UNFILLED }}  # default "false"
         run: |
           python scripts/schwab_place_order.py
 
