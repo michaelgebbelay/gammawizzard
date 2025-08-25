@@ -37,7 +37,7 @@ jobs:
         id: gate
         env:
           BYPASS_TIME_GATE: ${{ vars.BYPASS_TIME_GATE }}
-          GATE_WINDOW_MIN: 3              # +/- minutes allowed around target
+          GATE_WINDOW_MIN: 10              # +/- minutes allowed around target
           GATE_TARGET_OFFSET_MIN: 12      # minutes AFTER equity close (→ 16:12 / 13:12)
         run: |
           python - <<'PY'
