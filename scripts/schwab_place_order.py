@@ -8,7 +8,7 @@ from googleapiclient.discovery import build
 # schwab-py
 from schwab.auth import client_from_token_file
 
-__VERSION__ = "2025-08-26c"
+__VERSION__ = "2025-08-26e"
 
 LEO_TAB    = "leocross"
 SCHWAB_TAB = "schwab"
@@ -191,13 +191,39 @@ def make_client(app_key: str, app_secret: str, token_json: str):
         return client_from_token_file("schwab_token.json", app_key, app_secret)
     except TypeError as e3:
         print("INIT_TRY3 failed:", e3)
-    # last ditch: some very old snippets used api_secret kw
+    # last ditch for very old kw
     try:
         return client_from_token_file(token_path="schwab_token.json",
                                       api_key=app_key, api_secret=app_secret)  # noqa
     except TypeError as e4:
         print("INIT_TRY4 failed:", e4)
         raise
+
+# ---------- Buying power discovery ----------
+def discover_bp_option_only(sa: dict) -> float | None:
+    cands = []
+    for section in ("currentBalances","projectedBalances","initialBalances","balances"):
+        b = sa.get(section) or {}
+        for k in ("optionBuyingPower","optionsBuyingPower","availableFundsForOptionsTrading"):
+            v = b.get(k)
+            if isinstance(v,(int,float)): cands.append(float(v))
+    for k in ("optionBuyingPower","optionsBuyingPower","availableFundsForOptionsTrading"):
+        v = sa.get(k)
+        if isinstance(v,(int,float)): cands.append(float(v))
+    return max(cands) if cands else None
+
+def discover_bp_any(sa: dict) -> float | None:
+    cands = []
+    for section in ("currentBalances","projectedBalances","initialBalances","balances"):
+        b = sa.get(section) or {}
+        for k in ("optionBuyingPower","optionsBuyingPower","availableFundsForOptionsTrading",
+                  "buyingPower","cashAvailableForTrading","availableFunds","cashAvailableForTradingSettled"):
+            v = b.get(k)
+            if isinstance(v,(int,float)): cands.append(float(v))
+    for k in ("optionBuyingPower","optionsBuyingPower","availableFundsForOptionsTrading","buyingPower"):
+        v = sa.get(k)
+        if isinstance(v,(int,float)): cands.append(float(v))
+    return max(cands) if cands else None
 
 # ---------- main ----------
 def main():
@@ -213,10 +239,10 @@ def main():
     sa_json    = env_or_die("GOOGLE_SERVICE_ACCOUNT_JSON")
 
     # timing & tick
-    STAGE_SEC = env_int("STAGE_SEC", 15)
+    STAGE_SEC = env_int("STAGE_SEC", 60)
     TICK      = env_float("TICK", 0.05)
 
-    # per‑leg rails → condor ×2
+    # per‑leg rails → condor ×2 (still used for PRICING only; not for sizing)
     CREDIT_START_PER = env_float("CREDIT_START_PERLEG", 1.10)
     CREDIT_FLOOR_PER = env_float("CREDIT_FLOOR_PERLEG", 0.95)
     DEBIT_START_PER  = env_float("DEBIT_START_PERLEG",  0.90)
@@ -231,20 +257,25 @@ def main():
     OFFSET_CREDIT = 2*OFFSET_PER_CRED
     OFFSET_DEBIT  = 2*OFFSET_PER_DEB
 
-    SIZE_MODE        = env_str("SIZE_MODE","STATIC").upper()
+    # ---- sizing switches ----
+    SIZE_MODE        = env_str("SIZE_MODE","STATIC").upper()      # STATIC or PCT_BP
     CREDIT_ALLOC_PCT = env_float("CREDIT_ALLOC_PCT", 0.06)
     DEBIT_ALLOC_PCT  = env_float("DEBIT_ALLOC_PCT",  0.02)
-    MAX_QTY          = env_int("MAX_QTY", 999)
+    RISK_PER_CONTRACT_CREDIT = env_float("RISK_PER_CONTRACT_CREDIT", 300.0)  # << hard-coded risk per contract
+    RISK_PER_CONTRACT_DEBIT  = env_float("RISK_PER_CONTRACT_DEBIT",  200.0)
+    MAX_QTY          = env_int("MAX_QTY", 10)
     MIN_QTY          = env_int("MIN_QTY", 1)
     OPT_BP_OVERRIDE  = env_float("OPT_BP_OVERRIDE", -1.0)
+    BP_SOURCE        = env_str("BP_SOURCE","OPTION").upper()       # OPTION | MAX | BUYING
+    MAX_RISK_PER_TRADE = env_float("MAX_RISK_PER_TRADE", -1.0)     # absolute dollars
+    HARD_QTY_CUTOFF    = env_int("HARD_QTY_CUTOFF", 20)            # abort if computed > cutoff
 
+    # ---- guards ----
     FRESH_MIN               = env_int("FRESH_MIN", 120)
     ENFORCE_EXPIRY_TOMORROW = env_bool("ENFORCE_EXPIRY_TOMORROW", True)
-
-    # Optional guards
-    MAX_LEG_SPREAD = env_float("MAX_LEG_SPREAD", None)     # any leg ask-bid > this -> skip
-    MAX_NET_SPREAD = env_float("MAX_NET_SPREAD", None)     # condor (ask-bid) > this -> skip
-    CANCEL_IF_UNFILLED = env_bool("CANCEL_IF_UNFILLED", False)
+    MAX_LEG_SPREAD = env_float("MAX_LEG_SPREAD", None)
+    MAX_NET_SPREAD = env_float("MAX_NET_SPREAD", None)
+    CANCEL_IF_UNFILLED = env_bool("CANCEL_IF_UNFILLED", True)
 
     # --- Schwab client ---
     c = make_client(app_key, app_secret, token_json)
@@ -268,8 +299,7 @@ def main():
     last_px=spx_last()
 
     # Sheets
-    sa_info=json.loads(sa_json)
-    creds=service_account.Credentials.from_service_account_info(sa_info, scopes=["https://www.googleapis.com/auth/spreadsheets"])
+    creds=service_account.Credentials.from_service_account_info(json.loads(sa_json), scopes=["https://www.googleapis.com/auth/spreadsheets"])
     s=build("sheets","v4",credentials=creds)
     schwab_sheet_id=ensure_header_and_get_sheetid(s, sheet_id, SCHWAB_TAB, SCHWAB_HEADERS)
 
@@ -298,6 +328,7 @@ def main():
     def log_and_exit(src: str, msg: str, qty_val: int = 0):
         log_top(src, msg, qty_val, "", ""); print(msg); sys.exit(0)
 
+    # --- recency & dates ---
     ts = parse_iso(g("ts")); age_min=(datetime.now(timezone.utc)-ts).total_seconds()/60.0 if ts else None
     try:
         sig_d=date.fromisoformat(g("signal_date")) if g("signal_date") else None
@@ -309,6 +340,7 @@ def main():
         expected = next_trading_day(sig_d)
         if exp_d != expected: log_and_exit("SCHWAB_ERROR", f"DATE_MISMATCH sig={g('signal_date')} exp={g('expiry')} (expected {expected})")
 
+    # --- legs ---
     raw_legs=[g("occ_buy_put"), g("occ_sell_put"), g("occ_sell_call"), g("occ_buy_call")]
     if not all(raw_legs): log_and_exit("SCHWAB_ERROR","MISSING_LEGS")
 
@@ -345,14 +377,14 @@ def main():
     call_w = abs(strike_from_osi(leg_syms[3]) - strike_from_osi(leg_syms[2]))
     width  = round(min(put_w, call_w), 3)
 
-    # Leo recs
+    # Leo recs (for pricing, not sizing)
     def fnum(x):
         try: return float(x)
         except: return None
     rec_put=fnum(g("rec_put")); rec_call=fnum(g("rec_call"))
     rec_condor=fnum(g("rec_condor")) if g("rec_condor")!="" else (None if (rec_put is None or rec_call is None) else (rec_put+rec_call))
 
-    # mid + spreads
+    # mid + spreads / liquidity guards
     mid, net_bid, net_ask, legs_ba = compute_mid_condor(c, leg_syms)
     if MAX_LEG_SPREAD is not None and None not in legs_ba:
         bp_bid,bp_ask,sp_bid,sp_ask,sc_bid,sc_ask,bc_bid,bc_ask = legs_ba
@@ -364,7 +396,7 @@ def main():
         if net_spread > MAX_NET_SPREAD:
             log_and_exit("SCHWAB_SKIP", f"NET_SPREAD_EXCEEDS {net_spread:.2f}>{MAX_NET_SPREAD:.2f}")
 
-    # rung prices (clamped & snapped to next tick)
+    # rung prices (clamped & snapped to next tick) — rails only affect PRICING, not sizing
     def clamp_credit(x): return clamp_and_snap(x, CREDIT_FLOOR, CREDIT_START, TICK)
     def clamp_debit(x):  return clamp_and_snap(x, 0.01, DEBIT_CEIL, TICK)
     if is_credit:
@@ -381,7 +413,9 @@ def main():
     # ---------- qty sizing ----------
     qty_sheet = int((g("qty_exec") or "1"))
     qty_exec  = qty_sheet
+
     if SIZE_MODE=="PCT_BP":
+        # discover account BP (or use override)
         bp = OPT_BP_OVERRIDE if OPT_BP_OVERRIDE and OPT_BP_OVERRIDE>0 else None
         if bp is None:
             try:
@@ -391,32 +425,34 @@ def main():
                     j=rr.json()
                     if isinstance(j,list): j=j[0]
                     sa=j.get("securitiesAccount") or j
-                    cands=[]
-                    for section in ("currentBalances","projectedBalances","initialBalances","balances"):
-                        b=sa.get(section,{})
-                        for k in ("optionBuyingPower","optionsBuyingPower","buyingPower","cashAvailableForTrading","availableFunds","cashAvailableForTradingSettled"):
-                            v=b.get(k)
-                            if isinstance(v,(int,float)): cands.append(float(v))
-                    for k in ("optionBuyingPower","optionsBuyingPower","buyingPower"):
-                        v=sa.get(k)
-                        if isinstance(v,(int,float)): cands.append(float(v))
-                    bp = max(cands) if cands else None
+                    if BP_SOURCE in ("OPTION", "OPTIONS"):
+                        bp = discover_bp_option_only(sa)
+                    elif BP_SOURCE in ("MAX","BUYING"):
+                        bp = discover_bp_any(sa)
+                    else:
+                        bp = discover_bp_option_only(sa)
             except: bp=None
-        if bp is not None:
+
+        if bp is None:
+            print("WARN: could not fetch option buying power; using sheet qty.")
+        else:
             alloc = CREDIT_ALLOC_PCT if is_credit else DEBIT_ALLOC_PCT
             budget = max(bp*alloc, 0.0)
-            if is_credit:
-                rail_price = CREDIT_FLOOR  # lowest credit you'll accept
-                per_risk = max((width*100) - (rail_price*100), 1.0)
-            else:
-                rail_price = DEBIT_CEIL    # highest debit you'll pay
-                per_risk = max(rail_price*100, 1.0)
-            qty_exec = max(1, int(budget // per_risk))
-        else:
-            print("WARN: could not fetch option buying power; using sheet qty.")
-    # Enforce floors/caps
+            if MAX_RISK_PER_TRADE and MAX_RISK_PER_TRADE>0:
+                budget = min(budget, MAX_RISK_PER_TRADE)
+
+            risk_per_ct = RISK_PER_CONTRACT_CREDIT if is_credit else RISK_PER_CONTRACT_DEBIT
+            risk_per_ct = max(risk_per_ct, 1.0)
+
+            qty_exec = max(1, int(budget // risk_per_ct))
+            print(f"SIZING PCT_BP bp={bp:.2f} alloc={alloc:.4f} budget={budget:.2f} "
+                  f"risk_per_ct={risk_per_ct:.2f} -> qty={qty_exec}")
+
+    # floors/caps/hard stop
     if qty_exec < MIN_QTY: qty_exec = MIN_QTY
-    if MAX_QTY>0: qty_exec=min(qty_exec, MAX_QTY)
+    if MAX_QTY>0 and qty_exec > MAX_QTY: qty_exec = MAX_QTY
+    if HARD_QTY_CUTOFF>0 and qty_exec > HARD_QTY_CUTOFF:
+        log_and_exit("SCHWAB_ABORT", f"QTY_ABOVE_HARD_CUTOFF computed={qty_exec} cutoff={HARD_QTY_CUTOFF}", qty_exec)
 
     # ---------- pre-claim broker guard ----------
     if has_open_order_for_legs(c, acct_hash, leg_syms):
