@@ -18,7 +18,7 @@ permissions:
 jobs:
   leocross:
     runs-on: ubuntu-latest
-    timeout-minutes: 6
+    timeout-minutes: 8
 
     steps:
       - uses: actions/checkout@v4
@@ -32,27 +32,75 @@ jobs:
           python -m pip install --upgrade pip
           pip install --quiet requests google-api-python-client google-auth google-auth-httplib2
 
-      - name: Ping GammaWizard var2
+      # --- Pull the SPA shell ---
+      - name: Fetch var2 index.html
+        id: fetch_index
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="https://gandalf.gammawizard.com/var2/"
+          curl -sS "$base" -o var2_index.html
+          echo "ok=true" >> "$GITHUB_OUTPUT"
+
+      # --- Discover a main/runtime bundle and look for API strings inside ---
+      - name: Discover var2 API endpoint from bundle
+        id: discover
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="https://gandalf.gammawizard.com/var2/"
+          # Locate a JS bundle in index.html
+          js_path=$(grep -oE 'src="(main|runtime|polyfills)[^"]+\.js"' var2_index.html | head -n1 | sed -E 's#src="([^"]+)"#\1#')
+          if [ -z "${js_path:-}" ]; then
+            echo "No JS bundle reference found in index.html"
+            echo "api_url=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Fetch that bundle
+          curl -sS "${base%/}/$js_path" -o var2_main.js
+          # Try to extract a likely API URL
+          # (1) absolute
+          grep -Eo 'https?://[^"]+/rapi/[A-Za-z0-9_/?=&]+' var2_main.js | head -n1 > api_url.txt || true
+          # (2) relative
+          if [ ! -s api_url.txt ]; then
+            grep -Eo '/rapi/[A-Za-z0-9_/?=&]+' var2_main.js | head -n1 > api_url.txt || true
+          fi
+          if [ -s api_url.txt ]; then
+            url="$(cat api_url.txt)"
+            # If relative URL, prefix with site root (not /var2/)
+            if [[ "$url" == /* ]]; then url="https://gandalf.gammawizard.com${url}"; fi
+            echo "api_url=$url" >> "$GITHUB_OUTPUT"
+            echo "Discovered API: $url"
+          else
+            echo "No API URL discovered in bundle."
+            echo "api_url=" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Save artifacts so we can see exactly what the SPA is serving
+      - name: Upload discovery artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: var2-discovery
+          path: |
+            var2_index.html
+            var2_main.js
+            api_url.txt
+          if-no-files-found: ignore
+          retention-days: 3
+
+      # Optional: dump whatever /var2/?token returns (might be HTML)
+      - name: Dump /var2/?token payload
         shell: bash
         env:
           GW_VAR2_TOKEN: ${{ secrets.GW_VAR2_TOKEN }}
         run: |
           URL="https://gandalf.gammawizard.com/var2/?token=${GW_VAR2_TOKEN}"
-          code=$(curl -sS -o /dev/null -w "%{http_code}" "$URL")
-          echo "GammaWizard var2 HTTP ${code}"
-          test "$code" = "200"
+          echo "GET $URL"
+          curl -sS -D headers.txt "$URL" -o gw_last_payload.txt
+          echo "--- headers ---"; cat headers.txt; echo "---------------"
+          echo "--- first 400 chars ---"; head -c 400 gw_last_payload.txt; echo; echo "------------------------"
 
-      - name: Dump var2 payload (for debugging)
-        shell: bash
-        env:
-          GW_VAR2_TOKEN: ${{ secrets.GW_VAR2_TOKEN }}
-        run: |
-          URL="https://gandalf.gammawizard.com/var2/?token=${GW_VAR2_TOKEN}"
-          curl -sS "$URL" | tee gw_last_payload.txt | head -c 400
-          echo
-          echo "(saved full payload to gw_last_payload.txt)"
-
-      - name: Upload payload artifact
+      - name: Upload /var2/?token payload
         uses: actions/upload-artifact@v4
         with:
           name: var2-payload
@@ -60,24 +108,29 @@ jobs:
           if-no-files-found: ignore
           retention-days: 3
 
+      # --- Run the sheet writer using discovered API if present; otherwise fall back to /var2/?token= ---
       - name: Run leocross → Google Sheet (write A2, set header)
         env:
-          # --- Required secrets ---
-          GW_TOKEN:  ${{ secrets.GW_TOKEN }}               # not used in URL_TOKEN mode; harmless to keep
+          # Required secrets
+          GW_TOKEN:  ${{ secrets.GW_TOKEN }}                # not used if we go URL_TOKEN path
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
 
-          # --- Sizing defaults ---
-          LEO_SIZE_CREDIT: ${{ vars.LEO_SIZE_CREDIT }}     # default 4
-          LEO_SIZE_DEBIT:  ${{ vars.LEO_SIZE_DEBIT }}      # default 2
+          # Sizing defaults
+          LEO_SIZE_CREDIT: ${{ vars.LEO_SIZE_CREDIT }}
+          LEO_SIZE_DEBIT:  ${{ vars.LEO_SIZE_DEBIT }}
           LEO_TIE_SIDE:    CREDIT
-          LEO_WIDTH:       ${{ vars.LEO_WIDTH }}           # default 5
+          LEO_WIDTH:       ${{ vars.LEO_WIDTH }}
 
-          # --- var2 mode + debug ---
-          GW_URL:          https://gandalf.gammawizard.com/var2/
-          GW_HEADER:       URL_TOKEN
-          GW_VAR2_TOKEN:   ${{ secrets.GW_VAR2_TOKEN }}
-          GW_VAR2_JSON_PATH: ${{ vars.GW_VAR2_JSON_PATH }} # optional e.g., data.0
+          # Dynamic source selection:
+          # If 'discover.api_url' is non-empty, use it (header mode AUTO).
+          # Else use /var2/ with ?token= (URL_TOKEN mode).
+          GW_URL: ${{ steps.discover.outputs.api_url != '' && steps.discover.outputs.api_url || 'https://gandalf.gammawizard.com/var2/' }}
+          GW_HEADER: ${{ steps.discover.outputs.api_url != '' && 'AUTO' || 'URL_TOKEN' }}
+          GW_VAR2_TOKEN: ${{ secrets.GW_VAR2_TOKEN }}
+
+          # Optional debug
+          GW_VAR2_JSON_PATH: ${{ vars.GW_VAR2_JSON_PATH }}  # e.g., data.0.trade (if their API nests it)
           GW_PAYLOAD_PATH: gw_last_payload.txt
           GW_DEBUG: "1"
         run: |
