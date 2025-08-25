@@ -6,10 +6,10 @@ on:
   workflow_dispatch:
   # Fire at 1:12 ET and 4:12 ET across DST (Mon–Fri)
   schedule:
-    - cron: "10 17 * * 1-5"  # 1:12pm EDT
-    - cron: "10 18 * * 1-5"  # 1:12pm EST
-    - cron: "10 20 * * 1-5"  # 4:12pm EDT
-    - cron: "10 21 * * 1-5"  # 4:12pm EST
+    - cron: "10 17 * * 1-5"  # 1:10pm EDT
+    - cron: "10 18 * * 1-5"  # 1:10pm EST
+    - cron: "10 20 * * 1-5"  # 4:10pm EDT
+    - cron: "10 21 * * 1-5"  # 4:10pm EST
 
 concurrency:
   group: leocross-append
