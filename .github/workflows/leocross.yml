@@ -4,7 +4,6 @@ name: LeoCross Ticket
 
 on:
   workflow_dispatch:
-  # Run at 16:12 ET across DST by scheduling both 20:12Z (EDT) and 21:12Z (EST)
   schedule:
     - cron: "12 20 * * 1-5"
     - cron: "12 21 * * 1-5"
@@ -38,9 +37,28 @@ jobs:
         env:
           GW_VAR2_TOKEN: ${{ secrets.GW_VAR2_TOKEN }}
         run: |
-          code=$(curl -sS -o /dev/null -w "%{http_code}" "https://gandalf.gammawizard.com/var2/?token=${GW_VAR2_TOKEN}")
+          URL="https://gandalf.gammawizard.com/var2/?token=${GW_VAR2_TOKEN}"
+          code=$(curl -sS -o /dev/null -w "%{http_code}" "$URL")
           echo "GammaWizard var2 HTTP ${code}"
           test "$code" = "200"
+
+      - name: Dump var2 payload (for debugging)
+        shell: bash
+        env:
+          GW_VAR2_TOKEN: ${{ secrets.GW_VAR2_TOKEN }}
+        run: |
+          URL="https://gandalf.gammawizard.com/var2/?token=${GW_VAR2_TOKEN}"
+          curl -sS "$URL" | tee gw_last_payload.txt | head -c 400
+          echo
+          echo "(saved full payload to gw_last_payload.txt)"
+
+      - name: Upload payload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: var2-payload
+          path: gw_last_payload.txt
+          if-no-files-found: ignore
+          retention-days: 3
 
       - name: Run leocross → Google Sheet (write A2, set header)
         env:
@@ -50,14 +68,17 @@ jobs:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
 
           # --- Sizing defaults ---
-          LEO_SIZE_CREDIT: ${{ vars.LEO_SIZE_CREDIT }}   # default 4
-          LEO_SIZE_DEBIT:  ${{ vars.LEO_SIZE_DEBIT }}    # default 2
-          LEO_TIE_SIDE:    CREDIT                         # explicit tie-break
-          LEO_WIDTH:       ${{ vars.LEO_WIDTH }}          # default 5
+          LEO_SIZE_CREDIT: ${{ vars.LEO_SIZE_CREDIT }}     # default 4
+          LEO_SIZE_DEBIT:  ${{ vars.LEO_SIZE_DEBIT }}      # default 2
+          LEO_TIE_SIDE:    CREDIT
+          LEO_WIDTH:       ${{ vars.LEO_WIDTH }}           # default 5
 
-          # --- NEW: var2 mode ---
-          GW_URL:    https://gandalf.gammawizard.com/var2/
-          GW_HEADER: URL_TOKEN                            # force ?token= mode
-          GW_VAR2_TOKEN: ${{ secrets.GW_VAR2_TOKEN }}     # put token value in this secret
+          # --- var2 mode + debug ---
+          GW_URL:          https://gandalf.gammawizard.com/var2/
+          GW_HEADER:       URL_TOKEN
+          GW_VAR2_TOKEN:   ${{ secrets.GW_VAR2_TOKEN }}
+          GW_VAR2_JSON_PATH: ${{ vars.GW_VAR2_JSON_PATH }} # optional e.g., data.0
+          GW_PAYLOAD_PATH: gw_last_payload.txt
+          GW_DEBUG: "1"
         run: |
           python scripts/leocross_to_sheet.py
