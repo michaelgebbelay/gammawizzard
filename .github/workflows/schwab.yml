@@ -4,7 +4,6 @@ name: Schwab Place
 
 on:
   workflow_dispatch:
-  # Auto-run right after LeoCross finishes
   workflow_run:
     workflows: ["LeoCross Ticket"]
     types: [completed]
@@ -18,53 +17,71 @@ permissions:
 
 jobs:
   place:
-    # Only run if upstream concluded success OR manual dispatch
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 8
 
     steps:
-      # Time gate: pass only near 16:12 ET (±8 min) on Mon–Fri. Bypass with BYPASS_TIME_GATE=1
-      - name: Gate to ~16:12 ET (±8 min) Mon–Fri
-        id: gate
-        shell: bash
-        env:
-          BYPASS_TIME_GATE: ${{ vars.BYPASS_TIME_GATE }}
-        run: |
-          if [ "${BYPASS_TIME_GATE:-}" = "1" ]; then
-            echo "ok=true" >> "$GITHUB_OUTPUT"
-            echo "Bypass enabled → proceeding regardless of time."
-            exit 0
-          fi
-          ET_HHMM="$(TZ=America/New_York date +%H:%M)"
-          ET_DOW="$(TZ=America/New_York date +%u)"
-          HH="${ET_HHMM%:*}"; MM="${ET_HHMM#*:}"
-          NOW_MIN=$((10#$HH * 60 + 10#$MM))
-          TARGET_MIN=$((16 * 60 + 12))
-          DIFF=$(( NOW_MIN - TARGET_MIN ))
-          [ $DIFF -lt 0 ] && DIFF=$(( -DIFF ))
-          echo "Now ET=${ET_HHMM} (DOW=${ET_DOW}) | diff=${DIFF} min"
-          if [ "$ET_DOW" -ge 1 ] && [ "$ET_DOW" -le 5 ] && [ "$DIFF" -le 8 ]; then
-            echo "ok=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "ok=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install gate deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install --quiet pandas-market-calendars pytz
+
+      - name: Time gate (auto early-close aware)
+        id: gate
+        env:
+          BYPASS_TIME_GATE: ${{ vars.BYPASS_TIME_GATE }}
+          GATE_WINDOW_MIN: 3
+          GATE_TARGET_OFFSET_MIN: 12
+        run: |
+          python - <<'PY'
+          import os, datetime as dt, pytz
+          import pandas_market_calendars as mcal
+          et = pytz.timezone('America/New_York')
+          now = dt.datetime.now(et)
+          window = int(os.environ.get('GATE_WINDOW_MIN','3'))
+          offset = int(os.environ.get('GATE_TARGET_OFFSET_MIN','12'))
+          bypass = os.environ.get('BYPASS_TIME_GATE','') == '1'
+          ok=False; target=None; is_early='false'; reason=''
+          if bypass:
+              ok=True; reason='BYPASS'
+          else:
+              nyse = mcal.get_calendar('XNYS')
+              sched = nyse.schedule(start_date=now.date(), end_date=now.date(), tz='America/New_York')
+              if sched.empty:
+                  reason='NOT_TRADING_DAY'
+              else:
+                  close = sched['market_close'].iloc[0]
+                  target = close + dt.timedelta(minutes=offset)
+                  is_early = 'true' if close.hour < 16 else 'false'
+                  diff = abs((now - target).total_seconds())/60.0
+                  ok = diff <= window
+                  reason = f'diff={diff:.2f}min target={target.strftime("%H:%M")}'
+          out = os.environ['GITHUB_OUTPUT']
+          with open(out,'a') as fh:
+              fh.write(f"ok={'true' if ok else 'false'}\n")
+              fh.write(f"is_early_close={is_early}\n")
+              fh.write(f"target_hhmm={(target.strftime('%H:%M') if target else '')}\n")
+              fh.write(f"reason={reason}\n")
+          print("GATE", "ok" if ok else "skip", "is_early", is_early, "target", (target.strftime('%H:%M') if target else 'NA'), reason)
+          PY
+
+      - name: Install trading deps
+        if: ${{ steps.gate.outputs.ok == 'true' }}
         run: |
           python -m pip install --upgrade pip
           pip install --quiet schwab-py google-api-python-client google-auth google-auth-httplib2
 
       # Safety hotfix in case any old copy still uses api_secret=
       - name: Hotfix (ensure app_secret kwarg)
-        run: |
-          sed -i 's/api_secret=/app_secret=/g' scripts/schwab_place_order.py || true
+        if: ${{ steps.gate.outputs.ok == 'true' }}
+        run: sed -i 's/api_secret=/app_secret=/g' scripts/schwab_place_order.py || true
 
       - name: Place SPXW order from leocross!A2 and log at schwab!A2
         if: ${{ steps.gate.outputs.ok == 'true' }}
@@ -76,17 +93,17 @@ jobs:
           GSHEET_ID:         ${{ secrets.GSHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
 
-          # --- Optional: choose account explicitly ---
+          # --- Optional account selection ---
           SCHWAB_ACCT_HASH: ${{ vars.SCHWAB_ACCT_HASH }}
 
-          # --- Arm the placer (must be "place") ---
+          # --- Arm the placer ---
           SCHWAB_PLACE: ${{ vars.SCHWAB_PLACE || 'place' }}
 
           # --- Ladder timing & tick ---
           STAGE_SEC: ${{ vars.STAGE_SEC || 60 }}
-          TICK: 0.05  # SPX options tick
+          TICK: 0.05
 
-          # --- Per-leg rails (CONDOR uses 2x automatically for pricing only) ---
+          # --- Pricing rails (2x for condor) ---
           CREDIT_START_PERLEG:   ${{ vars.CREDIT_START_PERLEG || 1.10 }}
           CREDIT_FLOOR_PERLEG:   ${{ vars.CREDIT_FLOOR_PERLEG || 0.95 }}
           DEBIT_START_PERLEG:    ${{ vars.DEBIT_START_PERLEG  || 0.90 }}
@@ -95,7 +112,7 @@ jobs:
           OFFSET_PERLEG_DEBIT:   ${{ vars.OFFSET_PERLEG_DEBIT  ||  0.05 }}
 
           # --- Sizing (risk-per-contract) ---
-          SIZE_MODE:        ${{ vars.SIZE_MODE || 'PCT_BP' }}   # 'STATIC' uses sheet qty; 'PCT_BP' uses budget
+          SIZE_MODE:        ${{ vars.SIZE_MODE || 'PCT_BP' }}
           CREDIT_ALLOC_PCT: ${{ vars.CREDIT_ALLOC_PCT || 0.06 }}
           DEBIT_ALLOC_PCT:  ${{ vars.DEBIT_ALLOC_PCT  || 0.02 }}
           RISK_PER_CONTRACT_CREDIT: ${{ vars.RISK_PER_CONTRACT_CREDIT || 300 }}
@@ -116,6 +133,6 @@ jobs:
         run: |
           python scripts/schwab_place_order.py
 
-      - name: Skipped (outside window)
+      - name: Skipped (outside gate)
         if: ${{ steps.gate.outputs.ok != 'true' }}
-        run: echo "Time gate did not match; no order placed."
+        run: echo "Not within gate window; no order placed."
