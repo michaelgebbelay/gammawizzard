@@ -18,7 +18,7 @@ permissions:
 
 jobs:
   place:
-    # Only run if upstream concluded success OR manual dispatch
+    # Run on manual dispatch OR when upstream succeeded
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 8
@@ -56,6 +56,11 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install --quiet schwab-py google-api-python-client google-auth google-auth-httplib2
+
+      # Safety hotfix in case any old copy still uses api_secret=
+      - name: Hotfix (ensure app_secret kwarg)
+        run: |
+          sed -i 's/api_secret=/app_secret=/g' scripts/schwab_place_order.py || true
 
       - name: Place SPXW order from leocross!A2 and log at schwab!A2
         if: ${{ steps.gate.outputs.ok == 'true' }}
@@ -96,8 +101,9 @@ jobs:
           # --- Guards ---
           FRESH_MIN: ${{ vars.FRESH_MIN }}  # default 120
           ENFORCE_EXPIRY_TOMORROW: ${{ vars.ENFORCE_EXPIRY_TOMORROW }}  # default "true"
-          MAX_LEG_SPREAD: ${{ vars.MAX_LEG_SPREAD }}  # default 0.70
-          CANCEL_IF_UNFILLED: ${{ vars.CANCEL_IF_UNFILLED }}  # default "false"
+          MAX_LEG_SPREAD:  ${{ vars.MAX_LEG_SPREAD }}   # optional; e.g., 0.30
+          MAX_NET_SPREAD:  ${{ vars.MAX_NET_SPREAD }}   # optional; e.g., 0.25
+          CANCEL_IF_UNFILLED: ${{ vars.CANCEL_IF_UNFILLED }}  # "true"/"false"
         run: |
           python scripts/schwab_place_order.py
 
