@@ -34,30 +34,24 @@ jobs:
 
       - name: Run leocross → Google Sheet (write A2, set header)
         env:
-          # --- Google & Sheet ---
+          # --- Google Sheet ---
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
 
           # --- LeoCross sizing & logic ---
-          LEO_SIZE_CREDIT: ${{ vars.LEO_SIZE_CREDIT }}   # default 4
-          LEO_SIZE_DEBIT:  ${{ vars.LEO_SIZE_DEBIT }}    # default 2
-          LEO_TIE_SIDE:    CREDIT                        # CREDIT|DEBIT if Cat1==Cat2
-          LEO_WIDTH:       ${{ vars.LEO_WIDTH }}         # default 5
+          LEO_SIZE_CREDIT: ${{ vars.LEO_SIZE_CREDIT }}   # default 4 if unset
+          LEO_SIZE_DEBIT:  ${{ vars.LEO_SIZE_DEBIT }}    # default 2 if unset
+          LEO_TIE_SIDE:    CREDIT
+          LEO_WIDTH:       ${{ vars.LEO_WIDTH }}         # default 5 if unset
 
-          # --- GammaWizard auth ---
-          # Set GW_AUTH_MODE to AUTO:
-          #   - if GW_TOKEN is provided (weekly JWT), it will be used;
-          #   - else we'll login with email/password each run.
-          GW_AUTH_MODE: AUTO
+          # --- GammaWizard auth: LOGIN each run with your permanent creds ---
+          GW_AUTH_MODE: LOGIN
           GW_BASE: https://gandalf.gammawizard.com
           GW_ENDPOINT: /rapi/GetLeoCross
+          GW_AUTH_EMAIL: ${{ secrets.GW_EMAIL }}
+          GW_AUTH_PASSWORD: ${{ secrets.GW_PASSWORD }}
 
-          # Option A: Weekly token (preferred; update this once a week)
-          GW_TOKEN: ${{ secrets.GW_TOKEN }}               # optional; leave blank if using login
-
-          # Option B: Login (email + daily password)
-          GW_AUTH_EMAIL: ${{ secrets.GW_AUTH_EMAIL }}     # e.g., gouser@go.com (or your own)
-          GW_AUTH_PASSWORD: ${{ secrets.GW_AUTH_PASSWORD }} # daily password from Leo
+          # Do NOT pass GW_TOKEN here; forcing LOGIN avoids stale‑token 403s.
 
         run: |
           python scripts/leocross_to_sheet.py
