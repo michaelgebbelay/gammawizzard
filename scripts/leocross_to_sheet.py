@@ -1,11 +1,11 @@
 # scripts/leocross_to_sheet.py
-import os, json, sys, re, subprocess
+import os, json, sys, re, subprocess, csv, io
 from datetime import datetime, timezone, date
 import requests
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-__VERSION__ = "2025-08-26c"
+__VERSION__ = "2025-08-26d"
 
 LEO_TAB = "leocross"
 
@@ -19,17 +19,19 @@ HEADERS = [
     "summary"
 ]
 
-# ---------- env helpers ----------
+# -------------------- env helpers --------------------
 def env_or_die(name: str) -> str:
     v = os.environ.get(name)
     if not v:
         print(f"Missing required env: {name}", file=sys.stderr); sys.exit(1)
     return v
+
 def env_str(name: str, default: str = "") -> str:
     v = os.environ.get(name, None)
     if v is None: return default
     v = str(v).strip()
     return v if v != "" else default
+
 def env_int(name: str, default: int) -> int:
     s = os.environ.get(name, None)
     if s is None: return default
@@ -38,7 +40,7 @@ def env_int(name: str, default: int) -> int:
     try: return int(float(s))
     except: return default
 
-# ---------- small utils ----------
+# -------------------- utils --------------------
 def yymmdd(iso: str) -> str:
     try:
         dt = datetime.fromisoformat(iso.replace("Z","+00:00"))
@@ -47,10 +49,13 @@ def yymmdd(iso: str) -> str:
         try:
             d = date.fromisoformat(iso[:10])
             return f"{d:%y%m%d}"
-        except: return ""
+        except:
+            return ""
+
 def to_int(x):
     try: return int(round(float(x)))
     except: return None
+
 def extract_strike(sym: str):
     if not sym: return None
     t = sym.strip().upper().lstrip(".").replace("_","")
@@ -60,7 +65,7 @@ def extract_strike(sym: str):
     if m: return float(m.group(1))
     return None
 
-# ---------- ticket parsing (optional) ----------
+# -------------------- ticket parsing (optional) --------------------
 def parse_ticket_output(txt: str):
     m1 = re.search(r'(\d{4}-\d{2}-\d{2})\s*(?:->|\u2192)\s*(\d{4}-\d{2}-\d{2})\s*:\s*([A-Z_]+)\s*qty\s*=\s*(\d+)\s*width\s*=\s*([0-9.]+)', txt)
     if not m1: return None
@@ -91,8 +96,9 @@ def orient_pairs_for_side(bp, sp, sc, bc, is_credit):
         if not is_credit and bcs > scs: sc, bc = bc, sc
     return bp, sp, sc, bc
 
-# ---------- flexible "Trade" extractor ----------
+# -------------------- flexible "Trade" extractor --------------------
 def _lower_dict(d): return {str(k).lower(): v for k,v in d.items()}
+
 def _pick(m, *keys):
     for k in keys:
         v = m.get(k.lower())
@@ -114,7 +120,6 @@ def _normalize_trade_like(d):
         "Limit": _pick(m,"limit","limit_put","put_limit","p_limit"),
         "CLimit": _pick(m,"climit","limit_call","call_limit","c_limit"),
     }
-    # If it looks empty, return None
     if not any(t.values()): return None
     return t
 
@@ -140,12 +145,38 @@ def extract_trade_from_any(j):
             if t: return t
     return {}
 
-# ---------- API fetchers ----------
+# -------------------- API fetchers --------------------
 def _sanitize_token(t: str) -> str:
     t = (t or "").strip().strip('"').strip("'")
     if t.lower().startswith("bearer "):
         t = t.split(None, 1)[1].strip()
     return t
+
+def _parse_var2_text(text: str) -> dict:
+    """Best-effort parse when var2 returns text/plain instead of JSON."""
+    s = text.strip()
+    if not s: return {}
+    # 1) key[:=]value pairs across text
+    fields = ("Date","TDate","SPX","VIX","RV5","RV10","RV20","Cat1","Cat2","Put","Call","Limit","CLimit","expiry","expiration","exp")
+    got = {}
+    for m in re.finditer(r'(?mi)\b([A-Za-z][A-Za-z0-9_]*)\b\s*[:=]\s*([^\s,;|<>"]+)', s):
+        k = m.group(1); v = m.group(2)
+        if k in fields or k.lower() in [f.lower() for f in fields]:
+            got[k] = v
+    if got: return got
+    # 2) CSV (first row)
+    try:
+        rdr = csv.DictReader(io.StringIO(s))
+        row = next(rdr, None)
+        if isinstance(row, dict) and row: return row
+    except: pass
+    # 3) JSON5-like with single quotes → quick fix
+    if s.startswith("{") and s.endswith("}"):
+        try:
+            js = s.replace("'", '"')
+            return json.loads(js)
+        except: pass
+    return {}
 
 def fetch_leocross(gw_url: str, gw_token: str, gw_header_mode: str = "AUTO", gw_var2_token: str = ""):
     token = _sanitize_token(gw_token)
@@ -158,35 +189,40 @@ def fetch_leocross(gw_url: str, gw_token: str, gw_header_mode: str = "AUTO", gw_
         if "token=" not in url:
             sep = "&" if ("?" in url) else "?"
             url = f"{url}{sep}token={var2_tok}"
-        r = requests.get(url, headers={"Accept":"application/json","User-Agent":ua}, timeout=30)
-        if r.status_code == 200:
+        r = requests.get(url, headers={"Accept":"application/json, text/plain", "User-Agent":ua}, timeout=30)
+        if r.status_code != 200:
+            print(f"var2 GET failed: HTTP {r.status_code} body={r.text[:200]}", file=sys.stderr); sys.exit(1)
+        # Try JSON, then text heuristics
+        try:
             return r.json()
-        print(f"var2 GET failed: {r.status_code}", file=sys.stderr); sys.exit(1)
+        except:
+            parsed = _parse_var2_text(r.text)
+            if parsed: return parsed
+            print(f"var2 returned non-JSON and could not parse. First 200 chars:\n{r.text[:200]}", file=sys.stderr)
+            sys.exit(1)
 
     # Path 2: legacy GetLeoCross with headers
-    tries = []
-    if gw_header_mode.upper() == "AUTH_BEARER":
-        tries = [{"Authorization": f"Bearer {token}", "Accept": "application/json", "User-Agent": ua}]
-    elif gw_header_mode.upper() == "XAPIKEY":
-        tries = [{"x-api-key": token, "Accept": "application/json", "User-Agent": ua}]
-    elif gw_header_mode.upper() == "AUTH_RAW":
-        tries = [{"Authorization": token, "Accept": "application/json", "User-Agent": ua}]
-    else:
-        tries = [
-            {"Authorization": f"Bearer {token}", "Accept": "application/json", "User-Agent": ua},
-            {"x-api-key": token, "Accept": "application/json", "User-Agent": ua},
-            {"Authorization": token, "Accept": "application/json", "User-Agent": ua},
-        ]
+    tries = [
+        {"Authorization": f"Bearer {token}", "Accept": "application/json", "User-Agent": ua},
+        {"x-api-key": token, "Accept": "application/json", "User-Agent": ua},
+        {"Authorization": token, "Accept": "application/json", "User-Agent": ua},
+    ] if gw_header_mode.upper() == "AUTO" else (
+        [{"Authorization": f"Bearer {token}", "Accept": "application/json", "User-Agent": ua}] if gw_header_mode.upper()=="AUTH_BEARER" else
+        [{"x-api-key": token, "Accept": "application/json", "User-Agent": ua}] if gw_header_mode.upper()=="XAPIKEY" else
+        [{"Authorization": token, "Accept": "application/json", "User-Agent": ua}]
+    )
     last = None
     for hdr in tries:
         r = requests.get(gw_url, headers=hdr, timeout=30); last = r
-        if r.status_code == 200: return r.json()
+        if r.status_code == 200:
+            try: return r.json()
+            except: print("Legacy endpoint returned non-JSON.", file=sys.stderr); sys.exit(1)
         if r.status_code not in (401,403): break
-    print(f"LeoCross GET failed: {last.status_code}", file=sys.stderr); sys.exit(1)
+    print(f"LeoCross GET failed: {last.status_code} {last.text[:200]}", file=sys.stderr); sys.exit(1)
 
-# ---------- main ----------
+# -------------------- main --------------------
 def main():
-    gw_token   = env_or_die("GW_TOKEN")  # keep using your existing secret
+    gw_token   = env_or_die("GW_TOKEN")      # keep; may be unused in URL_TOKEN mode
     sheet_id   = env_or_die("GSHEET_ID")
     sa_json    = env_or_die("GOOGLE_SERVICE_ACCOUNT_JSON")
 
@@ -194,10 +230,10 @@ def main():
     size_credit = env_int("LEO_SIZE_CREDIT", 4)
     size_debit  = env_int("LEO_SIZE_DEBIT",  2)
     width_env   = env_int("LEO_WIDTH", 5)
-    tie_side    = env_str("LEO_TIE_SIDE", "CREDIT").upper()
+    tie_side    = env_str("LEO_TIE_SIDE", "CREDIT").upper()  # tie-breaker only
     gw_url      = env_str("GW_URL", "https://gandalf.gammawizard.com/rapi/GetLeoCross")
-    gw_header   = env_str("GW_HEADER", "AUTO")     # AUTH_BEARER | XAPIKEY | AUTH_RAW | AUTO | URL_TOKEN
-    gw_var2_tok = env_str("GW_VAR2_TOKEN", "")     # optional; falls back to GW_TOKEN
+    gw_header   = env_str("GW_HEADER", "AUTO")               # AUTH_BEARER | XAPIKEY | AUTH_RAW | AUTO | URL_TOKEN
+    gw_var2_tok = env_str("GW_VAR2_TOKEN", "")               # optional; falls back to GW_TOKEN
 
     # 1) Fetch
     api = fetch_leocross(gw_url, gw_token, gw_header, gw_var2_tok)
@@ -223,7 +259,7 @@ def main():
     rec_call = fnum(trade.get("Call", None))
     rec_condor = (rec_put + rec_call) if (rec_put is not None and rec_call is not None) else None
 
-    # 3) Optional ticket
+    # 3) Optional: parse ticket for explicit legs
     put_spread = call_spread = ""
     occ_buy_put = occ_sell_put = occ_sell_call = occ_buy_call = ""
     summary = ""
@@ -248,7 +284,7 @@ def main():
                 occ_sell_call = parsed["occ_sell_call"] or occ_sell_call
                 occ_buy_call  = parsed["occ_buy_call"]  or occ_buy_call
 
-    # 4) If legs missing, derive from Limit/CLimit + width_env
+    # 4) If legs missing, derive from Limit/CLimit + width_env (internal only)
     if not (occ_buy_put and occ_sell_put and occ_sell_call and occ_buy_call):
         w = width_env
         inner_put  = to_int(trade.get("Limit",""))
@@ -266,24 +302,26 @@ def main():
         occ_buy_call  = f".SPXW{exp6}C{c_high}"
         summary = summary or f"{signal_date} → {expiry} : AUTO legs width={w}"
 
-    # 5) Credit/Debit decision
+    # 5) Decide CREDIT/DEBIT (Cat rule + tie)
     credit = True
     try:
         c1, c2 = float(cat1), float(cat2)
-        credit = (c1 < c2) if c1 != c2 else (tie_side == "CREDIT")
+        if c1 > c2: credit = False
+        elif c1 < c2: credit = True
+        else: credit = (tie_side == "CREDIT")
     except:
         credit = True
 
-    # 6) Orient legs
+    # 6) Re-orient legs to match side
     occ_buy_put, occ_sell_put, occ_sell_call, occ_buy_call = orient_pairs_for_side(
         occ_buy_put, occ_sell_put, occ_sell_call, occ_buy_call, credit
     )
 
     side = "SHORT_IRON_CONDOR" if credit else "LONG_IRON_CONDOR"
     credit_or_debit = "credit" if credit else "debit"
-    qty_exec = env_int("LEO_SIZE_CREDIT", 4) if credit else env_int("LEO_SIZE_DEBIT", 2)
+    qty_exec = size_credit if credit else size_debit
 
-    # 7) Write Google Sheet (header + top insert + A2)
+    # 7) Sheets write (headers, top insert, write A2)
     sa_info = json.loads(sa_json)
     creds = service_account.Credentials.from_service_account_info(sa_info, scopes=["https://www.googleapis.com/auth/spreadsheets"])
     svc = build("sheets","v4",credentials=creds)
