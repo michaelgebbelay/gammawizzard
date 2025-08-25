@@ -42,8 +42,8 @@ jobs:
 
           # Internal derivation width if legs need to be built (not written to sheet)
           LEO_WIDTH: ${{ vars.LEO_WIDTH }}         # optional; default 5
-          GW_URL:    https://gandalf.gammawizard.com/rapi/GetLeoCross
-          GW_HEADER: AUTO   # AUTH_BEARER | XAPIKEY | AUTH_RAW | AUTO
+          GW_URL:    https://gandalf.gammawizard.com/var2/
+          GW_HEADER: URL_TOKEN
           GW_VAR2_TOKEN: ${{ secrets.GW_VAR2_TOKEN }}
         run: |
           python scripts/leocross_to_sheet.py
