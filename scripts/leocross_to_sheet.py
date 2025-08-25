@@ -5,7 +5,7 @@ import requests
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-__VERSION__ = "2025-08-22g"
+__VERSION__ = "2025-08-26b"
 
 LEO_TAB = "leocross"
 
@@ -19,6 +19,7 @@ HEADERS = [
     "summary"
 ]
 
+# -------------------- env helpers --------------------
 def env_or_die(name: str) -> str:
     v = os.environ.get(name)
     if not v:
@@ -39,11 +40,18 @@ def env_int(name: str, default: int) -> int:
     try: return int(float(s))
     except: return default
 
+# -------------------- utils --------------------
 def yymmdd(iso: str) -> str:
+    # Robust: accept 'YYYY-MM-DD' or full ISO datetimes
     try:
-        d = date.fromisoformat(iso)
-        return f"{d:%y%m%d}"
-    except: return ""
+        dt = datetime.fromisoformat(iso.replace("Z","+00:00"))
+        return f"{dt.date():%y%m%d}"
+    except:
+        try:
+            d = date.fromisoformat(iso[:10])
+            return f"{d:%y%m%d}"
+        except:
+            return ""
 
 def to_int(x):
     try: return int(round(float(x)))
@@ -88,27 +96,71 @@ def orient_pairs_for_side(bp, sp, sc, bc, is_credit):
         if not is_credit and bcs > scs: sc, bc = bc, sc
     return bp, sp, sc, bc
 
+# -------------------- Leo API (auth‑robust) --------------------
+def _sanitize_token(t: str) -> str:
+    t = (t or "").strip().strip('"').strip("'")
+    if t.lower().startswith("bearer "):
+        t = t.split(None, 1)[1].strip()
+    return t
+
+def fetch_leocross(gw_url: str, gw_token: str, gw_header_mode: str = "AUTO"):
+    token = _sanitize_token(gw_token)
+    ua = f"leocross_to_sheet/{__VERSION__}"
+    tries = []
+
+    def _do(headers):
+        return requests.get(gw_url, headers=headers, timeout=30)
+
+    if gw_header_mode.upper() == "AUTH_BEARER":
+        tries = [{"Authorization": f"Bearer {token}", "Accept": "application/json", "User-Agent": ua}]
+    elif gw_header_mode.upper() == "XAPIKEY":
+        tries = [{"x-api-key": token, "Accept": "application/json", "User-Agent": ua}]
+    elif gw_header_mode.upper() == "AUTH_RAW":
+        tries = [{"Authorization": token, "Accept": "application/json", "User-Agent": ua}]
+    else:
+        # AUTO: try common variants
+        tries = [
+            {"Authorization": f"Bearer {token}", "Accept": "application/json", "User-Agent": ua},
+            {"x-api-key": token, "Accept": "application/json", "User-Agent": ua},
+            {"Authorization": token, "Accept": "application/json", "User-Agent": ua},
+        ]
+
+    last = None
+    for hdr in tries:
+        r = _do(hdr); last = r
+        if r.status_code == 200:
+            return r.json()
+        if r.status_code not in (401,403):
+            # Different error → stop early
+            break
+
+    msg = f"LeoCross GET failed: {last.status_code} {last.text[:400]}"
+    # Helpful hints on 403/401
+    if last.status_code in (401,403):
+        hints = "Check GW_TOKEN: no 'Bearer ' prefix, no quotes/newlines; try setting GW_HEADER to AUTH_BEARER or XAPIKEY."
+        wa = last.headers.get("www-authenticate","")
+        if wa: hints += f" WWW-Authenticate: {wa}"
+        print(msg, hints, file=sys.stderr)
+    else:
+        print(msg, file=sys.stderr)
+    sys.exit(1)
+
+# -------------------- main --------------------
 def main():
     gw_token   = env_or_die("GW_TOKEN")
     sheet_id   = env_or_die("GSHEET_ID")
     sa_json    = env_or_die("GOOGLE_SERVICE_ACCOUNT_JSON")
 
-    # sizing defaults now 4 / 2 as you requested
+    # Optional config
     size_credit = env_int("LEO_SIZE_CREDIT", 4)
     size_debit  = env_int("LEO_SIZE_DEBIT",  2)
-    width_env   = env_int("LEO_WIDTH", 5)  # internal only, not written
-
-    tie_side    = env_str("LEO_TIE_SIDE", "CREDIT").upper()
+    width_env   = env_int("LEO_WIDTH", 5)
+    tie_side    = env_str("LEO_TIE_SIDE", "CREDIT").upper()  # tie-breaker only
+    gw_url      = env_str("GW_URL", "https://gandalf.gammawizard.com/rapi/GetLeoCross")
+    gw_header   = env_str("GW_HEADER", "AUTO")
 
     # 1) Leo API
-    r = requests.get(
-        "https://gandalf.gammawizard.com/rapi/GetLeoCross",
-        headers={"Authorization": f"Bearer {gw_token}"},
-        timeout=30
-    )
-    if r.status_code != 200:
-        print(f"LeoCross GET failed: {r.status_code} {r.text[:400]}", file=sys.stderr); sys.exit(1)
-    api = r.json()
+    api = fetch_leocross(gw_url, gw_token, gw_header)
 
     trade = {}
     if isinstance(api.get("Trade"), list) and api["Trade"]:
@@ -124,7 +176,6 @@ def main():
     rv5  = str(trade.get("RV5","")); rv10 = str(trade.get("RV10","")); rv20 = str(trade.get("RV20",""))
     cat1 = str(trade.get("Cat1","")); cat2 = str(trade.get("Cat2",""))
 
-    # Leo rec per leg
     def fnum(x):
         try: return float(x)
         except: return None
@@ -132,7 +183,7 @@ def main():
     rec_call = fnum(trade.get("Call", None))
     rec_condor = (rec_put + rec_call) if (rec_put is not None and rec_call is not None) else None
 
-    # 2) Optional: parse ticket for explicit legs
+    # 2) Optional: parse ticket
     put_spread = call_spread = ""
     occ_buy_put = occ_sell_put = occ_sell_call = occ_buy_call = ""
     summary = ""
@@ -157,7 +208,7 @@ def main():
                 occ_sell_call = parsed["occ_sell_call"] or occ_sell_call
                 occ_buy_call  = parsed["occ_buy_call"]  or occ_buy_call
 
-    # 3) If legs missing, derive from Limit/CLimit + width_env (internal only)
+    # 3) If legs missing, derive from Limit/CLimit + width_env
     if not (occ_buy_put and occ_sell_put and occ_sell_call and occ_buy_call):
         w = width_env
         inner_put  = to_int(trade.get("Limit",""))
@@ -175,13 +226,13 @@ def main():
         occ_buy_call  = f".SPXW{exp6}C{c_high}"
         summary = summary or f"{signal_date} → {expiry} : AUTO legs width={w}"
 
-    # 4) Decide CREDIT/DEBIT (Cat rule)
+    # 4) Decide CREDIT/DEBIT (Cat rule + tie)
     credit = True
     try:
         c1, c2 = float(cat1), float(cat2)
         if c1 > c2: credit = False
         elif c1 < c2: credit = True
-        else: credit = (env_str("LEO_TIE_SIDE","CREDIT").upper() == "CREDIT")
+        else: credit = (tie_side == "CREDIT")
     except:
         credit = True
 
