@@ -4,9 +4,10 @@ name: LeoCross Ticket
 
 on:
   workflow_dispatch:
+  # Run at 16:12 ET across DST by scheduling both 20:12Z (EDT) and 21:12Z (EST)
   schedule:
-    - cron: "12 20 * * 1-5"
-    - cron: "12 21 * * 1-5"
+    - cron: "12 20 * * 1-5"  # 4:12pm EDT Mon–Fri
+    - cron: "12 21 * * 1-5"  # 4:12pm EST Mon–Fri
 
 concurrency:
   group: leocross-append
@@ -18,8 +19,6 @@ permissions:
 jobs:
   leocross:
     runs-on: ubuntu-latest
-    timeout-minutes: 6
-
     steps:
       - uses: actions/checkout@v4
 
@@ -34,24 +33,21 @@ jobs:
 
       - name: Run leocross → Google Sheet (write A2, set header)
         env:
-          # --- Google Sheet ---
+          # --- Required ---
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
 
-          # --- LeoCross sizing & logic ---
-          LEO_SIZE_CREDIT: ${{ vars.LEO_SIZE_CREDIT }}   # default 4 if unset
-          LEO_SIZE_DEBIT:  ${{ vars.LEO_SIZE_DEBIT }}    # default 2 if unset
-          LEO_TIE_SIDE:    CREDIT
-          LEO_WIDTH:       ${{ vars.LEO_WIDTH }}         # default 5 if unset
+          # --- Leo sizing defaults (sheet qty column) ---
+          LEO_SIZE_CREDIT: ${{ vars.LEO_SIZE_CREDIT }}   # default 4
+          LEO_SIZE_DEBIT:  ${{ vars.LEO_SIZE_DEBIT }}    # default 2
+          LEO_TIE_SIDE:    ${{ vars.LEO_TIE_SIDE || 'CREDIT' }}
+          LEO_WIDTH:       ${{ vars.LEO_WIDTH || 5 }}
 
-          # --- GammaWizard auth: LOGIN each run with your permanent creds ---
+          # --- GammaWizard auth (LOGIN mode, no UI token) ---
           GW_AUTH_MODE: LOGIN
           GW_BASE: https://gandalf.gammawizard.com
           GW_ENDPOINT: /rapi/GetLeoCross
-          GW_AUTH_EMAIL: ${{ secrets.GW_EMAIL }}
+          GW_AUTH_EMAIL:    ${{ secrets.GW_EMAIL }}
           GW_AUTH_PASSWORD: ${{ secrets.GW_PASSWORD }}
-
-          # Do NOT pass GW_TOKEN here; forcing LOGIN avoids stale‑token 403s.
-
         run: |
           python scripts/leocross_to_sheet.py
