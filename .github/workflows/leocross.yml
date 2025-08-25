@@ -6,10 +6,10 @@ on:
   workflow_dispatch:
   # Fire at 1:12 ET and 4:12 ET across DST (Mon–Fri)
   schedule:
-    - cron: "12 17 * * 1-5"  # 1:12pm EDT
-    - cron: "12 18 * * 1-5"  # 1:12pm EST
-    - cron: "12 20 * * 1-5"  # 4:12pm EDT
-    - cron: "12 21 * * 1-5"  # 4:12pm EST
+    - cron: "10 17 * * 1-5"  # 1:12pm EDT
+    - cron: "10 18 * * 1-5"  # 1:12pm EST
+    - cron: "10 20 * * 1-5"  # 4:12pm EDT
+    - cron: "10 21 * * 1-5"  # 4:12pm EST
 
 concurrency:
   group: leocross-append
@@ -37,7 +37,7 @@ jobs:
         id: gate
         env:
           BYPASS_TIME_GATE: ${{ vars.BYPASS_TIME_GATE }}
-          GATE_WINDOW_MIN: 10              # +/- minutes allowed around target
+          GATE_WINDOW_MIN: 5              # +/- minutes allowed around target
           GATE_TARGET_OFFSET_MIN: 12      # minutes AFTER equity close (→ 16:12 / 13:12)
         run: |
           python - <<'PY'
