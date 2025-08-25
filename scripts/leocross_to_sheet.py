@@ -5,7 +5,7 @@ import requests
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-__VERSION__ = "2025-08-26d"
+__VERSION__ = "2025-08-26f"
 
 LEO_TAB = "leocross"
 
@@ -109,16 +109,17 @@ def _normalize_trade_like(d):
     """Create a Trade-like dict from any mapping with roughly matching keys."""
     m = _lower_dict(d)
     t = {
-        "Date": _pick(m,"date","signal_date"),
-        "TDate": _pick(m,"tdate","expiry","expiration","exp","expiry_date"),
-        "SPX": _pick(m,"spx","underlying","spot"),
+        "Date": _pick(m,"date","signal_date","sigdate","sig_date"),
+        "TDate": _pick(m,"tdate","expiry","expiration","exp","expiry_date","exp_date"),
+        "SPX": _pick(m,"spx","underlying","spot","under"),
         "VIX": _pick(m,"vix"),
         "RV5": _pick(m,"rv5"), "RV10": _pick(m,"rv10"), "RV20": _pick(m,"rv20"),
-        "Cat1": _pick(m,"cat1"), "Cat2": _pick(m,"cat2"),
-        "Put": _pick(m,"put","rec_put","put_rec"),
-        "Call": _pick(m,"call","rec_call","call_rec"),
-        "Limit": _pick(m,"limit","limit_put","put_limit","p_limit"),
-        "CLimit": _pick(m,"climit","limit_call","call_limit","c_limit"),
+        "Cat1": _pick(m,"cat1","cat_1","category1"),
+        "Cat2": _pick(m,"cat2","cat_2","category2"),
+        "Put": _pick(m,"put","rec_put","put_rec","putRec"),
+        "Call": _pick(m,"call","rec_call","call_rec","callRec"),
+        "Limit": _pick(m,"limit","limit_put","put_limit","p_limit","putStrike","put_strike"),
+        "CLimit": _pick(m,"climit","limit_call","call_limit","c_limit","callStrike","call_strike"),
     }
     if not any(t.values()): return None
     return t
@@ -133,14 +134,15 @@ def extract_trade_from_any(j):
     if isinstance(j, dict):
         t = _normalize_trade_like(j)
         if t: return t
-        # 3) nested dicts
-        for v in j.values():
+        # 3) nested dicts & common containers
+        for k,v in j.items():
             if isinstance(v, (dict, list)):
                 t = extract_trade_from_any(v)
                 if t: return t
     # 4) arrays
     if isinstance(j, list):
-        for item in j:
+        # prefer last trade‑like row
+        for item in reversed(j):
             t = extract_trade_from_any(item)
             if t: return t
     return {}
@@ -178,11 +180,37 @@ def _parse_var2_text(text: str) -> dict:
         except: pass
     return {}
 
-def fetch_leocross(gw_url: str, gw_token: str, gw_header_mode: str = "AUTO", gw_var2_token: str = ""):
+def _json_path(obj, path: str):
+    """Very small dot-path: e.g., 'data.0.trade'"""
+    cur = obj
+    for part in path.split("."):
+        if part == "": continue
+        if isinstance(cur, list):
+            try:
+                idx = int(part)
+                cur = cur[idx]
+                continue
+            except: return None
+        if isinstance(cur, dict):
+            if part in cur:
+                cur = cur[part]
+                continue
+            # try case-insensitive
+            low = {k.lower(): k for k in cur.keys()}
+            k = low.get(part.lower())
+            cur = cur[k] if k else None
+            if cur is None: return None
+            continue
+        return None
+    return cur
+
+def fetch_leocross(gw_url: str, gw_token: str, gw_header_mode: str = "AUTO",
+                   gw_var2_token: str = "", json_path: str = "", dump_path: str = "", debug: bool = False):
     token = _sanitize_token(gw_token)
     var2_tok = _sanitize_token(gw_var2_token or token)
     ua = f"leocross_to_sheet/{__VERSION__}"
 
+    raw = ""; ct = ""
     # Path 1: var2 with token in query
     if "/var2" in gw_url or gw_header_mode.upper() == "URL_TOKEN":
         url = gw_url
@@ -190,16 +218,32 @@ def fetch_leocross(gw_url: str, gw_token: str, gw_header_mode: str = "AUTO", gw_
             sep = "&" if ("?" in url) else "?"
             url = f"{url}{sep}token={var2_tok}"
         r = requests.get(url, headers={"Accept":"application/json, text/plain", "User-Agent":ua}, timeout=30)
+        raw = r.text; ct = (r.headers.get("content-type") or "")
+        if dump_path:
+            try:
+                with open(dump_path, "w", encoding="utf-8") as f: f.write(raw)
+                if debug: print(f"[var2] saved raw payload to {dump_path} (len={len(raw)}, ct={ct})")
+            except Exception as e:
+                if debug: print(f"[var2] failed to write dump: {e}")
         if r.status_code != 200:
-            print(f"var2 GET failed: HTTP {r.status_code} body={r.text[:200]}", file=sys.stderr); sys.exit(1)
-        # Try JSON, then text heuristics
+            print(f"var2 GET failed: HTTP {r.status_code} body={raw[:200]}", file=sys.stderr); sys.exit(1)
+        # Try JSON
+        j = None
         try:
-            return r.json()
+            j = r.json()
         except:
-            parsed = _parse_var2_text(r.text)
-            if parsed: return parsed
-            print(f"var2 returned non-JSON and could not parse. First 200 chars:\n{r.text[:200]}", file=sys.stderr)
-            sys.exit(1)
+            pass
+        if j is None:
+            # Try text heuristics
+            parsed = _parse_var2_text(raw)
+            if parsed:
+                j = parsed
+        # Apply optional JSON path
+        if j is not None and json_path:
+            at = _json_path(j, json_path)
+            if at is not None:
+                j = at
+        return j, raw, ct
 
     # Path 2: legacy GetLeoCross with headers
     tries = [
@@ -214,15 +258,22 @@ def fetch_leocross(gw_url: str, gw_token: str, gw_header_mode: str = "AUTO", gw_
     last = None
     for hdr in tries:
         r = requests.get(gw_url, headers=hdr, timeout=30); last = r
+        raw = r.text; ct = (r.headers.get("content-type") or "")
+        if dump_path:
+            try:
+                with open(dump_path, "w", encoding="utf-8") as f: f.write(raw)
+                if debug: print(f"[legacy] saved raw payload to {dump_path} (len={len(raw)}, ct={ct})")
+            except Exception as e:
+                if debug: print(f"[legacy] failed to write dump: {e}")
         if r.status_code == 200:
-            try: return r.json()
+            try: return r.json(), raw, ct
             except: print("Legacy endpoint returned non-JSON.", file=sys.stderr); sys.exit(1)
         if r.status_code not in (401,403): break
-    print(f"LeoCross GET failed: {last.status_code} {last.text[:200]}", file=sys.stderr); sys.exit(1)
+    print(f"LeoCross GET failed: {last.status_code} {raw[:200]}", file=sys.stderr); sys.exit(1)
 
 # -------------------- main --------------------
 def main():
-    gw_token   = env_or_die("GW_TOKEN")      # keep; may be unused in URL_TOKEN mode
+    gw_token   = env_or_die("GW_TOKEN")      # harmless in URL_TOKEN mode
     sheet_id   = env_or_die("GSHEET_ID")
     sa_json    = env_or_die("GOOGLE_SERVICE_ACCOUNT_JSON")
 
@@ -234,14 +285,25 @@ def main():
     gw_url      = env_str("GW_URL", "https://gandalf.gammawizard.com/rapi/GetLeoCross")
     gw_header   = env_str("GW_HEADER", "AUTO")               # AUTH_BEARER | XAPIKEY | AUTH_RAW | AUTO | URL_TOKEN
     gw_var2_tok = env_str("GW_VAR2_TOKEN", "")               # optional; falls back to GW_TOKEN
+    gw_json_path= env_str("GW_VAR2_JSON_PATH", "")           # optional JSON path, e.g. "data.0"
+    dump_path   = env_str("GW_PAYLOAD_PATH", "gw_last_payload.txt")
+    debug_on    = env_str("GW_DEBUG", "0").lower() in ("1","true","yes","on")
 
     # 1) Fetch
-    api = fetch_leocross(gw_url, gw_token, gw_header, gw_var2_tok)
+    api, raw, ct = fetch_leocross(gw_url, gw_token, gw_header, gw_var2_tok, gw_json_path, dump_path, debug_on)
 
     # 2) Build Trade dict, regardless of shape
-    trade = extract_trade_from_any(api)
+    trade = extract_trade_from_any(api if api is not None else {})
+    if not trade and raw:
+        # last-ditch try to parse text payload directly
+        trade = extract_trade_from_any(_parse_var2_text(raw))
+
     if not trade:
-        print("No Trade-like data in response.", file=sys.stderr); sys.exit(1)
+        print("No Trade-like data in response.", file=sys.stderr)
+        snippet = (raw or "")[:400].replace("\n","\\n")
+        print(f"--- payload snippet (first 400 chars) ---\n{snippet}\n--- end snippet ---", file=sys.stderr)
+        print(f"(content-type: {ct or 'unknown'} ; dump: {dump_path})", file=sys.stderr)
+        sys.exit(1)
 
     # Normalize fields to strings
     def s(x): return "" if x is None else str(x)
@@ -290,7 +352,10 @@ def main():
         inner_put  = to_int(trade.get("Limit",""))
         inner_call = to_int(trade.get("CLimit",""))
         if inner_put is None or inner_call is None:
-            print("Missing Limit/CLimit for leg derivation.", file=sys.stderr); sys.exit(1)
+            print("Missing Limit/CLimit for leg derivation.", file=sys.stderr)
+            snippet = (raw or "")[:200].replace("\n","\\n")
+            print(f"payload(first 200): {snippet}", file=sys.stderr)
+            sys.exit(1)
         p_low, p_high = inner_put - w, inner_put
         c_low, c_high = inner_call, inner_call + w
         put_spread  = f"{p_low}/{p_high}"
