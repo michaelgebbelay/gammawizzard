@@ -1,4 +1,5 @@
----  # yamllint disable rule:line-length rule:truthy
+# .github/workflows/leocross-ticket.yml
+# yamllint disable rule:line-length rule:truthy
 name: LeoCross Ticket
 
 on:
@@ -12,9 +13,14 @@ concurrency:
   group: leocross-append
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   leocross:
     runs-on: ubuntu-latest
+    timeout-minutes: 6
+
     steps:
       - uses: actions/checkout@v4
 
@@ -27,23 +33,31 @@ jobs:
           python -m pip install --upgrade pip
           pip install --quiet requests google-api-python-client google-auth google-auth-httplib2
 
+      - name: Ping GammaWizard var2
+        shell: bash
+        env:
+          GW_VAR2_TOKEN: ${{ secrets.GW_VAR2_TOKEN }}
+        run: |
+          code=$(curl -sS -o /dev/null -w "%{http_code}" "https://gandalf.gammawizard.com/var2/?token=${GW_VAR2_TOKEN}")
+          echo "GammaWizard var2 HTTP ${code}"
+          test "$code" = "200"
+
       - name: Run leocross → Google Sheet (write A2, set header)
         env:
-          GW_TOKEN: ${{ secrets.GW_TOKEN }}
+          # --- Required secrets ---
+          GW_TOKEN:  ${{ secrets.GW_TOKEN }}               # not used in URL_TOKEN mode; harmless to keep
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
 
-          # Sizing defaults (now 4 for credit, 2 for debit)
-          LEO_SIZE_CREDIT: ${{ vars.LEO_SIZE_CREDIT }}   # optional; default 4
-          LEO_SIZE_DEBIT: ${{ vars.LEO_SIZE_DEBIT }}    # optional; default 2
+          # --- Sizing defaults ---
+          LEO_SIZE_CREDIT: ${{ vars.LEO_SIZE_CREDIT }}   # default 4
+          LEO_SIZE_DEBIT:  ${{ vars.LEO_SIZE_DEBIT }}    # default 2
+          LEO_TIE_SIDE:    CREDIT                         # explicit tie-break
+          LEO_WIDTH:       ${{ vars.LEO_WIDTH }}          # default 5
 
-          # Tie-breaker if Cat1 == Cat2 (optional)
-          LEO_TIE_SIDE: ${{ vars.LEO_TIE_SIDE }}      # "CREDIT" or "DEBIT" (default CREDIT)
-
-          # Internal derivation width if legs need to be built (not written to sheet)
-          LEO_WIDTH: ${{ vars.LEO_WIDTH }}         # optional; default 5
+          # --- NEW: var2 mode ---
           GW_URL:    https://gandalf.gammawizard.com/var2/
-          GW_HEADER: URL_TOKEN
-          GW_VAR2_TOKEN: ${{ secrets.GW_VAR2_TOKEN }}
+          GW_HEADER: URL_TOKEN                            # force ?token= mode
+          GW_VAR2_TOKEN: ${{ secrets.GW_VAR2_TOKEN }}     # put token value in this secret
         run: |
           python scripts/leocross_to_sheet.py
