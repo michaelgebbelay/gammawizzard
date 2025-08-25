@@ -4,10 +4,12 @@ name: LeoCross Ticket
 
 on:
   workflow_dispatch:
-  # Run at 16:12 ET across DST by scheduling both 20:12Z (EDT) and 21:12Z (EST)
+  # Fire at 1:12 ET and 4:12 ET across DST (Mon–Fri)
   schedule:
-    - cron: "12 20 * * 1-5"  # 4:12pm EDT Mon–Fri
-    - cron: "12 21 * * 1-5"  # 4:12pm EST Mon–Fri
+    - cron: "12 17 * * 1-5"  # 1:12pm EDT
+    - cron: "12 18 * * 1-5"  # 1:12pm EST
+    - cron: "12 20 * * 1-5"  # 4:12pm EDT
+    - cron: "12 21 * * 1-5"  # 4:12pm EST
 
 concurrency:
   group: leocross-append
@@ -26,24 +28,74 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install gate deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install --quiet pandas-market-calendars pytz
+
+      - name: Time gate (auto early-close aware)
+        id: gate
+        env:
+          BYPASS_TIME_GATE: ${{ vars.BYPASS_TIME_GATE }}
+          GATE_WINDOW_MIN: 3              # +/- minutes allowed around target
+          GATE_TARGET_OFFSET_MIN: 12      # minutes AFTER equity close (→ 16:12 / 13:12)
+        run: |
+          python - <<'PY'
+          import os, datetime as dt, pytz
+          import pandas_market_calendars as mcal
+          et = pytz.timezone('America/New_York')
+          now = dt.datetime.now(et)
+          window = int(os.environ.get('GATE_WINDOW_MIN','3'))
+          offset = int(os.environ.get('GATE_TARGET_OFFSET_MIN','12'))
+          bypass = os.environ.get('BYPASS_TIME_GATE','') == '1'
+          ok=False; target=None; is_early='false'; reason=''
+          if bypass:
+              ok=True; reason='BYPASS'
+          else:
+              nyse = mcal.get_calendar('XNYS')
+              sched = nyse.schedule(start_date=now.date(), end_date=now.date(), tz='America/New_York')
+              if sched.empty:
+                  reason='NOT_TRADING_DAY'
+              else:
+                  close = sched['market_close'].iloc[0]   # tz-aware ET
+                  target = close + dt.timedelta(minutes=offset)  # 16:12 or 13:12
+                  is_early = 'true' if close.hour < 16 else 'false'
+                  diff = abs((now - target).total_seconds())/60.0
+                  ok = diff <= window
+                  reason = f'diff={diff:.2f}min target={target.strftime("%H:%M")}'
+          out = os.environ['GITHUB_OUTPUT']
+          with open(out,'a') as fh:
+              fh.write(f"ok={'true' if ok else 'false'}\n")
+              fh.write(f"is_early_close={is_early}\n")
+              fh.write(f"target_hhmm={(target.strftime('%H:%M') if target else '')}\n")
+              fh.write(f"reason={reason}\n")
+          print("GATE", "ok" if ok else "skip", "is_early", is_early, "target", (target.strftime('%H:%M') if target else 'NA'), reason)
+          PY
+
+      - uses: actions/setup-python@v5
+        if: ${{ steps.gate.outputs.ok == 'true' }}
+        with:
+          python-version: "3.11"
+
+      - name: Install leocross deps
+        if: ${{ steps.gate.outputs.ok == 'true' }}
         run: |
           python -m pip install --upgrade pip
           pip install --quiet requests google-api-python-client google-auth google-auth-httplib2
 
-      - name: Run leocross → Google Sheet (write A2, set header)
+      - name: Run leocross → Google Sheet (A2)
+        if: ${{ steps.gate.outputs.ok == 'true' }}
         env:
-          # --- Required ---
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
 
-          # --- Leo sizing defaults (sheet qty column) ---
-          LEO_SIZE_CREDIT: ${{ vars.LEO_SIZE_CREDIT }}   # default 4
-          LEO_SIZE_DEBIT:  ${{ vars.LEO_SIZE_DEBIT }}    # default 2
-          LEO_TIE_SIDE:    ${{ vars.LEO_TIE_SIDE || 'CREDIT' }}
-          LEO_WIDTH:       ${{ vars.LEO_WIDTH || 5 }}
+          # Leo defaults written to sheet
+          LEO_SIZE_CREDIT: ${{ vars.LEO_SIZE_CREDIT || 4 }}
+          LEO_SIZE_DEBIT:  ${{ vars.LEO_SIZE_DEBIT  || 2 }}
+          LEO_TIE_SIDE:    ${{ vars.LEO_TIE_SIDE   || 'CREDIT' }}
+          LEO_WIDTH:       ${{ vars.LEO_WIDTH      || 5 }}
 
-          # --- GammaWizard auth (LOGIN mode, no UI token) ---
+          # GammaWizard auth (login)
           GW_AUTH_MODE: LOGIN
           GW_BASE: https://gandalf.gammawizard.com
           GW_ENDPOINT: /rapi/GetLeoCross
@@ -51,3 +103,7 @@ jobs:
           GW_AUTH_PASSWORD: ${{ secrets.GW_PASSWORD }}
         run: |
           python scripts/leocross_to_sheet.py
+
+      - name: Skipped (outside gate)
+        if: ${{ steps.gate.outputs.ok != 'true' }}
+        run: echo "Not within gate window; no A2 write."
