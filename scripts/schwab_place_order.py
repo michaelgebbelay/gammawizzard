@@ -43,19 +43,21 @@ def env_int(name: str, default: int) -> int:
 
 # ---------- symbol & quotes ----------
 def to_schwab_opt(sym: str) -> str:
-    # Normalizes to 6-char root + YYMMDD + C/P + 8-digit mills strike (OSI)
     raw = (sym or "").strip().upper()
     if raw.startswith("."): raw = raw[1:]
     raw = raw.replace("_","")
+    # OSI strict
     m = re.match(r'^([A-Z.$^]{1,6})(\d{6})([CP])(\d{8})$', raw)
     if m:
         root, ymd, cp, strike8 = m.groups()
         return f"{root:<6}{ymd}{cp}{strike8}"
+    # ROOT+YYMMDD+CP+strike(.mmm)
     m = re.match(r'^([A-Z.$^]{1,6})(\d{6})([CP])(\d{1,5})(?:\.(\d{1,3}))?$', raw)
     if m:
         root, ymd, cp, i, frac = m.groups()
         mills = int(i) * 1000 + (int(frac.ljust(3,'0')) if frac else 0)
         return f"{root:<6}{ymd}{cp}{mills:08d}"
+    # already padded
     m = re.match(r'^(.{6})(\d{6})([CP])(\d{8})$', raw)
     if m:
         root6, ymd, cp, strike8 = m.groups()
@@ -208,7 +210,10 @@ def main():
     # --- Schwab client ---
     with open("schwab_token.json","w") as f: 
         f.write(token_json)
-    c = client_from_token_file(api_key=app_key, app_secret=app_secret, token_path="schwab_token.json")
+    c = client_from_token_file(api_key=app_key, api_secret=app_secret, token_path="schwab_token.json")
+    # NOTE: schwab-py uses param name 'api_secret' in newer versions; fall back if older:
+    if c is None:
+        c = client_from_token_file(api_key=app_key, app_secret=app_secret, token_path="schwab_token.json")
 
     acct_hash = env_str("SCHWAB_ACCT_HASH")
     if not acct_hash:
