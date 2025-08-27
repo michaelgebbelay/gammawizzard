@@ -4,7 +4,6 @@ name: LeoCross Ticket
 
 on:
   workflow_dispatch:
-  # Fire at 1:10 ET on holiday and 4:10 ET regular days across DST (Mon–Fri)
   schedule:
     - cron: "10 17 * * 1-5"  # 1:10pm EDT
     - cron: "10 18 * * 1-5"  # 1:10pm EST
@@ -21,81 +20,61 @@ permissions:
 jobs:
   leocross:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install gate deps
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install --quiet pandas-market-calendars pytz
+          pip install --quiet requests google-api-python-client google-auth google-auth-httplib2 pandas-market-calendars pytz
 
-      - name: Time gate (auto early-close aware)
+      - name: Time gate (sleep to 4:12/1:12; bypass only on manual dispatch)
         id: gate
         env:
-          BYPASS_TIME_GATE: ${{ vars.BYPASS_TIME_GATE }}
-          GATE_WINDOW_MIN: 5              # +/- minutes allowed around target
-          GATE_TARGET_OFFSET_MIN: 12      # minutes AFTER equity close (→ 16:12 / 13:12)
+          CONFIG_JSON: ${{ vars.CONFIG_JSON }}
         run: |
           python - <<'PY'
-          import os, datetime as dt, pytz
+          import os, time, json, datetime as dt, pytz
           import pandas_market_calendars as mcal
+          cfg = json.loads(os.environ.get("CONFIG_JSON","") or "{}")
+          window = int(cfg.get("gates",{}).get("leocross_window_min",5))
+          offset = int(cfg.get("gates",{}).get("target_offset_min",12))
           et = pytz.timezone('America/New_York')
           now = dt.datetime.now(et)
-          window = int(os.environ.get('GATE_WINDOW_MIN','3'))
-          offset = int(os.environ.get('GATE_TARGET_OFFSET_MIN','12'))
-          bypass = os.environ.get('BYPASS_TIME_GATE','') == '1'
+          bypass = (os.environ.get('GITHUB_EVENT_NAME','') == 'workflow_dispatch')
           ok=False; target=None; is_early='false'; reason=''
           if bypass:
-              ok=True; reason='BYPASS'
+              ok=True; reason='BYPASS_MANUAL'
           else:
               nyse = mcal.get_calendar('XNYS')
               sched = nyse.schedule(start_date=now.date(), end_date=now.date(), tz='America/New_York')
               if sched.empty:
                   reason='NOT_TRADING_DAY'
               else:
-                  close = sched['market_close'].iloc[0]   # tz-aware ET
-                  target = close + dt.timedelta(minutes=offset)  # 16:12 or 13:12
+                  close = sched['market_close'].iloc[0]
+                  target = close + dt.timedelta(minutes=offset)
                   is_early = 'true' if close.hour < 16 else 'false'
-                  diff = abs((now - target).total_seconds())/60.0
-                  ok = diff <= window
-                  reason = f'diff={diff:.2f}min target={target.strftime("%H:%M")}'
-          out = os.environ['GITHUB_OUTPUT']
-          with open(out,'a') as fh:
+                  delta = (now - target).total_seconds()/60.0
+                  if delta < 0:
+                      sl = min(180, int(max(0, -delta*60))); 
+                      if sl: print(f"Sleeping {sl}s to target…"); time.sleep(sl)
+                      now = dt.datetime.now(et); delta = (now - target).total_seconds()/60.0
+                  ok = (0 <= delta <= window); reason=f"delta={delta:.2f}min target={target.strftime('%H:%M') if target else 'NA'}"
+          with open(os.environ['GITHUB_OUTPUT'],'a') as fh:
               fh.write(f"ok={'true' if ok else 'false'}\n")
-              fh.write(f"is_early_close={is_early}\n")
-              fh.write(f"target_hhmm={(target.strftime('%H:%M') if target else '')}\n")
-              fh.write(f"reason={reason}\n")
-          print("GATE", "ok" if ok else "skip", "is_early", is_early, "target", (target.strftime('%H:%M') if target else 'NA'), reason)
+          print("GATE", "ok" if ok else "skip", reason)
           PY
-
-      - uses: actions/setup-python@v5
-        if: ${{ steps.gate.outputs.ok == 'true' }}
-        with:
-          python-version: "3.11"
-
-      - name: Install leocross deps
-        if: ${{ steps.gate.outputs.ok == 'true' }}
-        run: |
-          python -m pip install --upgrade pip
-          pip install --quiet requests google-api-python-client google-auth google-auth-httplib2
 
       - name: Run leocross → Google Sheet (A2)
         if: ${{ steps.gate.outputs.ok == 'true' }}
         env:
+          CONFIG_JSON: ${{ vars.CONFIG_JSON }}
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-
-          # Leo defaults written to sheet
-          LEO_SIZE_CREDIT: ${{ vars.LEO_SIZE_CREDIT || 4 }}
-          LEO_SIZE_DEBIT:  ${{ vars.LEO_SIZE_DEBIT  || 2 }}
-          LEO_TIE_SIDE:    ${{ vars.LEO_TIE_SIDE   || 'CREDIT' }}
-          LEO_WIDTH:       ${{ vars.LEO_WIDTH      || 5 }}
-
-          # GammaWizard auth (login)
           GW_AUTH_MODE: LOGIN
           GW_BASE: https://gandalf.gammawizard.com
           GW_ENDPOINT: /rapi/GetLeoCross
