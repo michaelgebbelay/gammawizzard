@@ -5,7 +5,7 @@ import requests
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-__VERSION__ = "2025-08-26k"
+__VERSION__ = "2025-08-27a"
 
 LEO_TAB = "leocross"
 
