@@ -12,7 +12,7 @@ from schwab.auth import client_from_token_file
 import pytz
 import pandas_market_calendars as mcal
 
-__VERSION__ = "2025-08-26h"
+__VERSION__ = "2025-08-27b"
 
 LEO_TAB    = "leocross"
 SCHWAB_TAB = "schwab"
@@ -149,6 +149,13 @@ def parse_iso(ts_str: str):
     except: return None
 
 def next_trading_day(d: date) -> date:
+    """Holiday-aware next trading day using XNYS calendar."""
+    cal = mcal.get_calendar('XNYS')
+    sched = cal.schedule(start_date=d, end_date=d + timedelta(days=7), tz='America/New_York')
+    for ts in sched.index:
+        if ts.date() > d:
+            return ts.date()
+    # Fallback (shouldn't happen): next weekday
     nd = d + timedelta(days=1)
     while nd.weekday() >= 5:
         nd += timedelta(days=1)
@@ -250,7 +257,7 @@ def main():
     sheet_id   = env_or_die("GSHEET_ID")
     sa_json    = env_or_die("GOOGLE_SERVICE_ACCOUNT_JSON")
 
-    STAGE_SEC = env_int("STAGE_SEC", 60)
+    STAGE_SEC = env_int("STAGE_SEC", 45)  # 45s per rung
     TICK      = env_float("TICK", 0.05)
 
     # per-leg rails → condor ×2 (pricing only, not sizing)
@@ -284,7 +291,7 @@ def main():
     # ---- liquidity guards (dynamic near the close) ----
     MAX_LEG_SPREAD_BASE = env_float("MAX_LEG_SPREAD", 0.30)   # base guard
     MAX_NET_SPREAD_BASE = env_float("MAX_NET_SPREAD", 0.30)   # base guard
-    # dynamic wideners (defaults are sane for last minutes)
+    # dynamic wideners
     MAX_NET_SPREAD_NEAR5 = env_float("MAX_NET_SPREAD_NEAR5", 0.60)
     MAX_NET_SPREAD_NEAR2 = env_float("MAX_NET_SPREAD_NEAR2", 0.80)
     MAX_NET_SPREAD_NEAR1 = env_float("MAX_NET_SPREAD_NEAR1", 1.00)
@@ -328,6 +335,23 @@ def main():
     creds=service_account.Credentials.from_service_account_info(json.loads(sa_json), scopes=["https://www.googleapis.com/auth/spreadsheets"])
     s=build("sheets","v4",credentials=creds)
     schwab_sheet_id=ensure_header_and_get_sheetid(s, sheet_id, SCHWAB_TAB, SCHWAB_HEADERS)
+
+    # Kill too-early runs regardless of env (safety)
+    if minutes_to_option_close() > 10:
+        # Log and exit quietly; ensures scheduled drifts can't place at 4:10.
+        def _log_skip(msg):  # local to avoid duplicating helpers
+            top_insert(s, sheet_id, schwab_sheet_id)
+            s.spreadsheets().values().update(
+                spreadsheetId=sheet_id, range=f"{SCHWAB_TAB}!A2",
+                valueInputOption="USER_ENTERED",
+                body={"values":[[
+                    datetime.now(timezone.utc).isoformat(),
+                    "SCHWAB_SKIP_EARLY","SPX",last_px,"","SKIP","","","","",
+                    "","","","", "", msg
+                ]]}
+            ).execute()
+        _log_skip(f"TOO_EARLY mins_to_close={minutes_to_option_close():.2f}")
+        print("TOO_EARLY", minutes_to_option_close()); sys.exit(0)
 
     two=s.spreadsheets().values().get(spreadsheetId=sheet_id, range=f"{LEO_TAB}!A1:AG2").execute().get("values",[])
     if len(two)<2:
