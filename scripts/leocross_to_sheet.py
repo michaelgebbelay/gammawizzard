@@ -5,10 +5,9 @@ import requests
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-__VERSION__ = "2025-08-27a"
+__VERSION__ = "2025-08-27c"
 
 LEO_TAB = "leocross"
-
 HEADERS = [
     "ts","signal_date","expiry","side","credit_or_debit","qty_exec",
     "put_spread","call_spread",
@@ -19,19 +18,27 @@ HEADERS = [
     "summary"
 ]
 
-# -------------------- env helpers --------------------
+# -------------------- config helpers --------------------
+def _load_cfg():
+    try: return json.loads(os.environ.get("CONFIG_JSON","") or "{}")
+    except: return {}
+CFG = _load_cfg()
+def cfg(path, default=None):
+    cur=CFG
+    for p in path.split("."):
+        if isinstance(cur, dict) and p in cur: cur=cur[p]
+        else: return default
+    return cur
 def env_or_die(name: str) -> str:
     v = os.environ.get(name)
     if not v:
         print(f"Missing required env: {name}", file=sys.stderr); sys.exit(1)
     return v
-
 def env_str(name: str, default: str = "") -> str:
     v = os.environ.get(name, None)
     if v is None: return default
     v = str(v).strip()
     return v if v != "" else default
-
 def env_int(name: str, default: int) -> int:
     s = os.environ.get(name, None)
     if s is None: return default
@@ -46,15 +53,13 @@ def yymmdd(iso: str) -> str:
         d = date.fromisoformat((iso or "")[:10])
         return f"{d:%y%m%d}"
     except: return ""
-
 def to_int(x):
     try: return int(round(float(x)))
     except: return None
-
 def extract_strike(sym: str):
     if not sym: return None
     t = sym.strip().upper().lstrip(".").replace("_","")
-    m = re.search(r'[PC](\d{6,8})$', t)  # OSI mills
+    m = re.search(r'[PC](\d{6,8})$', t);  # OSI mills
     if m: return int(m.group(1)) / 1000.0
     m = re.search(r'[PC](\d+(?:\.\d+)?)$', t)
     if m: return float(m.group(1))
@@ -98,7 +103,6 @@ def _pick(m, *keys):
         v = m.get(k.lower())
         if v not in (None,""): return v
     return None
-
 def _normalize_trade_like(d):
     m = _lower_dict(d)
     t = {
@@ -143,17 +147,10 @@ def _sanitize_token(t: str) -> str:
 
 def gw_authenticate(base: str, email: str, password: str) -> str:
     url = base.rstrip("/") + "/goauth/authenticateFireUser"
-    try:
-        r = requests.post(url, data={"email": email, "password": password}, timeout=30)
-    except Exception as e:
-        print(f"AUTH_HTTP_ERROR: {e}", file=sys.stderr); sys.exit(1)
+    r = requests.post(url, data={"email": email, "password": password}, timeout=30)
     if r.status_code != 200:
         print(f"AUTH_FAIL HTTP {r.status_code} body={r.text[:200]}", file=sys.stderr); sys.exit(1)
-    try:
-        j = r.json()
-    except:
-        print(f"AUTH_NON_JSON body={r.text[:200]}", file=sys.stderr); sys.exit(1)
-    tok = (j or {}).get("token")
+    j = r.json(); tok = (j or {}).get("token")
     if not tok:
         print(f"AUTH_NO_TOKEN payload={str(j)[:200]}", file=sys.stderr); sys.exit(1)
     return _sanitize_token(tok)
@@ -164,14 +161,10 @@ def gw_get_json(base: str, endpoint: str, token: str):
     r = requests.get(url, headers=hdr, timeout=30)
     if r.status_code != 200:
         print(f"GET_FAIL {endpoint} HTTP {r.status_code} body={r.text[:200]}", file=sys.stderr); sys.exit(1)
-    try:
-        return r.json()
-    except:
-        print(f"GET_NON_JSON {endpoint} body={r.text[:200]}", file=sys.stderr); sys.exit(1)
+    return r.json()
 
 # -------------------- main --------------------
 def main():
-    # Google bits
     sheet_id   = env_or_die("GSHEET_ID")
     sa_json    = env_or_die("GOOGLE_SERVICE_ACCOUNT_JSON")
 
@@ -191,17 +184,13 @@ def main():
         if not (email and password):
             print("GW_AUTH_MODE=LOGIN but GW_AUTH_EMAIL/PASSWORD missing.", file=sys.stderr); sys.exit(1)
         token = gw_authenticate(base, email, password)
-    else:  # AUTO
+    else:
         token = static_tok if static_tok else gw_authenticate(base, email, password)
 
     api = gw_get_json(base, endpoint, token)
-
     trade = extract_trade_from_any(api)
     if not trade:
-        print("No Trade-like data in response.", file=sys.stderr)
-        snippet = (json.dumps(api) if not isinstance(api,str) else api)[:400]
-        print(f"payload(first 400): {snippet}", file=sys.stderr)
-        sys.exit(1)
+        print("No Trade-like data in response.", file=sys.stderr); sys.exit(1)
 
     def s(x): return "" if x is None else str(x)
     signal_date = s(trade.get("Date",""))
@@ -242,7 +231,7 @@ def main():
                 occ_buy_call  = parsed["occ_buy_call"]  or occ_buy_call
 
     # Derive legs if missing, from Limit/CLimit + width
-    width_env   = env_int("LEO_WIDTH", 5)
+    width_env = int(cfg("policy.leo_width", env_int("LEO_WIDTH", 5)))
     if not (occ_buy_put and occ_sell_put and occ_sell_call and occ_buy_call):
         w = width_env
         inner_put  = to_int(trade.get("Limit",""))
@@ -261,7 +250,7 @@ def main():
         summary = summary or f"{signal_date} → {expiry} : AUTO legs width={w}"
 
     # Decide CREDIT/DEBIT (Cat rule + tie)
-    tie_side = env_str("LEO_TIE_SIDE", "CREDIT").upper()
+    tie_side = str(cfg("policy.leo_tie_side", env_str("LEO_TIE_SIDE","CREDIT"))).upper()
     credit = True
     try:
         c1, c2 = float(cat1), float(cat2)
@@ -277,7 +266,8 @@ def main():
 
     side = "SHORT_IRON_CONDOR" if credit else "LONG_IRON_CONDOR"
     credit_or_debit = "credit" if credit else "debit"
-    qty_exec = env_int("LEO_SIZE_CREDIT", 4) if credit else env_int("LEO_SIZE_DEBIT", 2)
+    qty_default = int(cfg("policy.leo_size_credit", 4) if credit else cfg("policy.leo_size_debit", 2))
+    qty_exec    = env_int("LEO_SIZE_CREDIT" if credit else "LEO_SIZE_DEBIT", qty_default)
 
     # Write Google Sheet
     creds = service_account.Credentials.from_service_account_info(json.loads(sa_json), scopes=["https://www.googleapis.com/auth/spreadsheets"])
