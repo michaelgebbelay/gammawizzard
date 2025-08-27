@@ -8,7 +8,11 @@ from googleapiclient.discovery import build
 # schwab-py
 from schwab.auth import client_from_token_file
 
-__VERSION__ = "2025-08-26e"
+# market clock for early closes
+import pytz
+import pandas_market_calendars as mcal
+
+__VERSION__ = "2025-08-26h"
 
 LEO_TAB    = "leocross"
 SCHWAB_TAB = "schwab"
@@ -48,23 +52,40 @@ def env_bool(name: str, default: bool) -> bool:
     if s is None: return default
     return str(s).strip().lower() in ("1","true","yes","y","on")
 
+# ---------- time helpers ----------
+_ET = pytz.timezone("America/New_York")
+def now_et() -> datetime:
+    return datetime.now(_ET)
+
+def todays_equity_close_et() -> datetime | None:
+    """NYSE close for *today* in ET (early-close aware)."""
+    cal = mcal.get_calendar('XNYS')
+    d = now_et().date()
+    sched = cal.schedule(start_date=d, end_date=d, tz='America/New_York')
+    if sched.empty: return None
+    return sched['market_close'].iloc[0].to_pydatetime()
+
+def minutes_to_option_close() -> float:
+    """SPX options generally halt at equity close + 15 minutes."""
+    close = todays_equity_close_et()
+    if close is None: return 1e9
+    opt_close = close + timedelta(minutes=15)
+    return (opt_close - now_et()).total_seconds() / 60.0
+
 # ---------- symbol & quotes ----------
 def to_schwab_opt(sym: str) -> str:
     raw = (sym or "").strip().upper()
     if raw.startswith("."): raw = raw[1:]
     raw = raw.replace("_","")
-    # OSI strict
     m = re.match(r'^([A-Z.$^]{1,6})(\d{6})([CP])(\d{8})$', raw)
     if m:
         root, ymd, cp, strike8 = m.groups()
         return f"{root:<6}{ymd}{cp}{strike8}"
-    # ROOT+YYMMDD+CP+strike(.mmm)
     m = re.match(r'^([A-Z.$^]{1,6})(\d{6})([CP])(\d{1,5})(?:\.(\d{1,3}))?$', raw)
     if m:
         root, ymd, cp, i, frac = m.groups()
         mills = int(i) * 1000 + (int(frac.ljust(3,'0')) if frac else 0)
         return f"{root:<6}{ymd}{cp}{mills:08d}"
-    # already padded?
     m = re.match(r'^(.{6})(\d{6})([CP])(\d{8})$', raw)
     if m:
         root6, ymd, cp, strike8 = m.groups()
@@ -166,38 +187,29 @@ def has_open_order_for_legs(c, acct_hash: str, legs_osi: list) -> bool:
     except:
         return False
 
-# ---------- Schwab client factory (robust to signature changes) ----------
+# ---------- Schwab client factory ----------
 def make_client(app_key: str, app_secret: str, token_json: str):
-    # write token file expected by the lib
     with open("schwab_token.json","w") as f: f.write(token_json)
-    # log library signature so we know what the runner has
     try:
-        sig = str(inspect.signature(client_from_token_file))
-        print("client_from_token_file signature:", sig)
+        sig = str(inspect.signature(client_from_token_file)); print("client_from_token_file signature:", sig)
     except Exception as e:
         print("SIG_INTROSPECT_ERR", e)
-    # try common call forms
     try:
-        return client_from_token_file(token_path="schwab_token.json",
-                                      api_key=app_key, app_secret=app_secret)
+        return client_from_token_file(token_path="schwab_token.json", api_key=app_key, app_secret=app_secret)
     except TypeError as e1:
         print("INIT_TRY1 failed:", e1)
     try:
-        return client_from_token_file(api_key=app_key, app_secret=app_secret,
-                                      token_path="schwab_token.json")
+        return client_from_token_file(api_key=app_key, app_secret=app_secret, token_path="schwab_token.json")
     except TypeError as e2:
         print("INIT_TRY2 failed:", e2)
     try:
         return client_from_token_file("schwab_token.json", app_key, app_secret)
     except TypeError as e3:
         print("INIT_TRY3 failed:", e3)
-    # last ditch for very old kw
     try:
-        return client_from_token_file(token_path="schwab_token.json",
-                                      api_key=app_key, api_secret=app_secret)  # noqa
+        return client_from_token_file(token_path="schwab_token.json", api_key=app_key, api_secret=app_secret)  # noqa
     except TypeError as e4:
-        print("INIT_TRY4 failed:", e4)
-        raise
+        print("INIT_TRY4 failed:", e4); raise
 
 # ---------- Buying power discovery ----------
 def discover_bp_option_only(sa: dict) -> float | None:
@@ -238,11 +250,10 @@ def main():
     sheet_id   = env_or_die("GSHEET_ID")
     sa_json    = env_or_die("GOOGLE_SERVICE_ACCOUNT_JSON")
 
-    # timing & tick
     STAGE_SEC = env_int("STAGE_SEC", 60)
     TICK      = env_float("TICK", 0.05)
 
-    # per‑leg rails → condor ×2 (still used for PRICING only; not for sizing)
+    # per-leg rails → condor ×2 (pricing only, not sizing)
     CREDIT_START_PER = env_float("CREDIT_START_PERLEG", 1.10)
     CREDIT_FLOOR_PER = env_float("CREDIT_FLOOR_PERLEG", 0.95)
     DEBIT_START_PER  = env_float("DEBIT_START_PERLEG",  0.90)
@@ -257,36 +268,51 @@ def main():
     OFFSET_CREDIT = 2*OFFSET_PER_CRED
     OFFSET_DEBIT  = 2*OFFSET_PER_DEB
 
-    # ---- sizing switches ----
-    SIZE_MODE        = env_str("SIZE_MODE","STATIC").upper()      # STATIC or PCT_BP
+    # ---- sizing ----
+    SIZE_MODE        = env_str("SIZE_MODE","STATIC").upper()
     CREDIT_ALLOC_PCT = env_float("CREDIT_ALLOC_PCT", 0.06)
     DEBIT_ALLOC_PCT  = env_float("DEBIT_ALLOC_PCT",  0.02)
-    RISK_PER_CONTRACT_CREDIT = env_float("RISK_PER_CONTRACT_CREDIT", 300.0)  # << hard-coded risk per contract
+    RISK_PER_CONTRACT_CREDIT = env_float("RISK_PER_CONTRACT_CREDIT", 300.0)
     RISK_PER_CONTRACT_DEBIT  = env_float("RISK_PER_CONTRACT_DEBIT",  200.0)
     MAX_QTY          = env_int("MAX_QTY", 10)
     MIN_QTY          = env_int("MIN_QTY", 1)
     OPT_BP_OVERRIDE  = env_float("OPT_BP_OVERRIDE", -1.0)
-    BP_SOURCE        = env_str("BP_SOURCE","OPTION").upper()       # OPTION | MAX | BUYING
-    MAX_RISK_PER_TRADE = env_float("MAX_RISK_PER_TRADE", -1.0)     # absolute dollars
-    HARD_QTY_CUTOFF    = env_int("HARD_QTY_CUTOFF", 20)            # abort if computed > cutoff
+    BP_SOURCE        = env_str("BP_SOURCE","OPTION").upper()
+    MAX_RISK_PER_TRADE = env_float("MAX_RISK_PER_TRADE", -1.0)
+    HARD_QTY_CUTOFF    = env_int("HARD_QTY_CUTOFF", 20)
 
-    # ---- guards ----
-    FRESH_MIN               = env_int("FRESH_MIN", 120)
-    ENFORCE_EXPIRY_TOMORROW = env_bool("ENFORCE_EXPIRY_TOMORROW", True)
-    MAX_LEG_SPREAD = env_float("MAX_LEG_SPREAD", None)
-    MAX_NET_SPREAD = env_float("MAX_NET_SPREAD", None)
+    # ---- liquidity guards (dynamic near the close) ----
+    MAX_LEG_SPREAD_BASE = env_float("MAX_LEG_SPREAD", 0.30)   # base guard
+    MAX_NET_SPREAD_BASE = env_float("MAX_NET_SPREAD", 0.30)   # base guard
+    # dynamic wideners (defaults are sane for last minutes)
+    MAX_NET_SPREAD_NEAR5 = env_float("MAX_NET_SPREAD_NEAR5", 0.60)
+    MAX_NET_SPREAD_NEAR2 = env_float("MAX_NET_SPREAD_NEAR2", 0.80)
+    MAX_NET_SPREAD_NEAR1 = env_float("MAX_NET_SPREAD_NEAR1", 1.00)
+    MAX_LEG_SPREAD_NEAR5 = env_float("MAX_LEG_SPREAD_NEAR5", 0.45)
+    MAX_LEG_SPREAD_NEAR2 = env_float("MAX_LEG_SPREAD_NEAR2", 0.60)
+    MAX_LEG_SPREAD_NEAR1 = env_float("MAX_LEG_SPREAD_NEAR1", 0.70)
+
+    SPREAD_RETRIES  = env_int("SPREAD_RETRIES", 3)   # additional quote polls if wide
+    SPREAD_WAIT_MS  = env_int("SPREAD_WAIT_MS", 250)
+
+    # bypass if we're *really* close to options cut-off
+    BYPASS_WIDE_SPREAD_NEAR_MIN = env_int("BYPASS_WIDE_SPREAD_NEAR_MIN", 2)
+
+    # last-ditch price escalation when time is almost out
+    EMERGENCY_MIN_TO_CLOSE = env_int("EMERGENCY_MIN_TO_CLOSE", 2)
+
     CANCEL_IF_UNFILLED = env_bool("CANCEL_IF_UNFILLED", True)
 
     # --- Schwab client ---
     c = make_client(app_key, app_secret, token_json)
 
-    # account hash (optional override)
+    # account hash
     acct_hash = env_str("SCHWAB_ACCT_HASH", "")
     if not acct_hash:
         r=c.get_account_numbers(); r.raise_for_status()
         acct=r.json()[0]; acct_hash=acct["hashValue"]
 
-    # last SPX price
+    # SPX last
     def spx_last():
         for sym in ["$SPX.X","SPX","SPX.X","$SPX"]:
             try:
@@ -335,8 +361,8 @@ def main():
         exp_d=date.fromisoformat(g("expiry")) if g("expiry") else None
     except:
         sig_d=exp_d=None
-    if age_min is None or age_min>FRESH_MIN: log_and_exit("SCHWAB_ERROR", f"STALE_OR_NO_TS age_min={age_min}")
-    if ENFORCE_EXPIRY_TOMORROW and sig_d and exp_d:
+    if age_min is None or age_min>env_int("FRESH_MIN", 120): log_and_exit("SCHWAB_ERROR", f"STALE_OR_NO_TS age_min={age_min}")
+    if env_bool("ENFORCE_EXPIRY_TOMORROW", True) and sig_d and exp_d:
         expected = next_trading_day(sig_d)
         if exp_d != expected: log_and_exit("SCHWAB_ERROR", f"DATE_MISMATCH sig={g('signal_date')} exp={g('expiry')} (expected {expected})")
 
@@ -384,38 +410,11 @@ def main():
     rec_put=fnum(g("rec_put")); rec_call=fnum(g("rec_call"))
     rec_condor=fnum(g("rec_condor")) if g("rec_condor")!="" else (None if (rec_put is None or rec_call is None) else (rec_put+rec_call))
 
-    # mid + spreads / liquidity guards
-    mid, net_bid, net_ask, legs_ba = compute_mid_condor(c, leg_syms)
-    if MAX_LEG_SPREAD is not None and None not in legs_ba:
-        bp_bid,bp_ask,sp_bid,sp_ask,sc_bid,sc_ask,bc_bid,bc_ask = legs_ba
-        worst = max(bp_ask-bp_bid, sp_ask-sp_bid, sc_ask-sc_bid, bc_ask-bc_bid)
-        if worst is not None and worst > MAX_LEG_SPREAD:
-            log_and_exit("SCHWAB_SKIP", f"LEG_SPREAD_EXCEEDS {worst:.2f}>{MAX_LEG_SPREAD:.2f}")
-    if MAX_NET_SPREAD is not None and net_bid is not None and net_ask is not None:
-        net_spread = net_ask - net_bid
-        if net_spread > MAX_NET_SPREAD:
-            log_and_exit("SCHWAB_SKIP", f"NET_SPREAD_EXCEEDS {net_spread:.2f}>{MAX_NET_SPREAD:.2f}")
-
-    # rung prices (clamped & snapped to next tick) — rails only affect PRICING, not sizing
-    def clamp_credit(x): return clamp_and_snap(x, CREDIT_FLOOR, CREDIT_START, TICK)
-    def clamp_debit(x):  return clamp_and_snap(x, 0.01, DEBIT_CEIL, TICK)
-    if is_credit:
-        start_price = clamp_credit(CREDIT_START)
-        rec_price   = clamp_credit(rec_condor if rec_condor is not None else mid)
-        stage3_base = None if mid is None else (mid + (2*env_float("OFFSET_PERLEG_CREDIT", -0.05)))
-        stage3_price= clamp_credit(stage3_base)
-    else:
-        start_price = clamp_debit(DEBIT_START)
-        rec_price   = clamp_debit(rec_condor if rec_condor is not None else mid)
-        stage3_base = None if mid is None else (mid + (2*env_float("OFFSET_PERLEG_DEBIT", +0.05)))
-        stage3_price= clamp_debit(stage3_base)
-
     # ---------- qty sizing ----------
     qty_sheet = int((g("qty_exec") or "1"))
     qty_exec  = qty_sheet
 
     if SIZE_MODE=="PCT_BP":
-        # discover account BP (or use override)
         bp = OPT_BP_OVERRIDE if OPT_BP_OVERRIDE and OPT_BP_OVERRIDE>0 else None
         if bp is None:
             try:
@@ -425,34 +424,87 @@ def main():
                     j=rr.json()
                     if isinstance(j,list): j=j[0]
                     sa=j.get("securitiesAccount") or j
-                    if BP_SOURCE in ("OPTION", "OPTIONS"):
+                    if BP_SOURCE in ("OPTION","OPTIONS"):
                         bp = discover_bp_option_only(sa)
-                    elif BP_SOURCE in ("MAX","BUYING"):
-                        bp = discover_bp_any(sa)
                     else:
-                        bp = discover_bp_option_only(sa)
+                        bp = discover_bp_any(sa)
             except: bp=None
-
-        if bp is None:
-            print("WARN: could not fetch option buying power; using sheet qty.")
-        else:
+        if bp is not None:
             alloc = CREDIT_ALLOC_PCT if is_credit else DEBIT_ALLOC_PCT
             budget = max(bp*alloc, 0.0)
             if MAX_RISK_PER_TRADE and MAX_RISK_PER_TRADE>0:
                 budget = min(budget, MAX_RISK_PER_TRADE)
-
             risk_per_ct = RISK_PER_CONTRACT_CREDIT if is_credit else RISK_PER_CONTRACT_DEBIT
             risk_per_ct = max(risk_per_ct, 1.0)
-
             qty_exec = max(1, int(budget // risk_per_ct))
             print(f"SIZING PCT_BP bp={bp:.2f} alloc={alloc:.4f} budget={budget:.2f} "
                   f"risk_per_ct={risk_per_ct:.2f} -> qty={qty_exec}")
+        else:
+            print("WARN: could not fetch option buying power; using sheet qty.")
 
-    # floors/caps/hard stop
     if qty_exec < MIN_QTY: qty_exec = MIN_QTY
     if MAX_QTY>0 and qty_exec > MAX_QTY: qty_exec = MAX_QTY
     if HARD_QTY_CUTOFF>0 and qty_exec > HARD_QTY_CUTOFF:
         log_and_exit("SCHWAB_ABORT", f"QTY_ABOVE_HARD_CUTOFF computed={qty_exec} cutoff={HARD_QTY_CUTOFF}", qty_exec)
+
+    # ---------- quotes / liquidity with dynamic limits ----------
+    def dynamic_limits() -> tuple[float|None,float|None,float]:
+        mins = max(0.0, minutes_to_option_close())
+        net = MAX_NET_SPREAD_BASE
+        leg = MAX_LEG_SPREAD_BASE
+        if mins <= 1.0:
+            net = max(net, MAX_NET_SPREAD_NEAR1)
+            if leg is not None: leg = max(leg, MAX_LEG_SPREAD_NEAR1)
+        elif mins <= 2.0:
+            net = max(net, MAX_NET_SPREAD_NEAR2)
+            if leg is not None: leg = max(leg, MAX_LEG_SPREAD_NEAR2)
+        elif mins <= 5.0:
+            net = max(net, MAX_NET_SPREAD_NEAR5)
+            if leg is not None: leg = max(leg, MAX_LEG_SPREAD_NEAR5)
+        return net, leg, mins
+
+    def passes_liquidity(mid, net_bid, net_ask, legs_ba) -> tuple[bool,str,float,float]:
+        net_th, leg_th, mins = dynamic_limits()
+        if mid is None or net_bid is None or net_ask is None:
+            return (False, "INCOMPLETE_QUOTES", net_th, mins)
+        net_spread = net_ask - net_bid
+        if net_th is not None and net_spread > net_th:
+            return (False, f"NET_SPREAD_EXCEEDS {net_spread:.2f}>{net_th:.2f} (mins_to_close={mins:.2f})", net_th, mins)
+        if leg_th is not None and None not in legs_ba:
+            bp_bid,bp_ask,sp_bid,sp_ask,sc_bid,sc_ask,bc_bid,bc_ask = legs_ba
+            worst = max(bp_ask-bp_bid, sp_ask-sp_bid, sc_ask-sc_bid, bc_ask-bc_bid)
+            if worst > leg_th:
+                return (False, f"LEG_SPREAD_EXCEEDS {worst:.2f}>{leg_th:.2f} (mins_to_close={mins:.2f})", net_th, mins)
+        return (True, "OK", net_th, mins)
+
+    # get quotes with retries
+    ok=False; info=""; net_th=MAX_NET_SPREAD_BASE; mins_left=999.0
+    for i in range(max(1, SPREAD_RETRIES+1)):
+        mid, net_bid, net_ask, legs_ba = compute_mid_condor(c, leg_syms)
+        ok, info, net_th, mins_left = passes_liquidity(mid, net_bid, net_ask, legs_ba)
+        if ok: break
+        if i < SPREAD_RETRIES:
+            time.sleep(max(1, SPREAD_WAIT_MS)/1000.0)
+    if not ok:
+        # near cutoff? optionally bypass guard so you don't miss the trade
+        if BYPASS_WIDE_SPREAD_NEAR_MIN>0 and mins_left <= BYPASS_WIDE_SPREAD_NEAR_MIN:
+            print("WIDE_SPREAD_BYPASS", info)
+        else:
+            log_and_exit("SCHWAB_SKIP", info)
+
+    # rung prices (clamped & snapped to next tick)
+    def clamp_credit(x): return clamp_and_snap(x, CREDIT_FLOOR, CREDIT_START, TICK)
+    def clamp_debit(x):  return clamp_and_snap(x, 0.01, DEBIT_CEIL, TICK)
+    if is_credit:
+        start_price = clamp_credit(CREDIT_START)
+        rec_price   = clamp_credit(rec_condor if rec_condor is not None else mid)
+        stage3_base = None if mid is None else (mid + OFFSET_CREDIT)
+        stage3_price= clamp_credit(stage3_base)
+    else:
+        start_price = clamp_debit(DEBIT_START)
+        rec_price   = clamp_debit(rec_condor if rec_condor is not None else mid)
+        stage3_base = None if mid is None else (mid + OFFSET_DEBIT)
+        stage3_price= clamp_debit(stage3_base)
 
     # ---------- pre-claim broker guard ----------
     if has_open_order_for_legs(c, acct_hash, leg_syms):
@@ -577,6 +629,18 @@ def main():
         rc, oid, price_used = replace(oid, stage3_price)
         end3 = time.time() + STAGE_SEC
         while time.time() < end3:
+            rc, st = status(oid)
+            if st and str(st).upper()=="FILLED": filled=True; break
+            time.sleep(1)
+
+    # emergency: if we are basically out of time, push to your acceptable floor/ceil
+    if not filled and EMERGENCY_MIN_TO_CLOSE>0 and minutes_to_option_close() <= EMERGENCY_MIN_TO_CLOSE:
+        emerg_price = (CREDIT_FLOOR if is_credit else DEBIT_CEIL)
+        rc, oid, price_used = replace(oid, emerg_price)
+        # wait remaining time but leave ~10s buffer
+        rem = max(0, minutes_to_option_close()*60 - 10)
+        end4 = time.time() + min(STAGE_SEC, rem)
+        while time.time() < end4:
             rc, st = status(oid)
             if st and str(st).upper()=="FILLED": filled=True; break
             time.sleep(1)
