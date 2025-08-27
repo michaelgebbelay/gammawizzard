@@ -8,11 +8,11 @@ from googleapiclient.discovery import build
 # schwab-py
 from schwab.auth import client_from_token_file
 
-# market clock for early closes
+# market clock (early closes)
 import pytz
 import pandas_market_calendars as mcal
 
-__VERSION__ = "2025-08-27b"
+__VERSION__ = "2025-08-27c"
 
 LEO_TAB    = "leocross"
 SCHWAB_TAB = "schwab"
@@ -23,6 +23,18 @@ SCHWAB_HEADERS = [
     "occ_buy_put","occ_sell_put","occ_sell_call","occ_buy_call",
     "order_id","status"
 ]
+
+# -------------------- config helpers --------------------
+def _load_cfg():
+    try: return json.loads(os.environ.get("CONFIG_JSON","") or "{}")
+    except: return {}
+CFG = _load_cfg()
+def cfg(path, default=None):
+    cur=CFG
+    for p in path.split("."):
+        if isinstance(cur, dict) and p in cur: cur=cur[p]
+        else: return default
+    return cur
 
 # ---------- env helpers ----------
 def env_or_die(name: str) -> str:
@@ -54,19 +66,18 @@ def env_bool(name: str, default: bool) -> bool:
 
 # ---------- time helpers ----------
 _ET = pytz.timezone("America/New_York")
+_MIN_OVERRIDE = env_float("MINUTES_TO_CLOSE_OVERRIDE", float(cfg("sim.minutes_to_close", -1)))
 def now_et() -> datetime:
     return datetime.now(_ET)
-
 def todays_equity_close_et() -> datetime | None:
-    """NYSE close for *today* in ET (early-close aware)."""
     cal = mcal.get_calendar('XNYS')
     d = now_et().date()
     sched = cal.schedule(start_date=d, end_date=d, tz='America/New_York')
     if sched.empty: return None
     return sched['market_close'].iloc[0].to_pydatetime()
-
 def minutes_to_option_close() -> float:
-    """SPX options generally halt at equity close + 15 minutes."""
+    if _MIN_OVERRIDE is not None and _MIN_OVERRIDE >= 0:
+        return _MIN_OVERRIDE
     close = todays_equity_close_et()
     if close is None: return 1e9
     opt_close = close + timedelta(minutes=15)
@@ -149,13 +160,11 @@ def parse_iso(ts_str: str):
     except: return None
 
 def next_trading_day(d: date) -> date:
-    """Holiday-aware next trading day using XNYS calendar."""
     cal = mcal.get_calendar('XNYS')
     sched = cal.schedule(start_date=d, end_date=d + timedelta(days=7), tz='America/New_York')
     for ts in sched.index:
         if ts.date() > d:
             return ts.date()
-    # Fallback (shouldn't happen): next weekday
     nd = d + timedelta(days=1)
     while nd.weekday() >= 5:
         nd += timedelta(days=1)
@@ -257,16 +266,22 @@ def main():
     sheet_id   = env_or_die("GSHEET_ID")
     sa_json    = env_or_die("GOOGLE_SERVICE_ACCOUNT_JSON")
 
-    STAGE_SEC = env_int("STAGE_SEC", 45)  # 45s per rung
-    TICK      = env_float("TICK", 0.05)
+    # ---- config (env takes precedence over CONFIG_JSON defaults) ----
+    DRY_RUN   = env_bool("DRY_RUN", bool(cfg("sim.dry_run", False)))
+    SIM_QUOTES= env_bool("SIM_QUOTES", bool(cfg("sim.quotes", False)))
+    SIM_MID   = env_float("SIM_MID", float(cfg("sim.mid", float("nan"))))
+    SIM_SPREAD= env_float("SIM_NET_SPREAD", float(cfg("sim.spread", float("nan"))))
+    SIM_FILL_ON_STAGE = env_int("SIM_FILL_ON_STAGE", int(cfg("sim.fill_on_stage", 2)))
 
-    # per-leg rails → condor ×2 (pricing only, not sizing)
-    CREDIT_START_PER = env_float("CREDIT_START_PERLEG", 1.10)
-    CREDIT_FLOOR_PER = env_float("CREDIT_FLOOR_PERLEG", 0.95)
-    DEBIT_START_PER  = env_float("DEBIT_START_PERLEG",  0.90)
-    DEBIT_CEIL_PER   = env_float("DEBIT_CEIL_PERLEG",   1.05)
-    OFFSET_PER_CRED  = env_float("OFFSET_PERLEG_CREDIT", -0.05)
-    OFFSET_PER_DEB   = env_float("OFFSET_PERLEG_DEBIT",  +0.05)
+    STAGE_SEC = env_int("STAGE_SEC", int(cfg("ladder.stage_sec", 45)))
+    TICK      = env_float("TICK", float(cfg("pricing.tick", 0.05)))
+
+    CREDIT_START_PER = env_float("CREDIT_START_PERLEG", float(cfg("pricing.credit_start_perleg", 1.10)))
+    CREDIT_FLOOR_PER = env_float("CREDIT_FLOOR_PERLEG", float(cfg("pricing.credit_floor_perleg", 0.95)))
+    DEBIT_START_PER  = env_float("DEBIT_START_PERLEG",  float(cfg("pricing.debit_start_perleg",  0.90)))
+    DEBIT_CEIL_PER   = env_float("DEBIT_CEIL_PERLEG",   float(cfg("pricing.debit_ceil_perleg",   1.05)))
+    OFFSET_PER_CRED  = env_float("OFFSET_PERLEG_CREDIT", float(cfg("pricing.offset_perleg_credit",-0.05)))
+    OFFSET_PER_DEB   = env_float("OFFSET_PERLEG_DEBIT",  float(cfg("pricing.offset_perleg_debit", 0.05)))
 
     CREDIT_START = 2*CREDIT_START_PER
     CREDIT_FLOOR = 2*CREDIT_FLOOR_PER
@@ -275,52 +290,49 @@ def main():
     OFFSET_CREDIT = 2*OFFSET_PER_CRED
     OFFSET_DEBIT  = 2*OFFSET_PER_DEB
 
-    # ---- sizing ----
-    SIZE_MODE        = env_str("SIZE_MODE","STATIC").upper()
-    CREDIT_ALLOC_PCT = env_float("CREDIT_ALLOC_PCT", 0.06)
-    DEBIT_ALLOC_PCT  = env_float("DEBIT_ALLOC_PCT",  0.02)
-    RISK_PER_CONTRACT_CREDIT = env_float("RISK_PER_CONTRACT_CREDIT", 300.0)
-    RISK_PER_CONTRACT_DEBIT  = env_float("RISK_PER_CONTRACT_DEBIT",  200.0)
-    MAX_QTY          = env_int("MAX_QTY", 10)
-    MIN_QTY          = env_int("MIN_QTY", 1)
-    OPT_BP_OVERRIDE  = env_float("OPT_BP_OVERRIDE", -1.0)
-    BP_SOURCE        = env_str("BP_SOURCE","OPTION").upper()
-    MAX_RISK_PER_TRADE = env_float("MAX_RISK_PER_TRADE", -1.0)
-    HARD_QTY_CUTOFF    = env_int("HARD_QTY_CUTOFF", 20)
+    SIZE_MODE        = env_str("SIZE_MODE", str(cfg("size.mode", "STATIC"))).upper()
+    CREDIT_ALLOC_PCT = env_float("CREDIT_ALLOC_PCT", float(cfg("size.credit_alloc_pct", 0.06)))
+    DEBIT_ALLOC_PCT  = env_float("DEBIT_ALLOC_PCT",  float(cfg("size.debit_alloc_pct",  0.02)))
+    RISK_PER_CONTRACT_CREDIT = env_float("RISK_PER_CONTRACT_CREDIT", float(cfg("size.risk_per_contract_credit", 300.0)))
+    RISK_PER_CONTRACT_DEBIT  = env_float("RISK_PER_CONTRACT_DEBIT",  float(cfg("size.risk_per_contract_debit",  200.0)))
+    MAX_QTY          = env_int("MAX_QTY", int(cfg("size.max_qty", 10)))
+    MIN_QTY          = env_int("MIN_QTY", int(cfg("size.min_qty", 1)))
+    OPT_BP_OVERRIDE  = env_float("OPT_BP_OVERRIDE", float(cfg("size.opt_bp_override", -1.0)))
+    BP_SOURCE        = env_str("BP_SOURCE", str(cfg("size.bp_source", "OPTION"))).upper()
+    MAX_RISK_PER_TRADE = env_float("MAX_RISK_PER_TRADE", float(cfg("size.max_risk_per_trade", -1.0)))
+    HARD_QTY_CUTOFF    = env_int("HARD_QTY_CUTOFF", int(cfg("size.hard_qty_cutoff", 20)))
 
-    # ---- liquidity guards (dynamic near the close) ----
-    MAX_LEG_SPREAD_BASE = env_float("MAX_LEG_SPREAD", 0.30)   # base guard
-    MAX_NET_SPREAD_BASE = env_float("MAX_NET_SPREAD", 0.30)   # base guard
-    # dynamic wideners
-    MAX_NET_SPREAD_NEAR5 = env_float("MAX_NET_SPREAD_NEAR5", 0.60)
-    MAX_NET_SPREAD_NEAR2 = env_float("MAX_NET_SPREAD_NEAR2", 0.80)
-    MAX_NET_SPREAD_NEAR1 = env_float("MAX_NET_SPREAD_NEAR1", 1.00)
-    MAX_LEG_SPREAD_NEAR5 = env_float("MAX_LEG_SPREAD_NEAR5", 0.45)
-    MAX_LEG_SPREAD_NEAR2 = env_float("MAX_LEG_SPREAD_NEAR2", 0.60)
-    MAX_LEG_SPREAD_NEAR1 = env_float("MAX_LEG_SPREAD_NEAR1", 0.70)
+    MAX_LEG_SPREAD_BASE = env_float("MAX_LEG_SPREAD", float(cfg("liquidity.base.leg", 0.30)))
+    MAX_NET_SPREAD_BASE = env_float("MAX_NET_SPREAD", float(cfg("liquidity.base.net", 0.30)))
+    MAX_NET_SPREAD_NEAR5 = env_float("MAX_NET_SPREAD_NEAR5", float(cfg("liquidity.near5.net", 0.60)))
+    MAX_NET_SPREAD_NEAR2 = env_float("MAX_NET_SPREAD_NEAR2", float(cfg("liquidity.near2.net", 0.80)))
+    MAX_NET_SPREAD_NEAR1 = env_float("MAX_NET_SPREAD_NEAR1", float(cfg("liquidity.near1.net", 1.00)))
+    MAX_LEG_SPREAD_NEAR5 = env_float("MAX_LEG_SPREAD_NEAR5", float(cfg("liquidity.near5.leg", 0.45)))
+    MAX_LEG_SPREAD_NEAR2 = env_float("MAX_LEG_SPREAD_NEAR2", float(cfg("liquidity.near2.leg", 0.60)))
+    MAX_LEG_SPREAD_NEAR1 = env_float("MAX_LEG_SPREAD_NEAR1", float(cfg("liquidity.near1.leg", 0.70)))
+    SPREAD_RETRIES  = env_int("SPREAD_RETRIES", int(cfg("liquidity.retries", 3)))
+    SPREAD_WAIT_MS  = env_int("SPREAD_WAIT_MS", int(cfg("liquidity.wait_ms", 250)))
+    BYPASS_WIDE_SPREAD_NEAR_MIN = env_int("BYPASS_WIDE_SPREAD_NEAR_MIN", int(cfg("liquidity.bypass_wide_spread_near_min", 2)))
 
-    SPREAD_RETRIES  = env_int("SPREAD_RETRIES", 3)   # additional quote polls if wide
-    SPREAD_WAIT_MS  = env_int("SPREAD_WAIT_MS", 250)
+    EMERGENCY_MIN_TO_CLOSE = env_int("EMERGENCY_MIN_TO_CLOSE", int(cfg("ladder.emergency_min_to_close", 2)))
+    CANCEL_IF_UNFILLED = env_bool("CANCEL_IF_UNFILLED", bool(cfg("ladder.cancel_if_unfilled", True)))
 
-    # bypass if we're *really* close to options cut-off
-    BYPASS_WIDE_SPREAD_NEAR_MIN = env_int("BYPASS_WIDE_SPREAD_NEAR_MIN", 2)
+    FRESH_MIN = env_int("FRESH_MIN", int(cfg("policy.fresh_min", 120)))
+    ENFORCE_EXPIRY_TOMORROW = env_bool("ENFORCE_EXPIRY_TOMORROW", bool(cfg("policy.enforce_expiry_tomorrow", True)))
 
-    # last-ditch price escalation when time is almost out
-    EMERGENCY_MIN_TO_CLOSE = env_int("EMERGENCY_MIN_TO_CLOSE", 2)
+    # --- Schwab client (skip network in DRY_RUN) ---
+    c = None
+    acct_hash = ""
+    if not DRY_RUN:
+        c = make_client(app_key, app_secret, token_json)
+        acct_hash = env_str("SCHWAB_ACCT_HASH", "")
+        if not acct_hash:
+            r=c.get_account_numbers(); r.raise_for_status()
+            acct=r.json()[0]; acct_hash=acct["hashValue"]
 
-    CANCEL_IF_UNFILLED = env_bool("CANCEL_IF_UNFILLED", True)
-
-    # --- Schwab client ---
-    c = make_client(app_key, app_secret, token_json)
-
-    # account hash
-    acct_hash = env_str("SCHWAB_ACCT_HASH", "")
-    if not acct_hash:
-        r=c.get_account_numbers(); r.raise_for_status()
-        acct=r.json()[0]; acct_hash=acct["hashValue"]
-
-    # SPX last
+    # SPX last (skip network in DRY_RUN)
     def spx_last():
+        if DRY_RUN: return "SIM"
         for sym in ["$SPX.X","SPX","SPX.X","$SPX"]:
             try:
                 q=c.get_quote(sym)
@@ -331,15 +343,14 @@ def main():
         return ""
     last_px=spx_last()
 
-    # Sheets
+    # Sheets client
     creds=service_account.Credentials.from_service_account_info(json.loads(sa_json), scopes=["https://www.googleapis.com/auth/spreadsheets"])
     s=build("sheets","v4",credentials=creds)
     schwab_sheet_id=ensure_header_and_get_sheetid(s, sheet_id, SCHWAB_TAB, SCHWAB_HEADERS)
 
-    # Kill too-early runs regardless of env (safety)
-    if minutes_to_option_close() > 10:
-        # Log and exit quietly; ensures scheduled drifts can't place at 4:10.
-        def _log_skip(msg):  # local to avoid duplicating helpers
+    # Hard kill too-early scheduled runs (prod only)
+    if not DRY_RUN and minutes_to_option_close() > 10:
+        def _log_skip(msg):
             top_insert(s, sheet_id, schwab_sheet_id)
             s.spreadsheets().values().update(
                 spreadsheetId=sheet_id, range=f"{SCHWAB_TAB}!A2",
@@ -351,7 +362,7 @@ def main():
                 ]]}
             ).execute()
         _log_skip(f"TOO_EARLY mins_to_close={minutes_to_option_close():.2f}")
-        print("TOO_EARLY", minutes_to_option_close()); sys.exit(0)
+        sys.exit(0)
 
     two=s.spreadsheets().values().get(spreadsheetId=sheet_id, range=f"{LEO_TAB}!A1:AG2").execute().get("values",[])
     if len(two)<2:
@@ -385,15 +396,14 @@ def main():
         exp_d=date.fromisoformat(g("expiry")) if g("expiry") else None
     except:
         sig_d=exp_d=None
-    if age_min is None or age_min>env_int("FRESH_MIN", 120): log_and_exit("SCHWAB_ERROR", f"STALE_OR_NO_TS age_min={age_min}")
-    if env_bool("ENFORCE_EXPIRY_TOMORROW", True) and sig_d and exp_d:
+    if age_min is None or age_min>FRESH_MIN: log_and_exit("SCHWAB_ERROR", f"STALE_OR_NO_TS age_min={age_min}")
+    if ENFORCE_EXPIRY_TOMORROW and sig_d and exp_d:
         expected = next_trading_day(sig_d)
         if exp_d != expected: log_and_exit("SCHWAB_ERROR", f"DATE_MISMATCH sig={g('signal_date')} exp={g('expiry')} (expected {expected})")
 
     # --- legs ---
     raw_legs=[g("occ_buy_put"), g("occ_sell_put"), g("occ_sell_call"), g("occ_buy_call")]
     if not all(raw_legs): log_and_exit("SCHWAB_ERROR","MISSING_LEGS")
-
     try:
         leg_syms = [to_schwab_opt(x) for x in raw_legs]
     except Exception as e:
@@ -440,11 +450,11 @@ def main():
 
     if SIZE_MODE=="PCT_BP":
         bp = OPT_BP_OVERRIDE if OPT_BP_OVERRIDE and OPT_BP_OVERRIDE>0 else None
-        if bp is None:
+        if (bp is None) and (not DRY_RUN):
             try:
                 url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}"
-                rr=c.session.get(url)
-                if rr.status_code==200:
+                rr=(c.session.get(url) if c else None)
+                if rr and rr.status_code==200:
                     j=rr.json()
                     if isinstance(j,list): j=j[0]
                     sa=j.get("securitiesAccount") or j
@@ -487,6 +497,16 @@ def main():
             if leg is not None: leg = max(leg, MAX_LEG_SPREAD_NEAR5)
         return net, leg, mins
 
+    # quotes (real or simulated)
+    legs_ba = (None,)*8
+    if SIM_QUOTES:
+        mid = SIM_MID if (not math.isnan(SIM_MID)) else (rec_condor if rec_condor is not None else (CREDIT_START if is_credit else DEBIT_START))
+        spread = SIM_SPREAD if (not math.isnan(SIM_SPREAD)) else 0.30
+        net_bid = max(0.01, mid - spread/2.0)
+        net_ask = max(net_bid + 0.01, mid + spread/2.0)
+    else:
+        mid, net_bid, net_ask, legs_ba = compute_mid_condor(c, leg_syms)
+
     def passes_liquidity(mid, net_bid, net_ask, legs_ba) -> tuple[bool,str,float,float]:
         net_th, leg_th, mins = dynamic_limits()
         if mid is None or net_bid is None or net_ask is None:
@@ -501,22 +521,21 @@ def main():
                 return (False, f"LEG_SPREAD_EXCEEDS {worst:.2f}>{leg_th:.2f} (mins_to_close={mins:.2f})", net_th, mins)
         return (True, "OK", net_th, mins)
 
-    # get quotes with retries
+    # retries
     ok=False; info=""; net_th=MAX_NET_SPREAD_BASE; mins_left=999.0
     for i in range(max(1, SPREAD_RETRIES+1)):
-        mid, net_bid, net_ask, legs_ba = compute_mid_condor(c, leg_syms)
         ok, info, net_th, mins_left = passes_liquidity(mid, net_bid, net_ask, legs_ba)
         if ok: break
-        if i < SPREAD_RETRIES:
+        if i < SPREAD_RETRIES and not SIM_QUOTES:
             time.sleep(max(1, SPREAD_WAIT_MS)/1000.0)
+            mid, net_bid, net_ask, legs_ba = compute_mid_condor(c, leg_syms)
     if not ok:
-        # near cutoff? optionally bypass guard so you don't miss the trade
         if BYPASS_WIDE_SPREAD_NEAR_MIN>0 and mins_left <= BYPASS_WIDE_SPREAD_NEAR_MIN:
             print("WIDE_SPREAD_BYPASS", info)
         else:
             log_and_exit("SCHWAB_SKIP", info)
 
-    # rung prices (clamped & snapped to next tick)
+    # rung prices
     def clamp_credit(x): return clamp_and_snap(x, CREDIT_FLOOR, CREDIT_START, TICK)
     def clamp_debit(x):  return clamp_and_snap(x, 0.01, DEBIT_CEIL, TICK)
     if is_credit:
@@ -530,8 +549,27 @@ def main():
         stage3_base = None if mid is None else (mid + OFFSET_DEBIT)
         stage3_price= clamp_debit(stage3_base)
 
-    # ---------- pre-claim broker guard ----------
-    if has_open_order_for_legs(c, acct_hash, leg_syms):
+    # order plan artifact for visibility
+    order_plan = {
+        "is_credit": is_credit,
+        "width": width,
+        "qty": qty_exec,
+        "minutes_to_close": minutes_to_option_close(),
+        "dynamic_limits": {"net": net_th},
+        "quotes": {"net_bid": net_bid, "net_ask": net_ask, "mid": mid, "sim": SIM_QUOTES},
+        "rungs": [
+            {"stage":1, "price": start_price},
+            {"stage":2, "price": rec_price},
+            {"stage":3, "price": stage3_price},
+            {"stage":"emergency", "price": (CREDIT_FLOOR if is_credit else DEBIT_CEIL)}
+        ]
+    }
+    try:
+        with open("order_plan.json","w") as f: json.dump(order_plan, f, indent=2)
+    except: pass
+
+    # ---------- guards ----------
+    if not DRY_RUN and has_open_order_for_legs(c, acct_hash, leg_syms):
         log_and_exit("SCHWAB_SKIP", "OPEN_ORDER_EXISTS (pre-claim)", qty_exec)
 
     # ---------- claim ----------
@@ -555,24 +593,23 @@ def main():
         ]]}
     ).execute()
 
-    ok_claim=False
-    for _ in range(10):
-        head=s.spreadsheets().values().get(spreadsheetId=sheet_id, range=f"{SCHWAB_TAB}!A2:P12").execute().get("values",[])
-        if head:
-            r=head[0]
-            if len(r)>=16 and r[1].upper()=="SCHWAB_CLAIM" and r[14]==run_id and r[15].upper()==fingerprint.upper():
-                ok_claim=True; break
-        time.sleep(0.2)
-    if not ok_claim:
-        print("CLAIM_RACE: another run holds the lock → exiting.")
-        sys.exit(0)
+    if not DRY_RUN:
+        ok_claim=False
+        for _ in range(10):
+            head=s.spreadsheets().values().get(spreadsheetId=sheet_id, range=f"{SCHWAB_TAB}!A2:P12").execute().get("values",[])
+            if head:
+                r=head[0]
+                if len(r)>=16 and r[1].upper()=="SCHWAB_CLAIM" and r[14]==run_id and r[15].upper()==fingerprint.upper():
+                    ok_claim=True; break
+            time.sleep(0.2)
+        if not ok_claim:
+            print("CLAIM_RACE: another run holds the lock → exiting."); sys.exit(0)
+        time.sleep(0.6)
+        if has_open_order_for_legs(c, acct_hash, leg_syms):
+            log_and_exit("SCHWAB_SKIP", "OPEN_ORDER_EXISTS (post-claim)", qty_exec)
 
-    # ---------- post-claim broker guard ----------
-    time.sleep(0.6)
-    if has_open_order_for_legs(c, acct_hash, leg_syms):
-        log_and_exit("SCHWAB_SKIP", "OPEN_ORDER_EXISTS (post-claim)", qty_exec)
-
-    # ---------- ladder ----------
+    # ---------- ladder (real or simulated) ----------
+    sim = {"stage":0, "filled":False, "oid":"SIM-0"}
     def build_order(price: float, q: int):
         return {
             "orderType": order_type, "session":"NORMAL", "price": f"{price:.2f}",
@@ -587,6 +624,9 @@ def main():
         }
 
     def place(order_price: float):
+        if DRY_RUN:
+            sim["stage"]=1; sim["oid"]="SIM-1"; sim["filled"]=(SIM_FILL_ON_STAGE==1)
+            return (200, sim["oid"], f"{order_price:.2f}")
         order = build_order(order_price, qty_exec)
         r = c.place_order(acct_hash, order)
         oid = ""
@@ -598,6 +638,11 @@ def main():
         return (r.status_code, oid, order["price"])
 
     def replace(oid: str, new_price: float):
+        if DRY_RUN:
+            sim["stage"] += 1
+            sim["oid"] = f"SIM-{sim['stage']}"
+            if SIM_FILL_ON_STAGE == sim["stage"]: sim["filled"]=True
+            return (200, sim["oid"], f"{new_price:.2f}")
         lo = CREDIT_FLOOR if is_credit else 0.01
         hi = CREDIT_START if is_credit else DEBIT_CEIL
         new_price = clamp_and_snap(new_price, lo, hi, TICK)
@@ -614,6 +659,8 @@ def main():
         return (r.status_code, new_id, f"{new_price:.2f}")
 
     def cancel(oid: str):
+        if DRY_RUN:
+            return 200
         try:
             url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
             r=c.session.delete(url)
@@ -624,6 +671,8 @@ def main():
             return None
 
     def status(oid: str):
+        if DRY_RUN:
+            return (200, "FILLED" if sim["filled"] else "WORKING")
         try:
             url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
             r=c.session.get(url)
@@ -657,11 +706,9 @@ def main():
             if st and str(st).upper()=="FILLED": filled=True; break
             time.sleep(1)
 
-    # emergency: if we are basically out of time, push to your acceptable floor/ceil
     if not filled and EMERGENCY_MIN_TO_CLOSE>0 and minutes_to_option_close() <= EMERGENCY_MIN_TO_CLOSE:
         emerg_price = (CREDIT_FLOOR if is_credit else DEBIT_CEIL)
         rc, oid, price_used = replace(oid, emerg_price)
-        # wait remaining time but leave ~10s buffer
         rem = max(0, minutes_to_option_close()*60 - 10)
         end4 = time.time() + min(STAGE_SEC, rem)
         while time.time() < end4:
@@ -669,16 +716,22 @@ def main():
             if st and str(st).upper()=="FILLED": filled=True; break
             time.sleep(1)
 
-    rc, st = status(oid)
-    final_status = st or sc
+    final_status = "FILLED" if filled else "WORKING"
+    if not DRY_RUN:
+        rc, st = status(oid)
+        final_status = st or sc
 
     if not filled and CANCEL_IF_UNFILLED and oid:
         cancel(oid)
-        rc, st = status(oid)
-        final_status = st or final_status
+        if not DRY_RUN:
+            rc, st = status(oid)
+            final_status = st or final_status
+        else:
+            final_status = "CANCELED"
 
     log_top("SCHWAB_PLACED" if filled else "SCHWAB_ORDER", str(final_status), qty_exec, oid, price_used)
     print("FINAL_STATUS", final_status, "ORDER_ID", oid, "PRICE_USED", price_used)
+    print("ORDER_PLAN_PATH", "order_plan.json")
 
 if __name__ == "__main__":
     main()
