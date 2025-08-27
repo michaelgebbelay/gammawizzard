@@ -8,11 +8,11 @@ from googleapiclient.discovery import build
 # schwab-py
 from schwab.auth import client_from_token_file
 
-# market clock (for expiry check / optional emergency)
+# market clock (for expiry guard, optional emergency)
 import pytz
 import pandas_market_calendars as mcal
 
-__VERSION__ = "2025-08-27r"
+__VERSION__ = "2025-08-27v"
 
 LEO_TAB    = "leocross"
 SCHWAB_TAB = "schwab"
@@ -65,7 +65,6 @@ def todays_equity_close_et() -> datetime | None:
     return sched['market_close'].iloc[0].to_pydatetime()
 
 def minutes_to_option_close() -> float:
-    """Used only for optional emergency rung and logging."""
     close = todays_equity_close_et()
     if close is None: return 1e9
     opt_close = close + timedelta(minutes=15)
@@ -121,7 +120,7 @@ def compute_mid_condor(c, legs_osi: list):
     net_bid=(sp_bid+sc_bid)-(bp_ask+bc_ask)
     net_ask=(sp_ask+sc_ask)-(bp_bid+bc_bid)
     mid=(net_bid+net_ask)/2.0
-    return (mid, net_bid, net_ask, (bp_bid,bp_ask,sp_bid,sp_ask,sc_bid,sc_ask,bc_bid,bc_ask))
+    return (mid, net_bid, net_ask, (bp_bid,bp_ask,sp_bid,sp_ask,sc_bid,sc_ask,bc_ask))
 
 # ---------- sheets ----------
 def ensure_header_and_get_sheetid(svc, spreadsheet_id: str, tab: str, header: list):
@@ -158,14 +157,32 @@ def next_trading_day(d: date) -> date:
         nd += timedelta(days=1)
     return nd
 
-def ceil_to_tick(x: float, tick: float)->float:
+# ---------- price helpers (strict 0.05 tick) ----------
+def snap_to_tick(x: float, tick: float)->float:
     if x is None: return None
-    return round(math.ceil((x + 1e-12)/tick)*tick, 2)
-def clamp_and_snap(x: float, lo: float, hi: float, tick: float)->float:
+    # Half-up rounding to tick (avoids banker's rounding)
+    n = int(math.floor((x / tick) + 0.5))
+    return round(n * tick, 2)
+
+def clamp_credit(x: float, tick: float, width: float)->float:
     if x is None: return None
-    y = max(lo, min(hi, x))
-    y = ceil_to_tick(y, tick)
-    return max(lo, min(hi, y))
+    hi = max(tick, width - tick)  # broker won't allow >= width
+    y  = snap_to_tick(x, tick)
+    return max(tick, min(hi, y))
+
+def clamp_debit(x: float, tick: float, width: float)->float:
+    if x is None: return None
+    hi = max(tick, width - tick)
+    y  = snap_to_tick(x, tick)
+    return max(tick, min(hi, y))
+
+def dedupe(seq):
+    out=[]; seen=set()
+    for v in seq:
+        if v is None: continue
+        if v not in seen:
+            seen.add(v); out.append(v)
+    return out
 
 # ---------- broker open‑order guard ----------
 def has_open_order_for_legs(c, acct_hash: str, legs_osi: list) -> bool:
@@ -255,11 +272,11 @@ def main():
     sheet_id   = env_or_die("GSHEET_ID")
     sa_json    = env_or_die("GOOGLE_SERVICE_ACCOUNT_JSON")
 
-    # timing + ladder
-    STAGE_SEC = env_int("STAGE_SEC", 45)     # give each rung real time to work
-    TICK      = env_float("TICK", 0.05)
-    EMERGENCY_MIN_TO_CLOSE = env_int("EMERGENCY_MIN_TO_CLOSE", 2)  # optional; leave as-is
+    # timing & behavior
+    STAGE_SEC = env_int("STAGE_SEC", 45)   # let each rung work
+    TICK      = env_float("TICK", 0.05)    # SPX
     CANCEL_IF_UNFILLED = env_bool("CANCEL_IF_UNFILLED", True)
+    EMERGENCY_MIN_TO_CLOSE = env_int("EMERGENCY_MIN_TO_CLOSE", 0)  # 0 disables emergency replace
 
     # sizing (unchanged)
     SIZE_MODE        = env_str("SIZE_MODE","STATIC").upper()
@@ -274,7 +291,7 @@ def main():
     MAX_RISK_PER_TRADE = env_float("MAX_RISK_PER_TRADE", -1.0)
     HARD_QTY_CUTOFF    = env_int("HARD_QTY_CUTOFF", 20)
 
-    # Schwab
+    # Schwab client
     c = make_client(app_key, app_secret, token_json)
     acct_hash = env_str("SCHWAB_ACCT_HASH", "")
     if not acct_hash:
@@ -324,7 +341,7 @@ def main():
     def log_and_exit(src: str, msg: str, qty_val: int = 0):
         log_top(src, msg, qty_val, "", ""); print(msg); sys.exit(0)
 
-    # recency & dates (keep safety)
+    # freshness/expiry guards (keep)
     ts = parse_iso(g("ts")); age_min=(datetime.now(timezone.utc)-ts).total_seconds()/60.0 if ts else None
     try:
         sig_d=date.fromisoformat(g("signal_date")) if g("signal_date") else None
@@ -383,12 +400,8 @@ def main():
     rec_put=fnum(g("rec_put")); rec_call=fnum(g("rec_call"))
     rec_condor=fnum(g("rec_condor")) if g("rec_condor")!="" else (None if (rec_put is None or rec_call is None) else (rec_put+rec_call))
 
-    # mid (best-effort; no liquidity guard)
-    mid, _, _, _ = compute_mid_condor(client_from_token_file, leg_syms) if False else (None,None,None,None)  # placeholder
-    try:
-        mid, _, _, _ = compute_mid_condor(make_client(app_key, app_secret, token_json), leg_syms)
-    except Exception:
-        mid = None
+    # mid (best-effort; no guards)
+    mid, _, _, _ = compute_mid_condor(c, leg_syms)
 
     # ---------- sizing ----------
     qty_sheet = int((g("qty_exec") or "1"))
@@ -409,13 +422,11 @@ def main():
         if bp is not None:
             alloc = CREDIT_ALLOC_PCT if is_credit else DEBIT_ALLOC_PCT
             budget = max(bp*alloc, 0.0)
-            if MAX_RISK_PER_TRADE and MAX_RISK_PER_TRADE>0:
-                budget = min(budget, MAX_RISK_PER_TRADE)
-            risk_per_ct = RISK_PER_CONTRACT_CREDIT if is_credit else RISK_PER_CONTRACT_DEBIT
+            if MAX_RISK_PER_TRADE and MAX_RISK_PER_TRADE>0: budget = min(budget, MAX_RISK_PER_TRADE)
+            risk_per_ct = (RISK_PER_CONTRACT_CREDIT if is_credit else RISK_PER_CONTRACT_DEBIT)
             risk_per_ct = max(risk_per_ct, 1.0)
             qty_exec = max(1, int(budget // risk_per_ct))
-            print(f"SIZING PCT_BP bp={bp:.2f} alloc={alloc:.4f} budget={budget:.2f} "
-                  f"risk_per_ct={risk_per_ct:.2f} -> qty={qty_exec}")
+            print(f"SIZING PCT_BP bp={bp:.2f} alloc={alloc:.4f} budget={budget:.2f} risk_per_ct={risk_per_ct:.2f} -> qty={qty_exec}")
         else:
             print("WARN: could not fetch option buying power; using sheet qty.")
 
@@ -424,47 +435,38 @@ def main():
     if HARD_QTY_CUTOFF>0 and qty_exec > HARD_QTY_CUTOFF:
         log_and_exit("SCHWAB_ABORT", f"QTY_ABOVE_HARD_CUTOFF computed={qty_exec} cutoff={HARD_QTY_CUTOFF}", qty_exec)
 
-    # ---------- fixed ladder (your spec) ----------
-    # Helpers
-    def snap_credit(x):
-        if x is None: return None
-        # Credit cannot exceed width - tick; cannot be negative
-        hi = max(TICK, width - TICK)
-        return clamp_and_snap(x, TICK, hi, TICK)
-    def snap_debit(x):
-        if x is None: return None
-        # Debit cannot exceed width - tick either
-        hi = max(TICK, width - TICK)
-        return clamp_and_snap(x, TICK, hi, TICK)
-
-    prices = []
+    # ---------- FIXED LADDER (exact order, strict 0.05 tick) ----------
     if is_credit:
-        # Stage order: Leo rec → 2.20 → mid → mid - 0.05
-        candidates = [
-            rec_condor,
-            2.20,
-            mid,
-            (None if mid is None else (mid - 0.05)),
+        # CREDIT: 2.20 → Leo rec → mid → mid-0.05
+        raw = [ 2.20,
+                rec_condor,
+                mid,
+                (None if mid is None else mid - 0.05) ]
+        rungs = [
+            clamp_credit(raw[0], TICK, width),
+            clamp_credit(raw[1], TICK, width) if raw[1] is not None else None,
+            clamp_credit(raw[2], TICK, width) if raw[2] is not None else None,
+            clamp_credit(raw[3], TICK, width) if raw[3] is not None else None,
         ]
-        for p in candidates:
-            p = snap_credit(p)
-            if p is not None and p not in prices:
-                prices.append(p)
     else:
-        # Stage order: 1.80 → Leo rec → mid → mid + 0.05
-        candidates = [
-            1.80,
-            rec_condor,
-            mid,
-            (None if mid is None else (mid + 0.05)),
+        # DEBIT (unchanged): 1.80 → Leo rec → mid → mid+0.05
+        raw = [ 1.80,
+                rec_condor,
+                mid,
+                (None if mid is None else mid + 0.05) ]
+        rungs = [
+            clamp_debit(raw[0], TICK, width),
+            clamp_debit(raw[1], TICK, width) if raw[1] is not None else None,
+            clamp_debit(raw[2], TICK, width) if raw[2] is not None else None,
+            clamp_debit(raw[3], TICK, width) if raw[3] is not None else None,
         ]
-        for p in candidates:
-            p = snap_debit(p)
-            if p is not None and p not in prices:
-                prices.append(p)
 
+    # Keep order but drop Nones / dups after snapping/clamping
+    prices = dedupe([p for p in rungs if p is not None])
     if not prices:
         log_and_exit("SCHWAB_ERROR", "NO_VALID_PRICES_AFTER_SNAP")
+
+    print("RUNG_PLAN", prices)  # visible in Actions log
 
     # ---------- pre-claim guard ----------
     if has_open_order_for_legs(c, acct_hash, leg_syms):
@@ -491,7 +493,7 @@ def main():
         ]]}
     ).execute()
 
-    # ---------- build / place / replace ----------
+    # ---------- place/replace ladder ----------
     def build_order(price: float, q: int):
         return {
             "orderType": ("NET_CREDIT" if is_credit else "NET_DEBIT"),
@@ -548,12 +550,9 @@ def main():
             j=r.json(); return (r.status_code, (j.get("status") or j.get("orderStatus")))
         except: return (None,None)
 
-    # stage helpers (also log each rung to the sheet)
-    def log_rung(tag: str, oid: str, price_used: str):
-        log_top(tag, "WORKING", qty_exec, oid, price_used)
-
     # Stage 1
-    sc, oid, price_used = place(prices[0]); log_rung("SCHWAB_WORKING_S1", oid, price_used)
+    sc, oid, price_used = place(prices[0])
+    log_top("SCHWAB_WORKING_S1", "WORKING", qty_exec, oid, price_used)
     filled=False
     end = time.time() + STAGE_SEC
     while time.time() < end:
@@ -561,11 +560,12 @@ def main():
         if st and str(st).upper()=="FILLED": filled=True; break
         time.sleep(1)
 
-    # Remaining stages
+    # Stages 2..n
     stage_idx = 2
     for p in prices[1:]:
         if filled: break
-        rc, oid, price_used = replace(oid, p); log_rung(f"SCHWAB_REPLACE_S{stage_idx}", oid, price_used)
+        rc, oid, price_used = replace(oid, p)
+        log_top(f"SCHWAB_REPLACE_S{stage_idx}", "WORKING", qty_exec, oid, price_used)
         end = time.time() + STAGE_SEC
         while time.time() < end:
             _, st = status(oid)
@@ -573,10 +573,10 @@ def main():
             time.sleep(1)
         stage_idx += 1
 
-    # Optional emergency push at the very end of the session (off-hours this will just queue)
+    # Optional emergency (disabled unless EMERGENCY_MIN_TO_CLOSE>0)
     if not filled and EMERGENCY_MIN_TO_CLOSE>0 and minutes_to_option_close() <= EMERGENCY_MIN_TO_CLOSE:
-        emerg_price = prices[-1]  # last rung already most aggressive per your sequence
-        rc, oid, price_used = replace(oid, emerg_price); log_rung("SCHWAB_REPLACE_EMERGENCY", oid, price_used)
+        rc, oid, price_used = replace(oid, prices[-1])
+        log_top("SCHWAB_REPLACE_EMERGENCY", "WORKING", qty_exec, oid, price_used)
         end = time.time() + STAGE_SEC
         while time.time() < end:
             _, st = status(oid)
@@ -591,9 +591,9 @@ def main():
         rc, st = status(oid)
         final_status = st or final_status
 
-    # Final log
     log_top("SCHWAB_PLACED" if filled else "SCHWAB_ORDER", str(final_status), qty_exec, oid, price_used)
     print("FINAL_STATUS", final_status, "ORDER_ID", oid, "PRICE_USED", price_used)
+    print("DONE_RUNG_PLAN", prices)
 
 if __name__ == "__main__":
     main()
