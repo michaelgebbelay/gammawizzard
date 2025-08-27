@@ -19,7 +19,7 @@ jobs:
   place:
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@v4
@@ -28,90 +28,61 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install gate deps
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install --quiet pandas-market-calendars pytz
+          pip install --quiet schwab-py google-api-python-client google-auth google-auth-httplib2 pandas-market-calendars pytz
 
-      - name: Time gate (auto early-close aware)
+      - name: Time gate (SOFT; bypassable)
         id: gate
         env:
           BYPASS_TIME_GATE: ${{ vars.BYPASS_TIME_GATE }}
-          GATE_WINDOW_MIN: 3
+          GATE_WINDOW_MIN: 15
           GATE_TARGET_OFFSET_MIN: 12
         run: |
           python - <<'PY'
-          import os, datetime as dt, pytz
+          import os, time, datetime as dt, pytz
           import pandas_market_calendars as mcal
+          # Hard bypass if BYPASS_TIME_GATE=1
+          if (os.environ.get('BYPASS_TIME_GATE','') == '1'):
+              print("GATE BYPASS"); 
+              with open(os.environ['GITHUB_OUTPUT'],'a') as fh: fh.write("ok=true\n")
+              raise SystemExit(0)
           et = pytz.timezone('America/New_York')
           now = dt.datetime.now(et)
-          window = int(os.environ.get('GATE_WINDOW_MIN','3'))
+          window = int(os.environ.get('GATE_WINDOW_MIN','15'))
           offset = int(os.environ.get('GATE_TARGET_OFFSET_MIN','12'))
-          bypass = os.environ.get('BYPASS_TIME_GATE','') == '1'
-          ok=False; target=None; is_early='false'; reason=''
-          if bypass:
-              ok=True; reason='BYPASS'
+          nyse = mcal.get_calendar('XNYS')
+          sched = nyse.schedule(start_date=now.date(), end_date=now.date(), tz='America/New_York')
+          ok=False
+          if not sched.empty:
+              close = sched['market_close'].iloc[0]
+              target = close + dt.timedelta(minutes=offset)
+              diff = abs((now - target).total_seconds())/60.0
+              ok = (diff <= window)       # soft gate, symmetric
+              print("GATE", "ok" if ok else "skip", f"diff={diff:.2f}m target={target.strftime('%H:%M')}")
           else:
-              nyse = mcal.get_calendar('XNYS')
-              sched = nyse.schedule(start_date=now.date(), end_date=now.date(), tz='America/New_York')
-              if sched.empty:
-                  reason='NOT_TRADING_DAY'
-              else:
-                  close = sched['market_close'].iloc[0]
-                  target = close + dt.timedelta(minutes=offset)
-                  is_early = 'true' if close.hour < 16 else 'false'
-                  diff = abs((now - target).total_seconds())/60.0
-                  ok = diff <= window
-                  reason = f'diff={diff:.2f}min target={target.strftime("%H:%M")}'
-          out = os.environ['GITHUB_OUTPUT']
-          with open(out,'a') as fh:
-              fh.write(f"ok={'true' if ok else 'false'}\n")
-              fh.write(f"is_early_close={is_early}\n")
-              fh.write(f"target_hhmm={(target.strftime('%H:%M') if target else '')}\n")
-              fh.write(f"reason={reason}\n")
-          print("GATE", "ok" if ok else "skip", "is_early", is_early, "target", (target.strftime('%H:%M') if target else 'NA'), reason)
+              print("GATE skip NOT_TRADING_DAY")
+          with open(os.environ['GITHUB_OUTPUT'],'a') as fh: fh.write(f"ok={'true' if ok else 'false'}\n")
           PY
-
-      - name: Install trading deps
-        if: ${{ steps.gate.outputs.ok == 'true' }}
-        run: |
-          python -m pip install --upgrade pip
-          pip install --quiet schwab-py google-api-python-client google-auth google-auth-httplib2
-
-      # Safety hotfix in case any old copy still uses api_secret=
-      - name: Hotfix (ensure app_secret kwarg)
-        if: ${{ steps.gate.outputs.ok == 'true' }}
-        run: sed -i 's/api_secret=/app_secret=/g' scripts/schwab_place_order.py || true
 
       - name: Place SPXW order from leocross!A2 and log at schwab!A2
         if: ${{ steps.gate.outputs.ok == 'true' }}
         env:
-          # --- Required secrets ---
+          # Required secrets
           SCHWAB_APP_KEY:    ${{ secrets.SCHWAB_APP_KEY }}
           SCHWAB_APP_SECRET: ${{ secrets.SCHWAB_APP_SECRET }}
           SCHWAB_TOKEN_JSON: ${{ secrets.SCHWAB_TOKEN_JSON }}
           GSHEET_ID:         ${{ secrets.GSHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-
-          # --- Optional account selection ---
-          SCHWAB_ACCT_HASH: ${{ vars.SCHWAB_ACCT_HASH }}
-
-          # --- Arm the placer ---
-          SCHWAB_PLACE: ${{ vars.SCHWAB_PLACE || 'place' }}
-
-          # --- Ladder timing & tick ---
-          STAGE_SEC: ${{ vars.STAGE_SEC || 60 }}
+          # Optional account selection
+          SCHWAB_ACCT_HASH:  ${{ vars.SCHWAB_ACCT_HASH }}
+          # Arm
+          SCHWAB_PLACE: place
+          # Ladder timing
+          STAGE_SEC: ${{ vars.STAGE_SEC || 45 }}
           TICK: 0.05
-
-          # --- Pricing rails (2x for condor) ---
-          CREDIT_START_PERLEG:   ${{ vars.CREDIT_START_PERLEG || 1.10 }}
-          CREDIT_FLOOR_PERLEG:   ${{ vars.CREDIT_FLOOR_PERLEG || 0.95 }}
-          DEBIT_START_PERLEG:    ${{ vars.DEBIT_START_PERLEG  || 0.90 }}
-          DEBIT_CEIL_PERLEG:     ${{ vars.DEBIT_CEIL_PERLEG   || 1.05 }}
-          OFFSET_PERLEG_CREDIT:  ${{ vars.OFFSET_PERLEG_CREDIT || -0.05 }}
-          OFFSET_PERLEG_DEBIT:   ${{ vars.OFFSET_PERLEG_DEBIT  ||  0.05 }}
-
-          # --- Sizing (risk-per-contract) ---
+          # Sizing
           SIZE_MODE:        ${{ vars.SIZE_MODE || 'PCT_BP' }}
           CREDIT_ALLOC_PCT: ${{ vars.CREDIT_ALLOC_PCT || 0.06 }}
           DEBIT_ALLOC_PCT:  ${{ vars.DEBIT_ALLOC_PCT  || 0.02 }}
@@ -123,16 +94,15 @@ jobs:
           HARD_QTY_CUTOFF:  ${{ vars.HARD_QTY_CUTOFF || 10 }}
           BP_SOURCE:        ${{ vars.BP_SOURCE || 'OPTION' }}
           OPT_BP_OVERRIDE:  ${{ vars.OPT_BP_OVERRIDE || 0 }}
-
-          # --- Guards ---
+          # Guards still active (freshness/expiry), but NO liquidity checks in code
           FRESH_MIN:               ${{ vars.FRESH_MIN || 120 }}
           ENFORCE_EXPIRY_TOMORROW: ${{ vars.ENFORCE_EXPIRY_TOMORROW || 'true' }}
-          MAX_LEG_SPREAD:          ${{ vars.MAX_LEG_SPREAD || 0.30 }}
-          MAX_NET_SPREAD:          ${{ vars.MAX_NET_SPREAD || 0.30 }}
-          CANCEL_IF_UNFILLED:      ${{ vars.CANCEL_IF_UNFILLED || 'true' }}
+          # Optional: emergency & cancel
+          EMERGENCY_MIN_TO_CLOSE: ${{ vars.EMERGENCY_MIN_TO_CLOSE || 2 }}
+          CANCEL_IF_UNFILLED:     ${{ vars.CANCEL_IF_UNFILLED || 'true' }}
         run: |
           python scripts/schwab_place_order.py
 
       - name: Skipped (outside gate)
         if: ${{ steps.gate.outputs.ok != 'true' }}
-        run: echo "Not within gate window; no order placed."
+        run: echo "Outside soft gate (set BYPASS_TIME_GATE=1 to force)."
