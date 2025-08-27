@@ -5,14 +5,12 @@ from datetime import datetime, timezone, date, timedelta
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-# schwab-py
 from schwab.auth import client_from_token_file
 
-# market clock (for expiry guard, optional emergency)
 import pytz
 import pandas_market_calendars as mcal
 
-__VERSION__ = "2025-08-27v"
+__VERSION__ = "2025-08-27z"
 
 LEO_TAB    = "leocross"
 SCHWAB_TAB = "schwab"
@@ -24,7 +22,7 @@ SCHWAB_HEADERS = [
     "order_id","status"
 ]
 
-# ---------- env helpers ----------
+# ---------------- env helpers ----------------
 def env_or_die(name: str) -> str:
     v = os.environ.get(name)
     if not v:
@@ -52,7 +50,7 @@ def env_bool(name: str, default: bool) -> bool:
     if s is None: return default
     return str(s).strip().lower() in ("1","true","yes","y","on")
 
-# ---------- time helpers ----------
+# ---------------- time helpers ----------------
 _ET = pytz.timezone("America/New_York")
 def now_et() -> datetime:
     return datetime.now(_ET)
@@ -70,7 +68,7 @@ def minutes_to_option_close() -> float:
     opt_close = close + timedelta(minutes=15)
     return (opt_close - now_et()).total_seconds() / 60.0
 
-# ---------- symbol/quotes ----------
+# ---------------- symbols / quotes ----------------
 def to_schwab_opt(sym: str) -> str:
     raw = (sym or "").strip().upper()
     if raw.startswith("."): raw = raw[1:]
@@ -120,9 +118,9 @@ def compute_mid_condor(c, legs_osi: list):
     net_bid=(sp_bid+sc_bid)-(bp_ask+bc_ask)
     net_ask=(sp_ask+sc_ask)-(bp_bid+bc_bid)
     mid=(net_bid+net_ask)/2.0
-    return (mid, net_bid, net_ask, (bp_bid,bp_ask,sp_bid,sp_ask,sc_bid,sc_ask,bc_ask))
+    return (mid, net_bid, net_ask, (bp_bid,bp_ask,sp_bid,sp_ask,sc_bid,sc_ask,bc_bid,bc_ask))
 
-# ---------- sheets ----------
+# ---------------- sheets ----------------
 def ensure_header_and_get_sheetid(svc, spreadsheet_id: str, tab: str, header: list):
     got = svc.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=f"{tab}!1:1").execute().get("values",[])
     if not got or got[0] != header:
@@ -157,16 +155,16 @@ def next_trading_day(d: date) -> date:
         nd += timedelta(days=1)
     return nd
 
-# ---------- price helpers (strict 0.05 tick) ----------
+# ---------------- price helpers (strict $0.05) ----------------
 def snap_to_tick(x: float, tick: float)->float:
     if x is None: return None
-    # Half-up rounding to tick (avoids banker's rounding)
+    # Half-up to tick (avoid banker's rounding)
     n = int(math.floor((x / tick) + 0.5))
     return round(n * tick, 2)
 
 def clamp_credit(x: float, tick: float, width: float)->float:
     if x is None: return None
-    hi = max(tick, width - tick)  # broker won't allow >= width
+    hi = max(tick, width - tick)
     y  = snap_to_tick(x, tick)
     return max(tick, min(hi, y))
 
@@ -184,7 +182,7 @@ def dedupe(seq):
             seen.add(v); out.append(v)
     return out
 
-# ---------- broker open‑order guard ----------
+# ---------------- open‑order guard ----------------
 def has_open_order_for_legs(c, acct_hash: str, legs_osi: list) -> bool:
     try:
         url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
@@ -208,7 +206,7 @@ def has_open_order_for_legs(c, acct_hash: str, legs_osi: list) -> bool:
     except:
         return False
 
-# ---------- Schwab client ----------
+# ---------------- Schwab client ----------------
 def make_client(app_key: str, app_secret: str, token_json: str):
     with open("schwab_token.json","w") as f: f.write(token_json)
     try:
@@ -232,7 +230,7 @@ def make_client(app_key: str, app_secret: str, token_json: str):
     except TypeError as e4:
         print("INIT_TRY4 failed:", e4); raise
 
-# ---------- Buying power ----------
+# ---------------- BP helpers ----------------
 def discover_bp_option_only(sa: dict) -> float | None:
     cands = []
     for section in ("currentBalances","projectedBalances","initialBalances","balances"):
@@ -258,25 +256,26 @@ def discover_bp_any(sa: dict) -> float | None:
         if isinstance(v,(int,float)): cands.append(float(v))
     return max(cands) if cands else None
 
-# ---------- main ----------
+# ---------------- main ----------------
 def main():
     print(f"schwab_place_order.py version {__VERSION__}")
 
     if (env_str("SCHWAB_PLACE") or env_str("SCHWAB_PLACE_VAR") or env_str("SCHWAB_PLACE_SEC")).lower()!="place":
         print("SCHWAB_PLACE not 'place' → skipping."); sys.exit(0)
 
-    # required secrets
+    # required
     app_key    = env_or_die("SCHWAB_APP_KEY")
     app_secret = env_or_die("SCHWAB_APP_SECRET")
     token_json = env_or_die("SCHWAB_TOKEN_JSON")
     sheet_id   = env_or_die("GSHEET_ID")
     sa_json    = env_or_die("GOOGLE_SERVICE_ACCOUNT_JSON")
 
-    # timing & behavior
-    STAGE_SEC = env_int("STAGE_SEC", 45)   # let each rung work
-    TICK      = env_float("TICK", 0.05)    # SPX
-    CANCEL_IF_UNFILLED = env_bool("CANCEL_IF_UNFILLED", True)
-    EMERGENCY_MIN_TO_CLOSE = env_int("EMERGENCY_MIN_TO_CLOSE", 0)  # 0 disables emergency replace
+    # timing
+    STAGE_SEC = env_int("STAGE_SEC", 30)                 # 30s per rung (your preference)
+    POST_LADDER_WAIT_SEC = env_int("POST_LADDER_WAIT_SEC", 300)  # 5 minutes after last replace
+    TICK      = env_float("TICK", 0.05)
+    CANCEL_IF_UNFILLED = env_bool("CANCEL_IF_UNFILLED", True)     # set false to leave working
+    EMERGENCY_MIN_TO_CLOSE = env_int("EMERGENCY_MIN_TO_CLOSE", 0) # disabled by default
 
     # sizing (unchanged)
     SIZE_MODE        = env_str("SIZE_MODE","STATIC").upper()
@@ -298,7 +297,7 @@ def main():
         r=c.get_account_numbers(); r.raise_for_status()
         acct=r.json()[0]; acct_hash=acct["hashValue"]
 
-    # last price (best effort)
+    # last price (best-effort)
     def spx_last():
         for sym in ["$SPX.X","SPX","SPX.X","$SPX"]:
             try:
@@ -341,7 +340,7 @@ def main():
     def log_and_exit(src: str, msg: str, qty_val: int = 0):
         log_top(src, msg, qty_val, "", ""); print(msg); sys.exit(0)
 
-    # freshness/expiry guards (keep)
+    # guards
     ts = parse_iso(g("ts")); age_min=(datetime.now(timezone.utc)-ts).total_seconds()/60.0 if ts else None
     try:
         sig_d=date.fromisoformat(g("signal_date")) if g("signal_date") else None
@@ -388,22 +387,20 @@ def main():
         return [bp, sp, sc, bc]
     leg_syms = fix_orientation(leg_syms)
 
-    # widths → clamp bounds
+    # width bounds
     put_w  = abs(strike_from_osi(leg_syms[1]) - strike_from_osi(leg_syms[0]))
     call_w = abs(strike_from_osi(leg_syms[3]) - strike_from_osi(leg_syms[2]))
     width  = round(min(put_w, call_w), 3)
 
-    # Leo recs (for pricing only)
+    # Leo recs & mid
     def fnum(x):
         try: return float(x)
         except: return None
     rec_put=fnum(g("rec_put")); rec_call=fnum(g("rec_call"))
     rec_condor=fnum(g("rec_condor")) if g("rec_condor")!="" else (None if (rec_put is None or rec_call is None) else (rec_put+rec_call))
-
-    # mid (best-effort; no guards)
     mid, _, _, _ = compute_mid_condor(c, leg_syms)
 
-    # ---------- sizing ----------
+    # sizing
     qty_sheet = int((g("qty_exec") or "1"))
     qty_exec  = qty_sheet
     if SIZE_MODE=="PCT_BP":
@@ -429,50 +426,61 @@ def main():
             print(f"SIZING PCT_BP bp={bp:.2f} alloc={alloc:.4f} budget={budget:.2f} risk_per_ct={risk_per_ct:.2f} -> qty={qty_exec}")
         else:
             print("WARN: could not fetch option buying power; using sheet qty.")
-
     if qty_exec < MIN_QTY: qty_exec = MIN_QTY
     if MAX_QTY>0 and qty_exec > MAX_QTY: qty_exec = MAX_QTY
     if HARD_QTY_CUTOFF>0 and qty_exec > HARD_QTY_CUTOFF:
         log_and_exit("SCHWAB_ABORT", f"QTY_ABOVE_HARD_CUTOFF computed={qty_exec} cutoff={HARD_QTY_CUTOFF}", qty_exec)
 
-    # ---------- FIXED LADDER (exact order, strict 0.05 tick) ----------
+    # ----- Build fixed ladder with strict direction -----
     if is_credit:
-        # CREDIT: 2.20 → Leo rec → mid → mid-0.05
-        raw = [ 2.20,
-                rec_condor,
-                mid,
-                (None if mid is None else mid - 0.05) ]
-        rungs = [
+        # CREDIT: 2.20 → Leo rec → mid → mid-0.05 (strictly DOWN by ≥ 1 tick)
+        raw = [2.20, rec_condor, mid, (None if mid is None else mid - 0.05)]
+        clamped = [
             clamp_credit(raw[0], TICK, width),
             clamp_credit(raw[1], TICK, width) if raw[1] is not None else None,
             clamp_credit(raw[2], TICK, width) if raw[2] is not None else None,
             clamp_credit(raw[3], TICK, width) if raw[3] is not None else None,
         ]
+        prices=[]; prev=None
+        for p in clamped:
+            if p is None: continue
+            if prev is None:
+                prices.append(p); prev=p; continue
+            # force strictly lower by >=1 tick
+            target = max(TICK, snap_to_tick(min(p, prev - TICK), TICK))
+            if target < prev:
+                prices.append(target); prev=target
+        # drop any accidental dupes
+        prices = dedupe(prices)
     else:
-        # DEBIT (unchanged): 1.80 → Leo rec → mid → mid+0.05
-        raw = [ 1.80,
-                rec_condor,
-                mid,
-                (None if mid is None else mid + 0.05) ]
-        rungs = [
+        # DEBIT: 1.80 → Leo rec → mid → mid+0.05 (strictly UP by ≥ 1 tick)
+        raw = [1.80, rec_condor, mid, (None if mid is None else mid + 0.05)]
+        clamped = [
             clamp_debit(raw[0], TICK, width),
             clamp_debit(raw[1], TICK, width) if raw[1] is not None else None,
             clamp_debit(raw[2], TICK, width) if raw[2] is not None else None,
             clamp_debit(raw[3], TICK, width) if raw[3] is not None else None,
         ]
+        prices=[]; prev=None
+        for p in clamped:
+            if p is None: continue
+            if prev is None:
+                prices.append(p); prev=p; continue
+            # force strictly higher by ≥1 tick
+            target = min(max(TICK, width - TICK), snap_to_tick(max(p, prev + TICK), TICK))
+            if target > prev:
+                prices.append(target); prev=target
+        prices = dedupe(prices)
 
-    # Keep order but drop Nones / dups after snapping/clamping
-    prices = dedupe([p for p in rungs if p is not None])
     if not prices:
         log_and_exit("SCHWAB_ERROR", "NO_VALID_PRICES_AFTER_SNAP")
+    print("RUNG_PLAN", prices)
 
-    print("RUNG_PLAN", prices)  # visible in Actions log
-
-    # ---------- pre-claim guard ----------
+    # pre-claim guard
     if has_open_order_for_legs(c, acct_hash, leg_syms):
         log_and_exit("SCHWAB_SKIP", "OPEN_ORDER_EXISTS (pre-claim)", qty_exec)
 
-    # ---------- claim ----------
+    # claim
     fingerprint = "|".join([ (g("signal_date") or "").upper(),
                               ("SHORT" if is_credit else "LONG"),
                               raw_legs[0].upper(), raw_legs[1].upper(), raw_legs[2].upper(), raw_legs[3].upper() ])
@@ -493,7 +501,7 @@ def main():
         ]]}
     ).execute()
 
-    # ---------- place/replace ladder ----------
+    # place/replace
     def build_order(price: float, q: int):
         return {
             "orderType": ("NET_CREDIT" if is_credit else "NET_DEBIT"),
@@ -507,7 +515,6 @@ def main():
                 {"instruction":"BUY_TO_OPEN","quantity":q,"instrument":{"symbol":leg_syms[3],"assetType":"OPTION"}},
             ]
         }
-
     def place(order_price: float):
         order = build_order(order_price, qty_exec)
         r = c.place_order(acct_hash, order)
@@ -518,7 +525,6 @@ def main():
             oid = r.headers.get("Location","").rstrip("/").split("/")[-1]
         print("PLACE_HTTP", r.status_code, "ORDER_ID", oid, "PRICE", order["price"])
         return (r.status_code, oid, order["price"])
-
     def replace(oid: str, new_price: float):
         order = build_order(new_price, qty_exec)
         url = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
@@ -531,7 +537,6 @@ def main():
             if loc: new_id=loc.rstrip("/").split("/")[-1] or oid
         print("REPLACE_HTTP", r.status_code, "ORDER_ID", new_id, "PRICE", f"{new_price:.2f}")
         return (r.status_code, new_id, f"{new_price:.2f}")
-
     def cancel(oid: str):
         try:
             url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
@@ -539,9 +544,7 @@ def main():
             print("CANCEL_HTTP", r.status_code, "ORDER_ID", oid)
             return r.status_code
         except Exception as e:
-            print("CANCEL_ERR", str(e))
-            return None
-
+            print("CANCEL_ERR", str(e)); return None
     def status(oid: str):
         try:
             url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
@@ -552,6 +555,7 @@ def main():
 
     # Stage 1
     sc, oid, price_used = place(prices[0])
+    top_idx = 1
     log_top("SCHWAB_WORKING_S1", "WORKING", qty_exec, oid, price_used)
     filled=False
     end = time.time() + STAGE_SEC
@@ -560,20 +564,18 @@ def main():
         if st and str(st).upper()=="FILLED": filled=True; break
         time.sleep(1)
 
-    # Stages 2..n
-    stage_idx = 2
-    for p in prices[1:]:
+    # Subsequent stages
+    for i, p in enumerate(prices[1:], start=2):
         if filled: break
         rc, oid, price_used = replace(oid, p)
-        log_top(f"SCHWAB_REPLACE_S{stage_idx}", "WORKING", qty_exec, oid, price_used)
+        log_top(f"SCHWAB_REPLACE_S{i}", "WORKING", qty_exec, oid, price_used)
         end = time.time() + STAGE_SEC
         while time.time() < end:
             _, st = status(oid)
             if st and str(st).upper()=="FILLED": filled=True; break
             time.sleep(1)
-        stage_idx += 1
 
-    # Optional emergency (disabled unless EMERGENCY_MIN_TO_CLOSE>0)
+    # Optional emergency (disabled by default)
     if not filled and EMERGENCY_MIN_TO_CLOSE>0 and minutes_to_option_close() <= EMERGENCY_MIN_TO_CLOSE:
         rc, oid, price_used = replace(oid, prices[-1])
         log_top("SCHWAB_REPLACE_EMERGENCY", "WORKING", qty_exec, oid, price_used)
@@ -583,10 +585,17 @@ def main():
             if st and str(st).upper()=="FILLED": filled=True; break
             time.sleep(1)
 
+    # Post-ladder wait so orders get time to execute
+    end_wait = time.time() + max(0, POST_LADDER_WAIT_SEC)
+    while (not filled) and time.time() < end_wait:
+        _, st = status(oid)
+        if st and str(st).upper()=="FILLED": filled=True; break
+        time.sleep(1)
+
     rc, st = status(oid)
     final_status = st or sc
 
-    if not filled and CANCEL_IF_UNFILLED and oid:
+    if (not filled) and CANCEL_IF_UNFILLED and oid:
         cancel(oid)
         rc, st = status(oid)
         final_status = st or final_status
