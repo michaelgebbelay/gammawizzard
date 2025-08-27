@@ -1,0 +1,78 @@
+# .github/workflows/sim-place.yml
+name: Sim Place (after-hours)
+
+on:
+  workflow_dispatch:
+    inputs:
+      sim_mid:
+        description: "Simulated net mid for condor"
+        required: false
+        default: "2.10"
+      sim_spread:
+        description: "Simulated net NBBO spread"
+        required: false
+        default: "0.40"
+      fill_on_stage:
+        description: "Fill on stage (1,2,3,4=emergency,0=never)"
+        required: false
+        default: "2"
+      minutes_to_close:
+        description: "Override minutes to option cutoff"
+        required: false
+        default: "1"
+
+permissions:
+  contents: read
+
+jobs:
+  sim:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install --quiet schwab-py google-api-python-client google-auth google-auth-httplib2 pandas-market-calendars pytz requests
+
+      - name: Write latest Leo row (no gate)
+        env:
+          CONFIG_JSON: ${{ vars.CONFIG_JSON }}
+          GSHEET_ID: ${{ secrets.GSHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GW_AUTH_MODE: LOGIN
+          GW_BASE: https://gandalf.gammawizard.com
+          GW_ENDPOINT: /rapi/GetLeoCross
+          GW_AUTH_EMAIL:    ${{ secrets.GW_EMAIL }}
+          GW_AUTH_PASSWORD: ${{ secrets.GW_PASSWORD }}
+        run: |
+          python scripts/leocross_to_sheet.py
+
+      - name: Simulate place (no broker calls)
+        env:
+          CONFIG_JSON: ${{ vars.CONFIG_JSON }}
+          SCHWAB_PLACE: place
+          DRY_RUN: "true"
+          SIM_QUOTES: "true"
+          SIM_MID: ${{ inputs.sim_mid }}
+          SIM_NET_SPREAD: ${{ inputs.sim_spread }}
+          SIM_FILL_ON_STAGE: ${{ inputs.fill_on_stage }}
+          MINUTES_TO_CLOSE_OVERRIDE: ${{ inputs.minutes_to_close }}
+          GSHEET_ID:         ${{ secrets.GSHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          # secrets below not used in DRY_RUN; present to keep interface uniform:
+          SCHWAB_APP_KEY:    "SIM"
+          SCHWAB_APP_SECRET: "SIM"
+          SCHWAB_TOKEN_JSON: "{}"
+        run: |
+          python scripts/schwab_place_order.py
+          ls -l order_plan.json || true
+
+      - name: Upload order plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: order-plan
+          path: order_plan.json
