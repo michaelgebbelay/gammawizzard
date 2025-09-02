@@ -1,9 +1,12 @@
-# .github/workflows/schwab-place.yml
 # yamllint disable rule:line-length rule:truthy
+---
 name: Schwab Place
 
 on:
+  # Manual run (for tests)
   workflow_dispatch:
+
+  # Auto-run right after LeoCross finishes
   workflow_run:
     workflows: ["LeoCross Ticket"]
     types: [completed]
@@ -12,16 +15,36 @@ concurrency:
   group: schwab-place
   cancel-in-progress: true
 
-permissions:
-  contents: read
-
 jobs:
   place:
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
     steps:
+      #---- Time gate. Pass ONLY at 16:12 ET or 13:12 PT on weekdays.
+      #     Set repo var BYPASS_TIME_GATE=1 to skip this gate (for tests).
+      - name: Gate to 16:12 ET / 13:12 PT (Mon–Fri)
+        id: gate
+        shell: bash
+        env:
+          BYPASS_TIME_GATE: ${{ vars.BYPASS_TIME_GATE }}
+        run: |
+          set -e
+          if [ "${BYPASS_TIME_GATE:-}" = "1" ]; then
+            echo "BYPASS_TIME_GATE=1 → proceed regardless of clock."
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          ET_TIME="$(TZ=America/New_York date +%H:%M)"
+          PT_TIME="$(TZ=America/Los_Angeles date +%H:%M)"
+          DOW="$(TZ=America/New_York date +%u)"
+          echo "Now ET=${ET_TIME}, PT=${PT_TIME}, DOW=${DOW}"
+          if { [ "$ET_TIME" = "16:12" ] || [ "$PT_TIME" = "13:12" ]; } && [ "$DOW" -ge 1 ] && [ "$DOW" -le 5 ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
@@ -31,78 +54,54 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install --quiet schwab-py google-api-python-client google-auth google-auth-httplib2 pandas-market-calendars pytz
+          pip install --quiet schwab-py google-api-python-client google-auth google-auth-httplib2
 
-      - name: Time gate (SOFT; bypassable)
-        id: gate
-        env:
-          BYPASS_TIME_GATE: ${{ vars.BYPASS_TIME_GATE }}
-          GATE_WINDOW_MIN: 15
-          GATE_TARGET_OFFSET_MIN: 12
-        run: |
-          python - <<'PY'
-          import os, time, datetime as dt, pytz
-          import pandas_market_calendars as mcal
-          # Hard bypass if BYPASS_TIME_GATE=1
-          if (os.environ.get('BYPASS_TIME_GATE','') == '1'):
-              print("GATE BYPASS"); 
-              with open(os.environ['GITHUB_OUTPUT'],'a') as fh: fh.write("ok=true\n")
-              raise SystemExit(0)
-          et = pytz.timezone('America/New_York')
-          now = dt.datetime.now(et)
-          window = int(os.environ.get('GATE_WINDOW_MIN','15'))
-          offset = int(os.environ.get('GATE_TARGET_OFFSET_MIN','12'))
-          nyse = mcal.get_calendar('XNYS')
-          sched = nyse.schedule(start_date=now.date(), end_date=now.date(), tz='America/New_York')
-          ok=False
-          if not sched.empty:
-              close = sched['market_close'].iloc[0]
-              target = close + dt.timedelta(minutes=offset)
-              diff = abs((now - target).total_seconds())/60.0
-              ok = (diff <= window)       # soft gate, symmetric
-              print("GATE", "ok" if ok else "skip", f"diff={diff:.2f}m target={target.strftime('%H:%M')}")
-          else:
-              print("GATE skip NOT_TRADING_DAY")
-          with open(os.environ['GITHUB_OUTPUT'],'a') as fh: fh.write(f"ok={'true' if ok else 'false'}\n")
-          PY
-
+      #---- PLACE (only if time gate passed)
       - name: Place SPXW order from leocross!A2 and log at schwab!A2
         if: ${{ steps.gate.outputs.ok == 'true' }}
         env:
-          # Required secrets
-          SCHWAB_APP_KEY:    ${{ secrets.SCHWAB_APP_KEY }}
+          # REQUIRED SECRETS
+          SCHWAB_APP_KEY: ${{ secrets.SCHWAB_APP_KEY }}
           SCHWAB_APP_SECRET: ${{ secrets.SCHWAB_APP_SECRET }}
           SCHWAB_TOKEN_JSON: ${{ secrets.SCHWAB_TOKEN_JSON }}
-          GSHEET_ID:         ${{ secrets.GSHEET_ID }}
+          GSHEET_ID: ${{ secrets.GSHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          # Optional account selection
-          SCHWAB_ACCT_HASH:  ${{ vars.SCHWAB_ACCT_HASH }}
-          # Arm
-          SCHWAB_PLACE: place
-          # Ladder timing
-          STAGE_SEC: ${{ vars.STAGE_SEC || 45 }}
-          TICK: 0.05
-          # Sizing
-          SIZE_MODE:        ${{ vars.SIZE_MODE || 'PCT_BP' }}
-          CREDIT_ALLOC_PCT: ${{ vars.CREDIT_ALLOC_PCT || 0.06 }}
-          DEBIT_ALLOC_PCT:  ${{ vars.DEBIT_ALLOC_PCT  || 0.02 }}
-          RISK_PER_CONTRACT_CREDIT: ${{ vars.RISK_PER_CONTRACT_CREDIT || 300 }}
-          RISK_PER_CONTRACT_DEBIT:  ${{ vars.RISK_PER_CONTRACT_DEBIT  || 200 }}
-          MAX_RISK_PER_TRADE: ${{ vars.MAX_RISK_PER_TRADE || 1500 }}
-          MAX_QTY:          ${{ vars.MAX_QTY || 6 }}
-          MIN_QTY:          ${{ vars.MIN_QTY || 1 }}
-          HARD_QTY_CUTOFF:  ${{ vars.HARD_QTY_CUTOFF || 10 }}
-          BP_SOURCE:        ${{ vars.BP_SOURCE || 'OPTION' }}
-          OPT_BP_OVERRIDE:  ${{ vars.OPT_BP_OVERRIDE || 0 }}
-          # Guards still active (freshness/expiry), but NO liquidity checks in code
-          FRESH_MIN:               ${{ vars.FRESH_MIN || 120 }}
-          ENFORCE_EXPIRY_TOMORROW: ${{ vars.ENFORCE_EXPIRY_TOMORROW || 'true' }}
-          # Optional: emergency & cancel
-          EMERGENCY_MIN_TO_CLOSE: ${{ vars.EMERGENCY_MIN_TO_CLOSE || 2 }}
-          CANCEL_IF_UNFILLED:     ${{ vars.CANCEL_IF_UNFILLED || 'true' }}
+
+          # ARM THE PLACER
+          SCHWAB_PLACE: ${{ vars.SCHWAB_PLACE }}   # must be "place" to actually place
+
+          # PRICING RAILS (per-leg; condor uses 2x these automatically)
+          CREDIT_START_PERLEG:  ${{ vars.CREDIT_START_PERLEG }}   # e.g. 1.10
+          CREDIT_FLOOR_PERLEG:  ${{ vars.CREDIT_FLOOR_PERLEG }}   # e.g. 0.95
+          DEBIT_START_PERLEG:   ${{ vars.DEBIT_START_PERLEG }}    # e.g. 0.90
+          DEBIT_CEIL_PERLEG:    ${{ vars.DEBIT_CEIL_PERLEG }}     # e.g. 1.05
+          OFFSET_PERLEG_CREDIT: ${{ vars.OFFSET_PERLEG_CREDIT }}  # e.g. -0.05 (mid-)
+          OFFSET_PERLEG_DEBIT:  ${{ vars.OFFSET_PERLEG_DEBIT }}   # e.g. +0.05 (mid+)
+
+          # LADDER TIMING & TICK
+          STAGE_SEC: ${{ vars.STAGE_SEC }}          # one knob, e.g. 15
+          TICK:      ${{ vars.TICK }}               # 0.05 for SPX
+
+          # SIZING (percent-of-BP at rails) — set SIZE_MODE=PCT_BP to enable
+          SIZE_MODE:         ${{ vars.SIZE_MODE }}         # STATIC or PCT_BP
+          CREDIT_ALLOC_PCT:  ${{ vars.CREDIT_ALLOC_PCT }}  # e.g. 0.06
+          DEBIT_ALLOC_PCT:   ${{ vars.DEBIT_ALLOC_PCT }}   # e.g. 0.02
+          MAX_QTY:           ${{ vars.MAX_QTY }}           # optional cap
+          OPT_BP_OVERRIDE:   ${{ vars.OPT_BP_OVERRIDE }}   # e.g. 20000 for tests
+
+          # FRESHNESS & EXPIRY GUARDS
+          FRESH_MIN:                ${{ vars.FRESH_MIN }}                # e.g. 120
+          ENFORCE_EXPIRY_TOMORROW:  ${{ vars.ENFORCE_EXPIRY_TOMORROW }}  # "true"/"false"
+
+          # NEW POSITION GUARDS (defaults ON if vars empty)
+          SKIP_IF_OPEN_SPX:  ${{ vars.SKIP_IF_OPEN_SPX }}  # "true" to skip if any SPX pos open
+          POS_SCOPE:         ${{ vars.POS_SCOPE }}         # EXPIRY or ANY
+          ENFORCE_NO_CLOSE:  ${{ vars.ENFORCE_NO_CLOSE }}  # "true" to block legs that would close
+
         run: |
           python scripts/schwab_place_order.py
 
-      - name: Skipped (outside gate)
+      #---- If the gate did NOT match, say so plainly
+      - name: Skipped (outside 16:12 ET / 13:12 PT)
         if: ${{ steps.gate.outputs.ok != 'true' }}
-        run: echo "Outside soft gate (set BYPASS_TIME_GATE=1 to force)."
+        run: echo "Time gate did not match; no order placed."
