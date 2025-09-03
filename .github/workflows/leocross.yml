@@ -1,5 +1,4 @@
 name: Place LeoCross
-
 on:
   workflow_dispatch:
     inputs:
