@@ -1,87 +1,48 @@
-# .github/workflows/leocross-ticket.yml
-# yamllint disable rule:line-length rule:truthy
-name: LeoCross Ticket
+name: Place LeoCross (Simple)
 
 on:
   workflow_dispatch:
+    inputs:
+      bypass:
+        description: 'Bypass time gate (manual run)'
+        required: false
+        default: 'false'
   schedule:
-    - cron: "10 17 * * 1-5"  # 1:10pm EDT
-    - cron: "10 18 * * 1-5"  # 1:10pm EST
     - cron: "10 20 * * 1-5"  # 4:10pm EDT
     - cron: "10 21 * * 1-5"  # 4:10pm EST
 
 concurrency:
-  group: leocross-append
+  group: leocross-simple
   cancel-in-progress: true
 
-permissions:
-  contents: read
-
 jobs:
-  leocross:
+  place:
     runs-on: ubuntu-latest
+    timeout-minutes: 6
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install --quiet requests google-api-python-client google-auth google-auth-httplib2 pandas-market-calendars pytz
-
-      - name: Time gate (SOFT; bypassable)
-        id: gate
+          pip install --quiet schwab-py requests google-api-python-client google-auth google-auth-httplib2
+      - name: Place SPXW order
         env:
-          BYPASS_TIME_GATE: ${{ vars.BYPASS_TIME_GATE }}
-          GATE_WINDOW_MIN: 15
-          GATE_TARGET_OFFSET_MIN: 12
-        run: |
-          python - <<'PY'
-          import os, time, datetime as dt, pytz
-          import pandas_market_calendars as mcal
-          if (os.environ.get('BYPASS_TIME_GATE','') == '1'):
-              print("GATE BYPASS"); 
-              with open(os.environ['GITHUB_OUTPUT'],'a') as fh: fh.write("ok=true\n")
-              raise SystemExit(0)
-          et = pytz.timezone('America/New_York')
-          now = dt.datetime.now(et)
-          window = int(os.environ.get('GATE_WINDOW_MIN','15'))
-          offset = int(os.environ.get('GATE_TARGET_OFFSET_MIN','12'))
-          nyse = mcal.get_calendar('XNYS')
-          sched = nyse.schedule(start_date=now.date(), end_date=now.date(), tz='America/New_York')
-          ok=False
-          if not sched.empty:
-              close = sched['market_close'].iloc[0]
-              target = close + dt.timedelta(minutes=offset)
-              diff = abs((now - target).total_seconds())/60.0
-              ok = (diff <= window)
-              print("GATE", "ok" if ok else "skip", f"diff={diff:.2f}m target={target.strftime('%H:%M')}")
-          else:
-              print("GATE skip NOT_TRADING_DAY")
-          with open(os.environ['GITHUB_OUTPUT'],'a') as fh: fh.write(f"ok={'true' if ok else 'false'}\n")
-          PY
-
-      - name: Run leocross → Google Sheet (A2)
-        if: ${{ steps.gate.outputs.ok == 'true' }}
-        env:
+          # ---- Schwab
+          SCHWAB_APP_KEY: ${{ secrets.SCHWAB_APP_KEY }}
+          SCHWAB_APP_SECRET: ${{ secrets.SCHWAB_APP_SECRET }}
+          SCHWAB_TOKEN_JSON: ${{ secrets.SCHWAB_TOKEN_JSON }}
+          # ---- GammaWizard (token OR email/password)
+          GW_TOKEN:    ${{ secrets.GW_TOKEN }}
+          GW_EMAIL:    ${{ secrets.GW_EMAIL }}
+          GW_PASSWORD: ${{ secrets.GW_PASSWORD }}
+          # ---- Google Sheet
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          # Leo defaults written to sheet
-          LEO_SIZE_CREDIT: ${{ vars.LEO_SIZE_CREDIT || 4 }}
-          LEO_SIZE_DEBIT:  ${{ vars.LEO_SIZE_DEBIT  || 2 }}
-          LEO_TIE_SIDE:    ${{ vars.LEO_TIE_SIDE   || 'CREDIT' }}
-          LEO_WIDTH:       ${{ vars.LEO_WIDTH      || 5 }}
-          # GammaWizard auth (login)
-          GW_AUTH_MODE: LOGIN
-          GW_BASE: https://gandalf.gammawizard.com
-          GW_ENDPOINT: /rapi/GetLeoCross
-          GW_AUTH_EMAIL:    ${{ secrets.GW_EMAIL }}
-          GW_AUTH_PASSWORD: ${{ secrets.GW_PASSWORD }}
+          SHEET_TAB: schwab
+          # ---- Manual bypass (works for workflow_dispatch)
+          BYPASS_TIME_GATE: ${{ github.event.inputs.bypass }}
         run: |
-          python scripts/leocross_to_sheet.py
-
-      - name: Skipped
-        if: ${{ steps.gate.outputs.ok != 'true' }}
-        run: echo "Outside soft gate (set BYPASS_TIME_GATE=1 to force)."
+          python scripts/leocross_place_simple.py
