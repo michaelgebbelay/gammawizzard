@@ -1,16 +1,6 @@
 # LIVE LeoCross → Schwab placer (cancel-then-place ladder, one order only)
 # MODE: PLACER_MODE = NOW | SCHEDULED   (default SCHEDULED: 16:08–16:14 ET weekdays)
-# Focus for this build: **print OBP inputs** used for sizing before any order.
-#
-# Rules (unchanged):
-# - Qty = floor(OptionBuyingPower / 5000); if OBP < 5000 or unreadable → ABORT
-# - 5-wide SPX iron condor from LeoCross Limit/CLimit (Cat2>=Cat1 → credit, else debit)
-# - NEVER CLOSE: pre-check positions by expiry/CP/strike; if any leg would offset → ABORT
-# - Exactly ONE order: each step = cancel all matching open orders, confirm 0 remain, then place new
-# - Ladder (30s each):
-#     CREDIT: 2.10 → mid → new mid → (prev mid − 0.05) → 1.90 → cancel
-#     DEBIT:  1.90 → mid → new mid → (prev mid + 0.05) → 2.10 → cancel
-# - One Google Sheet row at the end (status includes the step trace + OBP probe)
+# Focus: print OBP inputs used for sizing before any order, and write them in Sheet status.
 
 import os, sys, json, time, re
 from datetime import datetime, date
@@ -199,7 +189,7 @@ def positions_map(c, acct_hash: str):
     return out
 
 def list_matching_open_ids(c, acct_hash: str, canon_set):
-    url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
+    url=f"https://api/schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
     arr=schwab_get_json(c,url,tag="ORDERS") or []
     out=[]
     for o in arr:
@@ -226,18 +216,16 @@ def cancel_all_and_wait(c, acct_hash: str, canon_set, grace=CANCEL_GRACE):
             try: schwab_delete(c,url,tag=f"CANCEL:{oid}")
             except Exception as e: print(f"WARN cancel {oid}: {e}")
         if time.time()>=t_end:
-            # last check then proceed
             ids2=list_matching_open_ids(c,acct_hash,canon_set)
             if ids2: print(f"WARN lingering orders: {','.join(ids2)}")
             return
         time.sleep(0.5)
 
-# ===== OBP PROBE (prints everything I'm using) =====
+# ===== OBP PROBE =====
 def obp_probe(c, acct_hash: str):
     """
-    Returns (used_obp, summary_string) and prints a human-readable probe.
-    We look ONLY at optionBuyingPower/optionsBuyingPower across:
-      - top-level of securitiesAccount
+    Returns (used_obp, summary_string) and prints a probe of all OBP fields:
+      - top-level optionBuyingPower/optionsBuyingPower
       - currentBalances, projectedBalances, initialBalances, balances
     """
     url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}"
@@ -251,6 +239,7 @@ def obp_probe(c, acct_hash: str):
         "initial": sa.get("initialBalances",{}) or {},
         "balances": sa.get("balances",{}) or {},
     }
+
     def pick(sec):
         vals=[]
         for k in ("optionBuyingPower","optionsBuyingPower"):
@@ -259,24 +248,25 @@ def obp_probe(c, acct_hash: str):
         return max(vals) if vals else None
 
     vals = {name: pick(sec) for name,sec in sections.items()}
-    # choose the max across all OBP candidates
+
     used = max([v for v in vals.values() if v is not None], default=0.0)
 
-    # print probe to console
+    # console probe
     print("=== OBP PROBE ===")
     for name in ("top","current","projected","initial","balances"):
         v = vals.get(name)
-        print(f"{name:9s}: {('NA' if v is None else f'{v:.2f}')}")
+        print(f"{name:9s}: {'NA' if v is None else f'{v:.2f}'}")
     print(f"OBP_USED : {used:.2f}  (qty = floor(OBP_USED/5000))")
     print("=================")
 
-    # short summary for status cell
-    short = f"OBP top={('NA' if vals['top'] is None else f'{vals['top']:.2f}')}," \
-            f" curr={('NA' if vals['current'] is None else f'{vals['current']:.2f}')}," \
-            f" proj={('NA' if vals['projected'] is None else f'{vals['projected']:.2f}')}," \
-            f" init={('NA' if vals['initial'] is None else f'{vals['initial']:.2f}')}," \
-            f" bal={('NA' if vals['balances'] is None else f'{vals['balances']:.2f}')}," \
-            f" used={used:.2f}"
+    # safe formatting helper (avoids nested f-strings bug)
+    def fmt(v): return "NA" if v is None else f"{v:.2f}"
+
+    short = (
+        f"OBP top={fmt(vals['top'])}, curr={fmt(vals['current'])}, "
+        f"proj={fmt(vals['projected'])}, init={fmt(vals['initial'])}, "
+        f"bal={fmt(vals['balances'])}, used={used:.2f}"
+    )
     return used, short
 
 # ===== main =====
@@ -401,7 +391,7 @@ def main():
              legs[0],legs[1],legs[2],legs[3], "", f"ABORT_{reason}"]
         one_log(svc, sheet_id_num, sheet_id, SHEET_TAB, row); print(reason); sys.exit(0)
 
-    # ===== OBP probe + sizing (THIS IS WHAT YOU ASKED FOR) =====
+    # ===== OBP probe + sizing =====
     try:
         obp_used, obp_summary = obp_probe(c, acct_hash)
     except Exception as e:
@@ -462,7 +452,7 @@ def main():
             time.sleep(1)
         return False,last
 
-    # --- ladder sequence (single cycle; we’re debugging OBP here) ---
+    # --- ladder sequence (single cycle; OBP debug build) ---
     steps=[]; used_price=None; oid=""; filled=False; st=""
 
     # Step 0: start
