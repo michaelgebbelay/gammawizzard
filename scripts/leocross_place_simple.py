@@ -1,4 +1,4 @@
-# Simple LeoCross → Schwab placer (LIVE ONLY)
+# Simple LeoCross → Schwab placer (LIVE ONLY) with timed ladder
 # Modes: PLACER_MODE = NOW | SCHEDULED | OFF
 # - NOW        → place immediately (ignores time window)
 # - SCHEDULED  → only place in 16:08–16:14 ET window (Mon–Fri)
@@ -7,7 +7,8 @@
 # Behavior:
 # - Pulls LeoCross from GammaWizard (resilient: token or login; retries on 401/403).
 # - Builds 5‑wide SPXW iron condor (inner strikes from Limit/CLimit).
-# - Credit: 2.10 → mid → mid-0.05    Debit: 1.90 → mid → mid+0.05
+# - Credit ladder: start 2.10 → mid → mid-0.05 → then keep stepping -0.05 every LADDER_SEC down to CREDIT_FLOOR (default 1.90).
+# - Debit ladder:  start 1.90 → mid → mid+0.05 → then keep stepping +0.05 every LADDER_SEC up to DEBIT_CEIL   (default 2.10).
 # - Qty: 1 contract per $5k option BP (override with QTY_OVERRIDE).
 # - No‑close guard: if any leg would offset an existing SPX/SPXW position → ABORT (no order).
 # - Single Google Sheet write per run (top-insert append).
@@ -21,6 +22,12 @@
 #   PLACER_MODE=NOW|SCHEDULED|OFF   (default OFF)
 #   QTY_OVERRIDE=1                  (force lot size)
 #   OPT_BP_OVERRIDE=5000            (simulate BP for sizing, still live)
+#   LADDER_SEC=30                   (seconds between price steps)
+#   MAX_STEPS=50                    (max total price points INCLUDING the first; safety stop)
+#   CREDIT_START=2.10               (override start credit)
+#   DEBIT_START=1.90                (override start debit)
+#   CREDIT_FLOOR=1.90               (lowest credit we’ll quote)
+#   DEBIT_CEIL=2.10                 (highest debit we’ll pay)
 #   GW_TOKEN=...                    (used first unless GW_FORCE_LOGIN=1)
 #   GW_FORCE_LOGIN=1                (ignore GW_TOKEN, always login)
 #   GW_BASE=https://gandalf.gammawizard.com
@@ -36,13 +43,27 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build as gbuild
 
 # ---- constants / defaults
+def _to_int(s, d):
+    try: return int(s)
+    except: return d
+def _to_float(s, d):
+    try: return float(s)
+    except: return d
+
 TICK = 0.05
 WIDTH = 5                # 5-point wings
-CREDIT_START = 2.10
-DEBIT_START  = 1.90
-STAGE_SEC = 12           # ~36s total ladder
-MAX_QTY = 500
 ET = ZoneInfo("America/New_York")
+MAX_QTY = 500
+
+# Starts / bounds (can be overridden by env)
+CREDIT_START = _to_float(os.environ.get("CREDIT_START", "2.10"), 2.10)
+DEBIT_START  = _to_float(os.environ.get("DEBIT_START",  "1.90"), 1.90)
+CREDIT_FLOOR = _to_float(os.environ.get("CREDIT_FLOOR", "1.90"), 1.90)
+DEBIT_CEIL   = _to_float(os.environ.get("DEBIT_CEIL",   "2.10"), 2.10)
+
+# Ladder pacing
+LADDER_SEC = _to_int(os.environ.get("LADDER_SEC", "30"), 30)
+MAX_STEPS  = _to_int(os.environ.get("MAX_STEPS",  "50"), 50)
 
 GW_BASE = os.environ.get("GW_BASE", "https://gandalf.gammawizard.com")
 GW_ENDPOINT = os.environ.get("GW_ENDPOINT", "/rapi/GetLeoCross")
@@ -52,15 +73,14 @@ SA_JSON   = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 SHEET_TAB = os.environ.get("SHEET_TAB", "schwab")  # matches your tab
 
 # LIVE‑order sizing helpers
-def _to_int(s, d=0):
+def _to_int_def(s, d=0):
     try: return int(s)
     except: return d
-def _to_float(s, d=-1.0):
+def _to_float_def(s, d=-1.0):
     try: return float(s)
     except: return d
-
-QTY_OVERRIDE    = _to_int(os.environ.get("QTY_OVERRIDE", "0"), 0)
-OPT_BP_OVERRIDE = _to_float(os.environ.get("OPT_BP_OVERRIDE", "-1"), -1.0)
+QTY_OVERRIDE    = _to_int_def(os.environ.get("QTY_OVERRIDE", "0"), 0)
+OPT_BP_OVERRIDE = _to_float_def(os.environ.get("OPT_BP_OVERRIDE", "-1"), -1.0)
 
 # Header matches your 'schwab' tab format
 SCHWAB_HEADERS = [
@@ -271,6 +291,49 @@ def time_gate_ok() -> bool:
     # Accept 16:08–16:14 ET window
     return (now.hour == 16 and 8 <= now.minute <= 14)
 
+# ---- ladder helpers
+def build_ladder_prices(is_credit: bool, start: float, mid: float|None,
+                        floor_c: float, ceil_d: float, max_steps: int):
+    """
+    Returns a list of price points to try, length <= max_steps.
+    - Credit:  start → mid → mid-0.05 → mid-0.10 → ... → floor (>= floor)
+    - Debit:   start → mid → mid+0.05 → mid+0.10 → ... → ceil  (<= ceil)
+    De-duplicates and snaps to tick.
+    """
+    seen=set(); seq=[]
+    def add(p):
+        p = clamp_tick(p)
+        if is_credit:
+            if p < floor_c: p = floor_c
+            if p > start: p = start
+        else:
+            if p > ceil_d: p = ceil_d
+            if p < start: p = start
+        if p not in seen:
+            seen.add(p); seq.append(p)
+
+    add(start)
+    if mid is not None: add(mid)
+    if mid is not None:
+        step = -0.05 if is_credit else +0.05
+        k=1
+        while len(seq) < max_steps:
+            p = mid + step*k
+            if is_credit and p <= floor_c: add(floor_c); break
+            if (not is_credit) and p >= ceil_d: add(ceil_d); break
+            add(p); k+=1
+    else:
+        # No mid — walk from start to bound
+        step = -0.05 if is_credit else +0.05
+        cur = start
+        while len(seq) < max_steps:
+            cur = clamp_tick(cur + step)
+            if is_credit and cur <= floor_c: add(floor_c); break
+            if (not is_credit) and cur >= ceil_d: add(ceil_d); break
+            add(cur)
+    # Cap to max_steps
+    return seq[:max_steps]
+
 # ---- main
 def main():
     # Mode: NOW | SCHEDULED | OFF
@@ -416,19 +479,17 @@ def main():
     bp_usd = OPT_BP_OVERRIDE if OPT_BP_OVERRIDE > 0 else buying_power_usd(c, acct_hash)
     qty = QTY_OVERRIDE if QTY_OVERRIDE > 0 else qty_from_bp(bp_usd)
     order_type = "NET_CREDIT" if is_credit else "NET_DEBIT"
+    side_name  = "SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"
 
     # Ladder prices (snap to tick)
     mid = compute_mid_condor(c, legs)
-    if is_credit:
-        p1 = clamp_tick(CREDIT_START)
-        p2 = clamp_tick(mid if mid is not None else CREDIT_START)
-        p3 = clamp_tick((mid - 0.05) if mid is not None else CREDIT_START - 0.05)
-    else:
-        p1 = clamp_tick(DEBIT_START)
-        p2 = clamp_tick(mid if mid is not None else DEBIT_START)
-        p3 = clamp_tick((mid + 0.05) if mid is not None else DEBIT_START + 0.05)
+    start_price = clamp_tick(CREDIT_START if is_credit else DEBIT_START)
+    floor = CREDIT_FLOOR if is_credit else start_price  # credit walks down to floor
+    ceil  = DEBIT_CEIL   if not is_credit else start_price  # debit walks up to ceil
+    prices = build_ladder_prices(is_credit, start=start_price, mid=mid,
+                                 floor_c=CREDIT_FLOOR, ceil_d=DEBIT_CEIL, max_steps=MAX_STEPS)
 
-    # Build/Place/Status
+    # Build/Place/Status (+ replace that updates OID)
     def build_order(price: float):
         return {
             "orderType": order_type,
@@ -447,12 +508,26 @@ def main():
 
     def place(price):
         r = c.place_order(acct_hash, build_order(price))
+        oid = ""
         try:
             j=r.json(); oid = str(j.get("orderId") or j.get("order_id") or "")
         except:
             oid = r.headers.get("Location","").rstrip("/").split("/")[-1]
         print(f"PLACE {order_type} @ {price:.2f}  OID={oid} HTTP={r.status_code}")
         return oid
+
+    def replace_order(oid: str, price: float):
+        url = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
+        r = c.session.put(url, json=build_order(price))
+        new_id = oid
+        try:
+            j=r.json(); new_id=str(j.get("orderId") or j.get("order_id") or oid)
+        except:
+            loc=r.headers.get("Location","")
+            if loc:
+                new_id = loc.rstrip("/").split("/")[-1] or oid
+        print(f"REPLACE → {price:.2f} HTTP={r.status_code} NEW_ID={new_id}")
+        return new_id
 
     def status(oid: str):
         url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
@@ -463,59 +538,37 @@ def main():
             j={}
         return str(j.get("status") or j.get("orderStatus") or "")
 
-    # Stage 1
-    oid = place(p1)
-    end = time.time() + STAGE_SEC
-    while time.time() < end:
-        if status(oid).upper()=="FILLED":
-            row = [datetime.utcnow().isoformat()+"Z", source, "SPX", last_px,
-                   sig_date, "PLACE", ("SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"),
-                   qty, order_type, f"{p1:.2f}",
-                   legs[0], legs[1], legs[2], legs[3],
-                   oid, "FILLED_S1"]
-            one_log(svc, sheet_id_num, row); print("FILLED @ stage 1"); return
-        time.sleep(1)
+    # Ladder loop
+    used_price = prices[0]
+    oid = place(used_price)
+    filled=False; st=""
 
-    # Stage 2
-    r = c.session.put(f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}",
-                      json=build_order(p2))
-    print(f"REPLACE → {p2:.2f} HTTP={r.status_code}")
-    end = time.time() + STAGE_SEC
-    while time.time() < end:
-        if status(oid).upper()=="FILLED":
-            row = [datetime.utcnow().isoformat()+"Z", source, "SPX", last_px,
-                   sig_date, "PLACE", ("SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"),
-                   qty, order_type, f"{p2:.2f}",
-                   legs[0], legs[1], legs[2], legs[3],
-                   oid, "FILLED_S2"]
-            one_log(svc, sheet_id_num, row); print("FILLED @ stage 2"); return
-        time.sleep(1)
+    for i, tgt in enumerate(prices):
+        if i == 0:
+            # already placed at prices[0]
+            pass
+        else:
+            oid = replace_order(oid, tgt)
+            used_price = tgt
+        # wait LADDER_SEC (polling each 1s)
+        end = time.time() + LADDER_SEC
+        while time.time() < end:
+            st = status(oid).upper()
+            if st == "FILLED":
+                filled=True; break
+            time.sleep(1)
+        if filled:
+            break
 
-    # Stage 3
-    r = c.session.put(f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}",
-                      json=build_order(p3))
-    print(f"REPLACE → {p3:.2f} HTTP={r.status_code}")
-    end = time.time() + STAGE_SEC
-    st = ""
-    while time.time() < end:
-        st = status(oid).upper()
-        if st=="FILLED":
-            row = [datetime.utcnow().isoformat()+"Z", source, "SPX", last_px,
-                   sig_date, "PLACE", ("SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"),
-                   qty, order_type, f"{p3:.2f}",
-                   legs[0], legs[1], legs[2], legs[3],
-                   oid, "FILLED_S3"]
-            one_log(svc, sheet_id_num, row); print("FILLED @ stage 3"); return
-        time.sleep(1)
-
-    # Not filled yet → final snapshot
+    # Final log
+    final_status = "FILLED" if filled else (st or "WORKING")
     row = [datetime.utcnow().isoformat()+"Z", source, "SPX", last_px,
-           sig_date, "PLACE", ("SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"),
-           qty, order_type, f"{p3:.2f}",
+           sig_date, "PLACE", side_name,
+           qty, order_type, f"{used_price:.2f}",
            legs[0], legs[1], legs[2], legs[3],
-           oid, (st or "WORKING")]
+           oid, final_status]
     one_log(svc, sheet_id_num, row)
-    print(f"DONE (status={st or 'WORKING'}) OID={oid}")
+    print(f"FINAL {final_status} OID={oid} PRICE_USED={used_price:.2f}")
 
 if __name__ == "__main__":
     main()
