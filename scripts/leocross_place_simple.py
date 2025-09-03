@@ -1,20 +1,22 @@
-# Simple LeoCross → Schwab placer (with single Google Sheet log, bypass, and no‑close guard)
-# Runs at ~4:10pm ET by default. Ladder: credit 2.10→mid→mid-0.05; debit 1.90→mid→mid+0.05.
-# Qty: 1 contract per $5k option BP. If any leg would "close" an existing position → ABORT.
+# Simple LeoCross → Schwab placer (LIVE ONLY) with:
+# - PLACER_MODE: NOW | SCHEDULED | OFF
+# - One Google Sheet write per run
+# - No‑close guard: abort if any leg would offset an existing position
+# - Qty: 1 / $5k BP (override with QTY_OVERRIDE)
 import os, sys, json, time, math, re
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
 import requests
 from schwab.auth import client_from_token_file
 from google.oauth2 import service_account
-from googleapiclient.discovery import build
+from googleapiclient.discovery import build as gbuild
 
 # ---- constants / defaults
 TICK = 0.05
-WIDTH = 5
+WIDTH = 5                # 5-point wings
 CREDIT_START = 2.10
 DEBIT_START  = 1.90
-STAGE_SEC = 12
+STAGE_SEC = 12           # ~36s total ladder
 MAX_QTY = 500
 ET = ZoneInfo("America/New_York")
 
@@ -23,9 +25,19 @@ GW_ENDPOINT = os.environ.get("GW_ENDPOINT", "/rapi/GetLeoCross")
 
 SHEET_ID  = os.environ["GSHEET_ID"]
 SA_JSON   = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
-SHEET_TAB = os.environ.get("SHEET_TAB", "schwab")  # change if you prefer a different tab name
+SHEET_TAB = os.environ.get("SHEET_TAB", "schwab")  # matches your existing tab
 
-# Header matches your existing 'schwab' tab format
+# LIVE‑order sizing helpers
+try:
+    QTY_OVERRIDE = int(os.environ.get("QTY_OVERRIDE", "0"))
+except:
+    QTY_OVERRIDE = 0
+try:
+    OPT_BP_OVERRIDE = float(os.environ.get("OPT_BP_OVERRIDE", "-1"))
+except:
+    OPT_BP_OVERRIDE = -1.0
+
+# Header matches your 'schwab' tab format
 SCHWAB_HEADERS = [
     "ts","source","symbol","last_price",
     "signal_date","order_mode","side","qty_exec","order_type","limit_price",
@@ -79,13 +91,11 @@ def ensure_header_and_get_sheetid(svc, spreadsheet_id: str, tab: str, header: li
         ).execute()
         meta = svc.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
         sheet_id_num = next(sh["properties"]["sheetId"] for sh in meta["sheets"] if sh["properties"]["title"]==tab)
-        # brand new tab → write header
         svc.spreadsheets().values().update(
             spreadsheetId=spreadsheet_id, range=f"{tab}!1:1",
             valueInputOption="USER_ENTERED", body={"values":[header]}
         ).execute()
     else:
-        # write header only if row1 is empty
         got = svc.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=f"{tab}!1:1").execute().get("values",[])
         if not got:
             svc.spreadsheets().values().update(
@@ -200,10 +210,8 @@ def list_spx_option_positions(c, acct_hash: str):
         pass
     return out
 
-# ---- time gate with bypass for manual
+# ---- time gate (for SCHEDULED)
 def time_gate_ok() -> bool:
-    if str(os.environ.get("BYPASS_TIME_GATE","")).strip().lower() in ("1","true","yes"):
-        return True
     now = datetime.now(ET)
     if now.weekday() >= 5:   # Sat/Sun
         return False
@@ -212,6 +220,12 @@ def time_gate_ok() -> bool:
 
 # ---- main
 def main():
+    # Mode: NOW | SCHEDULED | OFF
+    MODE = os.environ.get("PLACER_MODE","OFF").strip().upper()
+    if MODE not in ("NOW","SCHEDULED","OFF"):
+        MODE = "OFF"
+    source = f"SIMPLE_{MODE}"
+
     # Schwab auth
     app_key    = os.environ["SCHWAB_APP_KEY"]
     app_secret = os.environ["SCHWAB_APP_SECRET"]
@@ -235,20 +249,24 @@ def main():
         return ""
     last_px = spx_last()
 
-    # Sheets client
+    # Sheets client (use gbuild to avoid name collision)
     creds = service_account.Credentials.from_service_account_info(json.loads(SA_JSON),
             scopes=["https://www.googleapis.com/auth/spreadsheets"])
-    svc = build("sheets","v4",credentials=creds)
+    svc = gbuild("sheets","v4",credentials=creds)
     sheet_id_num = ensure_header_and_get_sheetid(svc, SHEET_ID, SHEET_TAB, SCHWAB_HEADERS)
 
-    # Time gate (bypassable)
-    source = "SIMPLE_MANUAL" if os.environ.get("BYPASS_TIME_GATE","").lower() in ("1","true","yes") else "SIMPLE_AUTO"
-    if not time_gate_ok():
+    # Mode gating (log once and exit when OFF or outside window)
+    if MODE == "OFF":
+        row = [datetime.utcnow().isoformat()+"Z", source, "SPX", last_px,
+               "", "SKIP", "", "", "", "",
+               "","","","", "", "SKIP_OFF"]
+        one_log(svc, sheet_id_num, row); print("Mode=OFF → skipped"); sys.exit(0)
+
+    if MODE == "SCHEDULED" and not time_gate_ok():
         row = [datetime.utcnow().isoformat()+"Z", source, "SPX", last_px,
                "", "SKIP", "", "", "", "",
                "","","","", "", "SKIPPED_TIME_WINDOW"]
-        one_log(svc, sheet_id_num, row)
-        print("Skipped by time gate"); sys.exit(0)
+        one_log(svc, sheet_id_num, row); print("Scheduled window not met → skipped"); sys.exit(0)
 
     # LeoCross fetch
     token = gw_token()
@@ -275,8 +293,7 @@ def main():
     if not trade:
         row = [datetime.utcnow().isoformat()+"Z", source, "SPX", last_px,
                "", "ABORT", "", "", "", "", "","","","", "", "NO_TRADE_PAYLOAD"]
-        one_log(svc, sheet_id_num, row)
-        raise SystemExit("LeoCross: no trade payload")
+        one_log(svc, sheet_id_num, row); raise SystemExit("LeoCross: no trade payload")
 
     def fnum(x):
         try: return float(x)
@@ -333,12 +350,11 @@ def main():
                    legs[0], legs[1], legs[2], legs[3],
                    "", f"ABORT_WOULD_CLOSE {osi} cur={cur}"]
             one_log(svc, sheet_id_num, row)
-            print(f"ABORT_WOULD_CLOSE {osi} cur={cur}")
-            sys.exit(0)
+            print(f"ABORT_WOULD_CLOSE {osi} cur={cur}"); sys.exit(0)
 
-    # Qty = 1 per $5k BP
-    bp_usd = buying_power_usd(c, acct_hash)
-    qty = qty_from_bp(bp_usd)
+    # Qty = 1 per $5k BP (option to override for small live tests)
+    bp_usd = OPT_BP_OVERRIDE if OPT_BP_OVERRIDE > 0 else buying_power_usd(c, acct_hash)
+    qty = QTY_OVERRIDE if QTY_OVERRIDE > 0 else qty_from_bp(bp_usd)
     order_type = "NET_CREDIT" if is_credit else "NET_DEBIT"
 
     # Ladder prices (snap to tick)
@@ -352,8 +368,8 @@ def main():
         p2 = clamp_tick(mid if mid is not None else DEBIT_START)
         p3 = clamp_tick((mid + 0.05) if mid is not None else DEBIT_START + 0.05)
 
-    # Build/Place/Replace
-    def build(price: float):
+    # Build/Place/Status (rename to avoid 'build' collision)
+    def build_order(price: float):
         return {
             "orderType": order_type,
             "session": "NORMAL",
@@ -370,7 +386,7 @@ def main():
         }
 
     def place(price):
-        r = c.place_order(acct_hash, build(price))
+        r = c.place_order(acct_hash, build_order(price))
         try:
             j=r.json(); oid = str(j.get("orderId") or j.get("order_id") or "")
         except:
@@ -397,13 +413,12 @@ def main():
                    qty, order_type, f"{p1:.2f}",
                    legs[0], legs[1], legs[2], legs[3],
                    oid, "FILLED_S1"]
-            one_log(svc, sheet_id_num, row)
-            print("FILLED @ stage 1"); return
+            one_log(svc, sheet_id_num, row); print("FILLED @ stage 1"); return
         time.sleep(1)
 
     # Stage 2
     r = c.session.put(f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}",
-                      json=build(p2))
+                      json=build_order(p2))
     print(f"REPLACE → {p2:.2f} HTTP={r.status_code}")
     end = time.time() + STAGE_SEC
     while time.time() < end:
@@ -413,13 +428,12 @@ def main():
                    qty, order_type, f"{p2:.2f}",
                    legs[0], legs[1], legs[2], legs[3],
                    oid, "FILLED_S2"]
-            one_log(svc, sheet_id_num, row)
-            print("FILLED @ stage 2"); return
+            one_log(svc, sheet_id_num, row); print("FILLED @ stage 2"); return
         time.sleep(1)
 
     # Stage 3
     r = c.session.put(f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}",
-                      json=build(p3))
+                      json=build_order(p3))
     print(f"REPLACE → {p3:.2f} HTTP={r.status_code}")
     end = time.time() + STAGE_SEC
     st = ""
@@ -431,8 +445,7 @@ def main():
                    qty, order_type, f"{p3:.2f}",
                    legs[0], legs[1], legs[2], legs[3],
                    oid, "FILLED_S3"]
-            one_log(svc, sheet_id_num, row)
-            print("FILLED @ stage 3"); return
+            one_log(svc, sheet_id_num, row); print("FILLED @ stage 3"); return
         time.sleep(1)
 
     # Not filled yet → final snapshot
