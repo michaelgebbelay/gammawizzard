@@ -1,8 +1,32 @@
-# Simple LeoCross → Schwab placer (LIVE ONLY) with:
-# - PLACER_MODE: NOW | SCHEDULED | OFF
-# - One Google Sheet write per run
-# - No‑close guard: abort if any leg would offset an existing position
-# - Qty: 1 / $5k BP (override with QTY_OVERRIDE)
+# Simple LeoCross → Schwab placer (LIVE ONLY)
+# Modes: PLACER_MODE = NOW | SCHEDULED | OFF
+# - NOW        → place immediately (ignores time window)
+# - SCHEDULED  → only place in 16:08–16:14 ET window (Mon–Fri)
+# - OFF        → skip cleanly (still logs one row)
+#
+# Behavior:
+# - Pulls LeoCross from GammaWizard (resilient: token or login; retries on 401/403).
+# - Builds 5‑wide SPXW iron condor (inner strikes from Limit/CLimit).
+# - Credit: 2.10 → mid → mid-0.05    Debit: 1.90 → mid → mid+0.05
+# - Qty: 1 contract per $5k option BP (override with QTY_OVERRIDE).
+# - No‑close guard: if any leg would offset an existing SPX/SPXW position → ABORT (no order).
+# - Single Google Sheet write per run (top-insert append).
+#
+# Required env (secrets):
+#   SCHWAB_APP_KEY, SCHWAB_APP_SECRET, SCHWAB_TOKEN_JSON
+#   GSHEET_ID, GOOGLE_SERVICE_ACCOUNT_JSON
+#   (GammaWizard) GW_EMAIL, GW_PASSWORD  (optional GW_TOKEN too)
+#
+# Optional env:
+#   PLACER_MODE=NOW|SCHEDULED|OFF   (default OFF)
+#   QTY_OVERRIDE=1                  (force lot size)
+#   OPT_BP_OVERRIDE=5000            (simulate BP for sizing, still live)
+#   GW_TOKEN=...                    (used first unless GW_FORCE_LOGIN=1)
+#   GW_FORCE_LOGIN=1                (ignore GW_TOKEN, always login)
+#   GW_BASE=https://gandalf.gammawizard.com
+#   GW_ENDPOINT=/rapi/GetLeoCross
+#   GW_TIMEOUT=30                   (seconds)
+
 import os, sys, json, time, math, re
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
@@ -25,17 +49,18 @@ GW_ENDPOINT = os.environ.get("GW_ENDPOINT", "/rapi/GetLeoCross")
 
 SHEET_ID  = os.environ["GSHEET_ID"]
 SA_JSON   = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
-SHEET_TAB = os.environ.get("SHEET_TAB", "schwab")  # matches your existing tab
+SHEET_TAB = os.environ.get("SHEET_TAB", "schwab")  # matches your tab
 
 # LIVE‑order sizing helpers
-try:
-    QTY_OVERRIDE = int(os.environ.get("QTY_OVERRIDE", "0"))
-except:
-    QTY_OVERRIDE = 0
-try:
-    OPT_BP_OVERRIDE = float(os.environ.get("OPT_BP_OVERRIDE", "-1"))
-except:
-    OPT_BP_OVERRIDE = -1.0
+def _to_int(s, d=0):
+    try: return int(s)
+    except: return d
+def _to_float(s, d=-1.0):
+    try: return float(s)
+    except: return d
+
+QTY_OVERRIDE    = _to_int(os.environ.get("QTY_OVERRIDE", "0"), 0)
+OPT_BP_OVERRIDE = _to_float(os.environ.get("OPT_BP_OVERRIDE", "-1"), -1.0)
 
 # Header matches your 'schwab' tab format
 SCHWAB_HEADERS = [
@@ -120,24 +145,52 @@ def one_log(svc, sheet_id_num, row_vals: list):
         valueInputOption="USER_ENTERED", body={"values":[row_vals]}
     ).execute()
 
-# ---- GammaWizard
-def gw_token() -> str:
-    tok = _sanitize_token(os.environ.get("GW_TOKEN",""))
-    if tok: return tok
-    email = os.environ["GW_EMAIL"]
-    password = os.environ["GW_PASSWORD"]
+# ---- GammaWizard (resilient)
+def _gw_timeout():
+    try: return int(os.environ.get("GW_TIMEOUT", "30"))
+    except: return 30
+
+def gw_login_token() -> str:
+    email = os.environ.get("GW_EMAIL", "")
+    password = os.environ.get("GW_PASSWORD", "")
+    if not (email and password):
+        raise RuntimeError("GW_LOGIN_MISSING_CREDS")
     r = requests.post(f"{GW_BASE}/goauth/authenticateFireUser",
-                      data={"email":email,"password":password}, timeout=30)
-    r.raise_for_status()
+                      data={"email":email,"password":password}, timeout=_gw_timeout())
+    if r.status_code != 200:
+        raise RuntimeError(f"GW_LOGIN_HTTP_{r.status_code}: {r.text[:180]}")
     j=r.json(); t=j.get("token")
-    if not t: raise SystemExit("GW: no token in response")
+    if not t:
+        raise RuntimeError(f"GW_LOGIN_NO_TOKEN: {str(j)[:180]}")
     return t
 
-def gw_get_leocross(token: str) -> dict:
-    hdr={"Accept":"application/json","Authorization":f"Bearer {_sanitize_token(token)}"}
-    r = requests.get(f"{GW_BASE.rstrip('/')}/{GW_ENDPOINT.lstrip('/')}",
-                     headers=hdr, timeout=30)
-    r.raise_for_status()
+def gw_get_leocross_resilient() -> dict:
+    # Prefer GW_TOKEN unless GW_FORCE_LOGIN=1
+    use_login_first = os.environ.get("GW_FORCE_LOGIN","").lower() in ("1","true","yes")
+    token = None
+    if not use_login_first:
+        token = _sanitize_token(os.environ.get("GW_TOKEN","") or "")
+        if not token:
+            use_login_first = True
+    if use_login_first:
+        token = gw_login_token()
+
+    def _hit(tok: str):
+        hdr = {
+            "Accept":"application/json",
+            "Authorization": f"Bearer {_sanitize_token(tok)}",
+            "User-Agent": "gw-placer/1.0"
+        }
+        url = f"{GW_BASE.rstrip('/')}/{GW_ENDPOINT.lstrip('/')}"
+        return requests.get(url, headers=hdr, timeout=_gw_timeout())
+
+    r = _hit(token)
+    if r.status_code in (401, 403):
+        # fresh login once, then retry
+        fresh = gw_login_token()
+        r = _hit(fresh)
+    if r.status_code != 200:
+        raise RuntimeError(f"GW_HTTP_{r.status_code}: {r.text[:180]}")
     return r.json()
 
 # ---- Schwab helpers
@@ -249,7 +302,7 @@ def main():
         return ""
     last_px = spx_last()
 
-    # Sheets client (use gbuild to avoid name collision)
+    # Sheets client
     creds = service_account.Credentials.from_service_account_info(json.loads(SA_JSON),
             scopes=["https://www.googleapis.com/auth/spreadsheets"])
     svc = gbuild("sheets","v4",credentials=creds)
@@ -268,9 +321,16 @@ def main():
                "","","","", "", "SKIPPED_TIME_WINDOW"]
         one_log(svc, sheet_id_num, row); print("Scheduled window not met → skipped"); sys.exit(0)
 
-    # LeoCross fetch
-    token = gw_token()
-    api = gw_get_leocross(token)
+    # LeoCross fetch (resilient; clean abort on failure)
+    try:
+        api = gw_get_leocross_resilient()
+    except Exception as e:
+        row = [datetime.utcnow().isoformat()+"Z", source, "SPX", last_px,
+               "", "ABORT", "", "", "", "",
+               "","","","", "", f"ABORT_GW: {str(e)[:180]}"]
+        one_log(svc, sheet_id_num, row)
+        print(f"ABORT_GW: {e}")
+        sys.exit(0)
 
     # Extract trade flexibly
     def extract(j):
@@ -293,7 +353,7 @@ def main():
     if not trade:
         row = [datetime.utcnow().isoformat()+"Z", source, "SPX", last_px,
                "", "ABORT", "", "", "", "", "","","","", "", "NO_TRADE_PAYLOAD"]
-        one_log(svc, sheet_id_num, row); raise SystemExit("LeoCross: no trade payload")
+        one_log(svc, sheet_id_num, row); print("NO_TRADE_PAYLOAD"); sys.exit(0)
 
     def fnum(x):
         try: return float(x)
@@ -368,7 +428,7 @@ def main():
         p2 = clamp_tick(mid if mid is not None else DEBIT_START)
         p3 = clamp_tick((mid + 0.05) if mid is not None else DEBIT_START + 0.05)
 
-    # Build/Place/Status (rename to avoid 'build' collision)
+    # Build/Place/Status
     def build_order(price: float):
         return {
             "orderType": order_type,
