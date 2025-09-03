@@ -1,4 +1,4 @@
-# Simple LeoCross → Schwab placer (LIVE ONLY) with timed ladder
+# Simple LeoCross → Schwab placer (LIVE ONLY) with timed ladder & cash-based sizing
 # Modes: PLACER_MODE = NOW | SCHEDULED | OFF
 # - NOW        → place immediately (ignores time window)
 # - SCHEDULED  → only place in 16:08–16:14 ET window (Mon–Fri)
@@ -7,33 +7,28 @@
 # Behavior:
 # - Pulls LeoCross from GammaWizard (resilient: token or login; retries on 401/403).
 # - Builds 5‑wide SPXW iron condor (inner strikes from Limit/CLimit).
-# - Credit ladder: start 2.10 → mid → mid-0.05 → then keep stepping -0.05 every LADDER_SEC down to CREDIT_FLOOR (default 1.90).
-# - Debit ladder:  start 1.90 → mid → mid+0.05 → then keep stepping +0.05 every LADDER_SEC up to DEBIT_CEIL   (default 2.10).
-# - Qty: 1 contract per $5k option BP (override with QTY_OVERRIDE).
+# - Credit ladder: start → mid → mid-0.05 → then -0.05 every LADDER_SEC to CREDIT_FLOOR.
+# - Debit ladder:  start → mid → mid+0.05 → then +0.05 every LADDER_SEC to DEBIT_CEIL.
+# - Qty: **1 contract per PER_UNIT (default $5k) of CASH** (cashAvailableForTrading*). Floor division.
 # - No‑close guard: if any leg would offset an existing SPX/SPXW position → ABORT (no order).
-# - Single Google Sheet write per run (top-insert append).
+# - Single Google Sheet write per run (top-insert append) with a compact **step trace** in status.
 #
 # Required env (secrets):
 #   SCHWAB_APP_KEY, SCHWAB_APP_SECRET, SCHWAB_TOKEN_JSON
 #   GSHEET_ID, GOOGLE_SERVICE_ACCOUNT_JSON
 #   (GammaWizard) GW_EMAIL, GW_PASSWORD  (optional GW_TOKEN too)
 #
-# Optional env:
-#   PLACER_MODE=NOW|SCHEDULED|OFF   (default OFF)
-#   QTY_OVERRIDE=1                  (force lot size)
-#   OPT_BP_OVERRIDE=5000            (simulate BP for sizing, still live)
-#   LADDER_SEC=30                   (seconds between price steps)
-#   MAX_STEPS=50                    (max total price points INCLUDING the first; safety stop)
-#   CREDIT_START=2.10               (override start credit)
-#   DEBIT_START=1.90                (override start debit)
-#   CREDIT_FLOOR=1.90               (lowest credit we’ll quote)
-#   DEBIT_CEIL=2.10                 (highest debit we’ll pay)
-#   GW_TOKEN=...                    (used first unless GW_FORCE_LOGIN=1)
-#   GW_FORCE_LOGIN=1                (ignore GW_TOKEN, always login)
-#   GW_BASE=https://gandalf.gammawizard.com
-#   GW_ENDPOINT=/rapi/GetLeoCross
-#   GW_TIMEOUT=30                   (seconds)
-
+# Key options (env):
+#   PLACER_MODE=NOW|SCHEDULED|OFF        (default OFF)
+#   SIZE_SOURCE=CASH|OBP|BP_MIN|BP_MAX   (default CASH; use CASH for 1 per $5k cash)
+#   PER_UNIT=5000                        (dollars per contract)
+#   CASH_RESERVE=0                       (subtract before sizing)
+#   QTY_OVERRIDE=0                       (force exact qty if >0)
+#   OPT_BP_OVERRIDE=-1                   (testing: pretend base dollars)
+#   LADDER_SEC=30, MAX_STEPS=50
+#   CREDIT_START=2.10, DEBIT_START=1.90, CREDIT_FLOOR=1.90, DEBIT_CEIL=2.10
+#   GW_TOKEN=..., GW_FORCE_LOGIN=1, GW_BASE, GW_ENDPOINT, GW_TIMEOUT
+#
 import os, sys, json, time, math, re
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
@@ -42,20 +37,21 @@ from schwab.auth import client_from_token_file
 from google.oauth2 import service_account
 from googleapiclient.discovery import build as gbuild
 
-# ---- constants / defaults
-def _to_int(s, d):
+# ---- helpers for safe casts
+def _to_int(s, d):  # int with default
     try: return int(s)
     except: return d
-def _to_float(s, d):
+def _to_float(s, d):  # float with default
     try: return float(s)
     except: return d
 
+# ---- constants / defaults
 TICK = 0.05
-WIDTH = 5                # 5-point wings
+WIDTH = 5
 ET = ZoneInfo("America/New_York")
 MAX_QTY = 500
 
-# Starts / bounds (can be overridden by env)
+# Starts / bounds
 CREDIT_START = _to_float(os.environ.get("CREDIT_START", "2.10"), 2.10)
 DEBIT_START  = _to_float(os.environ.get("DEBIT_START",  "1.90"), 1.90)
 CREDIT_FLOOR = _to_float(os.environ.get("CREDIT_FLOOR", "1.90"), 1.90)
@@ -72,15 +68,12 @@ SHEET_ID  = os.environ["GSHEET_ID"]
 SA_JSON   = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 SHEET_TAB = os.environ.get("SHEET_TAB", "schwab")  # matches your tab
 
-# LIVE‑order sizing helpers
-def _to_int_def(s, d=0):
-    try: return int(s)
-    except: return d
-def _to_float_def(s, d=-1.0):
-    try: return float(s)
-    except: return d
-QTY_OVERRIDE    = _to_int_def(os.environ.get("QTY_OVERRIDE", "0"), 0)
-OPT_BP_OVERRIDE = _to_float_def(os.environ.get("OPT_BP_OVERRIDE", "-1"), -1.0)
+# Sizing options
+SIZE_SOURCE     = (os.environ.get("SIZE_SOURCE", "CASH") or "CASH").upper()  # CASH|OBP|BP_MIN|BP_MAX
+PER_UNIT        = _to_int(os.environ.get("PER_UNIT", "5000"), 5000)
+CASH_RESERVE    = _to_float(os.environ.get("CASH_RESERVE", "0"), 0.0)
+QTY_OVERRIDE    = _to_int(os.environ.get("QTY_OVERRIDE", "0"), 0)
+OPT_BP_OVERRIDE = _to_float(os.environ.get("OPT_BP_OVERRIDE", "-1"), -1.0)
 
 # Header matches your 'schwab' tab format
 SCHWAB_HEADERS = [
@@ -167,8 +160,7 @@ def one_log(svc, sheet_id_num, row_vals: list):
 
 # ---- GammaWizard (resilient)
 def _gw_timeout():
-    try: return int(os.environ.get("GW_TIMEOUT", "30"))
-    except: return 30
+    return _to_int(os.environ.get("GW_TIMEOUT", "30"), 30)
 
 def gw_login_token() -> str:
     email = os.environ.get("GW_EMAIL", "")
@@ -185,7 +177,6 @@ def gw_login_token() -> str:
     return t
 
 def gw_get_leocross_resilient() -> dict:
-    # Prefer GW_TOKEN unless GW_FORCE_LOGIN=1
     use_login_first = os.environ.get("GW_FORCE_LOGIN","").lower() in ("1","true","yes")
     token = None
     if not use_login_first:
@@ -206,7 +197,6 @@ def gw_get_leocross_resilient() -> dict:
 
     r = _hit(token)
     if r.status_code in (401, 403):
-        # fresh login once, then retry
         fresh = gw_login_token()
         r = _hit(fresh)
     if r.status_code != 200:
@@ -232,28 +222,52 @@ def compute_mid_condor(c, legs):
     net_ask=(sp_a+sc_a)-(bp_b+bc_b)
     return (net_bid+net_ask)/2.0
 
-def buying_power_usd(c, acct_hash: str) -> float:
+def pick_first(dct, keys):
+    for k in keys:
+        v = dct.get(k)
+        if isinstance(v,(int,float)): return float(v)
+    return None
+
+def sizing_base_usd(c, acct_hash: str, src: str) -> float:
+    """Return dollars to size against based on SIZE_SOURCE."""
     url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}"
     r=c.session.get(url, params={"fields":"positions"})
     if r.status_code!=200: return 0.0
     j=r.json()
     if isinstance(j,list): j=j[0]
     sa=j.get("securitiesAccount") or j
-    cands=[]
-    for section in ("currentBalances","projectedBalances","initialBalances","balances"):
-        b=sa.get(section,{})
-        for k in ("optionBuyingPower","optionsBuyingPower","buyingPower",
-                  "availableFunds","cashAvailableForTrading",
-                  "cashAvailableForTradingSettled"):
-            v=b.get(k)
-            if isinstance(v,(int,float)): cands.append(float(v))
-    for k in ("optionBuyingPower","optionsBuyingPower","buyingPower"):
-        v=sa.get(k)
-        if isinstance(v,(int,float)): cands.append(float(v))
-    return max(cands) if cands else 0.0
 
-def qty_from_bp(bp: float) -> int:
-    q = max(1, int(bp // 5000))
+    sections=("currentBalances","projectedBalances","initialBalances","balances")
+
+    def gather(keys):
+        vals=[]
+        for sec in sections:
+            b = sa.get(sec, {}) or {}
+            for k in keys:
+                v = b.get(k)
+                if isinstance(v,(int,float)): vals.append(float(v))
+        return vals
+
+    src = (src or "CASH").upper()
+    if src == "CASH":
+        vals = gather(("cashAvailableForTradingSettled","cashAvailableForTrading"))
+        return max(vals) if vals else 0.0
+    if src == "OBP":
+        vals = gather(("optionBuyingPower","optionsBuyingPower"))
+        return max(vals) if vals else 0.0
+    if src == "BP_MIN":
+        vals = gather(("cashAvailableForTradingSettled","cashAvailableForTrading","optionBuyingPower","optionsBuyingPower"))
+        return min(vals) if vals else 0.0
+    if src == "BP_MAX":
+        vals = gather(("cashAvailableForTradingSettled","cashAvailableForTrading","optionBuyingPower","optionsBuyingPower"))
+        return max(vals) if vals else 0.0
+    # default CASH
+    vals = gather(("cashAvailableForTradingSettled","cashAvailableForTrading"))
+    return max(vals) if vals else 0.0
+
+def qty_from_base(base: float) -> int:
+    base = max(0.0, base - max(0.0, CASH_RESERVE))
+    q = max(1, int(base // max(1, PER_UNIT)))
     return min(q, MAX_QTY)
 
 def list_spx_option_positions(c, acct_hash: str):
@@ -296,19 +310,16 @@ def build_ladder_prices(is_credit: bool, start: float, mid: float|None,
                         floor_c: float, ceil_d: float, max_steps: int):
     """
     Returns a list of price points to try, length <= max_steps.
-    - Credit:  start → mid → mid-0.05 → mid-0.10 → ... → floor (>= floor)
-    - Debit:   start → mid → mid+0.05 → mid+0.10 → ... → ceil  (<= ceil)
-    De-duplicates and snaps to tick.
+    - Credit:  start → mid → mid-0.05 → ... → floor
+    - Debit:   start → mid → mid+0.05 → ... → ceil
     """
     seen=set(); seq=[]
     def add(p):
         p = clamp_tick(p)
         if is_credit:
-            if p < floor_c: p = floor_c
-            if p > start: p = start
+            p = min(start, max(floor_c, p))
         else:
-            if p > ceil_d: p = ceil_d
-            if p < start: p = start
+            p = max(start, min(ceil_d, p))
         if p not in seen:
             seen.add(p); seq.append(p)
 
@@ -331,7 +342,6 @@ def build_ladder_prices(is_credit: bool, start: float, mid: float|None,
             if is_credit and cur <= floor_c: add(floor_c); break
             if (not is_credit) and cur >= ceil_d: add(ceil_d); break
             add(cur)
-    # Cap to max_steps
     return seq[:max_steps]
 
 # ---- main
@@ -475,17 +485,18 @@ def main():
             one_log(svc, sheet_id_num, row)
             print(f"ABORT_WOULD_CLOSE {osi} cur={cur}"); sys.exit(0)
 
-    # Qty = 1 per $5k BP (option to override for small live tests)
-    bp_usd = OPT_BP_OVERRIDE if OPT_BP_OVERRIDE > 0 else buying_power_usd(c, acct_hash)
-    qty = QTY_OVERRIDE if QTY_OVERRIDE > 0 else qty_from_bp(bp_usd)
+    # Qty = floor( (cash - reserve) / PER_UNIT ); override takes precedence
+    if OPT_BP_OVERRIDE > 0:
+        base_dollars = OPT_BP_OVERRIDE
+    else:
+        base_dollars = sizing_base_usd(c, acct_hash, SIZE_SOURCE)
+    qty = QTY_OVERRIDE if QTY_OVERRIDE > 0 else qty_from_base(base_dollars)
     order_type = "NET_CREDIT" if is_credit else "NET_DEBIT"
     side_name  = "SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"
 
     # Ladder prices (snap to tick)
     mid = compute_mid_condor(c, legs)
     start_price = clamp_tick(CREDIT_START if is_credit else DEBIT_START)
-    floor = CREDIT_FLOOR if is_credit else start_price  # credit walks down to floor
-    ceil  = DEBIT_CEIL   if not is_credit else start_price  # debit walks up to ceil
     prices = build_ladder_prices(is_credit, start=start_price, mid=mid,
                                  floor_c=CREDIT_FLOOR, ceil_d=DEBIT_CEIL, max_steps=MAX_STEPS)
 
@@ -538,19 +549,21 @@ def main():
             j={}
         return str(j.get("status") or j.get("orderStatus") or "")
 
-    # Ladder loop
+    # Ladder loop with step trace
+    path=[]
     used_price = prices[0]
     oid = place(used_price)
+    path.append(f"{used_price:.2f}")
     filled=False; st=""
 
     for i, tgt in enumerate(prices):
         if i == 0:
-            # already placed at prices[0]
-            pass
+            pass  # already placed at prices[0]
         else:
             oid = replace_order(oid, tgt)
             used_price = tgt
-        # wait LADDER_SEC (polling each 1s)
+            path.append(f"{used_price:.2f}")
+        # wait LADDER_SEC (poll 1s)
         end = time.time() + LADDER_SEC
         while time.time() < end:
             st = status(oid).upper()
@@ -560,8 +573,9 @@ def main():
         if filled:
             break
 
-    # Final log
-    final_status = "FILLED" if filled else (st or "WORKING")
+    # Final log (single write)
+    trace = "STEPS " + "→".join(path)
+    final_status = (("FILLED " + trace) if filled else ((st or "WORKING") + " " + trace))
     row = [datetime.utcnow().isoformat()+"Z", source, "SPX", last_px,
            sig_date, "PLACE", side_name,
            qty, order_type, f"{used_price:.2f}",
