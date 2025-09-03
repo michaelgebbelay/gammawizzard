@@ -1,4 +1,4 @@
-name: Place LeoCross (LIVE Minimal Hardened)
+name: Place LeoCross
 
 on:
   workflow_dispatch:
