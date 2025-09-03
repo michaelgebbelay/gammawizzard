@@ -12,13 +12,13 @@ on:
         required: false
         default: ''
       ladder_sec:
-        description: 'Seconds between price steps'
+        description: 'Seconds between price steps (default 30)'
         required: false
         default: '30'
-      max_steps:
-        description: 'Max price steps (including first)'
+      timebox_sec:
+        description: 'Total run time budget in seconds (default 180)'
         required: false
-        default: '50'
+        default: '180'
       credit_start:
         description: 'Start credit (e.g., 2.10)'
         required: false
@@ -28,25 +28,17 @@ on:
         required: false
         default: ''
       credit_floor:
-        description: 'Credit floor (min credit you’ll accept)'
+        description: 'Credit floor (min credit)'
         required: false
         default: ''
       debit_ceil:
-        description: 'Debit ceiling (max debit you’ll pay)'
+        description: 'Debit ceiling (max debit)'
         required: false
         default: ''
-      size_source:
-        description: 'Sizing: CASH | OBP | BP_MIN | BP_MAX'
-        required: false
-        default: 'CASH'
       per_unit:
         description: 'Dollars per contract (default 5000)'
         required: false
         default: '5000'
-      cash_reserve:
-        description: 'Subtract this from size base before dividing'
-        required: false
-        default: '0'
   schedule:
     # 4:10pm ET across DST (runs both; script enforces window in SCHEDULED mode)
     - cron: "10 20 * * 1-5"  # 4:10pm EDT
@@ -91,25 +83,25 @@ jobs:
           GW_FORCE_LOGIN: ${{ vars.GW_FORCE_LOGIN }}
           GW_TIMEOUT: ${{ vars.GW_TIMEOUT }}
 
-          # --- Mode selection (dispatch input > repo variable > default)
+          # --- Mode selection
           PLACER_MODE: ${{ github.event.inputs.mode != '' && github.event.inputs.mode || (vars.PLACER_MODE != '' && vars.PLACER_MODE || 'SCHEDULED') }}
 
-          # --- Sizing (CASH by default → 1 lot per $5k of cash)
-          SIZE_SOURCE:  ${{ github.event.inputs.size_source != '' && github.event.inputs.size_source || (vars.SIZE_SOURCE != '' && vars.SIZE_SOURCE || 'CASH') }}
-          PER_UNIT:     ${{ github.event.inputs.per_unit != '' && github.event.inputs.per_unit || (vars.PER_UNIT != '' && vars.PER_UNIT || 5000) }}
-          CASH_RESERVE: ${{ github.event.inputs.cash_reserve != '' && github.event.inputs.cash_reserve || (vars.CASH_RESERVE != '' && vars.CASH_RESERVE || 0) }}
-          QTY_OVERRIDE: ${{ github.event.inputs.qty }}
+          # --- Sizing (OBP by default → 1 lot per $5k OBP)
+          SIZE_SOURCE:   OBP
+          PER_UNIT:      ${{ github.event.inputs.per_unit != '' && github.event.inputs.per_unit || (vars.PER_UNIT != '' && vars.PER_UNIT || 5000) }}
+          CASH_RESERVE:  ${{ vars.CASH_RESERVE || 0 }}
+          QTY_OVERRIDE:  ${{ github.event.inputs.qty }}
           OPT_BP_OVERRIDE: ${{ vars.OPT_BP_OVERRIDE }}
 
-          # --- Ladder pacing (dispatch input > repo variable > script defaults)
-          LADDER_SEC:   ${{ github.event.inputs.ladder_sec != '' && github.event.inputs.ladder_sec || (vars.LADDER_SEC != '' && vars.LADDER_SEC || 30) }}
-          MAX_STEPS:    ${{ github.event.inputs.max_steps != '' && github.event.inputs.max_steps || (vars.MAX_STEPS != '' && vars.MAX_STEPS || 50) }}
+          # --- Ladder pacing + timebox
+          LADDER_SEC:    ${{ github.event.inputs.ladder_sec != '' && github.event.inputs.ladder_sec || (vars.LADDER_SEC != '' && vars.LADDER_SEC || 30) }}
+          TIMEBOX_SEC:   ${{ github.event.inputs.timebox_sec != '' && github.event.inputs.timebox_sec || (vars.TIMEBOX_SEC != '' && vars.TIMEBOX_SEC || 180) }}
 
-          # --- Price rails (optional)
-          CREDIT_START: ${{ github.event.inputs.credit_start != '' && github.event.inputs.credit_start || vars.CREDIT_START }}
-          DEBIT_START:  ${{ github.event.inputs.debit_start  != '' && github.event.inputs.debit_start  || vars.DEBIT_START }}
-          CREDIT_FLOOR: ${{ github.event.inputs.credit_floor != '' && github.event.inputs.credit_floor || vars.CREDIT_FLOOR }}
-          DEBIT_CEIL:   ${{ github.event.inputs.debit_ceil   != '' && github.event.inputs.debit_ceil   || vars.DEBIT_CEIL }}
+          # --- Price rails (optional overrides)
+          CREDIT_START:  ${{ github.event.inputs.credit_start != '' && github.event.inputs.credit_start || vars.CREDIT_START }}
+          DEBIT_START:   ${{ github.event.inputs.debit_start  != '' && github.event.inputs.debit_start  || vars.DEBIT_START }}
+          CREDIT_FLOOR:  ${{ github.event.inputs.credit_floor != '' && github.event.inputs.credit_floor || vars.CREDIT_FLOOR }}
+          DEBIT_CEIL:    ${{ github.event.inputs.debit_ceil   != '' && github.event.inputs.debit_ceil   || vars.DEBIT_CEIL }}
 
           PYTHONUNBUFFERED: "1"
         run: |
