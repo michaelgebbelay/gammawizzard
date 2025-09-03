@@ -1,17 +1,18 @@
-# Simple LeoCross → Schwab placer (LIVE ONLY) with timed ladder & cash-based sizing
+# Simple LeoCross → Schwab placer (LIVE ONLY) with mid-tracking ladder & OBP sizing
 # Modes: PLACER_MODE = NOW | SCHEDULED | OFF
 # - NOW        → place immediately (ignores time window)
 # - SCHEDULED  → only place in 16:08–16:14 ET window (Mon–Fri)
 # - OFF        → skip cleanly (still logs one row)
 #
-# Behavior:
-# - Pulls LeoCross from GammaWizard (resilient: token or login; retries on 401/403).
-# - Builds 5‑wide SPXW iron condor (inner strikes from Limit/CLimit).
-# - Credit ladder: start → mid → mid-0.05 → then -0.05 every LADDER_SEC to CREDIT_FLOOR.
-# - Debit ladder:  start → mid → mid+0.05 → then +0.05 every LADDER_SEC to DEBIT_CEIL.
-# - Qty: **1 contract per PER_UNIT (default $5k) of CASH** (cashAvailableForTrading*). Floor division.
-# - No‑close guard: if any leg would offset an existing SPX/SPXW position → ABORT (no order).
-# - Single Google Sheet write per run (top-insert append) with a compact **step trace** in status.
+# Ladder logic (30s steps; poll 1s):
+#   CREDIT: start(2.10) → mid → new_mid → (prev_mid - 0.05) → 1.90 → wait 30s → CANCEL → restart sequence
+#   DEBIT:  start(1.90) → mid → new_mid → (prev_mid + 0.05) → 2.10 → wait 30s → CANCEL → restart sequence
+# Timebox: default 180s (≈ 2.5–3.0 min). Stops when FILLED or timebox hit.
+#
+# Sizing: **Option Buying Power** only (optionBuyingPower/optionsBuyingPower), qty = floor(OBP / PER_UNIT).
+# Defaults: PER_UNIT=5000, SIZE_SOURCE=OBP. (This yields 1 lot per $5k OBP.)
+#
+# One Google Sheet write at the end with a step trace and sizing info in the status field.
 #
 # Required env (secrets):
 #   SCHWAB_APP_KEY, SCHWAB_APP_SECRET, SCHWAB_TOKEN_JSON
@@ -20,15 +21,15 @@
 #
 # Key options (env):
 #   PLACER_MODE=NOW|SCHEDULED|OFF        (default OFF)
-#   SIZE_SOURCE=CASH|OBP|BP_MIN|BP_MAX   (default CASH; use CASH for 1 per $5k cash)
+#   SIZE_SOURCE=OBP|CASH|BP_MIN|BP_MAX   (default OBP; OBP is recommended per your rule)
 #   PER_UNIT=5000                        (dollars per contract)
-#   CASH_RESERVE=0                       (subtract before sizing)
+#   CASH_RESERVE=0                       (ignored for OBP but available if you switch to CASH)
 #   QTY_OVERRIDE=0                       (force exact qty if >0)
-#   OPT_BP_OVERRIDE=-1                   (testing: pretend base dollars)
-#   LADDER_SEC=30, MAX_STEPS=50
-#   CREDIT_START=2.10, DEBIT_START=1.90, CREDIT_FLOOR=1.90, DEBIT_CEIL=2.10
+#   OPT_BP_OVERRIDE=-1                   (testing: pretend base dollars; still LIVE otherwise)
+#   LADDER_SEC=30, TIMEBOX_SEC=180
+#   CREDIT_START=2.10, CREDIT_FLOOR=1.90
+#   DEBIT_START=1.90,  DEBIT_CEIL=2.10
 #   GW_TOKEN=..., GW_FORCE_LOGIN=1, GW_BASE, GW_ENDPOINT, GW_TIMEOUT
-#
 import os, sys, json, time, math, re
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
@@ -57,9 +58,9 @@ DEBIT_START  = _to_float(os.environ.get("DEBIT_START",  "1.90"), 1.90)
 CREDIT_FLOOR = _to_float(os.environ.get("CREDIT_FLOOR", "1.90"), 1.90)
 DEBIT_CEIL   = _to_float(os.environ.get("DEBIT_CEIL",   "2.10"), 2.10)
 
-# Ladder pacing
-LADDER_SEC = _to_int(os.environ.get("LADDER_SEC", "30"), 30)
-MAX_STEPS  = _to_int(os.environ.get("MAX_STEPS",  "50"), 50)
+# Ladder pacing / timebox
+LADDER_SEC  = _to_int(os.environ.get("LADDER_SEC",  "30"), 30)
+TIMEBOX_SEC = _to_int(os.environ.get("TIMEBOX_SEC", "180"), 180)  # ~2.5–3.0 min
 
 GW_BASE = os.environ.get("GW_BASE", "https://gandalf.gammawizard.com")
 GW_ENDPOINT = os.environ.get("GW_ENDPOINT", "/rapi/GetLeoCross")
@@ -68,8 +69,8 @@ SHEET_ID  = os.environ["GSHEET_ID"]
 SA_JSON   = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 SHEET_TAB = os.environ.get("SHEET_TAB", "schwab")  # matches your tab
 
-# Sizing options
-SIZE_SOURCE     = (os.environ.get("SIZE_SOURCE", "CASH") or "CASH").upper()  # CASH|OBP|BP_MIN|BP_MAX
+# Sizing options (default OBP per your rule)
+SIZE_SOURCE     = (os.environ.get("SIZE_SOURCE", "OBP") or "OBP").upper()  # OBP|CASH|BP_MIN|BP_MAX
 PER_UNIT        = _to_int(os.environ.get("PER_UNIT", "5000"), 5000)
 CASH_RESERVE    = _to_float(os.environ.get("CASH_RESERVE", "0"), 0.0)
 QTY_OVERRIDE    = _to_int(os.environ.get("QTY_OVERRIDE", "0"), 0)
@@ -222,14 +223,8 @@ def compute_mid_condor(c, legs):
     net_ask=(sp_a+sc_a)-(bp_b+bc_b)
     return (net_bid+net_ask)/2.0
 
-def pick_first(dct, keys):
-    for k in keys:
-        v = dct.get(k)
-        if isinstance(v,(int,float)): return float(v)
-    return None
-
 def sizing_base_usd(c, acct_hash: str, src: str) -> float:
-    """Return dollars to size against based on SIZE_SOURCE."""
+    """Return dollars to size against. OBP uses ONLY optionBuyingPower/optionsBuyingPower."""
     url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}"
     r=c.session.get(url, params={"fields":"positions"})
     if r.status_code!=200: return 0.0
@@ -246,28 +241,33 @@ def sizing_base_usd(c, acct_hash: str, src: str) -> float:
             for k in keys:
                 v = b.get(k)
                 if isinstance(v,(int,float)): vals.append(float(v))
+        # ALSO check top-level mirrors
+        for k in keys:
+            v = sa.get(k)
+            if isinstance(v,(int,float)): vals.append(float(v))
         return vals
 
-    src = (src or "CASH").upper()
-    if src == "CASH":
-        vals = gather(("cashAvailableForTradingSettled","cashAvailableForTrading"))
-        return max(vals) if vals else 0.0
+    src = (src or "OBP").upper()
     if src == "OBP":
         vals = gather(("optionBuyingPower","optionsBuyingPower"))
         return max(vals) if vals else 0.0
+    if src == "CASH":
+        vals = gather(("cashAvailableForTradingSettled","cashAvailableForTrading","availableFunds"))
+        return max(vals) if vals else 0.0
     if src == "BP_MIN":
-        vals = gather(("cashAvailableForTradingSettled","cashAvailableForTrading","optionBuyingPower","optionsBuyingPower"))
+        vals = gather(("cashAvailableForTradingSettled","cashAvailableForTrading","availableFunds","optionBuyingPower","optionsBuyingPower"))
         return min(vals) if vals else 0.0
     if src == "BP_MAX":
-        vals = gather(("cashAvailableForTradingSettled","cashAvailableForTrading","optionBuyingPower","optionsBuyingPower"))
+        vals = gather(("cashAvailableForTradingSettled","cashAvailableForTrading","availableFunds","optionBuyingPower","optionsBuyingPower"))
         return max(vals) if vals else 0.0
-    # default CASH
-    vals = gather(("cashAvailableForTradingSettled","cashAvailableForTrading"))
+    # default OBP
+    vals = gather(("optionBuyingPower","optionsBuyingPower"))
     return max(vals) if vals else 0.0
 
 def qty_from_base(base: float) -> int:
-    base = max(0.0, base - max(0.0, CASH_RESERVE))
-    q = max(1, int(base // max(1, PER_UNIT)))
+    # reserve only applies for CASH sizing; kept generic for completeness
+    base_eff = max(0.0, base - max(0.0, CASH_RESERVE))
+    q = max(1, int(base_eff // max(1, PER_UNIT)))
     return min(q, MAX_QTY)
 
 def list_spx_option_positions(c, acct_hash: str):
@@ -304,45 +304,6 @@ def time_gate_ok() -> bool:
         return False
     # Accept 16:08–16:14 ET window
     return (now.hour == 16 and 8 <= now.minute <= 14)
-
-# ---- ladder helpers
-def build_ladder_prices(is_credit: bool, start: float, mid: float|None,
-                        floor_c: float, ceil_d: float, max_steps: int):
-    """
-    Returns a list of price points to try, length <= max_steps.
-    - Credit:  start → mid → mid-0.05 → ... → floor
-    - Debit:   start → mid → mid+0.05 → ... → ceil
-    """
-    seen=set(); seq=[]
-    def add(p):
-        p = clamp_tick(p)
-        if is_credit:
-            p = min(start, max(floor_c, p))
-        else:
-            p = max(start, min(ceil_d, p))
-        if p not in seen:
-            seen.add(p); seq.append(p)
-
-    add(start)
-    if mid is not None: add(mid)
-    if mid is not None:
-        step = -0.05 if is_credit else +0.05
-        k=1
-        while len(seq) < max_steps:
-            p = mid + step*k
-            if is_credit and p <= floor_c: add(floor_c); break
-            if (not is_credit) and p >= ceil_d: add(ceil_d); break
-            add(p); k+=1
-    else:
-        # No mid — walk from start to bound
-        step = -0.05 if is_credit else +0.05
-        cur = start
-        while len(seq) < max_steps:
-            cur = clamp_tick(cur + step)
-            if is_credit and cur <= floor_c: add(floor_c); break
-            if (not is_credit) and cur >= ceil_d: add(ceil_d); break
-            add(cur)
-    return seq[:max_steps]
 
 # ---- main
 def main():
@@ -485,22 +446,19 @@ def main():
             one_log(svc, sheet_id_num, row)
             print(f"ABORT_WOULD_CLOSE {osi} cur={cur}"); sys.exit(0)
 
-    # Qty = floor( (cash - reserve) / PER_UNIT ); override takes precedence
+    # Qty = floor( OBP / PER_UNIT ); override takes precedence
     if OPT_BP_OVERRIDE > 0:
         base_dollars = OPT_BP_OVERRIDE
+        base_src = "OVERRIDE"
     else:
         base_dollars = sizing_base_usd(c, acct_hash, SIZE_SOURCE)
+        base_src = SIZE_SOURCE
     qty = QTY_OVERRIDE if QTY_OVERRIDE > 0 else qty_from_base(base_dollars)
+    qty = max(1, qty)
     order_type = "NET_CREDIT" if is_credit else "NET_DEBIT"
     side_name  = "SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"
 
-    # Ladder prices (snap to tick)
-    mid = compute_mid_condor(c, legs)
-    start_price = clamp_tick(CREDIT_START if is_credit else DEBIT_START)
-    prices = build_ladder_prices(is_credit, start=start_price, mid=mid,
-                                 floor_c=CREDIT_FLOOR, ceil_d=DEBIT_CEIL, max_steps=MAX_STEPS)
-
-    # Build/Place/Status (+ replace that updates OID)
+    # Helpers to talk to Orders API
     def build_order(price: float):
         return {
             "orderType": order_type,
@@ -540,6 +498,12 @@ def main():
         print(f"REPLACE → {price:.2f} HTTP={r.status_code} NEW_ID={new_id}")
         return new_id
 
+    def cancel_order(oid: str):
+        url = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
+        r = c.session.delete(url)
+        print(f"CANCEL_HTTP {r.status_code} OID={oid}")
+        return r.status_code
+
     def status(oid: str):
         url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
         r=c.session.get(url)
@@ -549,40 +513,89 @@ def main():
             j={}
         return str(j.get("status") or j.get("orderStatus") or "")
 
-    # Ladder loop with step trace
-    path=[]
-    used_price = prices[0]
-    oid = place(used_price)
-    path.append(f"{used_price:.2f}")
-    filled=False; st=""
+    # Ladder sequence per your spec (timeboxed)
+    start_price = clamp_tick(CREDIT_START if is_credit else DEBIT_START)
+    bound_price = CREDIT_FLOOR if is_credit else DEBIT_CEIL
+    step_sign   = -0.05 if is_credit else +0.05
 
-    for i, tgt in enumerate(prices):
-        if i == 0:
-            pass  # already placed at prices[0]
-        else:
-            oid = replace_order(oid, tgt)
-            used_price = tgt
-            path.append(f"{used_price:.2f}")
-        # wait LADDER_SEC (poll 1s)
-        end = time.time() + LADDER_SEC
+    start_ts = time.time()
+    deadline = start_ts + TIMEBOX_SEC
+    path = []  # step trace across cancels
+    used_price = None
+    oid = None
+    filled = False
+    st = ""
+
+    def wait_poll(seconds: int, oid_local: str) -> tuple[bool,str]:
+        end = time.time() + seconds
+        last = ""
         while time.time() < end:
-            st = status(oid).upper()
-            if st == "FILLED":
-                filled=True; break
+            last = status(oid_local).upper()
+            if last == "FILLED":
+                return True, last
             time.sleep(1)
-        if filled:
-            break
+        return False, last
+
+    while time.time() < deadline and not filled:
+        # Step 0: start price
+        cur_mid = compute_mid_condor(c, legs)
+        used_price = start_price
+        oid = place(used_price); path.append(f"{used_price:.2f}")
+        filled, st = wait_poll(LADDER_SEC, oid)
+        if filled or time.time() >= deadline: break
+
+        # Step 1: mid
+        cur_mid = compute_mid_condor(c, legs)
+        if cur_mid is not None:
+            used_price = clamp_tick(cur_mid)
+            oid = replace_order(oid, used_price); path.append(f"{used_price:.2f}")
+            filled, st = wait_poll(LADDER_SEC, oid)
+            if filled or time.time() >= deadline: break
+
+        # Step 2: new mid
+        cur_mid2 = compute_mid_condor(c, legs)
+        if cur_mid2 is not None:
+            used_price = clamp_tick(cur_mid2)
+            oid = replace_order(oid, used_price); path.append(f"{used_price:.2f}")
+            filled, st = wait_poll(LADDER_SEC, oid)
+            if filled or time.time() >= deadline: break
+
+        # Step 3: previous mid ± 0.05
+        prev_mid = cur_mid2 if cur_mid2 is not None else cur_mid
+        if prev_mid is not None:
+            used_price = clamp_tick(prev_mid + step_sign)
+            # bound toward floor/ceil
+            if is_credit:
+                used_price = max(CREDIT_FLOOR, min(CREDIT_START, used_price))
+            else:
+                used_price = max(DEBIT_START, min(DEBIT_CEIL, used_price))
+            oid = replace_order(oid, used_price); path.append(f"{used_price:.2f}")
+            filled, st = wait_poll(LADDER_SEC, oid)
+            if filled or time.time() >= deadline: break
+
+        # Step 4: final bound (1.90 for credit, 2.10 for debit)
+        used_price = clamp_tick(bound_price)
+        oid = replace_order(oid, used_price); path.append(f"{used_price:.2f}")
+        filled, st = wait_poll(LADDER_SEC, oid)
+        if filled or time.time() >= deadline: break
+
+        # Not filled after bound step → CANCEL and restart (if time remains)
+        cancel_order(oid)
+        path.append("CXL")
+        # loop restarts; new OID will be placed at step 0
 
     # Final log (single write)
     trace = "STEPS " + "→".join(path)
-    final_status = (("FILLED " + trace) if filled else ((st or "WORKING") + " " + trace))
+    size_note = f" | SIZE {base_src}={base_dollars:.2f} PER={PER_UNIT} Q={qty}"
+    final_status = (("FILLED " + trace + size_note) if filled
+                    else ((st or "WORKING") + " " + trace + size_note))
     row = [datetime.utcnow().isoformat()+"Z", source, "SPX", last_px,
            sig_date, "PLACE", side_name,
-           qty, order_type, f"{used_price:.2f}",
+           qty, order_type, ("" if used_price is None else f"{used_price:.2f}"),
            legs[0], legs[1], legs[2], legs[3],
-           oid, final_status]
+           (oid or ""), final_status]
     one_log(svc, sheet_id_num, row)
-    print(f"FINAL {final_status} OID={oid} PRICE_USED={used_price:.2f}")
+    print(f"FINAL {final_status} OID={oid} PRICE_USED={used_price if used_price is not None else 'NA'}")
 
 if __name__ == "__main__":
     main()
