@@ -1,25 +1,25 @@
-# LIVE LeoCross → Schwab placer (minimal, reliable)
+# LIVE LeoCross → Schwab placer (minimal, hardened)
 # MODE: PLACER_MODE = NOW | SCHEDULED
 #
-# What it does (no fluff):
+# Fixed rules:
 # - OBP sizing: qty = floor(optionBuyingPower / 5000)
-# - Build 5-wide SPX iron condor (from LeoCross Limit/CLimit)
-# - NEVER CLOSE: if any leg would offset an existing position → skip & log
-# - Exactly ONE working order: every step = cancel any matching open orders, then place fresh
-# - Ladder (30s per step, polls 1s) — CREDIT: 2.10 → mid → new mid → prev mid - 0.05 → 1.90 → wait 30s → CANCEL → restart
-#                                             DEBIT:  1.90 → mid → new mid → prev mid + 0.05 → 2.10 → wait 30s → CANCEL → restart
-# - Timebox ≈ 180s. Stops on fill or timebox.
-# - One write to Google Sheet at the end (includes step trace + sizing)
+# - Build 5-wide SPX iron condor from LeoCross (Limit/CLimit)
+# - NEVER CLOSE: if any leg would offset existing pos → skip & log
+# - Exactly ONE working order: each step cancels matching open orders, then places fresh
+# - Ladder (30s/step; ~180s timebox)
+#     CREDIT: 2.10 → mid → new mid → (prev mid - 0.05) → 1.90 → cancel → restart
+#     DEBIT:  1.90 → mid → new mid → (prev mid + 0.05) → 2.10 → cancel → restart
+# - One Google Sheet write at the end with step trace + sizing
 #
 # Required env (secrets):
 #   SCHWAB_APP_KEY, SCHWAB_APP_SECRET, SCHWAB_TOKEN_JSON
 #   GSHEET_ID, GOOGLE_SERVICE_ACCOUNT_JSON
-#   GW_EMAIL, GW_PASSWORD  (GW_TOKEN optional; login fallback is automatic)
+#   GW_EMAIL, GW_PASSWORD    (GW_TOKEN optional)
 #
 # Only control:
-#   PLACER_MODE = NOW | SCHEDULED    (default SCHEDULED: only 16:08–16:14 ET, weekdays)
+#   PLACER_MODE = NOW | SCHEDULED   (default SCHEDULED → enforces 16:08–16:14 ET, weekdays)
 
-import os, sys, json, time, re
+import os, sys, json, time, re, math
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
 import requests
@@ -27,29 +27,30 @@ from schwab.auth import client_from_token_file
 from google.oauth2 import service_account
 from googleapiclient.discovery import build as gbuild
 
-# ---------- fixed constants per your spec ----------
+# -------- fixed constants --------
 TICK = 0.05
 WIDTH = 5
 ET = ZoneInfo("America/New_York")
-STEP_WAIT = 30           # seconds between steps
-TIMEBOX_SEC = 180        # ~2.5–3.0 minutes total
+
+STEP_WAIT   = 30         # seconds between steps
+TIMEBOX_SEC = 180        # ~2.5–3 minutes overall
 CREDIT_START = 2.10
 CREDIT_FLOOR = 1.90
 DEBIT_START  = 1.90
 DEBIT_CEIL   = 2.10
-PER_UNIT = 5000          # 1 contract per $5k OBP
+PER_UNIT = 5000          # 1 contract per $5k of OBP
 
 GW_BASE = "https://gandalf.gammawizard.com"
 GW_ENDPOINT = "/rapi/GetLeoCross"
 
-SHEET_TAB = "schwab"     # log tab (one row)
+SHEET_TAB = "schwab"
 
-# ---------- little utils ----------
-def _to_int(x, d):  # safe cast
+# -------- small utils --------
+def _to_int(x, d): 
     try: return int(x)
     except: return d
 
-def _to_float(x, d):
+def _to_float(x, d): 
     try: return float(x)
     except: return d
 
@@ -76,16 +77,13 @@ def to_osi(sym: str) -> str:
     return f"{root:<6}{ymd}{cp}{mills:08d}"
 
 def osi_canon(osi: str):
-    """Canonical key ignoring root: (yymmdd, 'C'/'P', strike_mills)."""
-    ymd = osi[6:12]
-    cp = osi[12]
-    strike8 = osi[-8:]
-    return (ymd, cp, strike8)
+    """Canonical key ignoring root: (yymmdd, 'C'/'P', strike8)."""
+    return (osi[6:12], osi[12], osi[-8:])
 
 def strike_from_osi(osi: str) -> float:
     return int(osi[-8:]) / 1000.0
 
-# ---------- Sheets ----------
+# -------- Google Sheets --------
 SCHWAB_HEADERS = [
     "ts","source","symbol","last_price",
     "signal_date","order_mode","side","qty_exec","order_type","limit_price",
@@ -120,7 +118,63 @@ def one_log(svc, sheet_id_num, spreadsheet_id: str, tab: str, row_vals: list):
     svc.spreadsheets().values().update(spreadsheetId=spreadsheet_id, range=f"{tab}!A2",
         valueInputOption="USER_ENTERED", body={"values":[row_vals]}).execute()
 
-# ---------- GammaWizard (resilient fetch) ----------
+# -------- hardened Schwab HTTP wrappers (retry/backoff, fail-safe) --------
+def _retry_backoff(attempt):  # 0,1,2,3 -> 0.5,1,2,4
+    return 0.5 * (2 ** attempt)
+
+def schwab_get_json(c, url, params=None, max_try=4, tag=""):
+    last = ""
+    for i in range(max_try):
+        try:
+            r = c.session.get(url, params=(params or {}), timeout=15)
+            if r.status_code == 200:
+                return r.json()
+            last = f"HTTP_{r.status_code}:{r.text[:120]}"
+        except Exception as e:
+            last = f"{type(e).__name__}:{str(e)}"
+        time.sleep(_retry_backoff(i))
+    raise RuntimeError(f"SCHWAB_GET_FAIL({tag}) {last}")
+
+def schwab_post_json(c, url, payload, max_try=3, tag=""):
+    last = ""
+    for i in range(max_try):
+        try:
+            r = c.session.post(url, json=payload, timeout=15)
+            if r.status_code in (200,201,202):
+                return r
+            last = f"HTTP_{r.status_code}:{r.text[:120]}"
+        except Exception as e:
+            last = f"{type(e).__name__}:{str(e)}"
+        time.sleep(_retry_backoff(i))
+    raise RuntimeError(f"SCHWAB_POST_FAIL({tag}) {last}")
+
+def schwab_put_json(c, url, payload, max_try=3, tag=""):
+    last = ""
+    for i in range(max_try):
+        try:
+            r = c.session.put(url, json=payload, timeout=15)
+            if r.status_code in (200,201,202):
+                return r
+            last = f"HTTP_{r.status_code}:{r.text[:120]}"
+        except Exception as e:
+            last = f"{type(e).__name__}:{str(e)}"
+        time.sleep(_retry_backoff(i))
+    raise RuntimeError(f"SCHWAB_PUT_FAIL({tag}) {last}")
+
+def schwab_delete(c, url, max_try=3, tag=""):
+    last = ""
+    for i in range(max_try):
+        try:
+            r = c.session.delete(url, timeout=15)
+            if r.status_code in (200,201,202,204):
+                return r
+            last = f"HTTP_{r.status_code}:{r.text[:120]}"
+        except Exception as e:
+            last = f"{type(e).__name__}:{str(e)}"
+        time.sleep(_retry_backoff(i))
+    raise RuntimeError(f"SCHWAB_DELETE_FAIL({tag}) {last}")
+
+# -------- GammaWizard (resilient) --------
 def _gw_timeout(): return _to_int(os.environ.get("GW_TIMEOUT", "30"), 30)
 
 def gw_login_token():
@@ -128,7 +182,7 @@ def gw_login_token():
     if not (email and password): raise RuntimeError("GW_LOGIN_MISSING_CREDS")
     r = requests.post(f"{GW_BASE}/goauth/authenticateFireUser", data={"email":email,"password":password}, timeout=_gw_timeout())
     if r.status_code!=200: raise RuntimeError(f"GW_LOGIN_HTTP_{r.status_code}: {r.text[:180]}")
-    j=r.json(); t=j.get("token"); 
+    j=r.json(); t=j.get("token")
     if not t: raise RuntimeError(f"GW_LOGIN_NO_TOKEN: {str(j)[:180]}")
     return t
 
@@ -143,7 +197,7 @@ def gw_get_leocross():
     if r.status_code!=200: raise RuntimeError(f"GW_HTTP_{r.status_code}: {r.text[:180]}")
     return r.json()
 
-# ---------- Schwab helpers ----------
+# -------- Schwab domain logic --------
 def fetch_bid_ask(c, sym_osi: str):
     r=c.get_quote(sym_osi)
     if r.status_code!=200: return (None,None)
@@ -164,11 +218,8 @@ def compute_mid_condor(c, legs):
 
 def get_obp(c, acct_hash: str) -> float:
     url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}"
-    r=c.session.get(url, params={"fields":"positions"})
-    if r.status_code!=200: return 0.0
-    j=r.json(); 
-    if isinstance(j,list): j=j[0]
-    sa=j.get("securitiesAccount") or j
+    j = schwab_get_json(c, url, params={"fields":"positions"}, tag="OBP")
+    sa=j[0]["securitiesAccount"] if isinstance(j,list) else (j.get("securitiesAccount") or j)
     vals=[]
     for sec in ("currentBalances","projectedBalances","initialBalances","balances"):
         b=sa.get(sec,{}) or {}
@@ -182,13 +233,10 @@ def get_obp(c, acct_hash: str) -> float:
 
 def positions_map_canon(c, acct_hash: str):
     """Return {(ymd,cp,strike8): qty} across SPX/SPXW options."""
+    url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}"
+    j = schwab_get_json(c, url, params={"fields":"positions"}, tag="POSITIONS")
+    sa=j[0]["securitiesAccount"] if isinstance(j,list) else (j.get("securitiesAccount") or j)
     out={}
-    url=f"https://api/schwabapi.com/trader/v1/accounts/{acct_hash}"
-    r=c.session.get(url, params={"fields":"positions"})
-    if r.status_code!=200: return out
-    j=r.json(); 
-    if isinstance(j,list): j=j[0]
-    sa=j.get("securitiesAccount") or j
     for p in (sa.get("positions") or []):
         instr=p.get("instrument",{}) or {}
         if (instr.get("assetType") or "").upper()!="OPTION": continue
@@ -201,29 +249,14 @@ def positions_map_canon(c, acct_hash: str):
         out[key]=out.get(key,0.0)+qty
     return out
 
-def would_close_guard(legs, pos_map_canon):
-    """Return (ok_bool, reason_or_empty)."""
-    intended = [
-        ("BUY_TO_OPEN",  legs[0]),
-        ("SELL_TO_OPEN", legs[1]),
-        ("SELL_TO_OPEN", legs[2]),
-        ("BUY_TO_OPEN",  legs[3]),
-    ]
-    for instr, osi in intended:
-        key = osi_canon(osi)
-        cur = pos_map_canon.get(key, 0.0)
-        if instr=="BUY_TO_OPEN"  and cur < 0:  # buying against an open short
-            return (False, f"LEG_WOULD_CLOSE {key} cur={cur}")
-        if instr=="SELL_TO_OPEN" and cur > 0:  # selling against an open long
-            return (False, f"LEG_WOULD_CLOSE {key} cur={cur}")
-    return (True, "")
-
 def open_orders_for_legs(c, acct_hash: str, legs_set):
     url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
-    r=c.session.get(url)
-    if r.status_code!=200: return []
+    try:
+        j = schwab_get_json(c, url, tag="ORDERS")
+    except RuntimeError:
+        return []  # fail-soft: if we can't list, we won't try to cancel; next step will place and either fail or succeed
     out=[]
-    for o in (r.json() or []):
+    for o in (j or []):
         st=str(o.get("status") or "").upper()
         if st not in ("WORKING","QUEUED","PENDING_ACTIVATION","OPEN"): 
             continue
@@ -239,25 +272,26 @@ def open_orders_for_legs(c, acct_hash: str, legs_set):
 
 def cancel_order(c, acct_hash: str, oid: str):
     url = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
-    r = c.session.delete(url)
-    print(f"CANCEL_HTTP {r.status_code} OID={oid}")
+    try:
+        schwab_delete(c, url, tag=f"CANCEL:{oid}")
+    except RuntimeError as e:
+        print(f"WARN cancel: {e}")
 
 def cancel_all_matching(c, acct_hash: str, legs_set):
     for oid in open_orders_for_legs(c, acct_hash, legs_set):
         cancel_order(c, acct_hash, oid)
 
-# ---------- time gate ----------
+# -------- time gate --------
 def time_gate_ok() -> bool:
     now = datetime.now(ET)
     if now.weekday()>=5: return False
     return (now.hour==16 and 8 <= now.minute <= 14)
 
-# ---------- main ----------
+# -------- main --------
 def main():
     MODE = (os.environ.get("PLACER_MODE","SCHEDULED") or "SCHEDULED").upper()
     source = f"SIMPLE_{MODE}"
 
-    # --- Secrets
     sheet_id = os.environ["GSHEET_ID"]
     sa_json  = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
 
@@ -268,11 +302,11 @@ def main():
     with open("schwab_token.json","w") as f: f.write(token_json)
     c = client_from_token_file(api_key=app_key, app_secret=app_secret, token_path="schwab_token.json")
 
-    # Account hash
+    # acct hash
     r=c.get_account_numbers(); r.raise_for_status()
     acct_hash = r.json()[0]["hashValue"]
 
-    # Last SPX for log
+    # last SPX
     def spx_last():
         for sym in ["$SPX.X","SPX","SPX.X","$SPX"]:
             try:
@@ -284,7 +318,7 @@ def main():
         return ""
     last_px = spx_last()
 
-    # Sheets client
+    # Sheets
     creds = service_account.Credentials.from_service_account_info(json.loads(sa_json),
             scopes=["https://www.googleapis.com/auth/spreadsheets"])
     svc = gbuild("sheets","v4",credentials=creds)
@@ -295,8 +329,7 @@ def main():
         row = [datetime.utcnow().isoformat()+"Z", source, "SPX", last_px,
                "", "SKIP", "", "", "", "",
                "","","","", "", "SKIPPED_TIME_WINDOW"]
-        one_log(svc, sheet_id_num, sheet_id, SHEET_TAB, row)
-        print("Scheduled window not met → skipped"); sys.exit(0)
+        one_log(svc, sheet_id_num, sheet_id, SHEET_TAB, row); print("Scheduled window not met → skipped"); sys.exit(0)
 
     # LeoCross
     try:
@@ -336,13 +369,13 @@ def main():
     inner_put  = _to_int(float(trade.get("Limit")), 0)
     inner_call = _to_int(float(trade.get("CLimit")), 0)
 
-    # Build legs (width=5), orient for side by Cat rule (tie→credit)
     def fnum(x):
         try: return float(x)
         except: return None
     cat1=fnum(trade.get("Cat1")); cat2=fnum(trade.get("Cat2"))
     is_credit = True if (cat2 is None or cat1 is None or cat2 >= cat1) else False
 
+    # legs
     p_low, p_high = inner_put - WIDTH, inner_put
     c_low, c_high = inner_call, inner_call + WIDTH
     bp = to_osi(f".SPXW{exp6}P{p_low}")
@@ -350,7 +383,6 @@ def main():
     sc = to_osi(f".SPXW{exp6}C{c_low}")
     bc = to_osi(f".SPXW{exp6}C{c_high}")
 
-    # Orient
     def orient(bp,sp,sc,bc):
         bpS=strike_from_osi(bp); spS=strike_from_osi(sp)
         scS=strike_from_osi(sc); bcS=strike_from_osi(bc)
@@ -364,9 +396,36 @@ def main():
     legs = orient(bp,sp,sc,bc)
     legs_set = set(legs)
 
-    # NO CLOSE guard (root-agnostic)
-    pos_map = positions_map_canon(c, acct_hash)
-    ok, reason = would_close_guard(legs, pos_map)
+    # NO CLOSE guard (root-agnostic). If net fails, ABORT_NET.
+    try:
+        pos_map = positions_map_canon(c, acct_hash)
+    except Exception as e:
+        row = [datetime.utcnow().isoformat()+"Z", source, "SPX", last_px,
+               sig_date, "ABORT", ("SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"),
+               "", ("NET_CREDIT" if is_credit else "NET_DEBIT"), "",
+               legs[0], legs[1], legs[2], legs[3],
+               "", f"ABORT_NET_POSITIONS: {str(e)[:140]}"]
+        one_log(svc, sheet_id_num, sheet_id, SHEET_TAB, row)
+        print(f"ABORT_NET_POSITIONS {e}")
+        sys.exit(0)
+
+    def would_close_guard():
+        intended = [
+            ("BUY_TO_OPEN",  legs[0]),
+            ("SELL_TO_OPEN", legs[1]),
+            ("SELL_TO_OPEN", legs[2]),
+            ("BUY_TO_OPEN",  legs[3]),
+        ]
+        for instr, osi in intended:
+            key = osi_canon(osi)
+            cur = pos_map.get(key, 0.0)
+            if instr=="BUY_TO_OPEN"  and cur < 0:  # buying against short
+                return (False, f"LEG_WOULD_CLOSE {key} cur={cur}")
+            if instr=="SELL_TO_OPEN" and cur > 0:  # selling against long
+                return (False, f"LEG_WOULD_CLOSE {key} cur={cur}")
+        return (True, "")
+
+    ok, reason = would_close_guard()
     if not ok:
         row = [datetime.utcnow().isoformat()+"Z", source, "SPX", last_px,
                sig_date, "ABORT", ("SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"),
@@ -375,15 +434,24 @@ def main():
                "", f"ABORT_{reason}"]
         one_log(svc, sheet_id_num, sheet_id, SHEET_TAB, row); print(reason); sys.exit(0)
 
-    # Qty (OBP)
-    obp = get_obp(c, acct_hash)
-    qty = max(1, obp // PER_UNIT)
-    qty = int(qty)
+    # qty (OBP). If OBP fetch fails → ABORT_NET.
+    try:
+        obp = get_obp(c, acct_hash)
+    except Exception as e:
+        row = [datetime.utcnow().isoformat()+"Z", source, "SPX", last_px,
+               sig_date, "ABORT", ("SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"),
+               "", ("NET_CREDIT" if is_credit else "NET_DEBIT"), "",
+               legs[0], legs[1], legs[2], legs[3],
+               "", f"ABORT_NET_OBP: {str(e)[:140]}"]
+        one_log(svc, sheet_id_num, sheet_id, SHEET_TAB, row)
+        print(f"ABORT_NET_OBP {e}")
+        sys.exit(0)
 
+    qty = max(1, int(obp // PER_UNIT))
     side_name  = "SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"
     order_type = "NET_CREDIT" if is_credit else "NET_DEBIT"
 
-    # Order builders
+    # order builders
     def build_order(price: float):
         return {
             "orderType": order_type,
@@ -401,8 +469,14 @@ def main():
         }
 
     def place(price):
-        cancel_all_matching(c, acct_hash, legs_set)    # hard ensure single order
-        r = c.place_order(acct_hash, build_order(price))
+        # hard ensure single order for these legs
+        cancel_all_matching(c, acct_hash, legs_set)
+        # POST via our hardened wrapper
+        url = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
+        try:
+            r = schwab_post_json(c, url, build_order(price), tag=f"PLACE@{price:.2f}")
+        except Exception as e:
+            raise RuntimeError(f"PLACE_FAIL {e}")
         oid = ""
         try:
             j=r.json(); oid = str(j.get("orderId") or j.get("order_id") or "")
@@ -411,16 +485,16 @@ def main():
         print(f"PLACE {order_type} @ {price:.2f}  OID={oid} HTTP={r.status_code}")
         return oid
 
-    def cancel_wait_all():
-        ids = open_orders_for_legs(c, acct_hash, legs_set)
-        for oid in ids: cancel_order(c, acct_hash, oid)
-
     def status_of(oid: str):
         url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
-        r=c.session.get(url)
-        try: j=r.json() if r.status_code==200 else {}
-        except: j={}
+        try:
+            j = schwab_get_json(c, url, tag=f"STATUS:{oid}")
+        except Exception:
+            return ""  # treat unknown as not filled; ladder timebox will handle it
         return str(j.get("status") or j.get("orderStatus") or "")
+
+    def cancel_all():
+        cancel_all_matching(c, acct_hash, legs_set)
 
     def wait_or_filled(seconds: int, oid_local: str):
         end = time.time() + seconds
@@ -431,7 +505,7 @@ def main():
             time.sleep(1)
         return False,last
 
-    # Ladder loop
+    # ladder (timeboxed)
     path=[]; used_price=None; oid=""; filled=False; st=""
     start_ts = time.time()
     deadline = start_ts + TIMEBOX_SEC
@@ -439,60 +513,62 @@ def main():
     bound_price = CREDIT_FLOOR if is_credit else DEBIT_CEIL
     step_sign = -0.05 if is_credit else +0.05
 
-    while time.time() < deadline and not filled:
-        # Step 0: start
+    # 0) start
+    try:
         used_price = start_price
         oid = place(used_price); path.append(f"{used_price:.2f}")
         filled, st = wait_or_filled(STEP_WAIT, oid)
-        if filled or time.time() >= deadline: break
+        if filled: 
+            trace = "STEPS " + "→".join(path)
+        # 1) mid
+        if not filled and time.time() < deadline:
+            cancel_all()
+            mid1 = compute_mid_condor(c, legs)
+            used_price = clamp_tick(mid1 if mid1 is not None else start_price)
+            oid = place(used_price); path.append(f"{used_price:.2f}")
+            filled, st = wait_or_filled(STEP_WAIT, oid)
+        # 2) new mid
+        if not filled and time.time() < deadline:
+            cancel_all()
+            mid2 = compute_mid_condor(c, legs)
+            used_price = clamp_tick(mid2 if mid2 is not None else used_price)
+            oid = place(used_price); path.append(f"{used_price:.2f}")
+            filled, st = wait_or_filled(STEP_WAIT, oid)
+        # 3) prev mid ± 0.05
+        if not filled and time.time() < deadline:
+            cancel_all()
+            pm = mid2 if ('mid2' in locals() and mid2 is not None) else (mid1 if ('mid1' in locals()) else None)
+            step_px = clamp_tick((pm + step_sign) if pm is not None else used_price + step_sign)
+            if is_credit: step_px = max(CREDIT_FLOOR, min(CREDIT_START, step_px))
+            else:         step_px = max(DEBIT_START,  min(DEBIT_CEIL,   step_px))
+            used_price = step_px
+            oid = place(used_price); path.append(f"{used_price:.2f}")
+            filled, st = wait_or_filled(STEP_WAIT, oid)
+        # 4) bound → wait → cancel
+        if not filled and time.time() < deadline:
+            cancel_all()
+            used_price = clamp_tick(bound_price)
+            oid = place(used_price); path.append(f"{used_price:.2f}")
+            filled, st = wait_or_filled(STEP_WAIT, oid)
+            if not filled:
+                cancel_all(); path.append("CXL")
+        trace = "STEPS " + "→".join(path)
+    except Exception as e:
+        # network or place failure: abort & log
+        row = [datetime.utcnow().isoformat()+"Z", source, "SPX", last_px,
+               sig_date, "ABORT", side_name,
+               qty, order_type, ("" if used_price is None else f"{used_price:.2f}"),
+               legs[0], legs[1], legs[2], legs[3],
+               "", f"ABORT_NET_ORDER: {str(e)[:140]}"]
+        one_log(svc, sheet_id_num, sheet_id, SHEET_TAB, row)
+        print(f"ABORT_NET_ORDER {e}")
+        sys.exit(0)
 
-        # Step 1: mid
-        cancel_wait_all()
-        mid1 = compute_mid_condor(c, legs)
-        used_price = clamp_tick(mid1 if mid1 is not None else start_price)
-        oid = place(used_price); path.append(f"{used_price:.2f}")
-        filled, st = wait_or_filled(STEP_WAIT, oid)
-        if filled or time.time() >= deadline: break
-
-        # Step 2: new mid
-        cancel_wait_all()
-        mid2 = compute_mid_condor(c, legs)
-        used_price = clamp_tick(mid2 if mid2 is not None else used_price)
-        oid = place(used_price); path.append(f"{used_price:.2f}")
-        filled, st = wait_or_filled(STEP_WAIT, oid)
-        if filled or time.time() >= deadline: break
-
-        # Step 3: previous mid ± 0.05
-        cancel_wait_all()
-        prev_mid = mid2 if mid2 is not None else mid1
-        step_px = clamp_tick((prev_mid + step_sign) if prev_mid is not None else used_price + step_sign)
-        if is_credit:
-            step_px = max(CREDIT_FLOOR, min(CREDIT_START, step_px))
-        else:
-            step_px = max(DEBIT_START, min(DEBIT_CEIL, step_px))
-        used_price = step_px
-        oid = place(used_price); path.append(f"{used_price:.2f}")
-        filled, st = wait_or_filled(STEP_WAIT, oid)
-        if filled or time.time() >= deadline: break
-
-        # Step 4: bound
-        cancel_wait_all()
-        used_price = clamp_tick(bound_price)
-        oid = place(used_price); path.append(f"{used_price:.2f}")
-        filled, st = wait_or_filled(STEP_WAIT, oid)
-        if filled or time.time() >= deadline: break
-
-        # after bound wait → CANCEL and restart
-        cancel_wait_all()
-        path.append("CXL")
-
-    # Final one-row log
-    trace = "STEPS " + "→".join(path)
+    # final one-row log
     status_txt = ("FILLED " + trace) if filled else ((st or "WORKING") + " " + trace)
     row = [datetime.utcnow().isoformat()+"Z", source, "SPX", last_px,
-           sig_date, "PLACE", ("SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"),
-           qty, ("NET_CREDIT" if is_credit else "NET_DEBIT"),
-           ("" if used_price is None else f"{used_price:.2f}"),
+           sig_date, "PLACE", side_name,
+           qty, order_type, ("" if used_price is None else f"{used_price:.2f}"),
            legs[0], legs[1], legs[2], legs[3],
            oid, status_txt + f" | OBP={get_obp(c, acct_hash):.2f} PER={PER_UNIT} Q={qty}"]
     one_log(svc, sheet_id_num, sheet_id, SHEET_TAB, row)
