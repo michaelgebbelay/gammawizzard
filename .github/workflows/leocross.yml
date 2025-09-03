@@ -18,23 +18,23 @@ on:
       max_steps:
         description: 'Max price steps (including first)'
         required: false
-        default: '50'
+        default: '5'
       credit_start:
         description: 'Start credit (e.g., 2.10)'
         required: false
-        default: ''
+        default: '2.10'
       debit_start:
         description: 'Start debit (e.g., 1.90)'
         required: false
-        default: ''
+        default: '1.90'
       credit_floor:
         description: 'Credit floor (min credit you’ll accept)'
         required: false
-        default: ''
+        default: '1.9'
       debit_ceil:
         description: 'Debit ceiling (max debit you’ll pay)'
         required: false
-        default: ''
+        default: '2.1'
   schedule:
     # 4:10pm ET across DST (runs both; script enforces window in SCHEDULED mode)
     - cron: "10 20 * * 1-5"  # 4:10pm EDT
