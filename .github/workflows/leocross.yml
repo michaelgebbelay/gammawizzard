@@ -22,19 +22,19 @@ on:
       credit_start:
         description: 'Start credit (e.g., 2.10)'
         required: false
-        default: ''
+        default: '2.1'
       debit_start:
         description: 'Start debit (e.g., 1.90)'
         required: false
-        default: ''
+        default: '1.9'
       credit_floor:
         description: 'Credit floor (min credit)'
         required: false
-        default: ''
+        default: '1.9'
       debit_ceil:
         description: 'Debit ceiling (max debit)'
         required: false
-        default: ''
+        default: '2.05'
       per_unit:
         description: 'Dollars per contract (default 5000)'
         required: false
