@@ -18,23 +18,35 @@ on:
       max_steps:
         description: 'Max price steps (including first)'
         required: false
-        default: '5'
+        default: '50'
       credit_start:
         description: 'Start credit (e.g., 2.10)'
         required: false
-        default: '2.10'
+        default: ''
       debit_start:
         description: 'Start debit (e.g., 1.90)'
         required: false
-        default: '1.90'
+        default: ''
       credit_floor:
         description: 'Credit floor (min credit you’ll accept)'
         required: false
-        default: '1.9'
+        default: ''
       debit_ceil:
         description: 'Debit ceiling (max debit you’ll pay)'
         required: false
-        default: '2.1'
+        default: ''
+      size_source:
+        description: 'Sizing: CASH | OBP | BP_MIN | BP_MAX'
+        required: false
+        default: 'CASH'
+      per_unit:
+        description: 'Dollars per contract (default 5000)'
+        required: false
+        default: '5000'
+      cash_reserve:
+        description: 'Subtract this from size base before dividing'
+        required: false
+        default: '0'
   schedule:
     # 4:10pm ET across DST (runs both; script enforces window in SCHEDULED mode)
     - cron: "10 20 * * 1-5"  # 4:10pm EDT
@@ -82,7 +94,10 @@ jobs:
           # --- Mode selection (dispatch input > repo variable > default)
           PLACER_MODE: ${{ github.event.inputs.mode != '' && github.event.inputs.mode || (vars.PLACER_MODE != '' && vars.PLACER_MODE || 'SCHEDULED') }}
 
-          # --- Sizing
+          # --- Sizing (CASH by default → 1 lot per $5k of cash)
+          SIZE_SOURCE:  ${{ github.event.inputs.size_source != '' && github.event.inputs.size_source || (vars.SIZE_SOURCE != '' && vars.SIZE_SOURCE || 'CASH') }}
+          PER_UNIT:     ${{ github.event.inputs.per_unit != '' && github.event.inputs.per_unit || (vars.PER_UNIT != '' && vars.PER_UNIT || 5000) }}
+          CASH_RESERVE: ${{ github.event.inputs.cash_reserve != '' && github.event.inputs.cash_reserve || (vars.CASH_RESERVE != '' && vars.CASH_RESERVE || 0) }}
           QTY_OVERRIDE: ${{ github.event.inputs.qty }}
           OPT_BP_OVERRIDE: ${{ vars.OPT_BP_OVERRIDE }}
 
@@ -96,7 +111,6 @@ jobs:
           CREDIT_FLOOR: ${{ github.event.inputs.credit_floor != '' && github.event.inputs.credit_floor || vars.CREDIT_FLOOR }}
           DEBIT_CEIL:   ${{ github.event.inputs.debit_ceil   != '' && github.event.inputs.debit_ceil   || vars.DEBIT_CEIL }}
 
-          # --- Misc
           PYTHONUNBUFFERED: "1"
         run: |
           python scripts/leocross_place_simple.py
