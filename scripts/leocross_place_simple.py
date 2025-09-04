@@ -1,6 +1,6 @@
-# LIVE LeoCross → Schwab placer (cancel-then-place ladder, one order only)
-# MODE: PLACER_MODE = NOW | SCHEDULED   (default SCHEDULED: 16:08–16:14 ET weekdays)
-# Sizing: fixed manual quantity at top. No OBP, no env/inputs.
+# LIVE LeoCross → Schwab placer (cancel-then-place ladder)
+# MODE: PLACER_MODE = NOW | SCHEDULED (default SCHEDULED: 16:08–16:14 ET)
+# Sizing: fixed manual quantity at top. No OBP. Partial-fill aware. Never closes legs.
 
 import os, sys, json, time, re
 from datetime import datetime, date, timezone
@@ -11,7 +11,7 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build as gbuild
 
 # ===== manual setting =====
-QTY = 4   # <<< change this when you want a different contract count
+QTY = 4  # <<< change this when you want a different contract count
 
 # ===== constants =====
 TICK = 0.05
@@ -98,11 +98,11 @@ def one_log(svc, sheet_id_num, spreadsheet_id: str, tab: str, row_vals: list):
 # ===== Schwab hardened HTTP =====
 def _backoff(i): return 0.5*(2**i)
 
-def schwab_get_json(c, url, params=None, tries=4, tag=""):
+def schwab_get_json(c, url, params=None, tries=6, tag=""):
     last=""
     for i in range(tries):
         try:
-            r=c.session.get(url, params=(params or {}), timeout=15)
+            r=c.session.get(url, params=(params or {}), timeout=20)
             if r.status_code==200: return r.json()
             last=f"HTTP_{r.status_code}:{r.text[:120]}"
         except Exception as e:
@@ -110,11 +110,11 @@ def schwab_get_json(c, url, params=None, tries=4, tag=""):
         time.sleep(_backoff(i))
     raise RuntimeError(f"SCHWAB_GET_FAIL({tag}) {last}")
 
-def schwab_post_json(c, url, payload, tries=3, tag=""):
+def schwab_post_json(c, url, payload, tries=5, tag=""):
     last=""
     for i in range(tries):
         try:
-            r=c.session.post(url, json=payload, timeout=15)
+            r=c.session.post(url, json=payload, timeout=20)
             if r.status_code in (200,201,202): return r
             last=f"HTTP_{r.status_code}:{r.text[:120]}"
         except Exception as e:
@@ -122,11 +122,11 @@ def schwab_post_json(c, url, payload, tries=3, tag=""):
         time.sleep(_backoff(i))
     raise RuntimeError(f"SCHWAB_POST_FAIL({tag}) {last}")
 
-def schwab_delete(c, url, tries=3, tag=""):
+def schwab_delete(c, url, tries=5, tag=""):
     last=""
     for i in range(tries):
         try:
-            r=c.session.delete(url, timeout=15)
+            r=c.session.delete(url, timeout=20)
             if r.status_code in (200,201,202,204): return r
             last=f"HTTP_{r.status_code}:{r.text[:120]}"
         except Exception as e:
@@ -198,8 +198,11 @@ def list_matching_open_ids(c, acct_hash: str, canon_set):
     start_et = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
     url=f"https://api/schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
     params = {"fromEnteredTime": iso_z(start_et), "toEnteredTime": iso_z(now_et), "maxResults": 200}
-    arr = schwab_get_json(c, url, params=params, tag="ORDERS") or []
-
+    try:
+        arr = schwab_get_json(c, url, params=params, tag="ORDERS") or []
+    except Exception as e:
+        print(f"WARN orders lookup failed: {e} (continuing without cancel)")
+        return []  # degrade gracefully — risk: parallel working orders
     out=[]
     for o in arr or []:
         st=str(o.get("status") or "").upper()
@@ -218,23 +221,29 @@ def list_matching_open_ids(c, acct_hash: str, canon_set):
 def cancel_all_and_wait(c, acct_hash: str, canon_set, grace=CANCEL_GRACE):
     t_end=time.time()+grace
     while True:
-        ids=list_matching_open_ids(c,acct_hash,canon_set)
+        try:
+            ids=list_matching_open_ids(c,acct_hash,canon_set)
+        except Exception as e:
+            print(f"WARN cancel phase lookup: {e} (skipping cancel)")
+            return
         if not ids: return
         for oid in ids:
-            url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
+            url=f"https://api/schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
             try: schwab_delete(c,url,tag=f"CANCEL:{oid}")
             except Exception as e: print(f"WARN cancel {oid}: {e}")
         if time.time()>=t_end:
-            ids2=list_matching_open_ids(c,acct_hash,canon_set)
-            if ids2: print(f"WARN lingering orders: {','.join(ids2)}")
+            try:
+                ids2=list_matching_open_ids(c,acct_hash,canon_set)
+                if ids2: print(f"WARN lingering orders: {','.join(ids2)}")
+            except Exception: pass
             return
         time.sleep(0.5)
 
 def condor_units_open(pos_map, legs):
-    """How many full condors are already open with the same four legs (buys: 0 & 3; sells: 1 & 2)."""
-    b1 = max(0.0,  pos_map.get(osi_canon(legs[0]), 0.0))   # long qty on buy leg
+    """How many full condors are already open with these exact legs."""
+    b1 = max(0.0,  pos_map.get(osi_canon(legs[0]), 0.0))  # BUY legs long qty
     b2 = max(0.0,  pos_map.get(osi_canon(legs[3]), 0.0))
-    s1 = max(0.0, -pos_map.get(osi_canon(legs[1]), 0.0))   # short qty on sell leg
+    s1 = max(0.0, -pos_map.get(osi_canon(legs[1]), 0.0))  # SELL legs short qty
     s2 = max(0.0, -pos_map.get(osi_canon(legs[2]), 0.0))
     return int(min(b1, b2, s1, s2))
 
@@ -360,7 +369,7 @@ def main():
              legs[0],legs[1],legs[2],legs[3], "", f"ABORT_{reason}"]
         one_log(svc, sheet_id_num, sheet_id, SHEET_TAB, row); print(reason); sys.exit(0)
 
-    # compute remaining size (handle partial fills gracefully)
+    # compute remaining size (handles partial fills gracefully)
     already_units = condor_units_open(pos, legs)
     rem_qty = max(0, QTY - already_units)
     if rem_qty == 0:
@@ -394,7 +403,7 @@ def main():
 
     def place(price: float) -> str:
         cancel_all_and_wait(c, acct_hash, canon)  # cancel/replace ladder
-        url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
+        url=f"https://api/schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
         r=schwab_post_json(c,url,order_payload(price),tag=f"PLACE@{price:.2f}")
         try:
             j=r.json(); return str(j.get("orderId") or j.get("order_id") or "")
@@ -402,7 +411,7 @@ def main():
             loc=r.headers.get("Location",""); return loc.rstrip("/").split("/")[-1] if loc else ""
 
     def order_status(oid: str) -> str:
-        url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
+        url=f"https://api/schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
         try:
             j=schwab_get_json(c,url,tag=f"STATUS:{oid}")
             return str(j.get("status") or j.get("orderStatus") or "")
