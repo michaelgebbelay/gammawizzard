@@ -6,8 +6,6 @@ import os, sys, json, time, re
 from datetime import datetime, date, timezone
 from zoneinfo import ZoneInfo
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 from schwab.auth import client_from_token_file
 from google.oauth2 import service_account
 from googleapiclient.discovery import build as gbuild
@@ -58,7 +56,7 @@ def to_osi(sym: str) -> str:
     if not m: raise ValueError("Cannot parse option symbol: " + sym)
     root, ymd, cp, strike, frac = (m.groups()+("",))[:5]
     mills = int(strike)*1000 + (int((frac or "0").ljust(3,'0')) if frac else 0) if len(strike)<8 else int(strike)
-    return f"{root:<6}{ymd}{cp}{mills:08d}"
+    return "{:<6s}{}{}{:08d}".format(root, ymd, cp, mills)
 
 def osi_canon(osi: str):
     return (osi[6:12], osi[12], osi[-8:])  # (yymmdd, C/P, strike8)
@@ -81,9 +79,9 @@ def ensure_header_and_get_sheetid(svc, spreadsheet_id: str, tab: str, header: li
             body={"requests":[{"addSheet":{"properties":{"title":tab}}}]}).execute()
         meta = svc.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
         sheet_id_num = next(sh["properties"]["sheetId"] for sh in meta["sheets"] if sh["properties"]["title"]==tab)
-    got = svc.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=f"{tab}!1:1").execute().get("values",[])
+    got = svc.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range="{}!1:1".format(tab)).execute().get("values",[])
     if not got or got[0] != header:
-        svc.spreadsheets().values().update(spreadsheetId=spreadsheet_id, range=f"{tab}!1:1",
+        svc.spreadsheets().values().update(spreadsheetId=spreadsheet_id, range="{}!1:1".format(tab),
             valueInputOption="USER_ENTERED", body={"values":[header]}).execute()
     return sheet_id_num
 
@@ -94,22 +92,11 @@ def top_insert(svc, spreadsheet_id: str, sheet_id_num: int):
 
 def one_log(svc, sheet_id_num, spreadsheet_id: str, tab: str, row_vals: list):
     top_insert(svc, spreadsheet_id, sheet_id_num)
-    svc.spreadsheets().values().update(spreadsheetId=spreadsheet_id, range=f"{tab}!A2",
+    svc.spreadsheets().values().update(spreadsheetId=spreadsheet_id, range="{}!A2".format(tab),
         valueInputOption="USER_ENTERED", body={"values":[row_vals]}).execute()
 
-# ======== SCHWAB HTTP HELPERS (with retries) ========
+# ======== SCHWAB HTTP HELPERS (loop retries) ========
 def _backoff(i): return 0.6*(2**i)
-
-def _mount_retries(session):
-    retry = Retry(
-        total=8, connect=8, read=6, status=6, backoff_factor=0.4,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=False,
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
 
 def schwab_get_json(c, url, params=None, tries=8, tag=""):
     last=""
@@ -271,7 +258,6 @@ def main():
 
     with open("schwab_token.json","w") as f: f.write(token_json)
     c=client_from_token_file(api_key=app_key, app_secret=app_secret, token_path="schwab_token.json")
-    _mount_retries(c.session)
 
     r=c.get_account_numbers(); r.raise_for_status()
     acct_hash=r.json()[0]["hashValue"]
