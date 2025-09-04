@@ -1,15 +1,17 @@
-# scripts/leocross_place_simple.py
 # LIVE LeoCross → Schwab placer (cancel-then-place ladder, one order only)
 # MODE: PLACER_MODE = NOW | SCHEDULED   (default SCHEDULED: 16:08–16:14 ET weekdays)
-# Change: allow fixed contract sizing via PLACER_QTY (≥1). If set, skip OBP sizing.
+# Sizing: fixed manual quantity at top (no OBP checks, no env/inputs).
 
 import os, sys, json, time, re
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timezone
 from zoneinfo import ZoneInfo
 import requests
 from schwab.auth import client_from_token_file
 from google.oauth2 import service_account
 from googleapiclient.discovery import build as gbuild
+
+# ===== manual settings =====
+QTY = 4  # <<<<< CHANGE THIS WHEN YOU WANT A DIFFERENT CONTRACT COUNT
 
 # ===== fixed constants =====
 TICK = 0.05
@@ -23,7 +25,6 @@ CREDIT_START = 2.10
 CREDIT_FLOOR = 1.90
 DEBIT_START  = 1.90
 DEBIT_CEIL   = 2.10
-PER_UNIT = 5000
 
 GW_BASE = "https://gandalf.gammawizard.com"
 GW_ENDPOINT = "/rapi/GetLeoCross"
@@ -62,6 +63,9 @@ def osi_canon(osi: str):
 
 def strike_from_osi(osi: str) -> float:
     return int(osi[-8:]) / 1000.0
+
+def iso_z(dt):
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 # ===== Sheets =====
 def ensure_header_and_get_sheetid(svc, spreadsheet_id: str, tab: str, header: list):
@@ -191,29 +195,17 @@ def positions_map(c, acct_hash: str):
 def list_matching_open_ids(c, acct_hash: str, canon_set):
     """
     Schwab orders endpoint requires fromEnteredTime AND toEnteredTime (ZonedDateTime).
-    Query 'today 00:00 ET' → now ET, then filter to working/queued/etc.
+    Query 'today 00:00 ET' → now ET (sent as UTC Z), then filter to working statuses.
     """
     now_et = datetime.now(ET)
     start_et = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
-
-    # Use the library helper to ensure correct parameter names/formatting.
-    try:
-        resp = c.get_orders_for_account(
-            acct_hash,
-            from_entered_datetime=start_et,
-            to_entered_datetime=now_et,
-            # status filter optional; we filter below to include multiple statuses
-        )
-        arr = resp.json() if resp.status_code == 200 else []
-    except Exception:
-        # Fallback to raw call with explicit params if needed
-        url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
-        params = {
-            "fromEnteredTime": start_et.isoformat(),
-            "toEnteredTime": now_et.isoformat(),
-            "maxResults": 200
-        }
-        arr = schwab_get_json(c, url, params=params, tag="ORDERS") or []
+    url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
+    params = {
+        "fromEnteredTime": iso_z(start_et),
+        "toEnteredTime": iso_z(now_et),
+        "maxResults": 200
+    }
+    arr = schwab_get_json(c, url, params=params, tag="ORDERS") or []
 
     out=[]
     for o in arr or []:
@@ -244,50 +236,6 @@ def cancel_all_and_wait(c, acct_hash: str, canon_set, grace=CANCEL_GRACE):
             if ids2: print(f"WARN lingering orders: {','.join(ids2)}")
             return
         time.sleep(0.5)
-
-# ===== OBP PROBE =====
-def obp_probe(c, acct_hash: str):
-    """
-    Returns (used_obp, summary_string) and prints a probe of all OBP fields:
-      - top-level optionBuyingPower/optionsBuyingPower
-      - currentBalances, projectedBalances, initialBalances, balances
-    """
-    url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}"
-    j=schwab_get_json(c, url, params={"fields":"positions"}, tag="OBP_PROBE")
-    sa=j[0]["securitiesAccount"] if isinstance(j,list) else (j.get("securitiesAccount") or j)
-
-    sections = {
-        "top": sa,
-        "current": sa.get("currentBalances",{}) or {},
-        "projected": sa.get("projectedBalances",{}) or {},
-        "initial": sa.get("initialBalances",{}) or {},
-        "balances": sa.get("balances",{}) or {},
-    }
-
-    def pick(sec):
-        vals=[]
-        for k in ("optionBuyingPower","optionsBuyingPower"):
-            v=sec.get(k)
-            if isinstance(v,(int,float)): vals.append(float(v))
-        return max(vals) if vals else None
-
-    vals = {name: pick(sec) for name,sec in sections.items()}
-    used = max([v for v in vals.values() if v is not None], default=0.0)
-
-    print("=== OBP PROBE ===")
-    for name in ("top","current","projected","initial","balances"):
-        v = vals.get(name)
-        print(f"{name:9s}: {'NA' if v is None else f'{v:.2f}'}")
-    print(f"OBP_USED : {used:.2f}  (qty = floor(OBP_USED/5000))")
-    print("=================")
-
-    def fmt(v): return "NA" if v is None else f"{v:.2f}"
-    short = (
-        f"OBP top={fmt(vals['top'])}, curr={fmt(vals['current'])}, "
-        f"proj={fmt(vals['projected'])}, init={fmt(vals['initial'])}, "
-        f"bal={fmt(vals['balances'])}, used={used:.2f}"
-    )
-    return used, short
 
 # ===== main =====
 def main():
@@ -330,7 +278,7 @@ def main():
                  "","","","", "", "SKIPPED_TIME_WINDOW"]
             one_log(svc, sheet_id_num, sheet_id, SHEET_TAB, row); print("skip window"); sys.exit(0)
 
-    # GW → trade
+    # ---- GW → trade payload ----
     try:
         api=gw_get_leocross()
     except Exception as e:
@@ -399,7 +347,7 @@ def main():
 
     def would_close():
         checks=[("BUY",legs[0],-1),("SELL",legs[1],+1),("SELL",legs[2],+1),("BUY",legs[3],-1)]
-        for instr, osi, sign in checks:
+        for _, osi, sign in checks:
             cur = pos.get(osi_canon(osi), 0.0)
             if sign<0 and cur<0: return (False, f"LEG_WOULD_CLOSE {osi}")
             if sign>0 and cur>0: return (False, f"LEG_WOULD_CLOSE {osi}")
@@ -410,36 +358,6 @@ def main():
              ("SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"), "", ("NET_CREDIT" if is_credit else "NET_DEBIT"), "",
              legs[0],legs[1],legs[2],legs[3], "", f"ABORT_{reason}"]
         one_log(svc, sheet_id_num, sheet_id, SHEET_TAB, row); print(reason); sys.exit(0)
-
-    # ===== Sizing: fixed qty if PLACER_QTY is set; otherwise OBP-based =====
-    qty_env = (os.environ.get("PLACER_QTY") or "").strip()
-    qty_source = ""
-    if qty_env:
-        try:
-            qty = int(qty_env)
-            if qty < 1: raise ValueError("qty must be ≥1")
-        except Exception as e:
-            row=[datetime.utcnow().isoformat()+"Z", source, "SPX", last_px, sig_date, "ABORT",
-                 ("SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"), "", ("NET_CREDIT" if is_credit else "NET_DEBIT"), "",
-                 legs[0],legs[1],legs[2],legs[3], "", f"ABORT_BAD_QTY:{str(e)[:140]}"]
-            one_log(svc, sheet_id_num, sheet_id, SHEET_TAB, row); print(f"Bad PLACER_QTY: {qty_env}"); sys.exit(0)
-        obp_summary = "OBP_SKIPPED_FIXED_QTY"
-        qty_source = f"FIXED_QTY={qty}"
-    else:
-        try:
-            obp_used, obp_summary = obp_probe(c, acct_hash)
-        except Exception as e:
-            row=[datetime.utcnow().isoformat()+"Z", source, "SPX", last_px, sig_date, "ABORT",
-                 ("SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"), "", ("NET_CREDIT" if is_credit else "NET_DEBIT"), "",
-                 legs[0],legs[1],legs[2],legs[3], "", f"ABORT_OBP_NET:{str(e)[:140]}"]
-            one_log(svc, sheet_id_num, sheet_id, SHEET_TAB, row); print(e); sys.exit(0)
-        qty = int(obp_used // PER_UNIT)
-        if qty < 1:
-            row=[datetime.utcnow().isoformat()+"Z", source, "SPX", last_px, sig_date, "ABORT",
-                 ("SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"), "", ("NET_CREDIT" if is_credit else "NET_DEBIT"), "",
-                 legs[0],legs[1],legs[2],legs[3], "", f"ABORT_OBP_LT_5K {obp_summary}"]
-            one_log(svc, sheet_id_num, sheet_id, SHEET_TAB, row); print("OBP too low"); sys.exit(0)
-        qty_source = f"OBP_QTY={qty}"
 
     side_name  = "SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"
     order_type = "NET_CREDIT" if is_credit else "NET_DEBIT"
@@ -454,10 +372,10 @@ def main():
             "orderStrategyType": "SINGLE",
             "complexOrderStrategyType": "IRON_CONDOR",
             "orderLegCollection":[
-                {"instruction":"BUY_TO_OPEN", "positionEffect":"OPENING","quantity":qty,"instrument":{"symbol":legs[0],"assetType":"OPTION"}},
-                {"instruction":"SELL_TO_OPEN","positionEffect":"OPENING","quantity":qty,"instrument":{"symbol":legs[1],"assetType":"OPTION"}},
-                {"instruction":"SELL_TO_OPEN","positionEffect":"OPENING","quantity":qty,"instrument":{"symbol":legs[2],"assetType":"OPTION"}},
-                {"instruction":"BUY_TO_OPEN", "positionEffect":"OPENING","quantity":qty,"instrument":{"symbol":legs[3],"assetType":"OPTION"}},
+                {"instruction":"BUY_TO_OPEN", "positionEffect":"OPENING","quantity":QTY,"instrument":{"symbol":legs[0],"assetType":"OPTION"}},
+                {"instruction":"SELL_TO_OPEN","positionEffect":"OPENING","quantity":QTY,"instrument":{"symbol":legs[1],"assetType":"OPTION"}},
+                {"instruction":"SELL_TO_OPEN","positionEffect":"OPENING","quantity":QTY,"instrument":{"symbol":legs[2],"assetType":"OPTION"}},
+                {"instruction":"BUY_TO_OPEN", "positionEffect":"OPENING","quantity":QTY,"instrument":{"symbol":legs[3],"assetType":"OPTION"}},
             ]
         }
 
@@ -486,7 +404,7 @@ def main():
             time.sleep(1)
         return False,last
 
-    # --- ladder sequence (single cycle) ---
+    # --- ladder sequence ---
     steps=[]; used_price=None; oid=""; filled=False; st=""
 
     # Step 0: start
@@ -508,7 +426,7 @@ def main():
         oid = place(used_price); steps.append(f"{used_price:.2f}")
         filled, st = wait_or_filled(STEP_WAIT, oid)
     if not filled:
-        # Step 3: prev mid ± 0.05
+        # Step 3: prev mid ± 0.05 (bounded)
         cancel_all_and_wait(c, acct_hash, canon)
         pm = m2 if ('m2' in locals() and m2 is not None) else (m1 if ('m1' in locals()) else None)
         step_px = clamp_tick((pm + (-0.05 if is_credit else +0.05)) if pm is not None else used_price)
@@ -526,12 +444,12 @@ def main():
         cancel_all_and_wait(c, acct_hash, canon)
         steps.append("CXL")
 
-    # ---- final log with OBP/qty summary included ----
+    # ---- final log ----
     trace = "STEPS " + "→".join(steps)
-    status_txt = (("FILLED " + trace) if filled else ((st or "WORKING") + " " + trace)) + f" | {obp_summary} | {qty_source}"
+    status_txt = (("FILLED " + trace) if filled else ((st or "WORKING") + " " + trace)) + f" | QTY={QTY}"
     row = [datetime.utcnow().isoformat()+"Z", source, "SPX", last_px,
            sig_date, "PLACE", ("SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"),
-           qty, ("NET_CREDIT" if is_credit else "NET_DEBIT"),
+           QTY, ("NET_CREDIT" if is_credit else "NET_DEBIT"),
            ("" if used_price is None else f"{used_price:.2f}"),
            legs[0],legs[1],legs[2],legs[3],
            oid, status_txt]
