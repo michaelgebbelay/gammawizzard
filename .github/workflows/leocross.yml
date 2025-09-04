@@ -7,10 +7,6 @@ on:
         description: 'PLACER_MODE: NOW | SCHEDULED'
         required: true
         default: 'SCHEDULED'
-      qty:
-        description: 'Number of contracts (integer ≥ 1). Leave blank to auto-size by OBP.'
-        required: false
-        default: ''
   schedule:
     # 4:10pm ET; script itself enforces 16:08–16:14 when SCHEDULED
     - cron: "10 20 * * 1-5"
@@ -35,10 +31,7 @@ jobs:
           pip install --quiet schwab-py requests google-api-python-client google-auth google-auth-httplib2
       - name: Place SPXW order (LIVE)
         env:
-          # Mode (manual input or default SCHEDULED)
           PLACER_MODE: ${{ github.event.inputs.mode != '' && github.event.inputs.mode || 'SCHEDULED' }}
-          # Contract count: prefer manual input; else use repo secret/variable so schedules work too.
-          PLACER_QTY: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.qty != '' && github.event.inputs.qty) || secrets.PLACER_QTY || vars.PLACER_QTY || '' }}
           # Schwab
           SCHWAB_APP_KEY: ${{ secrets.SCHWAB_APP_KEY }}
           SCHWAB_APP_SECRET: ${{ secrets.SCHWAB_APP_SECRET }}
