@@ -1,6 +1,6 @@
 # LIVE LeoCross → Schwab placer (cancel-then-place ladder, one order only)
 # MODE: PLACER_MODE = NOW | SCHEDULED   (default SCHEDULED: 16:08–16:14 ET weekdays)
-# Sizing: fixed manual quantity at top (no OBP checks, no env/inputs).
+# Sizing: fixed manual quantity at top. No OBP, no env/inputs.
 
 import os, sys, json, time, re
 from datetime import datetime, date, timezone
@@ -10,10 +10,10 @@ from schwab.auth import client_from_token_file
 from google.oauth2 import service_account
 from googleapiclient.discovery import build as gbuild
 
-# ===== manual settings =====
-QTY = 4  # <<<<< CHANGE THIS WHEN YOU WANT A DIFFERENT CONTRACT COUNT
+# ===== manual setting =====
+QTY = 4   # <<< change this when you want a different contract count
 
-# ===== fixed constants =====
+# ===== constants =====
 TICK = 0.05
 WIDTH = 5
 ET = ZoneInfo("America/New_York")
@@ -37,7 +37,7 @@ HEADERS = [
     "order_id","status"
 ]
 
-# ===== tiny utils =====
+# ===== utils =====
 def clamp_tick(x: float) -> float:
     return round(round(x / TICK) * TICK + 1e-12, 2)
 
@@ -193,18 +193,11 @@ def positions_map(c, acct_hash: str):
     return out
 
 def list_matching_open_ids(c, acct_hash: str, canon_set):
-    """
-    Schwab orders endpoint requires fromEnteredTime AND toEnteredTime (ZonedDateTime).
-    Query 'today 00:00 ET' → now ET (sent as UTC Z), then filter to working statuses.
-    """
+    """Schwab /orders requires fromEnteredTime/toEnteredTime. Query today 00:00 ET → now ET (UTC Z)."""
     now_et = datetime.now(ET)
     start_et = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
-    url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
-    params = {
-        "fromEnteredTime": iso_z(start_et),
-        "toEnteredTime": iso_z(now_et),
-        "maxResults": 200
-    }
+    url=f"https://api/schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
+    params = {"fromEnteredTime": iso_z(start_et), "toEnteredTime": iso_z(now_et), "maxResults": 200}
     arr = schwab_get_json(c, url, params=params, tag="ORDERS") or []
 
     out=[]
@@ -236,6 +229,14 @@ def cancel_all_and_wait(c, acct_hash: str, canon_set, grace=CANCEL_GRACE):
             if ids2: print(f"WARN lingering orders: {','.join(ids2)}")
             return
         time.sleep(0.5)
+
+def condor_units_open(pos_map, legs):
+    """How many full condors are already open with the same four legs (buys: 0 & 3; sells: 1 & 2)."""
+    b1 = max(0.0,  pos_map.get(osi_canon(legs[0]), 0.0))   # long qty on buy leg
+    b2 = max(0.0,  pos_map.get(osi_canon(legs[3]), 0.0))
+    s1 = max(0.0, -pos_map.get(osi_canon(legs[1]), 0.0))   # short qty on sell leg
+    s2 = max(0.0, -pos_map.get(osi_canon(legs[2]), 0.0))
+    return int(min(b1, b2, s1, s2))
 
 # ===== main =====
 def main():
@@ -286,7 +287,7 @@ def main():
              "","","","", "", f"ABORT_GW:{str(e)[:150]}"]
         one_log(svc, sheet_id_num, sheet_id, SHEET_TAB, row); print(e); sys.exit(0)
 
-    # extract
+    # extract minimal fields from GW
     def extract(j):
         if isinstance(j,dict):
             if "Trade" in j:
@@ -317,7 +318,7 @@ def main():
     cat1=fnum(tr.get("Cat1")); cat2=fnum(tr.get("Cat2"))
     is_credit = True if (cat2 is None or cat1 is None or cat2>=cat1) else False
 
-    # legs (width 5), orient
+    # legs (width 5), orient so legs[0],legs[3] are BUY_TO_OPEN; legs[1],legs[2] are SELL_TO_OPEN
     p_low,p_high = inner_put-5, inner_put
     c_low,c_high = inner_call, inner_call+5
     bp = to_osi(f".SPXW{exp6}P{p_low}"); sp = to_osi(f".SPXW{exp6}P{p_high}")
@@ -336,7 +337,7 @@ def main():
     legs = orient(bp,sp,sc,bc)
     canon = {osi_canon(x) for x in legs}
 
-    # NO-CLOSE guard
+    # NO-CLOSE guard (never flip an existing leg)
     try:
         pos = positions_map(c, acct_hash)
     except Exception as e:
@@ -359,6 +360,18 @@ def main():
              legs[0],legs[1],legs[2],legs[3], "", f"ABORT_{reason}"]
         one_log(svc, sheet_id_num, sheet_id, SHEET_TAB, row); print(reason); sys.exit(0)
 
+    # compute remaining size (handle partial fills gracefully)
+    already_units = condor_units_open(pos, legs)
+    rem_qty = max(0, QTY - already_units)
+    if rem_qty == 0:
+        row=[datetime.utcnow().isoformat()+"Z", source, "SPX", last_px, sig_date, "SKIP",
+             ("SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"), already_units,
+             ("NET_CREDIT" if is_credit else "NET_DEBIT"), "",
+             legs[0],legs[1],legs[2],legs[3], "",
+             f"ALREADY_AT_TARGET QTY_TARGET={QTY} OPEN_UNITS={already_units}"]
+        one_log(svc, sheet_id_num, sheet_id, SHEET_TAB, row)
+        print("Already at target qty; nothing to place."); sys.exit(0)
+
     side_name  = "SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"
     order_type = "NET_CREDIT" if is_credit else "NET_DEBIT"
 
@@ -372,15 +385,15 @@ def main():
             "orderStrategyType": "SINGLE",
             "complexOrderStrategyType": "IRON_CONDOR",
             "orderLegCollection":[
-                {"instruction":"BUY_TO_OPEN", "positionEffect":"OPENING","quantity":QTY,"instrument":{"symbol":legs[0],"assetType":"OPTION"}},
-                {"instruction":"SELL_TO_OPEN","positionEffect":"OPENING","quantity":QTY,"instrument":{"symbol":legs[1],"assetType":"OPTION"}},
-                {"instruction":"SELL_TO_OPEN","positionEffect":"OPENING","quantity":QTY,"instrument":{"symbol":legs[2],"assetType":"OPTION"}},
-                {"instruction":"BUY_TO_OPEN", "positionEffect":"OPENING","quantity":QTY,"instrument":{"symbol":legs[3],"assetType":"OPTION"}},
+                {"instruction":"BUY_TO_OPEN", "positionEffect":"OPENING","quantity":rem_qty,"instrument":{"symbol":legs[0],"assetType":"OPTION"}},
+                {"instruction":"SELL_TO_OPEN","positionEffect":"OPENING","quantity":rem_qty,"instrument":{"symbol":legs[1],"assetType":"OPTION"}},
+                {"instruction":"SELL_TO_OPEN","positionEffect":"OPENING","quantity":rem_qty,"instrument":{"symbol":legs[2],"assetType":"OPTION"}},
+                {"instruction":"BUY_TO_OPEN", "positionEffect":"OPENING","quantity":rem_qty,"instrument":{"symbol":legs[3],"assetType":"OPTION"}},
             ]
         }
 
     def place(price: float) -> str:
-        cancel_all_and_wait(c, acct_hash, canon)
+        cancel_all_and_wait(c, acct_hash, canon)  # cancel/replace ladder
         url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
         r=schwab_post_json(c,url,order_payload(price),tag=f"PLACE@{price:.2f}")
         try:
@@ -407,10 +420,11 @@ def main():
     # --- ladder sequence ---
     steps=[]; used_price=None; oid=""; filled=False; st=""
 
-    # Step 0: start
+    # Step 0: start @ 2.10 credit (or 1.90 debit)
     used_price = clamp_tick(CREDIT_START if is_credit else DEBIT_START)
     oid = place(used_price); steps.append(f"{used_price:.2f}")
     filled, st = wait_or_filled(STEP_WAIT, oid)
+
     if not filled:
         # Step 1: mid
         cancel_all_and_wait(c, acct_hash, canon)
@@ -418,6 +432,7 @@ def main():
         used_price = clamp_tick(m1 if m1 is not None else used_price)
         oid = place(used_price); steps.append(f"{used_price:.2f}")
         filled, st = wait_or_filled(STEP_WAIT, oid)
+
     if not filled:
         # Step 2: new mid
         cancel_all_and_wait(c, acct_hash, canon)
@@ -425,8 +440,9 @@ def main():
         used_price = clamp_tick(m2 if m2 is not None else used_price)
         oid = place(used_price); steps.append(f"{used_price:.2f}")
         filled, st = wait_or_filled(STEP_WAIT, oid)
+
     if not filled:
-        # Step 3: prev mid ± 0.05 (bounded)
+        # Step 3: prev mid ±0.05, bounded to floor/ceil
         cancel_all_and_wait(c, acct_hash, canon)
         pm = m2 if ('m2' in locals() and m2 is not None) else (m1 if ('m1' in locals()) else None)
         step_px = clamp_tick((pm + (-0.05 if is_credit else +0.05)) if pm is not None else used_price)
@@ -435,6 +451,7 @@ def main():
         used_price = step_px
         oid = place(used_price); steps.append(f"{used_price:.2f}")
         filled, st = wait_or_filled(STEP_WAIT, oid)
+
     if not filled:
         # Step 4: bound, then cancel
         cancel_all_and_wait(c, acct_hash, canon)
@@ -446,10 +463,11 @@ def main():
 
     # ---- final log ----
     trace = "STEPS " + "→".join(steps)
-    status_txt = (("FILLED " + trace) if filled else ((st or "WORKING") + " " + trace)) + f" | QTY={QTY}"
+    status_txt = (("FILLED " + trace) if filled else ((st or "WORKING") + " " + trace)) \
+                 + f" | TARGET={QTY} OPEN_UNITS={already_units} REM={rem_qty}"
     row = [datetime.utcnow().isoformat()+"Z", source, "SPX", last_px,
-           sig_date, "PLACE", ("SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"),
-           QTY, ("NET_CREDIT" if is_credit else "NET_DEBIT"),
+           sig_date, "PLACE", side_name,
+           rem_qty, ("NET_CREDIT" if is_credit else "NET_DEBIT"),
            ("" if used_price is None else f"{used_price:.2f}"),
            legs[0],legs[1],legs[2],legs[3],
            oid, status_txt]
