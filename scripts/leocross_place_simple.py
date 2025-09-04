@@ -1,9 +1,10 @@
+# scripts/leocross_place_simple.py
 # LIVE LeoCross → Schwab placer (cancel-then-place ladder, one order only)
 # MODE: PLACER_MODE = NOW | SCHEDULED   (default SCHEDULED: 16:08–16:14 ET weekdays)
 # Change: allow fixed contract sizing via PLACER_QTY (≥1). If set, skip OBP sizing.
 
 import os, sys, json, time, re
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 import requests
 from schwab.auth import client_from_token_file
@@ -17,7 +18,6 @@ ET = ZoneInfo("America/New_York")
 
 STEP_WAIT = 30
 CANCEL_GRACE = 12
-WINDOW_SEC = 180
 
 CREDIT_START = 2.10
 CREDIT_FLOOR = 1.90
@@ -189,10 +189,34 @@ def positions_map(c, acct_hash: str):
     return out
 
 def list_matching_open_ids(c, acct_hash: str, canon_set):
-    url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
-    arr=schwab_get_json(c,url,tag="ORDERS") or []
+    """
+    Schwab orders endpoint requires fromEnteredTime AND toEnteredTime (ZonedDateTime).
+    Query 'today 00:00 ET' → now ET, then filter to working/queued/etc.
+    """
+    now_et = datetime.now(ET)
+    start_et = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    # Use the library helper to ensure correct parameter names/formatting.
+    try:
+        resp = c.get_orders_for_account(
+            acct_hash,
+            from_entered_datetime=start_et,
+            to_entered_datetime=now_et,
+            # status filter optional; we filter below to include multiple statuses
+        )
+        arr = resp.json() if resp.status_code == 200 else []
+    except Exception:
+        # Fallback to raw call with explicit params if needed
+        url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
+        params = {
+            "fromEnteredTime": start_et.isoformat(),
+            "toEnteredTime": now_et.isoformat(),
+            "maxResults": 200
+        }
+        arr = schwab_get_json(c, url, params=params, tag="ORDERS") or []
+
     out=[]
-    for o in arr:
+    for o in arr or []:
         st=str(o.get("status") or "").upper()
         if st not in ("WORKING","QUEUED","PENDING_ACTIVATION","OPEN"): continue
         got=set()
@@ -462,7 +486,7 @@ def main():
             time.sleep(1)
         return False,last
 
-    # --- ladder sequence (single cycle; OBP debug build) ---
+    # --- ladder sequence (single cycle) ---
     steps=[]; used_price=None; oid=""; filled=False; st=""
 
     # Step 0: start
