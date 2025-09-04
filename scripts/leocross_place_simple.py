@@ -1,6 +1,6 @@
 # LIVE LeoCross → Schwab placer (cancel-then-place ladder, one order only)
 # MODE: PLACER_MODE = NOW | SCHEDULED   (default SCHEDULED: 16:08–16:14 ET weekdays)
-# Focus: print OBP inputs used for sizing before any order, and write them in Sheet status.
+# Change: allow fixed contract sizing via PLACER_QTY (≥1). If set, skip OBP sizing.
 
 import os, sys, json, time, re
 from datetime import datetime, date
@@ -95,7 +95,7 @@ def one_log(svc, sheet_id_num, spreadsheet_id: str, tab: str, row_vals: list):
 def _backoff(i): return 0.5*(2**i)
 
 def schwab_get_json(c, url, params=None, tries=4, tag=""):
-    last=""; 
+    last=""
     for i in range(tries):
         try:
             r=c.session.get(url, params=(params or {}), timeout=15)
@@ -140,7 +140,7 @@ def gw_login_token():
     if not (email and pwd): raise RuntimeError("GW_LOGIN_MISSING_CREDS")
     r=requests.post(f"{GW_BASE}/goauth/authenticateFireUser", data={"email":email,"password":pwd}, timeout=_gw_timeout())
     if r.status_code!=200: raise RuntimeError(f"GW_LOGIN_HTTP_{r.status_code}:{r.text[:180]}")
-    j=r.json(); t=j.get("token"); 
+    j=r.json(); t=j.get("token")
     if not t: raise RuntimeError("GW_LOGIN_NO_TOKEN")
     return t
 
@@ -189,7 +189,7 @@ def positions_map(c, acct_hash: str):
     return out
 
 def list_matching_open_ids(c, acct_hash: str, canon_set):
-    url=f"https://api/schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
+    url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
     arr=schwab_get_json(c,url,tag="ORDERS") or []
     out=[]
     for o in arr:
@@ -201,7 +201,7 @@ def list_matching_open_ids(c, acct_hash: str, canon_set):
             if not sym: continue
             try: got.add(osi_canon(to_osi(sym)))
             except: pass
-        if got==canon_set: 
+        if got==canon_set:
             oid=str(o.get("orderId") or "")
             if oid: out.append(oid)
     return out
@@ -248,10 +248,8 @@ def obp_probe(c, acct_hash: str):
         return max(vals) if vals else None
 
     vals = {name: pick(sec) for name,sec in sections.items()}
-
     used = max([v for v in vals.values() if v is not None], default=0.0)
 
-    # console probe
     print("=== OBP PROBE ===")
     for name in ("top","current","projected","initial","balances"):
         v = vals.get(name)
@@ -259,9 +257,7 @@ def obp_probe(c, acct_hash: str):
     print(f"OBP_USED : {used:.2f}  (qty = floor(OBP_USED/5000))")
     print("=================")
 
-    # safe formatting helper (avoids nested f-strings bug)
     def fmt(v): return "NA" if v is None else f"{v:.2f}"
-
     short = (
         f"OBP top={fmt(vals['top'])}, curr={fmt(vals['current'])}, "
         f"proj={fmt(vals['projected'])}, init={fmt(vals['initial'])}, "
@@ -322,13 +318,13 @@ def main():
     def extract(j):
         if isinstance(j,dict):
             if "Trade" in j:
-                tr=j["Trade"]; 
+                tr=j["Trade"]
                 return tr[-1] if isinstance(tr,list) and tr else tr if isinstance(tr,dict) else {}
             keys=("Date","TDate","Limit","CLimit","Cat1","Cat2")
             if any(k in j for k in keys): return j
             for v in j.values():
                 if isinstance(v,(dict,list)):
-                    t=extract(v); 
+                    t=extract(v)
                     if t: return t
         if isinstance(j,list):
             for it in reversed(j):
@@ -343,7 +339,7 @@ def main():
 
     sig_date=str(tr.get("Date","")); exp_iso=str(tr.get("TDate","")); exp6=yymmdd(exp_iso)
     inner_put=int(float(tr.get("Limit"))); inner_call=int(float(tr.get("CLimit")))
-    def fnum(x): 
+    def fnum(x):
         try: return float(x)
         except: return None
     cat1=fnum(tr.get("Cat1")); cat2=fnum(tr.get("Cat2"))
@@ -391,21 +387,35 @@ def main():
              legs[0],legs[1],legs[2],legs[3], "", f"ABORT_{reason}"]
         one_log(svc, sheet_id_num, sheet_id, SHEET_TAB, row); print(reason); sys.exit(0)
 
-    # ===== OBP probe + sizing =====
-    try:
-        obp_used, obp_summary = obp_probe(c, acct_hash)
-    except Exception as e:
-        row=[datetime.utcnow().isoformat()+"Z", source, "SPX", last_px, sig_date, "ABORT",
-             ("SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"), "", ("NET_CREDIT" if is_credit else "NET_DEBIT"), "",
-             legs[0],legs[1],legs[2],legs[3], "", f"ABORT_OBP_NET:{str(e)[:140]}"]
-        one_log(svc, sheet_id_num, sheet_id, SHEET_TAB, row); print(e); sys.exit(0)
-
-    qty = int(obp_used // PER_UNIT)
-    if qty < 1:
-        row=[datetime.utcnow().isoformat()+"Z", source, "SPX", last_px, sig_date, "ABORT",
-             ("SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"), "", ("NET_CREDIT" if is_credit else "NET_DEBIT"), "",
-             legs[0],legs[1],legs[2],legs[3], "", f"ABORT_OBP_LT_5K {obp_summary}"]
-        one_log(svc, sheet_id_num, sheet_id, SHEET_TAB, row); print("OBP too low"); sys.exit(0)
+    # ===== Sizing: fixed qty if PLACER_QTY is set; otherwise OBP-based =====
+    qty_env = (os.environ.get("PLACER_QTY") or "").strip()
+    qty_source = ""
+    if qty_env:
+        try:
+            qty = int(qty_env)
+            if qty < 1: raise ValueError("qty must be ≥1")
+        except Exception as e:
+            row=[datetime.utcnow().isoformat()+"Z", source, "SPX", last_px, sig_date, "ABORT",
+                 ("SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"), "", ("NET_CREDIT" if is_credit else "NET_DEBIT"), "",
+                 legs[0],legs[1],legs[2],legs[3], "", f"ABORT_BAD_QTY:{str(e)[:140]}"]
+            one_log(svc, sheet_id_num, sheet_id, SHEET_TAB, row); print(f"Bad PLACER_QTY: {qty_env}"); sys.exit(0)
+        obp_summary = "OBP_SKIPPED_FIXED_QTY"
+        qty_source = f"FIXED_QTY={qty}"
+    else:
+        try:
+            obp_used, obp_summary = obp_probe(c, acct_hash)
+        except Exception as e:
+            row=[datetime.utcnow().isoformat()+"Z", source, "SPX", last_px, sig_date, "ABORT",
+                 ("SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"), "", ("NET_CREDIT" if is_credit else "NET_DEBIT"), "",
+                 legs[0],legs[1],legs[2],legs[3], "", f"ABORT_OBP_NET:{str(e)[:140]}"]
+            one_log(svc, sheet_id_num, sheet_id, SHEET_TAB, row); print(e); sys.exit(0)
+        qty = int(obp_used // PER_UNIT)
+        if qty < 1:
+            row=[datetime.utcnow().isoformat()+"Z", source, "SPX", last_px, sig_date, "ABORT",
+                 ("SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"), "", ("NET_CREDIT" if is_credit else "NET_DEBIT"), "",
+                 legs[0],legs[1],legs[2],legs[3], "", f"ABORT_OBP_LT_5K {obp_summary}"]
+            one_log(svc, sheet_id_num, sheet_id, SHEET_TAB, row); print("OBP too low"); sys.exit(0)
+        qty_source = f"OBP_QTY={qty}"
 
     side_name  = "SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"
     order_type = "NET_CREDIT" if is_credit else "NET_DEBIT"
@@ -492,9 +502,9 @@ def main():
         cancel_all_and_wait(c, acct_hash, canon)
         steps.append("CXL")
 
-    # ---- final log with OBP summary included ----
+    # ---- final log with OBP/qty summary included ----
     trace = "STEPS " + "→".join(steps)
-    status_txt = (("FILLED " + trace) if filled else ((st or "WORKING") + " " + trace)) + f" | {obp_summary}"
+    status_txt = (("FILLED " + trace) if filled else ((st or "WORKING") + " " + trace)) + f" | {obp_summary} | {qty_source}"
     row = [datetime.utcnow().isoformat()+"Z", source, "SPX", last_px,
            sig_date, "PLACE", ("SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"),
            qty, ("NET_CREDIT" if is_credit else "NET_DEBIT"),
