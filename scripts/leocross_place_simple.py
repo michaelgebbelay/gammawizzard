@@ -1,6 +1,6 @@
 # LIVE LeoCross → Schwab placer (cancel-then-place ladder, one order only)
 # MODE: PLACER_MODE = NOW | SCHEDULED (default SCHEDULED: 16:08–16:14 ET)
-# Sizing: fixed manual quantity at top. No buying-power checks. Partial-fill safe. Never closes legs.
+# Responsibility: EXECUTE ONLY. No position checks. No OBP. Fixed manual QTY.
 
 import os, sys, json, time, re
 from datetime import datetime, date, timezone
@@ -47,7 +47,7 @@ def _sanitize_token(t: str) -> str:
 
 def yymmdd(iso: str) -> str:
     d = date.fromisoformat((iso or "")[:10])
-    return f"{d:%y%m%d}"
+    return "{:%y%m%d}".format(d)
 
 def to_osi(sym: str) -> str:
     raw = (sym or "").strip().upper().lstrip(".").replace("_","")
@@ -95,7 +95,7 @@ def one_log(svc, sheet_id_num, spreadsheet_id: str, tab: str, row_vals: list):
     svc.spreadsheets().values().update(spreadsheetId=spreadsheet_id, range="{}!A2".format(tab),
         valueInputOption="USER_ENTERED", body={"values":[row_vals]}).execute()
 
-# ======== SCHWAB HTTP HELPERS (loop retries) ========
+# ======== SCHWAB HTTP HELPERS ========
 def _backoff(i): return 0.6*(2**i)
 
 def schwab_get_json(c, url, params=None, tries=8, tag=""):
@@ -175,25 +175,8 @@ def mid_condor(c, legs):
     net_bid=(sp_b+sc_b)-(bp_a+bc_a); net_ask=(sp_a+sc_a)-(bp_b+bc_b)
     return (net_bid+net_ask)/2.0
 
-# ======== POSITIONS / ORDERS / GUARDS ========
-def positions_map(c, acct_hash: str):
-    url="https://api.schwabapi.com/trader/v1/accounts/{}".format(acct_hash)
-    j=schwab_get_json(c,url,params={"fields":"positions"},tag="POSITIONS")
-    sa=j[0]["securitiesAccount"] if isinstance(j,list) else (j.get("securitiesAccount") or j)
-    out={}
-    for p in (sa.get("positions") or []):
-        ins=p.get("instrument",{}) or {}
-        if (ins.get("assetType") or "").upper()!="OPTION": continue
-        sym=ins.get("symbol","")
-        try: key=osi_canon(to_osi(sym))
-        except: continue
-        qty=float(p.get("longQuantity",0))-float(p.get("shortQuantity",0))
-        if abs(qty)<1e-9: continue
-        out[key]=out.get(key,0.0)+qty
-    return out
-
+# ======== ORDERS (for cancel/replace ladder only) ========
 def list_matching_open_ids(c, acct_hash: str, canon_set):
-    """Schwab /orders requires fromEnteredTime/toEnteredTime. Query today 00:00 ET → now ET (UTC Z)."""
     now_et = datetime.now(ET)
     start_et = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
     url="https://api.schwabapi.com/trader/v1/accounts/{}/orders".format(acct_hash)
@@ -202,7 +185,7 @@ def list_matching_open_ids(c, acct_hash: str, canon_set):
         arr = schwab_get_json(c, url, params=params, tag="ORDERS") or []
     except Exception as e:
         print("WARN orders lookup failed: {} (continuing without cancel)".format(e))
-        return []  # degrade gracefully — risk: parallel working orders
+        return []
     out=[]
     for o in arr or []:
         st=str(o.get("status") or "").upper()
@@ -238,14 +221,6 @@ def cancel_all_and_wait(c, acct_hash: str, canon_set, grace=CANCEL_GRACE):
             except Exception: pass
             return
         time.sleep(0.5)
-
-def condor_units_open(pos_map, legs):
-    """How many full condors are already open with these exact legs."""
-    b1 = max(0.0,  pos_map.get(osi_canon(legs[0]), 0.0))  # BUY legs long qty
-    b2 = max(0.0,  pos_map.get(osi_canon(legs[3]), 0.0))
-    s1 = max(0.0, -pos_map.get(osi_canon(legs[1]), 0.0))  # SELL legs short qty
-    s2 = max(0.0, -pos_map.get(osi_canon(legs[2]), 0.0))
-    return int(min(b1, b2, s1, s2))
 
 # ======== MAIN ========
 def main():
@@ -288,7 +263,7 @@ def main():
                  "","","","", "", "SKIPPED_TIME_WINDOW"]
             one_log(svc, sheet_id_num, sheet_id, SHEET_TAB, row); print("skip window"); sys.exit(0)
 
-    # ---- GW → trade payload ----
+    # GW → trade
     try:
         api=gw_get_leocross()
     except Exception as e:
@@ -296,7 +271,7 @@ def main():
              "","","","", "", "ABORT_GW:{}".format(str(e)[:150])]
         one_log(svc, sheet_id_num, sheet_id, SHEET_TAB, row); print(e); sys.exit(0)
 
-    # extract minimal fields from GW
+    # extract
     def extract(j):
         if isinstance(j,dict):
             if "Trade" in j:
@@ -327,7 +302,7 @@ def main():
     cat1=fnum(tr.get("Cat1")); cat2=fnum(tr.get("Cat2"))
     is_credit = True if (cat2 is None or cat1 is None or cat2>=cat1) else False
 
-    # legs (width 5), orient so legs[0],legs[3] are BUY_TO_OPEN; legs[1],legs[2] are SELL_TO_OPEN
+    # legs (width 5), orient
     p_low,p_high = inner_put-5, inner_put
     c_low,c_high = inner_call, inner_call+5
     bp = to_osi(".SPXW{}P{}".format(exp6, p_low));  sp = to_osi(".SPXW{}P{}".format(exp6, p_high))
@@ -346,41 +321,6 @@ def main():
     legs = orient(bp,sp,sc,bc)
     canon = {osi_canon(x) for x in legs}
 
-    # NO-CLOSE guard (never flip an existing leg)
-    try:
-        pos = positions_map(c, acct_hash)
-    except Exception as e:
-        row=[datetime.utcnow().isoformat()+"Z", source, "SPX", last_px, sig_date, "ABORT",
-             ("SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"), "", ("NET_CREDIT" if is_credit else "NET_DEBIT"), "",
-             legs[0],legs[1],legs[2],legs[3], "", "ABORT_NET_POS:{}".format(str(e)[:140])]
-        one_log(svc, sheet_id_num, sheet_id, SHEET_TAB, row); print(e); sys.exit(0)
-
-    def would_close():
-        checks=[("BUY",legs[0],-1),("SELL",legs[1],+1),("SELL",legs[2],+1),("BUY",legs[3],-1)]
-        for _, osi, sign in checks:
-            cur = pos.get(osi_canon(osi), 0.0)
-            if sign<0 and cur<0: return (False, "LEG_WOULD_CLOSE {}".format(osi))
-            if sign>0 and cur>0: return (False, "LEG_WOULD_CLOSE {}".format(osi))
-        return (True,"")
-    ok,reason = would_close()
-    if not ok:
-        row=[datetime.utcnow().isoformat()+"Z", source, "SPX", last_px, sig_date, "ABORT",
-             ("SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"), "", ("NET_CREDIT" if is_credit else "NET_DEBIT"), "",
-             legs[0],legs[1],legs[2],legs[3], "", "ABORT_{}".format(reason)]
-        one_log(svc, sheet_id_num, sheet_id, SHEET_TAB, row); print(reason); sys.exit(0)
-
-    # compute remaining size (handles partial fills gracefully)
-    already_units = condor_units_open(pos, legs)
-    rem_qty = max(0, QTY - already_units)
-    if rem_qty == 0:
-        row=[datetime.utcnow().isoformat()+"Z", source, "SPX", last_px, sig_date, "SKIP",
-             ("SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"), already_units,
-             ("NET_CREDIT" if is_credit else "NET_DEBIT"), "",
-             legs[0],legs[1],legs[2],legs[3], "",
-             "ALREADY_AT_TARGET QTY_TARGET={} OPEN_UNITS={}".format(QTY, already_units)]
-        one_log(svc, sheet_id_num, sheet_id, SHEET_TAB, row)
-        print("Already at target qty; nothing to place."); sys.exit(0)
-
     side_name  = "SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"
     order_type = "NET_CREDIT" if is_credit else "NET_DEBIT"
 
@@ -394,10 +334,10 @@ def main():
             "orderStrategyType": "SINGLE",
             "complexOrderStrategyType": "IRON_CONDOR",
             "orderLegCollection":[
-                {"instruction":"BUY_TO_OPEN", "positionEffect":"OPENING","quantity":rem_qty,"instrument":{"symbol":legs[0],"assetType":"OPTION"}},
-                {"instruction":"SELL_TO_OPEN","positionEffect":"OPENING","quantity":rem_qty,"instrument":{"symbol":legs[1],"assetType":"OPTION"}},
-                {"instruction":"SELL_TO_OPEN","positionEffect":"OPENING","quantity":rem_qty,"instrument":{"symbol":legs[2],"assetType":"OPTION"}},
-                {"instruction":"BUY_TO_OPEN", "positionEffect":"OPENING","quantity":rem_qty,"instrument":{"symbol":legs[3],"assetType":"OPTION"}},
+                {"instruction":"BUY_TO_OPEN", "positionEffect":"OPENING","quantity":QTY,"instrument":{"symbol":legs[0],"assetType":"OPTION"}},
+                {"instruction":"SELL_TO_OPEN","positionEffect":"OPENING","quantity":QTY,"instrument":{"symbol":legs[1],"assetType":"OPTION"}},
+                {"instruction":"SELL_TO_OPEN","positionEffect":"OPENING","quantity":QTY,"instrument":{"symbol":legs[2],"assetType":"OPTION"}},
+                {"instruction":"BUY_TO_OPEN", "positionEffect":"OPENING","quantity":QTY,"instrument":{"symbol":legs[3],"assetType":"OPTION"}},
             ]
         }
 
@@ -473,10 +413,10 @@ def main():
     # ---- final log ----
     trace = "STEPS " + "→".join(steps)
     status_txt = (("FILLED " + trace) if filled else ((st or "WORKING") + " " + trace)) \
-                 + " | TARGET={} OPEN_UNITS={} REM={}".format(QTY, already_units, rem_qty)
+                 + " | QTY={}".format(QTY)
     row = [datetime.utcnow().isoformat()+"Z", source, "SPX", last_px,
            sig_date, "PLACE", side_name,
-           rem_qty, ("NET_CREDIT" if is_credit else "NET_DEBIT"),
+           QTY, ("NET_CREDIT" if is_credit else "NET_DEBIT"),
            ("" if used_price is None else "{:.2f}".format(used_price)),
            legs[0],legs[1],legs[2],legs[3],
            oid, status_txt]
