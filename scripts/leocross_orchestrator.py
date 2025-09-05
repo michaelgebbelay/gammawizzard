@@ -1,10 +1,9 @@
-# LeoCross ORCHESTRATOR: guard → decide remaining size → run placer when safe.
-# - No OBP here.
-# - Blocks ONLY when the intended order would "close" any existing leg.
-# - If you already hold partial units, it runs the placer for the REMAINING qty.
+# LeoCross ORCHESTRATOR: guard → remaining size → run placer when safe.
+# Blocks ONLY if the intended order would "close" any existing leg.
+# If partial units already exist, runs placer for REMAINDER (QTY_TARGET - open_units).
 #
 # Manual daily target:
-QTY_TARGET = 4  # <<< change this when you want a different target size
+QTY_TARGET = 4  # <<< change this to your target size
 
 import os, sys, json, time, re, subprocess
 from datetime import datetime, date, timezone
@@ -22,11 +21,7 @@ def yymmdd(iso: str) -> str:
     return "{:%y%m%d}".format(d)
 
 def to_osi(sym: str) -> str:
-    """
-    Robust OSI normalizer:
-      - handles 'SPXW  250904C06475000', '.SPXW250904C06475000', '...P6425.00', etc.
-      - outputs OCC 21-char OSI string.
-    """
+    """Robust OSI normalizer for Schwab/TOS symbols."""
     raw = (sym or "").upper()
     raw = re.sub(r'\s+', '', raw)      # strip spaces
     raw = raw.lstrip('.')              # remove leading dot
@@ -45,8 +40,7 @@ def to_osi(sym: str) -> str:
     return "{:<6s}{}{}{:08d}".format(root, ymd, cp, mills)
 
 def osi_canon(osi: str):
-    # canonical identity ignoring root differences (SPX vs SPXW)
-    return (osi[6:12], osi[12], osi[-8:])
+    return (osi[6:12], osi[12], osi[-8:])  # ignore root differences
 
 def strike_from_osi(osi: str) -> float:
     return int(osi[-8:]) / 1000.0
@@ -106,7 +100,7 @@ def gw_login_token():
 def gw_get_leocross():
     tok=_sanitize_token(os.environ.get("GW_TOKEN","") or "")
     def hit(t):
-        h={"Accept":"application/json","Authorization":"Bearer {}".format(_sanitize_token(t)),"User-Agent":"gw-orchestrator/1.0"}
+        h={"Accept":"application/json","Authorization":"Bearer {}".format(_sanitize_token(t)),"User-Agent":"gw-orchestrator/1.1"}
         return requests.get("{}/{}".format(GW_BASE.rstrip("/"), GW_ENDPOINT.lstrip("/")), headers=h, timeout=_gw_timeout())
     r=hit(tok) if tok else None
     if (r is None) or (r.status_code in (401,403)): r=hit(gw_login_token())
@@ -132,27 +126,37 @@ def extract_trade(j):
 
 # ---------- condor helpers ----------
 def condor_units_open(pos_map, legs):
-    """Full condors already open with these exact legs (long wings >0, short inners <0)."""
-    b1 = max(0.0,  pos_map.get(osi_canon(legs[0]), 0.0))
-    b2 = max(0.0,  pos_map.get(osi_canon(legs[3]), 0.0))
-    s1 = max(0.0, -pos_map.get(osi_canon(legs[1]), 0.0))
-    s2 = max(0.0, -pos_map.get(osi_canon(legs[2]), 0.0))
+    b1 = max(0.0,  pos_map.get(osi_canon(legs[0]), 0.0))  # long wing put
+    b2 = max(0.0,  pos_map.get(osi_canon(legs[3]), 0.0))  # long wing call
+    s1 = max(0.0, -pos_map.get(osi_canon(legs[1]), 0.0))  # short inner put
+    s2 = max(0.0, -pos_map.get(osi_canon(legs[2]), 0.0))  # short inner call
     return int(min(b1, b2, s1, s2))
 
 # ---------- main ----------
 def main():
-    # Schwab auth
-    app_key=os.environ["SCHWAB_APP_KEY"]; app_secret=os.environ["SCHWAB_APP_SECRET"]; token_json=os.environ["SCHWAB_TOKEN_JSON"]
-    with open("schwab_token.json","w") as f: f.write(token_json)
-    c=client_from_token_file(api_key=app_key, app_secret=app_secret, token_path="schwab_token.json")
-    r=c.get_account_numbers(); r.raise_for_status()
-    acct_hash=r.json()[0]["hashValue"]
+    # ---- Schwab auth (catch refresh failures cleanly) ----
+    try:
+        app_key=os.environ["SCHWAB_APP_KEY"]; app_secret=os.environ["SCHWAB_APP_SECRET"]; token_json=os.environ["SCHWAB_TOKEN_JSON"]
+        with open("schwab_token.json","w") as f: f.write(token_json)
+        c=client_from_token_file(api_key=app_key, app_secret=app_secret, token_path="schwab_token.json")
+        r=c.get_account_numbers(); r.raise_for_status()
+        acct_hash=r.json()[0]["hashValue"]
+    except Exception as e:
+        msg=str(e)
+        if ("unsupported_token_type" in msg) or ("refresh_token_authentication_error" in msg):
+            print("ORCH ABORT: SCHWAB_OAUTH_REFRESH_FAILED — rotate SCHWAB_TOKEN_JSON secret.")
+        else:
+            print("ORCH ABORT: SCHWAB_CLIENT_INIT_FAILED — {}".format(msg[:200]))
+        return 1
 
-    # Leo signal → legs
-    api=gw_get_leocross()
-    tr=extract_trade(api)
-    if not tr:
-        print("ORCH SKIP: NO_TRADE_PAYLOAD"); return 0
+    # ---- Leo signal → legs ----
+    try:
+        api=gw_get_leocross()
+        tr=extract_trade(api)
+        if not tr:
+            print("ORCH SKIP: NO_TRADE_PAYLOAD"); return 0
+    except Exception as e:
+        print("ORCH ABORT: GW_FETCH_FAILED — {}".format(str(e)[:200])); return 1
 
     sig_date=str(tr.get("Date","")); exp_iso=str(tr.get("TDate","")); exp6=yymmdd(exp_iso)
     inner_put=int(float(tr.get("Limit"))); inner_call=int(float(tr.get("CLimit")))
@@ -162,7 +166,6 @@ def main():
     cat1=fnum(tr.get("Cat1")); cat2=fnum(tr.get("Cat2"))
     is_credit = True if (cat2 is None or cat1 is None or cat2>=cat1) else False
 
-    # width-5 condor
     p_low,p_high = inner_put-5, inner_put
     c_low,c_high = inner_call, inner_call+5
     bp = to_osi(".SPXW{}P{}".format(exp6, p_low));  sp = to_osi(".SPXW{}P{}".format(exp6, p_high))
@@ -180,10 +183,12 @@ def main():
         return [bp,sp,sc,bc]
     legs = orient(bp,sp,sc,bc)
 
-    # positions
-    pos = positions_map(c, acct_hash)
+    # ---- positions → NO‑CLOSE guard ----
+    try:
+        pos = positions_map(c, acct_hash)
+    except Exception as e:
+        print("ORCH ABORT: POSITIONS_FAILED — {}".format(str(e)[:200])); return 1
 
-    # NO‑CLOSE safety
     checks=[("BUY",legs[0],-1),("SELL",legs[1],+1),("SELL",legs[2],+1),("BUY",legs[3],-1)]
     for _, osi, sign in checks:
         cur = pos.get(osi_canon(osi), 0.0)
@@ -191,7 +196,7 @@ def main():
             print("ORCH SKIP: WOULD_CLOSE {} qty={}".format(osi, cur))
             return 0
 
-    # Remaining size logic (allow partial fills)
+    # ---- remaining qty (partial aware) ----
     units_open = condor_units_open(pos, legs)
     rem_qty = max(0, QTY_TARGET - units_open)
     print("ORCH DECISION: target={} open_units={} rem_qty={}".format(QTY_TARGET, units_open, rem_qty))
@@ -199,13 +204,10 @@ def main():
         print("ORCH SKIP: Already at or above target.")
         return 0
 
-    # Invoke placer with an internal override; user doesn’t touch this.
+    # ---- call placer with override ----
     env = dict(os.environ)
     env["QTY_OVERRIDE"] = str(rem_qty)
-
-    # Keep placer mode passthrough (NOW|SCHEDULED). Placer will time-gate SCHEDULED.
-    cmd = [sys.executable, "scripts/leocross_place_simple.py"]
-    rc = subprocess.call(cmd, env=env)
+    rc = subprocess.call([sys.executable, "scripts/leocross_place_simple.py"], env=env)
     return rc
 
 if __name__ == "__main__":
