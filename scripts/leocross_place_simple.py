@@ -1,6 +1,9 @@
 # LIVE LeoCross → Schwab placer (cancel-then-place ladder, one order only)
+# Responsibility: EXECUTE ONLY. No position checks. No OBP. Fixed QTY, with optional override for orchestrator.
 # MODE: PLACER_MODE = NOW | SCHEDULED (default SCHEDULED: 16:08–16:14 ET)
-# Responsibility: EXECUTE ONLY. No position checks. No OBP. Fixed manual QTY.
+#
+# Manual default size:
+QTY = 4   # <<< change this when you want a different default contract count
 
 import os, sys, json, time, re
 from datetime import datetime, date, timezone
@@ -9,9 +12,6 @@ import requests
 from schwab.auth import client_from_token_file
 from google.oauth2 import service_account
 from googleapiclient.discovery import build as gbuild
-
-# ======== MANUAL SETTING ========
-QTY = 4   # <<< change this when you want a different contract count
 
 # ======== CONSTANTS ========
 TICK = 0.05
@@ -50,16 +50,24 @@ def yymmdd(iso: str) -> str:
     return "{:%y%m%d}".format(d)
 
 def to_osi(sym: str) -> str:
-    raw = (sym or "").strip().upper().lstrip(".").replace("_","")
-    m = re.match(r'^([A-Z.$^]{1,6})(\d{6})([CP])(\d{1,5})(?:\.(\d{1,3}))?$', raw) or \
-        re.match(r'^([A-Z.$^]{1,6})(\d{6})([CP])(\d{8})$', raw)
+    # ROBUST OSI parser: normalize Schwab/TOS variants
+    raw = (sym or "").upper()
+    raw = re.sub(r'\s+', '', raw)
+    raw = raw.lstrip('.')
+    raw = re.sub(r'[^A-Z0-9.$^]', '', raw)
+
+    m = re.match(r'^([A-Z.$^]{1,6})(\d{6})([CP])(\d{1,5})(?:\.(\d{1,3}))?$', raw) \
+        or re.match(r'^([A-Z.$^]{1,6})(\d{6})([CP])(\d{8})$', raw)
     if not m: raise ValueError("Cannot parse option symbol: " + sym)
     root, ymd, cp, strike, frac = (m.groups()+("",))[:5]
-    mills = int(strike)*1000 + (int((frac or "0").ljust(3,'0')) if frac else 0) if len(strike)<8 else int(strike)
+    if len(strike)==8 and not frac:
+        mills = int(strike)
+    else:
+        mills = int(strike)*1000 + (int((frac or "0").ljust(3,'0')) if frac else 0)
     return "{:<6s}{}{}{:08d}".format(root, ymd, cp, mills)
 
 def osi_canon(osi: str):
-    return (osi[6:12], osi[12], osi[-8:])  # (yymmdd, C/P, strike8)
+    return (osi[6:12], osi[12], osi[-8:])
 
 def strike_from_osi(osi: str) -> float:
     return int(osi[-8:]) / 1000.0
@@ -224,6 +232,13 @@ def cancel_all_and_wait(c, acct_hash: str, canon_set, grace=CANCEL_GRACE):
 
 # ======== MAIN ========
 def main():
+    # default quantity with optional override from orchestrator
+    qty_override = os.environ.get("QTY_OVERRIDE")
+    try:
+        qty = int(qty_override) if qty_override else QTY
+    except Exception:
+        qty = QTY
+
     MODE=(os.environ.get("PLACER_MODE","SCHEDULED") or "SCHEDULED").upper()
     source="SIMPLE_" + MODE
 
@@ -255,7 +270,7 @@ def main():
     svc=gbuild("sheets","v4",credentials=creds)
     sheet_id_num=ensure_header_and_get_sheetid(svc, sheet_id, SHEET_TAB, HEADERS)
 
-    # schedule gate
+    # schedule gate (placer enforces the time window)
     if MODE=="SCHEDULED":
         now=datetime.now(ET)
         if now.weekday()>=5 or not (now.hour==16 and 8<=now.minute<=14):
@@ -302,7 +317,7 @@ def main():
     cat1=fnum(tr.get("Cat1")); cat2=fnum(tr.get("Cat2"))
     is_credit = True if (cat2 is None or cat1 is None or cat2>=cat1) else False
 
-    # legs (width 5), orient
+    # legs (width 5), orient so BUY legs are wings; SELL legs are inners for credit (inverse for debit)
     p_low,p_high = inner_put-5, inner_put
     c_low,c_high = inner_call, inner_call+5
     bp = to_osi(".SPXW{}P{}".format(exp6, p_low));  sp = to_osi(".SPXW{}P{}".format(exp6, p_high))
@@ -334,10 +349,10 @@ def main():
             "orderStrategyType": "SINGLE",
             "complexOrderStrategyType": "IRON_CONDOR",
             "orderLegCollection":[
-                {"instruction":"BUY_TO_OPEN", "positionEffect":"OPENING","quantity":QTY,"instrument":{"symbol":legs[0],"assetType":"OPTION"}},
-                {"instruction":"SELL_TO_OPEN","positionEffect":"OPENING","quantity":QTY,"instrument":{"symbol":legs[1],"assetType":"OPTION"}},
-                {"instruction":"SELL_TO_OPEN","positionEffect":"OPENING","quantity":QTY,"instrument":{"symbol":legs[2],"assetType":"OPTION"}},
-                {"instruction":"BUY_TO_OPEN", "positionEffect":"OPENING","quantity":QTY,"instrument":{"symbol":legs[3],"assetType":"OPTION"}},
+                {"instruction":"BUY_TO_OPEN", "positionEffect":"OPENING","quantity":qty,"instrument":{"symbol":legs[0],"assetType":"OPTION"}},
+                {"instruction":"SELL_TO_OPEN","positionEffect":"OPENING","quantity":qty,"instrument":{"symbol":legs[1],"assetType":"OPTION"}},
+                {"instruction":"SELL_TO_OPEN","positionEffect":"OPENING","quantity":qty,"instrument":{"symbol":legs[2],"assetType":"OPTION"}},
+                {"instruction":"BUY_TO_OPEN", "positionEffect":"OPENING","quantity":qty,"instrument":{"symbol":legs[3],"assetType":"OPTION"}},
             ]
         }
 
@@ -413,10 +428,10 @@ def main():
     # ---- final log ----
     trace = "STEPS " + "→".join(steps)
     status_txt = (("FILLED " + trace) if filled else ((st or "WORKING") + " " + trace)) \
-                 + " | QTY={}".format(QTY)
+                 + " | QTY={}".format(qty)
     row = [datetime.utcnow().isoformat()+"Z", source, "SPX", last_px,
            sig_date, "PLACE", side_name,
-           QTY, ("NET_CREDIT" if is_credit else "NET_DEBIT"),
+           qty, ("NET_CREDIT" if is_credit else "NET_DEBIT"),
            ("" if used_price is None else "{:.2f}".format(used_price)),
            legs[0],legs[1],legs[2],legs[3],
            oid, status_txt]
