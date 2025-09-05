@@ -2,9 +2,9 @@
 Generate a fresh Schwab token JSON locally.
 
 Usage:
-  export SCHWAB_APP_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-  export SCHWAB_APP_SECRET=yyyyyyyyyyyyyyyyyyyyyyyyyyyy
-  export SCHWAB_REDIRECT_URI=http://localhost:8765     # must match your app's registered redirect URI
+  export SCHWAB_APP_KEY=wtdRgK6ENV2R2NQ0aAcBAc9Ux8Vihb4hQiTnymAlS23FDgwS
+  export SCHWAB_APP_SECRET=Y4JhG3N18mlZTnGRXifVZFfCc7mg51k3bOZZiQj9pC3Y79wZ1EH2eOXiT1tETBIn
+  export SCHWAB_REDIRECT_URI=https://127.0.0.1:8182     # must match your app's registered redirect URI
   python scripts/schwab_token_bootstrap.py
 """
 
