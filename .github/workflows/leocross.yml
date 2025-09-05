@@ -8,7 +8,7 @@ on:
         required: true
         default: 'SCHEDULED'
   schedule:
-    # 4:10pm ET; placer itself enforces the 16:08–16:14 window when SCHEDULED
+    # 4:10pm ET; placer itself enforces 16:08–16:14 when SCHEDULED
     - cron: "10 20 * * 1-5"
     - cron: "10 21 * * 1-5"
 
@@ -32,7 +32,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install --quiet schwab-py requests google-api-python-client google-auth google-auth-httplib2
 
-      # Single, self-contained step: the orchestrator decides and, if safe, runs the placer.
+      # Single step: the orchestrator guards and—if safe—invokes the placer.
       - name: LeoCross orchestrator (guard + run)
         env:
           PLACER_MODE: ${{ github.event.inputs.mode != '' && github.event.inputs.mode || 'SCHEDULED' }}
@@ -40,7 +40,7 @@ jobs:
           SCHWAB_APP_KEY: ${{ secrets.SCHWAB_APP_KEY }}
           SCHWAB_APP_SECRET: ${{ secrets.SCHWAB_APP_SECRET }}
           SCHWAB_TOKEN_JSON: ${{ secrets.SCHWAB_TOKEN_JSON }}
-          # Sheets (used by the placer)
+          # Sheets (placer uses these)
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           # GammaWizard
