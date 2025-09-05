@@ -1,9 +1,7 @@
 # LIVE LeoCross → Schwab placer (cancel-then-place ladder, one order only)
-# Responsibility: EXECUTE ONLY. No position checks. No OBP. Fixed QTY, with optional override for orchestrator.
-# MODE: PLACER_MODE = NOW | SCHEDULED (default SCHEDULED: 16:08–16:14 ET)
-#
-# Manual default size:
-QTY = 4   # <<< change this when you want a different default contract count
+# EXECUTOR ONLY: no position checks, no OBP. Default QTY, optional QTY_OVERRIDE from orchestrator.
+# MODE: PLACER_MODE = NOW | SCHEDULED   (default SCHEDULED: 16:08–16:14 ET)
+QTY = 4   # <<< default size; orchestrator may override per-run with QTY_OVERRIDE
 
 import os, sys, json, time, re
 from datetime import datetime, date, timezone
@@ -13,11 +11,9 @@ from schwab.auth import client_from_token_file
 from google.oauth2 import service_account
 from googleapiclient.discovery import build as gbuild
 
-# ======== CONSTANTS ========
 TICK = 0.05
 WIDTH = 5
 ET = ZoneInfo("America/New_York")
-
 STEP_WAIT = 30
 CANCEL_GRACE = 12
 
@@ -30,14 +26,10 @@ GW_BASE = "https://gandalf.gammawizard.com"
 GW_ENDPOINT = "/rapi/GetLeoCross"
 
 SHEET_TAB = "schwab"
-HEADERS = [
-    "ts","source","symbol","last_price",
-    "signal_date","order_mode","side","qty_exec","order_type","limit_price",
-    "occ_buy_put","occ_sell_put","occ_sell_call","occ_buy_call",
-    "order_id","status"
-]
+HEADERS = ["ts","source","symbol","last_price","signal_date","order_mode","side","qty_exec",
+           "order_type","limit_price","occ_buy_put","occ_sell_put","occ_sell_call","occ_buy_call",
+           "order_id","status"]
 
-# ======== UTILS ========
 def clamp_tick(x: float) -> float:
     return round(round(x / TICK) * TICK + 1e-12, 2)
 
@@ -50,12 +42,10 @@ def yymmdd(iso: str) -> str:
     return "{:%y%m%d}".format(d)
 
 def to_osi(sym: str) -> str:
-    # ROBUST OSI parser: normalize Schwab/TOS variants
     raw = (sym or "").upper()
     raw = re.sub(r'\s+', '', raw)
     raw = raw.lstrip('.')
     raw = re.sub(r'[^A-Z0-9.$^]', '', raw)
-
     m = re.match(r'^([A-Z.$^]{1,6})(\d{6})([CP])(\d{1,5})(?:\.(\d{1,3}))?$', raw) \
         or re.match(r'^([A-Z.$^]{1,6})(\d{6})([CP])(\d{8})$', raw)
     if not m: raise ValueError("Cannot parse option symbol: " + sym)
@@ -75,7 +65,6 @@ def strike_from_osi(osi: str) -> float:
 def iso_z(dt):
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-# ======== SHEETS ========
 def ensure_header_and_get_sheetid(svc, spreadsheet_id: str, tab: str, header: list):
     meta = svc.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
     sheet_id_num = None
@@ -103,7 +92,6 @@ def one_log(svc, sheet_id_num, spreadsheet_id: str, tab: str, row_vals: list):
     svc.spreadsheets().values().update(spreadsheetId=spreadsheet_id, range="{}!A2".format(tab),
         valueInputOption="USER_ENTERED", body={"values":[row_vals]}).execute()
 
-# ======== SCHWAB HTTP HELPERS ========
 def _backoff(i): return 0.6*(2**i)
 
 def schwab_get_json(c, url, params=None, tries=8, tag=""):
@@ -142,7 +130,6 @@ def schwab_delete(c, url, tries=6, tag=""):
         time.sleep(_backoff(i))
     raise RuntimeError("SCHWAB_DELETE_FAIL({}) {}".format(tag, last))
 
-# ======== GW + QUOTES ========
 def _gw_timeout():
     try: return int(os.environ.get("GW_TIMEOUT","30"))
     except: return 30
@@ -183,7 +170,6 @@ def mid_condor(c, legs):
     net_bid=(sp_b+sc_b)-(bp_a+bc_a); net_ask=(sp_a+sc_a)-(bp_b+bc_b)
     return (net_bid+net_ask)/2.0
 
-# ======== ORDERS (for cancel/replace ladder only) ========
 def list_matching_open_ids(c, acct_hash: str, canon_set):
     now_et = datetime.now(ET)
     start_et = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -230,14 +216,12 @@ def cancel_all_and_wait(c, acct_hash: str, canon_set, grace=CANCEL_GRACE):
             return
         time.sleep(0.5)
 
-# ======== MAIN ========
 def main():
-    # default quantity with optional override from orchestrator
-    qty_override = os.environ.get("QTY_OVERRIDE")
+    qty = QTY
+    ov = os.environ.get("QTY_OVERRIDE")
     try:
-        qty = int(qty_override) if qty_override else QTY
-    except Exception:
-        qty = QTY
+        if ov: qty = int(ov)
+    except: pass
 
     MODE=(os.environ.get("PLACER_MODE","SCHEDULED") or "SCHEDULED").upper()
     source="SIMPLE_" + MODE
@@ -252,7 +236,7 @@ def main():
     r=c.get_account_numbers(); r.raise_for_status()
     acct_hash=r.json()[0]["hashValue"]
 
-    # last SPX (for log)
+    # last SPX
     def spx_last():
         for sym in ["$SPX.X","SPX","SPX.X","$SPX"]:
             try:
@@ -264,13 +248,13 @@ def main():
         return ""
     last_px=spx_last()
 
-    # Sheets client
+    # Sheets
     creds=service_account.Credentials.from_service_account_info(json.loads(sa_json),
         scopes=["https://www.googleapis.com/auth/spreadsheets"])
     svc=gbuild("sheets","v4",credentials=creds)
     sheet_id_num=ensure_header_and_get_sheetid(svc, sheet_id, SHEET_TAB, HEADERS)
 
-    # schedule gate (placer enforces the time window)
+    # schedule window
     if MODE=="SCHEDULED":
         now=datetime.now(ET)
         if now.weekday()>=5 or not (now.hour==16 and 8<=now.minute<=14):
@@ -286,7 +270,6 @@ def main():
              "","","","", "", "ABORT_GW:{}".format(str(e)[:150])]
         one_log(svc, sheet_id_num, sheet_id, SHEET_TAB, row); print(e); sys.exit(0)
 
-    # extract
     def extract(j):
         if isinstance(j,dict):
             if "Trade" in j:
@@ -317,7 +300,7 @@ def main():
     cat1=fnum(tr.get("Cat1")); cat2=fnum(tr.get("Cat2"))
     is_credit = True if (cat2 is None or cat1 is None or cat2>=cat1) else False
 
-    # legs (width 5), orient so BUY legs are wings; SELL legs are inners for credit (inverse for debit)
+    # legs, oriented
     p_low,p_high = inner_put-5, inner_put
     c_low,c_high = inner_call, inner_call+5
     bp = to_osi(".SPXW{}P{}".format(exp6, p_low));  sp = to_osi(".SPXW{}P{}".format(exp6, p_high))
@@ -339,7 +322,6 @@ def main():
     side_name  = "SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"
     order_type = "NET_CREDIT" if is_credit else "NET_DEBIT"
 
-    # --- build payload ---
     def order_payload(price: float):
         return {
             "orderType": order_type,
@@ -357,8 +339,8 @@ def main():
         }
 
     def place(price: float) -> str:
-        cancel_all_and_wait(c, acct_hash, canon)  # cancel/replace ladder
-        url="https://api.schwabapi.com/trader/v1/accounts/{}/orders".format(acct_hash)
+        cancel_all_and_wait(c, acct_hash, canon)
+        url="https://api/schwabapi.com/trader/v1/accounts/{}/orders".format(acct_hash)
         r=schwab_post_json(c,url,order_payload(price),tag="PLACE@{:.2f}".format(price))
         try:
             j=r.json(); return str(j.get("orderId") or j.get("order_id") or "")
@@ -381,16 +363,18 @@ def main():
             time.sleep(1)
         return False,last
 
-    # --- ladder sequence ---
+    # account id
+    r=c.get_account_numbers(); r.raise_for_status()
+    acct_hash=r.json()[0]["hashValue"]
+
+    # ladder
     steps=[]; used_price=None; oid=""; filled=False; st=""
 
-    # Step 0: start @ 2.10 credit (or 1.90 debit)
     used_price = clamp_tick(CREDIT_START if is_credit else DEBIT_START)
     oid = place(used_price); steps.append("{:.2f}".format(used_price))
     filled, st = wait_or_filled(STEP_WAIT, oid)
 
     if not filled:
-        # Step 1: mid
         cancel_all_and_wait(c, acct_hash, canon)
         m1 = mid_condor(c, legs)
         used_price = clamp_tick(m1 if m1 is not None else used_price)
@@ -398,7 +382,6 @@ def main():
         filled, st = wait_or_filled(STEP_WAIT, oid)
 
     if not filled:
-        # Step 2: new mid
         cancel_all_and_wait(c, acct_hash, canon)
         m2 = mid_condor(c, legs)
         used_price = clamp_tick(m2 if m2 is not None else used_price)
@@ -406,7 +389,6 @@ def main():
         filled, st = wait_or_filled(STEP_WAIT, oid)
 
     if not filled:
-        # Step 3: prev mid ±0.05, bounded to floor/ceil
         cancel_all_and_wait(c, acct_hash, canon)
         pm = m2 if ('m2' in locals() and m2 is not None) else (m1 if ('m1' in locals()) else None)
         step_px = clamp_tick((pm + (-0.05 if is_credit else +0.05)) if pm is not None else used_price)
@@ -417,7 +399,6 @@ def main():
         filled, st = wait_or_filled(STEP_WAIT, oid)
 
     if not filled:
-        # Step 4: bound, then cancel
         cancel_all_and_wait(c, acct_hash, canon)
         used_price = clamp_tick(CREDIT_FLOOR if is_credit else DEBIT_CEIL)
         oid = place(used_price); steps.append("{:.2f}".format(used_price))
@@ -425,12 +406,16 @@ def main():
         cancel_all_and_wait(c, acct_hash, canon)
         steps.append("CXL")
 
-    # ---- final log ----
+    # log
+    creds=service_account.Credentials.from_service_account_info(json.loads(sa_json),
+        scopes=["https://www.googleapis.com/auth/spreadsheets"])
+    svc=gbuild("sheets","v4",credentials=creds)
+    sheet_id_num=ensure_header_and_get_sheetid(svc, sheet_id, SHEET_TAB, HEADERS)
     trace = "STEPS " + "→".join(steps)
-    status_txt = (("FILLED " + trace) if filled else ((st or "WORKING") + " " + trace)) \
-                 + " | QTY={}".format(qty)
-    row = [datetime.utcnow().isoformat()+"Z", source, "SPX", last_px,
-           sig_date, "PLACE", side_name,
+    side_name  = "SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"
+    status_txt = (("FILLED " + trace) if filled else ((st or "WORKING") + " " + trace)) + " | QTY={}".format(qty)
+    row = [datetime.utcnow().isoformat()+"Z", "SIMPLE_"+MODE, "SPX", last_px,
+           str(tr.get("Date","")), "PLACE", side_name,
            qty, ("NET_CREDIT" if is_credit else "NET_DEBIT"),
            ("" if used_price is None else "{:.2f}".format(used_price)),
            legs[0],legs[1],legs[2],legs[3],
@@ -438,7 +423,6 @@ def main():
     one_log(svc, sheet_id_num, sheet_id, SHEET_TAB, row)
     print("FINAL {} OID={} PRICE_USED={}".format(status_txt, oid, ("{:.2f}".format(used_price) if used_price is not None else "NA")))
 
-# ---- entry (schedule gate) ----
 def time_gate_ok():
     now=datetime.now(ZoneInfo("America/New_York"))
     return (now.weekday()<5 and now.hour==16 and 8<=now.minute<=14)
