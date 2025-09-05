@@ -8,7 +8,7 @@ on:
         required: true
         default: 'SCHEDULED'
   schedule:
-    # 4:10pm ET; script itself enforces 16:08–16:14 when SCHEDULED
+    # 4:10pm ET; placer itself enforces the 16:08–16:14 window when SCHEDULED
     - cron: "10 20 * * 1-5"
     - cron: "10 21 * * 1-5"
 
@@ -17,7 +17,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  place:
+  run:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -32,34 +32,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install --quiet schwab-py requests google-api-python-client google-auth google-auth-httplib2
 
-      # ---------- GUARD: checks for overlap / conflicts ----------
-      - name: Guard LeoCross (overlap check)
-        id: guard
-        env:
-          # Mode (for time gate in placer — guard itself does not enforce time)
-          PLACER_MODE: ${{ github.event.inputs.mode != '' && github.event.inputs.mode || 'SCHEDULED' }}
-          # Schwab
-          SCHWAB_APP_KEY: ${{ secrets.SCHWAB_APP_KEY }}
-          SCHWAB_APP_SECRET: ${{ secrets.SCHWAB_APP_SECRET }}
-          SCHWAB_TOKEN_JSON: ${{ secrets.SCHWAB_TOKEN_JSON }}
-          # GammaWizard
-          GW_TOKEN:    ${{ secrets.GW_TOKEN }}
-          GW_EMAIL:    ${{ secrets.GW_EMAIL }}
-          GW_PASSWORD: ${{ secrets.GW_PASSWORD }}
-          PYTHONUNBUFFERED: "1"
-        run: |
-          python scripts/leocross_guard.py
-
-      # ---------- PLACER: only runs if guard says proceed ----------
-      - name: Place SPXW order (LIVE)
-        if: steps.guard.outputs.proceed == 'true'
+      # Single, self-contained step: the orchestrator decides and, if safe, runs the placer.
+      - name: LeoCross orchestrator (guard + run)
         env:
           PLACER_MODE: ${{ github.event.inputs.mode != '' && github.event.inputs.mode || 'SCHEDULED' }}
           # Schwab
           SCHWAB_APP_KEY: ${{ secrets.SCHWAB_APP_KEY }}
           SCHWAB_APP_SECRET: ${{ secrets.SCHWAB_APP_SECRET }}
           SCHWAB_TOKEN_JSON: ${{ secrets.SCHWAB_TOKEN_JSON }}
-          # Sheets
+          # Sheets (used by the placer)
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           # GammaWizard
@@ -68,9 +49,4 @@ jobs:
           GW_PASSWORD: ${{ secrets.GW_PASSWORD }}
           PYTHONUNBUFFERED: "1"
         run: |
-          python scripts/leocross_place_simple.py
-
-      - name: Guard decision (echo)
-        if: steps.guard.outputs.proceed != 'true'
-        run: |
-          echo "Guard skipped placement. Reason: ${{ steps.guard.outputs.reason }}"
+          python scripts/leocross_orchestrator.py
