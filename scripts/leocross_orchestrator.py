@@ -1,11 +1,15 @@
-# LeoCross ORCHESTRATOR: guard → remaining size → run placer when safe.
-# Blocks ONLY if the intended order would "close" any existing leg.
-# If partial units already exist, runs placer for REMAINDER (QTY_TARGET - open_units).
-#
-# Manual daily target:
-QTY_TARGET = 4  # <<< change this to your target size
+# LeoCross ORCHESTRATOR (STRICT OVERLAP GUARD)
+# - Fetch LeoCross trade
+# - Build intended 4 legs (SPXW)
+# - STRICT GUARD:
+#     * Block if ANY leg is present but not ALL 4 are present in the correct direction (partial overlap).
+#     * Block if any leg would be "closed" (opposite sign).
+#     * Allow topping up only if ALL 4 legs are already present in the same direction; size = target - open_units.
+# - If allowed, run placer with QTY_OVERRIDE.
 
-import os, sys, json, time, re, subprocess
+QTY_TARGET = 4  # daily target units (condors)
+
+import os, sys, json, time, re
 from datetime import datetime, date, timezone
 from zoneinfo import ZoneInfo
 import requests
@@ -15,32 +19,31 @@ ET = ZoneInfo("America/New_York")
 GW_BASE = "https://gandalf.gammawizard.com"
 GW_ENDPOINT = "/rapi/GetLeoCross"
 
-# ---------- utils ----------
+# Set GUARD_ONLY=1 to just print the snapshot/decision and exit (no placing)
+GUARD_ONLY = (os.environ.get("GUARD_ONLY","0").strip().lower() in ("1","true","yes","y"))
+
+# ===== utils =====
 def yymmdd(iso: str) -> str:
     d = date.fromisoformat((iso or "")[:10])
     return "{:%y%m%d}".format(d)
 
 def to_osi(sym: str) -> str:
-    """Robust OSI normalizer for Schwab/TOS symbols."""
     raw = (sym or "").upper()
-    raw = re.sub(r'\s+', '', raw)      # strip spaces
-    raw = raw.lstrip('.')              # remove leading dot
+    raw = re.sub(r'\s+', '', raw)
+    raw = raw.lstrip('.')
     raw = re.sub(r'[^A-Z0-9.$^]', '', raw)
-
     m = re.match(r'^([A-Z.$^]{1,6})(\d{6})([CP])(\d{1,5})(?:\.(\d{1,3}))?$', raw) \
         or re.match(r'^([A-Z.$^]{1,6})(\d{6})([CP])(\d{8})$', raw)
     if not m: raise ValueError("Cannot parse option symbol: " + sym)
     root, ymd, cp, strike, frac = (m.groups()+("",))[:5]
-
-    if len(strike) == 8 and not frac:
+    if len(strike)==8 and not frac:
         mills = int(strike)
     else:
-        mills = int(strike)*1000 + (int((frac or "0").ljust(3, '0')) if frac else 0)
-
+        mills = int(strike)*1000 + (int((frac or "0").ljust(3,'0')) if frac else 0)
     return "{:<6s}{}{}{:08d}".format(root, ymd, cp, mills)
 
 def osi_canon(osi: str):
-    return (osi[6:12], osi[12], osi[-8:])  # ignore root differences
+    return (osi[6:12], osi[12], osi[-8:])  # (yymmdd, C/P, strike8)
 
 def strike_from_osi(osi: str) -> float:
     return int(osi[-8:]) / 1000.0
@@ -50,7 +53,7 @@ def iso_z(dt):
 
 def _backoff(i): return 0.6*(2**i)
 
-# ---------- Schwab helpers ----------
+# ===== Schwab helpers =====
 def schwab_get_json(c, url, params=None, tries=6, tag=""):
     last=""
     for i in range(tries):
@@ -63,23 +66,44 @@ def schwab_get_json(c, url, params=None, tries=6, tag=""):
         time.sleep(_backoff(i))
     raise RuntimeError("SCHWAB_GET_FAIL({}) {}".format(tag, last))
 
+def _osi_from_instrument(ins: dict) -> str | None:
+    """Robust OSI from Schwab instrument; fall back to structured fields when needed."""
+    sym = (ins.get("symbol") or "")
+    try:
+        return to_osi(sym)
+    except Exception:
+        pass
+    exp = ins.get("optionExpirationDate") or ins.get("expirationDate") or ""
+    pc  = (ins.get("putCall") or ins.get("type") or "").upper()
+    strike = ins.get("strikePrice") or ins.get("strike")
+    try:
+        if exp and pc in ("CALL","PUT") and strike is not None:
+            ymd = date.fromisoformat(str(exp)[:10]).strftime("%y%m%d")
+            cp = "C" if pc.startswith("C") else "P"
+            mills = int(round(float(strike)*1000))
+            return "{:<6s}{}{}{:08d}".format("SPXW", ymd, cp, mills)
+    except Exception:
+        pass
+    return None
+
 def positions_map(c, acct_hash: str):
+    """Return {canon: net_qty} for all options. Positive=long, negative=short."""
     url="https://api.schwabapi.com/trader/v1/accounts/{}".format(acct_hash)
     j=schwab_get_json(c,url,params={"fields":"positions"},tag="POSITIONS")
     sa=j[0]["securitiesAccount"] if isinstance(j,list) else (j.get("securitiesAccount") or j)
     out={}
     for p in (sa.get("positions") or []):
         ins=p.get("instrument",{}) or {}
-        if (ins.get("assetType") or "").upper()!="OPTION": continue
-        sym=ins.get("symbol","")
-        try: key=osi_canon(to_osi(sym))
-        except: continue
+        atype = (ins.get("assetType") or ins.get("type") or "").upper()
+        if atype != "OPTION": continue
+        osi = _osi_from_instrument(ins)
+        if not osi: continue
         qty=float(p.get("longQuantity",0))-float(p.get("shortQuantity",0))
         if abs(qty)<1e-9: continue
-        out[key]=out.get(key,0.0)+qty
+        out[osi_canon(osi)] = out.get(osi_canon(osi), 0.0) + qty
     return out
 
-# ---------- GW ----------
+# ===== GW =====
 def _gw_timeout():
     try: return int(os.environ.get("GW_TIMEOUT","30"))
     except: return 30
@@ -100,7 +124,7 @@ def gw_login_token():
 def gw_get_leocross():
     tok=_sanitize_token(os.environ.get("GW_TOKEN","") or "")
     def hit(t):
-        h={"Accept":"application/json","Authorization":"Bearer {}".format(_sanitize_token(t)),"User-Agent":"gw-orchestrator/1.1"}
+        h={"Accept":"application/json","Authorization":"Bearer {}".format(_sanitize_token(t)),"User-Agent":"gw-orchestrator/1.3"}
         return requests.get("{}/{}".format(GW_BASE.rstrip("/"), GW_ENDPOINT.lstrip("/")), headers=h, timeout=_gw_timeout())
     r=hit(tok) if tok else None
     if (r is None) or (r.status_code in (401,403)): r=hit(gw_login_token())
@@ -124,17 +148,25 @@ def extract_trade(j):
             if t: return t
     return {}
 
-# ---------- condor helpers ----------
+# ===== condor math =====
 def condor_units_open(pos_map, legs):
-    b1 = max(0.0,  pos_map.get(osi_canon(legs[0]), 0.0))  # long wing put
-    b2 = max(0.0,  pos_map.get(osi_canon(legs[3]), 0.0))  # long wing call
-    s1 = max(0.0, -pos_map.get(osi_canon(legs[1]), 0.0))  # short inner put
-    s2 = max(0.0, -pos_map.get(osi_canon(legs[2]), 0.0))  # short inner call
+    # legs: [bp, sp, sc, bc] where bp/bc are long wings; sp/sc are short inners
+    b1 = max(0.0,  pos_map.get(osi_canon(legs[0]), 0.0))  # long put wing
+    b2 = max(0.0,  pos_map.get(osi_canon(legs[3]), 0.0))  # long call wing
+    s1 = max(0.0, -pos_map.get(osi_canon(legs[1]), 0.0))  # short put inner
+    s2 = max(0.0, -pos_map.get(osi_canon(legs[2]), 0.0))  # short call inner
     return int(min(b1, b2, s1, s2))
 
-# ---------- main ----------
+def print_guard_snapshot(pos, legs, is_credit):
+    labels = [("BUY_PUT",legs[0],-1),("SELL_PUT",legs[1],+1),("SELL_CALL",legs[2],+1),("BUY_CALL",legs[3],-1)]
+    print("ORCH GUARD SNAPSHOT ({}):".format("CREDIT" if is_credit else "DEBIT"))
+    for name, osi, sign in labels:
+        can = osi_canon(osi); cur = pos.get(can, 0.0)
+        print("  {:10s} {}  acct_qty={:+g}  sign={:+d}".format(name, osi, cur, sign))
+
+# ===== main =====
 def main():
-    # ---- Schwab auth (catch refresh failures cleanly) ----
+    # ---- Schwab auth ----
     try:
         app_key=os.environ["SCHWAB_APP_KEY"]; app_secret=os.environ["SCHWAB_APP_SECRET"]; token_json=os.environ["SCHWAB_TOKEN_JSON"]
         with open("schwab_token.json","w") as f: f.write(token_json)
@@ -166,10 +198,13 @@ def main():
     cat1=fnum(tr.get("Cat1")); cat2=fnum(tr.get("Cat2"))
     is_credit = True if (cat2 is None or cat1 is None or cat2>=cat1) else False
 
+    # Build planned legs (width 5)
     p_low,p_high = inner_put-5, inner_put
     c_low,c_high = inner_call, inner_call+5
-    bp = to_osi(".SPXW{}P{}".format(exp6, p_low));  sp = to_osi(".SPXW{}P{}".format(exp6, p_high))
-    sc = to_osi(".SPXW{}C{}".format(exp6, c_low));  bc = to_osi(".SPXW{}C{}".format(exp6, c_high))
+    bp = to_osi(".SPXW{}P{}".format(exp6, p_low))   # BUY_TO_OPEN
+    sp = to_osi(".SPXW{}P{}".format(exp6, p_high))  # SELL_TO_OPEN
+    sc = to_osi(".SPXW{}C{}".format(exp6, c_low))   # SELL_TO_OPEN
+    bc = to_osi(".SPXW{}C{}".format(exp6, c_high))  # BUY_TO_OPEN
 
     def orient(bp,sp,sc,bc):
         bpS=strike_from_osi(bp); spS=strike_from_osi(sp)
@@ -183,31 +218,71 @@ def main():
         return [bp,sp,sc,bc]
     legs = orient(bp,sp,sc,bc)
 
-    # ---- positions → NO‑CLOSE guard ----
+    # ---- positions ----
     try:
         pos = positions_map(c, acct_hash)
     except Exception as e:
         print("ORCH ABORT: POSITIONS_FAILED — {}".format(str(e)[:200])); return 1
 
-    checks=[("BUY",legs[0],-1),("SELL",legs[1],+1),("SELL",legs[2],+1),("BUY",legs[3],-1)]
-    for _, osi, sign in checks:
-        cur = pos.get(osi_canon(osi), 0.0)
-        if (sign<0 and cur<0) or (sign>0 and cur>0):
-            print("ORCH SKIP: WOULD_CLOSE {} qty={}".format(osi, cur))
-            return 0
+    print_guard_snapshot(pos, legs, is_credit)
 
-    # ---- remaining qty (partial aware) ----
-    units_open = condor_units_open(pos, legs)
-    rem_qty = max(0, QTY_TARGET - units_open)
-    print("ORCH DECISION: target={} open_units={} rem_qty={}".format(QTY_TARGET, units_open, rem_qty))
-    if rem_qty == 0:
-        print("ORCH SKIP: Already at or above target.")
+    # ---- STRICT OVERLAP GUARD ----
+    # Desired signs for planned OPENING order:
+    # BUY_TO_OPEN -> desired long -> sign -1 (we block if acct is short)
+    # SELL_TO_OPEN -> desired short -> sign +1 (we block if acct is long)
+    checks=[("BUY",legs[0],-1),("SELL",legs[1],+1),("SELL",legs[2],+1),("BUY",legs[3],-1)]
+
+    any_opposite=False
+    nonzero_count=0
+    aligned_count=0
+    present_legs=[]
+    opposite_legs=[]
+
+    for label, osi, sign in checks:
+        cur = pos.get(osi_canon(osi), 0.0)
+        if abs(cur) > 1e-9:
+            nonzero_count += 1
+            present_legs.append((label, osi, cur))
+        # opposite (would close) ?
+        if (sign < 0 and cur < 0) or (sign > 0 and cur > 0):
+            any_opposite = True
+            opposite_legs.append((label, osi, cur))
+        # aligned with intended direction?
+        if (sign < 0 and cur >= 0) or (sign > 0 and cur <= 0):
+            if abs(cur) > 1e-9:
+                aligned_count += 1
+
+    if any_opposite:
+        details="; ".join(["{} {} acct_qty={:+g}".format(l, o, q) for (l,o,q) in opposite_legs])
+        print("ORCH SKIP: WOULD_CLOSE — {}".format(details))
         return 0
 
-    # ---- call placer with override ----
+    if nonzero_count == 0:
+        # clean account for these strikes → allow full target
+        rem_qty = QTY_TARGET
+        print("ORCH DECISION: target={} open_units=0 rem_qty={}".format(QTY_TARGET, rem_qty))
+    elif nonzero_count == 4 and aligned_count == 4:
+        # all four legs present in the same direction → allow top-up to target
+        units_open = condor_units_open(pos, legs)
+        rem_qty = max(0, QTY_TARGET - units_open)
+        print("ORCH DECISION: target={} open_units={} rem_qty={}".format(QTY_TARGET, units_open, rem_qty))
+        if rem_qty == 0:
+            print("ORCH SKIP: Already at/above target for these strikes.")
+            return 0
+    else:
+        # partial overlap (1–3 legs present) → strict block
+        details="; ".join(["{} {} acct_qty={:+g}".format(l, o, q) for (l,o,q) in present_legs])
+        print("ORCH SKIP: PARTIAL_OVERLAP — {}".format(details))
+        return 0
+
+    if GUARD_ONLY:
+        print("ORCH GUARD_ONLY=1 — allowed, NOT invoking placer.")
+        return 0
+
+    # ---- run placer with override ----
     env = dict(os.environ)
     env["QTY_OVERRIDE"] = str(rem_qty)
-    rc = subprocess.call([sys.executable, "scripts/leocross_place_simple.py"], env=env)
+    rc = os.spawnve(os.P_WAIT, sys.executable, [sys.executable, "scripts/leocross_place_simple.py"], env)
     return rc
 
 if __name__ == "__main__":
