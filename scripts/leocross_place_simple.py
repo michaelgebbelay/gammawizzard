@@ -18,8 +18,8 @@ TICK = 0.05
 WIDTH = 5
 ET = ZoneInfo("America/New_York")
 
-STEP_WAIT = 30
-CANCEL_GRACE = 12
+STEP_WAIT = 30          # seconds to wait at each rung
+CANCEL_GRACE = 12       # seconds to allow cancels to clear
 
 CREDIT_START = 2.10
 CREDIT_FLOOR = 1.90
@@ -50,7 +50,7 @@ def yymmdd(iso: str) -> str:
     return "{:%y%m%d}".format(d)
 
 def to_osi(sym: str) -> str:
-    # ROBUST OSI parser: normalize Schwab/TOS variants
+    # ROBUST OSI parser: normalize Schwab/TOS variants and output 21-char OSI
     raw = (sym or "").upper()
     raw = re.sub(r'\s+', '', raw)
     raw = raw.lstrip('.')
@@ -396,67 +396,76 @@ def main():
             time.sleep(1)
         return False,last
 
-    # --- ladder sequence ---
-    steps=[]; used_price=None; oid=""; filled=False; st=""
+    # --- ladder sequence (with "no duplicate price re-post") ---
+    steps=[]; current_price=None; oid=""; filled=False; st=""
 
     # Step 0: start @ 2.10 credit (or 1.90 debit)
-    used_price = clamp_tick(CREDIT_START if is_credit else DEBIT_START)
-    oid = place(used_price); steps.append("{:.2f}".format(used_price))
+    current_price = clamp_tick(CREDIT_START if is_credit else DEBIT_START)
+    oid = place(current_price); steps.append("{:.2f}".format(current_price))
     filled, st = wait_or_filled(STEP_WAIT, oid)
 
     if not filled:
         # Step 1: mid
-        try: cancel_all_and_wait(c, acct_hash, canon)
-        except Exception as e: print("WARN cancel phase failed: {}".format(e))
         m1 = mid_condor(c, legs)
-        used_price = clamp_tick(m1 if m1 is not None else used_price)
-        oid = place(used_price); steps.append("{:.2f}".format(used_price))
+        next_price = clamp_tick(m1 if m1 is not None else current_price)
+        if next_price != current_price or not oid:
+            oid = place(next_price); steps.append("{:.2f}".format(next_price))
+            current_price = next_price
+        else:
+            steps.append("HOLD@{:.2f}".format(current_price))
         filled, st = wait_or_filled(STEP_WAIT, oid)
 
     if not filled:
         # Step 2: new mid
-        try: cancel_all_and_wait(c, acct_hash, canon)
-        except Exception as e: print("WARN cancel phase failed: {}".format(e))
         m2 = mid_condor(c, legs)
-        used_price = clamp_tick(m2 if m2 is not None else used_price)
-        oid = place(used_price); steps.append("{:.2f}".format(used_price))
+        next_price = clamp_tick(m2 if m2 is not None else current_price)
+        if next_price != current_price or not oid:
+            oid = place(next_price); steps.append("{:.2f}".format(next_price))
+            current_price = next_price
+        else:
+            steps.append("HOLD@{:.2f}".format(current_price))
         filled, st = wait_or_filled(STEP_WAIT, oid)
 
     if not filled:
         # Step 3: prev mid ±0.05, bounded to floor/ceil
-        try: cancel_all_and_wait(c, acct_hash, canon)
-        except Exception as e: print("WARN cancel phase failed: {}".format(e))
         pm = m2 if ('m2' in locals() and m2 is not None) else (m1 if ('m1' in locals()) else None)
-        step_px = clamp_tick((pm + (-0.05 if is_credit else +0.05)) if pm is not None else used_price)
+        step_px = clamp_tick((pm + (-0.05 if is_credit else +0.05)) if pm is not None else current_price)
         if is_credit: step_px = max(CREDIT_FLOOR, min(CREDIT_START, step_px))
         else:         step_px = max(DEBIT_START,  min(DEBIT_CEIL,   step_px))
-        used_price = step_px
-        oid = place(used_price); steps.append("{:.2f}".format(used_price))
+        next_price = step_px
+        if next_price != current_price or not oid:
+            oid = place(next_price); steps.append("{:.2f}".format(next_price))
+            current_price = next_price
+        else:
+            steps.append("HOLD@{:.2f}".format(current_price))
         filled, st = wait_or_filled(STEP_WAIT, oid)
 
     if not filled:
         # Step 4: bound, then cancel
-        try: cancel_all_and_wait(c, acct_hash, canon)
-        except Exception as e: print("WARN cancel phase failed: {}".format(e))
-        used_price = clamp_tick(CREDIT_FLOOR if is_credit else DEBIT_CEIL)
-        oid = place(used_price); steps.append("{:.2f}".format(used_price))
+        next_price = clamp_tick(CREDIT_FLOOR if is_credit else DEBIT_CEIL)
+        if next_price != current_price or not oid:
+            oid = place(next_price); steps.append("{:.2f}".format(next_price))
+            current_price = next_price
+        else:
+            steps.append("HOLD@{:.2f}".format(current_price))
         filled, st = wait_or_filled(STEP_WAIT, oid)
         try: cancel_all_and_wait(c, acct_hash, canon)
-        except Exception as e: print("WARN cancel phase failed: {}".format(e))
+        except Exception as e: print("WARN final cancel phase failed: {}".format(e))
         steps.append("CXL")
 
     # ---- final log ----
     trace = "STEPS " + "→".join(steps)
+    side_name  = "SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"
     status_txt = (("FILLED " + trace) if filled else ((st or "WORKING") + " " + trace)) + " | QTY={}".format(qty)
 
     row = [datetime.utcnow().isoformat()+"Z", "SIMPLE_"+MODE, "SPX", last_px,
            str(tr.get("Date","")), "PLACE", side_name,
            qty, ("NET_CREDIT" if is_credit else "NET_DEBIT"),
-           ("" if used_price is None else "{:.2f}".format(used_price)),
+           ("" if current_price is None else "{:.2f}".format(current_price)),
            legs[0],legs[1],legs[2],legs[3],
            oid, status_txt]
     one_log(svc, sheet_id_num, sheet_id, SHEET_TAB, row)
-    print("FINAL {} OID={} PRICE_USED={}".format(status_txt, oid, ("{:.2f}".format(used_price) if used_price is not None else "NA")))
+    print("FINAL {} OID={} PRICE_USED={}".format(status_txt, oid, ("{:.2f}".format(current_price) if current_price is not None else "NA")))
 
 # ---- time gate ----
 def time_gate_ok():
