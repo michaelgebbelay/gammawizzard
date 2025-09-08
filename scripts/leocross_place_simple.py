@@ -142,7 +142,7 @@ def schwab_delete(c, url, tries=6, tag=""):
         time.sleep(_backoff(i))
     raise RuntimeError("SCHWAB_DELETE_FAIL({}) {}".format(tag, last))
 
-# ======== GW ========
+# ======== GW API ========
 def _gw_timeout():
     try: return int(os.environ.get("GW_TIMEOUT","30"))
     except: return 30
@@ -165,6 +165,24 @@ def gw_get_leocross():
     if (r is None) or (r.status_code in (401,403)): r=hit(gw_login_token())
     if r.status_code!=200: raise RuntimeError("GW_HTTP_{}:{}".format(r.status_code, (r.text or "")[:180]))
     return r.json()
+
+# ======== QUOTES & MID ========
+def fetch_bid_ask(c, osi: str):
+    r=c.get_quote(osi)
+    if r.status_code!=200: return (None,None)
+    d=list(r.json().values())[0] if isinstance(r.json(), dict) else {}
+    q=d.get("quote", d)
+    b=q.get("bidPrice") or q.get("bid") or q.get("bidPriceInDouble")
+    a=q.get("askPrice") or q.get("ask") or q.get("askPriceInDouble")
+    return (float(b) if b is not None else None, float(a) if a is not None else None)
+
+def mid_condor(c, legs):
+    bp,sp,sc,bc=legs
+    bp_b,bp_a=fetch_bid_ask(c,bp); sp_b,sp_a=fetch_bid_ask(c,sp)
+    sc_b,sc_a=fetch_bid_ask(c,sc); bc_b,bc_a=fetch_bid_ask(c,bc)
+    if None in (bp_b,bp_a,sp_b,sp_a,sc_b,sc_a,bc_b,bc_a): return None
+    net_bid=(sp_b+sc_b)-(bp_a+bc_a); net_ask=(sp_a+sc_a)-(bp_b+bc_b)
+    return (net_bid+net_ask)/2.0
 
 # ======== ORDERS (for cancel/replace ladder only) ========
 def list_matching_open_ids(c, acct_hash: str, canon_set):
