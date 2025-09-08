@@ -231,13 +231,50 @@ def cancel_all_and_wait(c, acct_hash: str, canon_set, grace=CANCEL_GRACE):
             return
         time.sleep(0.5)
 
+# ======== FILLS (partial-fill accounting) ========
+def order_filled_qty(c, acct_hash: str, oid: str) -> int:
+    """Return number of complex contracts filled on this order id."""
+    if not oid:
+        return 0
+    url = "https://api.schwabapi.com/trader/v1/accounts/{}/orders/{}".format(acct_hash, oid)
+    try:
+        j = schwab_get_json(c, url, tag="FILLS:{}".format(oid)) or {}
+    except Exception:
+        return 0
+
+    # 1) Direct field (if present)
+    for k in ("filledQuantity", "filled_quantity", "quantityFilled"):
+        v = j.get(k)
+        if isinstance(v, (int, float)):
+            return int(v)
+
+    # 2) Sum of orderActivityCollection quantities (fallback)
+    tot = 0.0
+    acts = j.get("orderActivityCollection") or []
+    for a in acts:
+        # Many APIs provide activity-level 'quantity'
+        q = a.get("quantity")
+        if isinstance(q, (int, float)):
+            tot += float(q)
+            continue
+        # Else, infer from executionLegs (use max leg qty, not sum across legs)
+        legs = a.get("executionLegs") or []
+        leg_qtys = []
+        for lg in legs:
+            ql = lg.get("quantity")
+            if isinstance(ql, (int, float)):
+                leg_qtys.append(float(ql))
+        if leg_qtys:
+            tot += max(leg_qtys)
+    return int(round(tot))
+
 # ======== MAIN ========
 def main():
     # Accept per-run override from orchestrator, else default QTY
-    qty = QTY
+    qty_target = QTY
     ov = os.environ.get("QTY_OVERRIDE")
     try:
-        if ov: qty = int(ov)
+        if ov: qty_target = int(ov)
     except: pass
 
     MODE=(os.environ.get("PLACER_MODE","SCHEDULED") or "SCHEDULED").upper()
@@ -342,7 +379,7 @@ def main():
     order_type = "NET_CREDIT" if is_credit else "NET_DEBIT"
 
     # --- payload ---
-    def order_payload(price: float):
+    def order_payload(price: float, q: int):
         return {
             "orderType": order_type,
             "session": "NORMAL",
@@ -351,22 +388,22 @@ def main():
             "orderStrategyType": "SINGLE",
             "complexOrderStrategyType": "IRON_CONDOR",
             "orderLegCollection":[
-                {"instruction":"BUY_TO_OPEN", "positionEffect":"OPENING","quantity":qty,"instrument":{"symbol":legs[0],"assetType":"OPTION"}},
-                {"instruction":"SELL_TO_OPEN","positionEffect":"OPENING","quantity":qty,"instrument":{"symbol":legs[1],"assetType":"OPTION"}},
-                {"instruction":"SELL_TO_OPEN","positionEffect":"OPENING","quantity":qty,"instrument":{"symbol":legs[2],"assetType":"OPTION"}},
-                {"instruction":"BUY_TO_OPEN", "positionEffect":"OPENING","quantity":qty,"instrument":{"symbol":legs[3],"assetType":"OPTION"}},
+                {"instruction":"BUY_TO_OPEN", "positionEffect":"OPENING","quantity":q,"instrument":{"symbol":legs[0],"assetType":"OPTION"}},
+                {"instruction":"SELL_TO_OPEN","positionEffect":"OPENING","quantity":q,"instrument":{"symbol":legs[1],"assetType":"OPTION"}},
+                {"instruction":"SELL_TO_OPEN","positionEffect":"OPENING","quantity":q,"instrument":{"symbol":legs[2],"assetType":"OPTION"}},
+                {"instruction":"BUY_TO_OPEN", "positionEffect":"OPENING","quantity":q,"instrument":{"symbol":legs[3],"assetType":"OPTION"}},
             ]
         }
 
     # --- submit helpers with graceful network failure handling ---
-    def place(price: float) -> str:
+    def place(price: float, q: int) -> str:
         try:
             cancel_all_and_wait(c, acct_hash, canon)
         except Exception as e:
             print("WARN cancel phase failed: {}".format(e))
         try:
             url="https://api.schwabapi.com/trader/v1/accounts/{}/orders".format(acct_hash)
-            r=schwab_post_json(c,url,order_payload(price),tag="PLACE@{:.2f}".format(price))
+            r=schwab_post_json(c,url,order_payload(price, q),tag="PLACE@{:.2f}".format(price))
             try:
                 j=r.json(); return str(j.get("orderId") or j.get("order_id") or "")
             except Exception:
@@ -396,76 +433,108 @@ def main():
             time.sleep(1)
         return False,last
 
-    # --- ladder sequence (with "no duplicate price re-post") ---
-    steps=[]; current_price=None; oid=""; filled=False; st=""
+    # --- ladder sequence (partial-fill aware, no duplicate repost at same price) ---
+    steps=[]; price_now=None; oid=""; filled=False; st=""
+    filled_total = 0
+    remaining = qty_target
+
+    def record_partial(oid_local, working_q):
+        nonlocal filled_total, remaining
+        f = order_filled_qty(c, acct_hash, oid_local)
+        f = max(0, min(int(f), int(working_q)))
+        if f > 0:
+            filled_total += f
+            remaining = max(0, qty_target - filled_total)
+            print("PARTIAL FILLED: +{} (total {}/{})".format(f, filled_total, qty_target))
 
     # Step 0: start @ 2.10 credit (or 1.90 debit)
-    current_price = clamp_tick(CREDIT_START if is_credit else DEBIT_START)
-    oid = place(current_price); steps.append("{:.2f}".format(current_price))
-    filled, st = wait_or_filled(STEP_WAIT, oid)
+    price_now = clamp_tick(CREDIT_START if is_credit else DEBIT_START)
+    if remaining > 0:
+        oid = place(price_now, remaining); steps.append("{:.2f}@{}".format(price_now, remaining))
+        filled, st = wait_or_filled(STEP_WAIT, oid)
+        if not filled: record_partial(oid, remaining)
+        else: 
+            filled_total += remaining; remaining = 0
 
-    if not filled:
+    if (remaining > 0) and (not filled):
         # Step 1: mid
         m1 = mid_condor(c, legs)
-        next_price = clamp_tick(m1 if m1 is not None else current_price)
-        if next_price != current_price or not oid:
-            oid = place(next_price); steps.append("{:.2f}".format(next_price))
-            current_price = next_price
+        next_price = clamp_tick(m1 if m1 is not None else price_now)
+        if next_price != price_now or not oid:
+            oid = place(next_price, remaining); steps.append("{:.2f}@{}".format(next_price, remaining))
+            price_now = next_price
         else:
-            steps.append("HOLD@{:.2f}".format(current_price))
+            steps.append("HOLD@{:.2f}".format(price_now))
         filled, st = wait_or_filled(STEP_WAIT, oid)
+        if not filled: record_partial(oid, remaining)
+        else:
+            filled_total += remaining; remaining = 0
 
-    if not filled:
+    if (remaining > 0) and (not filled):
         # Step 2: new mid
         m2 = mid_condor(c, legs)
-        next_price = clamp_tick(m2 if m2 is not None else current_price)
-        if next_price != current_price or not oid:
-            oid = place(next_price); steps.append("{:.2f}".format(next_price))
-            current_price = next_price
+        next_price = clamp_tick(m2 if m2 is not None else price_now)
+        if next_price != price_now or not oid:
+            oid = place(next_price, remaining); steps.append("{:.2f}@{}".format(next_price, remaining))
+            price_now = next_price
         else:
-            steps.append("HOLD@{:.2f}".format(current_price))
+            steps.append("HOLD@{:.2f}".format(price_now))
         filled, st = wait_or_filled(STEP_WAIT, oid)
+        if not filled: record_partial(oid, remaining)
+        else:
+            filled_total += remaining; remaining = 0
 
-    if not filled:
+    if (remaining > 0) and (not filled):
         # Step 3: prev mid ±0.05, bounded to floor/ceil
         pm = m2 if ('m2' in locals() and m2 is not None) else (m1 if ('m1' in locals()) else None)
-        step_px = clamp_tick((pm + (-0.05 if is_credit else +0.05)) if pm is not None else current_price)
+        step_px = clamp_tick((pm + (-0.05 if is_credit else +0.05)) if pm is not None else price_now)
         if is_credit: step_px = max(CREDIT_FLOOR, min(CREDIT_START, step_px))
         else:         step_px = max(DEBIT_START,  min(DEBIT_CEIL,   step_px))
         next_price = step_px
-        if next_price != current_price or not oid:
-            oid = place(next_price); steps.append("{:.2f}".format(next_price))
-            current_price = next_price
+        if next_price != price_now or not oid:
+            oid = place(next_price, remaining); steps.append("{:.2f}@{}".format(next_price, remaining))
+            price_now = next_price
         else:
-            steps.append("HOLD@{:.2f}".format(current_price))
+            steps.append("HOLD@{:.2f}".format(price_now))
         filled, st = wait_or_filled(STEP_WAIT, oid)
+        if not filled: record_partial(oid, remaining)
+        else:
+            filled_total += remaining; remaining = 0
 
-    if not filled:
-        # Step 4: bound, then cancel
+    if (remaining > 0) and (not filled):
+        # Step 4: bound, then cancel outstanding remainder
         next_price = clamp_tick(CREDIT_FLOOR if is_credit else DEBIT_CEIL)
-        if next_price != current_price or not oid:
-            oid = place(next_price); steps.append("{:.2f}".format(next_price))
-            current_price = next_price
+        if next_price != price_now or not oid:
+            oid = place(next_price, remaining); steps.append("{:.2f}@{}".format(next_price, remaining))
+            price_now = next_price
         else:
-            steps.append("HOLD@{:.2f}".format(current_price))
+            steps.append("HOLD@{:.2f}".format(price_now))
         filled, st = wait_or_filled(STEP_WAIT, oid)
+        if not filled: record_partial(oid, remaining)
+        else:
+            filled_total += remaining; remaining = 0
         try: cancel_all_and_wait(c, acct_hash, canon)
         except Exception as e: print("WARN final cancel phase failed: {}".format(e))
         steps.append("CXL")
 
     # ---- final log ----
+    canceled = max(0, qty_target - filled_total)
     trace = "STEPS " + "→".join(steps)
     side_name  = "SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"
-    status_txt = (("FILLED " + trace) if filled else ((st or "WORKING") + " " + trace)) + " | QTY={}".format(qty)
+    status_txt = (("FILLED " + trace) if filled_total == qty_target else ((st or "WORKING") + " " + trace))
+    status_txt += " | FILLED {}/{} | CANCELED {}".format(filled_total, qty_target, canceled)
 
+    # Write sheet
     row = [datetime.utcnow().isoformat()+"Z", "SIMPLE_"+MODE, "SPX", last_px,
            str(tr.get("Date","")), "PLACE", side_name,
-           qty, ("NET_CREDIT" if is_credit else "NET_DEBIT"),
-           ("" if current_price is None else "{:.2f}".format(current_price)),
+           filled_total, ("NET_CREDIT" if is_credit else "NET_DEBIT"),
+           ("" if price_now is None else "{:.2f}".format(price_now)),
            legs[0],legs[1],legs[2],legs[3],
            oid, status_txt]
     one_log(svc, sheet_id_num, sheet_id, SHEET_TAB, row)
-    print("FINAL {} OID={} PRICE_USED={}".format(status_txt, oid, ("{:.2f}".format(current_price) if current_price is not None else "NA")))
+    print("FINAL {} OID={} PRICE_USED={}  (FILLED {}/{}; CANCELED {})"
+          .format(status_txt, oid, ("{:.2f}".format(price_now) if price_now is not None else "NA"),
+                  filled_total, qty_target, canceled))
 
 # ---- time gate ----
 def time_gate_ok():
