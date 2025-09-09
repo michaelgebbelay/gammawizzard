@@ -26,7 +26,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
+      - name: Debug run id
+        run: |
+          echo "RUN_ID=$GITHUB_RUN_ID ATTEMPT=$GITHUB_RUN_ATTEMPT EVENT=$GITHUB_EVENT_NAME REF=$GITHUB_REF"
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
