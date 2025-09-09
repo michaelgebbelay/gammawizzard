@@ -1,11 +1,9 @@
-# LeoCross ORCHESTRATOR (STRICT OVERLAP GUARD)
-# - Fetch LeoCross trade
-# - Build intended 4 legs (SPXW)
-# - STRICT GUARD:
-#     * Block if ANY leg is present but not ALL 4 are present in the correct direction (partial overlap).
-#     * Block if any leg would be "closed" (opposite sign).
-#     * Allow topping up only if ALL 4 legs are already present in the same direction; size = target - open_units.
-# - If allowed, run placer with QTY_OVERRIDE.
+# LeoCross ORCHESTRATOR (STRICT OVERLAP GUARD + Google Sheet logging)
+# Behavior is identical to your working strict-overlap guard:
+# - Block if ANY partial overlap (1–3 legs present).
+# - Block if any leg would be "closed" (opposite sign).
+# - Allow only if clean OR all 4 legs already on (top-up to target).
+# The only addition: log every decision to a "guard" tab in your Sheet.
 
 QTY_TARGET = 4  # daily target units (condors)
 
@@ -15,14 +13,56 @@ from zoneinfo import ZoneInfo
 import requests
 from schwab.auth import client_from_token_file
 
+# Google Sheets (same secrets as placer)
+from google.oauth2 import service_account
+from googleapiclient.discovery import build as gbuild
+
 ET = ZoneInfo("America/New_York")
 GW_BASE = "https://gandalf.gammawizard.com"
 GW_ENDPOINT = "/rapi/GetLeoCross"
 
-# Set GUARD_ONLY=1 to just print the snapshot/decision and exit (no placing)
+# Optional: preview-only mode (unchanged; if unset, does nothing)
 GUARD_ONLY = (os.environ.get("GUARD_ONLY","0").strip().lower() in ("1","true","yes","y"))
 
-# ===== utils =====
+# ===== Sheets helpers (new) =====
+GUARD_TAB = "guard"
+GUARD_HEADERS = [
+    "ts","source","symbol","signal_date","decision","detail","open_units","rem_qty",
+    "occ_buy_put","occ_sell_put","occ_sell_call","occ_buy_call",
+    "acct_qty_bp","acct_qty_sp","acct_qty_sc","acct_qty_bc"
+]
+
+def ensure_header_and_get_sheetid(svc, spreadsheet_id: str, tab: str, header: list):
+    meta = svc.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    sheet_id_num = None
+    for sh in meta["sheets"]:
+        if sh["properties"]["title"] == tab:
+            sheet_id_num = sh["properties"]["sheetId"]; break
+    if sheet_id_num is None:
+        svc.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id,
+            body={"requests":[{"addSheet":{"properties":{"title":tab}}}]}).execute()
+        meta = svc.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+        sheet_id_num = next(sh["properties"]["sheetId"] for sh in meta["sheets"] if sh["properties"]["title"]==tab)
+    got = svc.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=f"{tab}!1:1").execute().get("values",[])
+    if not got or got[0] != header:
+        svc.spreadsheets().values().update(spreadsheetId=spreadsheet_id, range=f"{tab}!1:1",
+            valueInputOption="USER_ENTERED", body={"values":[header]}).execute()
+    return sheet_id_num
+
+def top_insert(svc, spreadsheet_id: str, sheet_id_num: int):
+    svc.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id,
+        body={"requests":[{"insertDimension":{"range":{"sheetId":sheet_id_num,"dimension":"ROWS","startIndex":1,"endIndex":2},
+                                               "inheritFromBefore": False}}]}).execute()
+
+def guard_log(svc, sheet_id_num, spreadsheet_id: str, row_vals: list):
+    try:
+        top_insert(svc, spreadsheet_id, sheet_id_num)
+        svc.spreadsheets().values().update(spreadsheetId=spreadsheet_id, range=f"{GUARD_TAB}!A2",
+            valueInputOption="USER_ENTERED", body={"values":[row_vals]}).execute()
+    except Exception as e:
+        print("ORCH WARN: guard log failed — {}".format(str(e)[:200]))
+
+# ===== utils (unchanged) =====
 def yymmdd(iso: str) -> str:
     d = date.fromisoformat((iso or "")[:10])
     return "{:%y%m%d}".format(d)
@@ -53,7 +93,7 @@ def iso_z(dt):
 
 def _backoff(i): return 0.6*(2**i)
 
-# ===== Schwab helpers =====
+# ===== Schwab helpers (unchanged) =====
 def schwab_get_json(c, url, params=None, tries=6, tag=""):
     last=""
     for i in range(tries):
@@ -103,7 +143,7 @@ def positions_map(c, acct_hash: str):
         out[osi_canon(osi)] = out.get(osi_canon(osi), 0.0) + qty
     return out
 
-# ===== GW =====
+# ===== GW (unchanged) =====
 def _gw_timeout():
     try: return int(os.environ.get("GW_TIMEOUT","30"))
     except: return 30
@@ -148,9 +188,8 @@ def extract_trade(j):
             if t: return t
     return {}
 
-# ===== condor math =====
+# ===== condor math (unchanged) =====
 def condor_units_open(pos_map, legs):
-    # legs: [bp, sp, sc, bc] where bp/bc are long wings; sp/sc are short inners
     b1 = max(0.0,  pos_map.get(osi_canon(legs[0]), 0.0))  # long put wing
     b2 = max(0.0,  pos_map.get(osi_canon(legs[3]), 0.0))  # long call wing
     s1 = max(0.0, -pos_map.get(osi_canon(legs[1]), 0.0))  # short put inner
@@ -164,8 +203,30 @@ def print_guard_snapshot(pos, legs, is_credit):
         can = osi_canon(osi); cur = pos.get(can, 0.0)
         print("  {:10s} {}  acct_qty={:+g}  sign={:+d}".format(name, osi, cur, sign))
 
-# ===== main =====
+# ===== main (only addition is Sheets logging) =====
 def main():
+    # Init Sheets (non-fatal if it fails)
+    svc = None; sheet_id = None; guard_sheet_id = None
+    try:
+        sheet_id=os.environ["GSHEET_ID"]
+        sa_json=os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+        creds=service_account.Credentials.from_service_account_info(json.loads(sa_json),
+            scopes=["https://www.googleapis.com/auth/spreadsheets"])
+        svc=gbuild("sheets","v4",credentials=creds)
+        guard_sheet_id = ensure_header_and_get_sheetid(svc, sheet_id, GUARD_TAB, GUARD_HEADERS)
+    except Exception as e:
+        print("ORCH WARN: Sheets init failed — {}".format(str(e)[:200]))
+        svc=None
+
+    def log(decision, detail, legs=None, acct_qty=(0,0,0,0), open_units="", rem_qty=""):
+        if not svc: return
+        bp,sp,sc,bc = (legs or ("","","",""))
+        bpq,spq,scq,bcq = acct_qty
+        row=[datetime.utcnow().isoformat()+"Z","ORCH","SPX",sig_date if 'sig_date' in locals() else "",
+             decision, detail, open_units, rem_qty,
+             bp,sp,sc,bc, bpq,spq,scq,bcq]
+        guard_log(svc, guard_sheet_id, sheet_id, row)
+
     # ---- Schwab auth ----
     try:
         app_key=os.environ["SCHWAB_APP_KEY"]; app_secret=os.environ["SCHWAB_APP_SECRET"]; token_json=os.environ["SCHWAB_TOKEN_JSON"]
@@ -175,10 +236,9 @@ def main():
         acct_hash=r.json()[0]["hashValue"]
     except Exception as e:
         msg=str(e)
-        if ("unsupported_token_type" in msg) or ("refresh_token_authentication_error" in msg):
-            print("ORCH ABORT: SCHWAB_OAUTH_REFRESH_FAILED — rotate SCHWAB_TOKEN_JSON secret.")
-        else:
-            print("ORCH ABORT: SCHWAB_CLIENT_INIT_FAILED — {}".format(msg[:200]))
+        reason="SCHWAB_OAUTH_REFRESH_FAILED — rotate SCHWAB_TOKEN_JSON secret." if ("unsupported_token_type" in msg or "refresh_token_authentication_error" in msg) else ("SCHWAB_CLIENT_INIT_FAILED — " + msg[:200])
+        print("ORCH ABORT:", reason)
+        log("ABORT", reason)
         return 1
 
     # ---- Leo signal → legs ----
@@ -186,9 +246,13 @@ def main():
         api=gw_get_leocross()
         tr=extract_trade(api)
         if not tr:
-            print("ORCH SKIP: NO_TRADE_PAYLOAD"); return 0
+            print("ORCH SKIP: NO_TRADE_PAYLOAD")
+            log("SKIP","NO_TRADE_PAYLOAD")
+            return 0
     except Exception as e:
-        print("ORCH ABORT: GW_FETCH_FAILED — {}".format(str(e)[:200])); return 1
+        reason="GW_FETCH_FAILED — {}".format(str(e)[:200])
+        print("ORCH ABORT:", reason); log("ABORT", reason)
+        return 1
 
     sig_date=str(tr.get("Date","")); exp_iso=str(tr.get("TDate","")); exp6=yymmdd(exp_iso)
     inner_put=int(float(tr.get("Limit"))); inner_call=int(float(tr.get("CLimit")))
@@ -222,14 +286,20 @@ def main():
     try:
         pos = positions_map(c, acct_hash)
     except Exception as e:
-        print("ORCH ABORT: POSITIONS_FAILED — {}".format(str(e)[:200])); return 1
+        reason="POSITIONS_FAILED — {}".format(str(e)[:200])
+        print("ORCH ABORT:", reason); log("ABORT", reason, legs)
+        return 1
 
     print_guard_snapshot(pos, legs, is_credit)
 
-    # ---- STRICT OVERLAP GUARD ----
-    # Desired signs for planned OPENING order:
-    # BUY_TO_OPEN -> desired long -> sign -1 (we block if acct is short)
-    # SELL_TO_OPEN -> desired short -> sign +1 (we block if acct is long)
+    # snapshot quantities in account (for logging)
+    bpq = pos.get(osi_canon(legs[0]), 0.0)
+    spq = pos.get(osi_canon(legs[1]), 0.0)
+    scq = pos.get(osi_canon(legs[2]), 0.0)
+    bcq = pos.get(osi_canon(legs[3]), 0.0)
+    acct_snapshot=(bpq,spq,scq,bcq)
+
+    # ---- STRICT OVERLAP GUARD (unchanged logic) ----
     checks=[("BUY",legs[0],-1),("SELL",legs[1],+1),("SELL",legs[2],+1),("BUY",legs[3],-1)]
 
     any_opposite=False
@@ -243,11 +313,9 @@ def main():
         if abs(cur) > 1e-9:
             nonzero_count += 1
             present_legs.append((label, osi, cur))
-        # opposite (would close) ?
         if (sign < 0 and cur < 0) or (sign > 0 and cur > 0):
             any_opposite = True
             opposite_legs.append((label, osi, cur))
-        # aligned with intended direction?
         if (sign < 0 and cur >= 0) or (sign > 0 and cur <= 0):
             if abs(cur) > 1e-9:
                 aligned_count += 1
@@ -255,31 +323,33 @@ def main():
     if any_opposite:
         details="; ".join(["{} {} acct_qty={:+g}".format(l, o, q) for (l,o,q) in opposite_legs])
         print("ORCH SKIP: WOULD_CLOSE — {}".format(details))
+        log("SKIP","WOULD_CLOSE — {}".format(details), legs, acct_snapshot, "", "")
         return 0
 
     if nonzero_count == 0:
-        # clean account for these strikes → allow full target
         rem_qty = QTY_TARGET
         print("ORCH DECISION: target={} open_units=0 rem_qty={}".format(QTY_TARGET, rem_qty))
+        log("ALLOW","CLEAN_ACCOUNT", legs, acct_snapshot, 0, rem_qty)
     elif nonzero_count == 4 and aligned_count == 4:
-        # all four legs present in the same direction → allow top-up to target
         units_open = condor_units_open(pos, legs)
         rem_qty = max(0, QTY_TARGET - units_open)
         print("ORCH DECISION: target={} open_units={} rem_qty={}".format(QTY_TARGET, units_open, rem_qty))
         if rem_qty == 0:
             print("ORCH SKIP: Already at/above target for these strikes.")
+            log("SKIP","AT_OR_ABOVE_TARGET", legs, acct_snapshot, units_open, 0)
             return 0
+        log("ALLOW","TOP_UP", legs, acct_snapshot, units_open, rem_qty)
     else:
-        # partial overlap (1–3 legs present) → strict block
         details="; ".join(["{} {} acct_qty={:+g}".format(l, o, q) for (l,o,q) in present_legs])
         print("ORCH SKIP: PARTIAL_OVERLAP — {}".format(details))
+        log("SKIP","PARTIAL_OVERLAP — {}".format(details), legs, acct_snapshot, "", "")
         return 0
 
     if GUARD_ONLY:
         print("ORCH GUARD_ONLY=1 — allowed, NOT invoking placer.")
         return 0
 
-    # ---- run placer with override ----
+    # ---- run placer with override (unchanged) ----
     env = dict(os.environ)
     env["QTY_OVERRIDE"] = str(rem_qty)
     rc = os.spawnve(os.P_WAIT, sys.executable, [sys.executable, "scripts/leocross_place_simple.py"], env)
