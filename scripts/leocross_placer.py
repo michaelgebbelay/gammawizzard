@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-# LeoCross PLACER (bounded loop): (re)price/submit the order until target units are open or timeout.
-# Prevents oversizing by recomputing remainder each cycle from live positions.
+# LeoCross PLACER (bounded loop): place or reprice until target units are open or timeout.
+# Prevent oversizing: remainder = target - condor_units_open(positions) every loop.
 
-import os, sys, json, time, math, re, signal
+import os, sys, json, time, re, signal
 from datetime import datetime, timezone, date
 from zoneinfo import ZoneInfo
 import requests
@@ -10,19 +10,21 @@ from schwab.auth import client_from_token_file
 
 ET = ZoneInfo("America/New_York")
 
-# --- config from env ---
-IS_CREDIT     = (os.environ.get("IS_CREDIT","true").lower() == "true")
-REPRICE_ONLY  = (os.environ.get("REPRICE_ONLY","0").strip() in ("1","true","yes","y"))
-QTY_TARGET    = int(os.environ.get("QTY_TARGET","4") or "4")
-QTY_OVERRIDE  = os.environ.get("QTY_OVERRIDE","")
-OPEN_IDS_INIT = [x for x in (os.environ.get("OPEN_ORDER_IDS","") or "").split(",") if x.strip()]
-LEGS          = json.loads(os.environ.get("LEGS_JSON","[]") or "[]")
-CANON_KEY     = os.environ.get("CANON_KEY","")
-TICK          = float(os.environ.get("TICK","0.05") or "0.05")
-MAX_SEC       = int(os.environ.get("PLACER_MAX_SEC","240") or "240")
-SLEEP_SEC     = float(os.environ.get("PLACER_SLEEP_SEC","10") or "10")
-EDGE          = float(os.environ.get("PLACER_EDGE","0.05") or "0.05")  # start a touch off mid
-MIN_CREDIT    = float(os.environ.get("MIN_CREDIT","0.10") or "0.10")
+# --- config from env (read-only) ---
+IS_CREDIT      = (os.environ.get("IS_CREDIT","true").lower() == "true")
+QTY_TARGET     = int(os.environ.get("QTY_TARGET","4") or "4")
+QTY_OVERRIDE   = os.environ.get("QTY_OVERRIDE","")
+OPEN_IDS_INIT  = [x for x in (os.environ.get("OPEN_ORDER_IDS","") or "").split(",") if x.strip()]
+LEGS           = json.loads(os.environ.get("LEGS_JSON","[]") or "[]")
+CANON_KEY      = os.environ.get("CANON_KEY","")
+
+TICK           = float(os.environ.get("TICK","0.05") or "0.05")
+MAX_SEC        = int(os.environ.get("PLACER_MAX_SEC","240") or "240")
+SLEEP_SEC      = float(os.environ.get("PLACER_SLEEP_SEC","10") or "10")
+EDGE           = float(os.environ.get("PLACER_EDGE","0.05") or "0.05")   # nudge off mid
+MIN_CREDIT     = float(os.environ.get("MIN_CREDIT","0.10") or "0.10")
+# Initial “reprice only” hint from orchestrator; may change at runtime:
+REPRICE_MODE_INIT = (os.environ.get("REPRICE_ONLY","0").strip() in ("1","true","yes","y"))
 
 # --- Schwab client ---
 def schwab_client():
@@ -41,7 +43,7 @@ def schwab_get_json(c, url, params=None, tries=6, tag=""):
         try:
             r=c.session.get(url, params=(params or {}), timeout=20)
             if r.status_code==200: return r.json()
-            last=f"HTTP_{r.status_code}:{(r.text or '')[:160]}"
+            last=f"HTTP_{r.status_code}:{(r.text or '')[:200]}"
         except Exception as e:
             last=f"{type(e).__name__}:{e}"
         time.sleep(_backoff(i))
@@ -53,7 +55,7 @@ def schwab_post_json(c, url, body, tries=3, tag=""):
         try:
             r=c.session.post(url, json=body, timeout=20)
             if r.status_code in (200,201): return r.json() if r.text else {}
-            if r.status_code in (202,): return {}  # accepted
+            if r.status_code in (202,): return {}
             last=f"HTTP_{r.status_code}:{(r.text or '')[:240]}"
         except Exception as e:
             last=f"{type(e).__name__}:{e}"
@@ -93,10 +95,7 @@ def to_osi(sym: str) -> str:
         or re.match(r'^([A-Z.$^]{1,6})(\d{6})([CP])(\d{8})$', raw)
     if not m: raise ValueError("Cannot parse option symbol: " + sym)
     root, ymd, cp, strike, frac = (m.groups()+("",))[:5]
-    if len(strike)==8 and not frac:
-        mills = int(strike)
-    else:
-        mills = int(strike)*1000 + (int((frac or "0").ljust(3,'0')) if frac else 0)
+    mills = int(strike)*1000 + (int((frac or "0").ljust(3,'0')) if frac else 0) if len(strike)<8 else int(strike)
     return "{:<6s}{}{}{:08d}".format(root, ymd, cp, mills)
 
 def osi_canon(osi: str): return (osi[6:12], osi[12], osi[-8:])
@@ -104,10 +103,8 @@ def strike_from_osi(osi: str) -> float: return int(osi[-8:]) / 1000.0
 
 def _osi_from_instrument(ins: dict):
     sym = (ins.get("symbol") or "")
-    try:
-        return to_osi(sym)
-    except Exception:
-        pass
+    try: return to_osi(sym)
+    except: pass
     exp = ins.get("optionExpirationDate") or ins.get("expirationDate") or ""
     pc  = (ins.get("putCall") or ins.get("type") or "").upper()
     strike = ins.get("strikePrice") or ins.get("strike")
@@ -117,8 +114,7 @@ def _osi_from_instrument(ins: dict):
             cp = "C" if pc.startswith("C") else "P"
             mills = int(round(float(strike)*1000))
             return "{:<6s}{}{}{:08d}".format("SPXW", ymd, cp, mills)
-    except Exception:
-        pass
+    except: pass
     return None
 
 def positions_map(c, acct_hash: str):
@@ -140,7 +136,7 @@ def positions_map(c, acct_hash: str):
 def list_matching_open_ids(c, acct_hash: str, canon_set):
     now = datetime.now(ET)
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
+    url=f"https://api/schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
     arr = schwab_get_json(c, url, params={
         "fromEnteredTime": start.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "toEnteredTime":   now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -170,12 +166,8 @@ def condor_units_open(pos_map, legs):
     s2 = max(0.0, -pos_map.get(osi_canon(legs[2]), 0.0))
     return int(min(b1, b2, s1, s2))
 
-def round_tick(x: float, tick: float) -> float:
-    return round(x / tick) * tick
-
 # --- quotes & pricing ---
 def get_leg_mids(c, symbols):
-    # Try Schwab quotes endpoint (if symbol OSI not accepted, this may return empty; we degrade gracefully)
     url="https://api.schwabapi.com/marketdata/v1/quotes"
     try:
         j = schwab_get_json(c, url, params={"symbols": ",".join(symbols)}, tag="QUOTES") or {}
@@ -190,40 +182,32 @@ def get_leg_mids(c, symbols):
     except Exception:
         return {}
 
+def round_tick(x: float, tick: float) -> float:
+    return round(x / tick) * tick
+
 def compute_net_price(c, legs, is_credit: bool, edge: float, tick: float) -> float:
     mids = get_leg_mids(c, legs)
-    # BUY_PUT, SELL_PUT, SELL_CALL, BUY_CALL
-    # If missing quotes, fall back to a conservative default
     bput = mids.get(legs[0]); sput = mids.get(legs[1]); scall = mids.get(legs[2]); bcall = mids.get(legs[3])
     if all(x is not None for x in (bput,sput,scall,bcall)):
         net = (sput + scall) - (bput + bcall)
-        if not is_credit: net = -net  # debit condor net as positive debit
-        # Nudge toward market to improve fill
+        if not is_credit: net = -net  # positive debit for debit condor
         px = (net - edge) if is_credit else (net + edge)
         px = max(MIN_CREDIT, px) if is_credit else max(0.05, px)
         return float(f"{round_tick(px, tick):.2f}")
-    # Fallback
+    # Fallback if quotes missing
     return float(f"{(0.75 if is_credit else 1.25):.2f}")
 
-# --- order build/replace ---
+# --- order builders ---
 def build_condor_order(legs, qty: int, is_credit: bool, price: float):
-    # instruction mapping: legs ordered [BUY_PUT, SELL_PUT, SELL_CALL, BUY_CALL] when is_credit=True
     if is_credit:
         instr = ["BUY_TO_OPEN","SELL_TO_OPEN","SELL_TO_OPEN","BUY_TO_OPEN"]
         orderType = "NET_CREDIT"
     else:
         instr = ["SELL_TO_OPEN","BUY_TO_OPEN","BUY_TO_OPEN","SELL_TO_OPEN"]
         orderType = "NET_DEBIT"
-
-    olc=[]
-    for i, sym in enumerate(legs):
-        olc.append({
-            "instruction": instr[i],
-            "quantity": qty,
-            "instrument": {"symbol": sym, "assetType": "OPTION"}
-        })
-
-    body = {
+    olc=[{"instruction": instr[i], "quantity": qty, "instrument": {"symbol": legs[i], "assetType":"OPTION"}}
+         for i in range(4)]
+    return {
         "orderType": orderType,
         "session": "NORMAL",
         "price": f"{price:.2f}",
@@ -232,21 +216,14 @@ def build_condor_order(legs, qty: int, is_credit: bool, price: float):
         "complexOrderStrategyType": "IRON_CONDOR",
         "orderLegCollection": olc
     }
-    return body
 
 def place_order(c, acct_hash, legs, qty, is_credit, price):
     url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
-    body = build_condor_order(legs, qty, is_credit, price)
-    return schwab_post_json(c, url, body, tag="PLACE")
+    return schwab_post_json(c, url, build_condor_order(legs, qty, is_credit, price), tag="PLACE")
 
 def replace_order(c, acct_hash, order_id, legs, qty, is_credit, price):
     url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{order_id}"
-    body = build_condor_order(legs, qty, is_credit, price)
-    return schwab_put_json(c, url, body, tag=f"REPLACE_{order_id}")
-
-def cancel_order(c, acct_hash, order_id):
-    url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{order_id}"
-    return schwab_delete(c, url, tag=f"CANCEL_{order_id}")
+    return schwab_put_json(c, url, build_condor_order(legs, qty, is_credit, price), tag=f"REPLACE_{order_id}")
 
 # --- signal handling ---
 def _term(signum, frame):
@@ -274,83 +251,80 @@ def main():
     canon = {osi_canon(x) for x in LEGS}
     start_ts = time.time()
     last_price = None
-    working_ids = OPEN_IDS_INIT[:]  # may be empty
-    cycle = 0
+    working_ids = OPEN_IDS_INIT[:]
 
-    # If NEW and guard provided a remainder, use that for the first placement only.
+    # *** KEY FIX: runtime flag that we can flip mid-run ***
+    reprice_mode = bool(REPRICE_MODE_INIT)
+
+    # Use guard's remainder only for the first PLACE, then always recompute
     first_rem_override = None
-    if not REPRICE_ONLY and QTY_OVERRIDE.strip().isdigit():
+    if not reprice_mode and QTY_OVERRIDE.strip().isdigit():
         first_rem_override = int(QTY_OVERRIDE.strip())
 
+    cycle = 0
     while True:
         cycle += 1
-        # Stop conditions
         if (time.time() - start_ts) > MAX_SEC:
             print("PLACER ABORT: DEADLINE_REACHED")
             return 1
 
-        # Live account state
         pos = positions_map(c, acct_hash)
         units_open = condor_units_open(pos, LEGS)
         rem = max(0, QTY_TARGET - units_open)
 
-        print(f"PLACER LOOP#{cycle}: units_open={units_open} target={QTY_TARGET} rem={rem} working_ids={','.join(working_ids) or '-'}")
+        # Always refresh working ids
+        working_ids = list_matching_open_ids(c, acct_hash, canon)
+
+        print(f"PLACER LOOP#{cycle}: units_open={units_open} target={QTY_TARGET} rem={rem} working_ids={','.join(working_ids) or '-'} mode={'REPRICE' if reprice_mode else 'NEW'}")
 
         if rem == 0:
             print("PLACER DONE: target reached.")
             return 0
 
-        # Refresh working order ids (in case of fills/cancels)
-        working_ids = list_matching_open_ids(c, acct_hash, canon)
+        # If any working order exists, from now on we operate in repricing mode
+        if working_ids:
+            reprice_mode = True
 
-        # Determine action this cycle
-        if REPRICE_ONLY:
-            # If no working order remains, create/replace remainder at current price
+        # --- REPRICE MODE ---
+        if reprice_mode:
+            # Compute an evolving target price and reprice existing orders
+            px_base = compute_net_price(c, LEGS, IS_CREDIT, EDGE, TICK)
+            # Walk toward market each loop (one tick per loop)
+            adj = TICK * max(1, cycle)
+            px = max(MIN_CREDIT, px_base - adj) if IS_CREDIT else (px_base + adj)
+            px = float(f"{round_tick(px, TICK):.2f}")
+
+            # If we somehow lost the working order (broker canceled), place the remainder anew
             if not working_ids:
-                # Create a new remainder order
-                px = compute_net_price(c, LEGS, IS_CREDIT, EDGE, TICK)
-                last_price = px
                 print(f"PLACER ACTION: PLACE remainder qty={rem} price={px:.2f} ({'credit' if IS_CREDIT else 'debit'})")
                 try:
                     place_order(c, acct_hash, LEGS, rem, IS_CREDIT, px)
                 except Exception as e:
                     print("PLACER WARN: PLACE failed —", str(e)[:200])
             else:
-                # Reprice existing working order(s)
-                px_base = compute_net_price(c, LEGS, IS_CREDIT, EDGE, TICK)
-                # Walk toward market each loop
-                adj = (TICK if IS_CREDIT else TICK) * cycle
-                px = max(MIN_CREDIT, px_base - adj) if IS_CREDIT else (px_base + adj)
-                px = float(f"{round_tick(px, TICK):.2f}")
-                if last_price is None or abs(px - last_price) >= TICK/2:
+                if (last_price is None) or (abs(px - last_price) >= TICK/2):
                     for oid in working_ids:
-                        print(f"PLACER ACTION: REPLACE order_id={oid} price={px:.2f}")
+                        print(f"PLACER ACTION: REPLACE order_id={oid} qty={rem} price={px:.2f}")
                         try:
                             replace_order(c, acct_hash, oid, LEGS, rem, IS_CREDIT, px)
                         except Exception as e:
                             print(f"PLACER WARN: REPLACE {oid} failed —", str(e)[:200])
                     last_price = px
 
-        else:
-            # NEW path: if a working order exists, switch to reprice flow
-            if working_ids:
-                print("PLACER INFO: found existing working order(s), switching to repricing mode.")
-                os.environ["REPRICE_ONLY"] = "1"
-                # continue loop; next iteration will reprice
-            else:
-                # Place (first time) with either guard's override or current remainder
-                qty = first_rem_override if first_rem_override is not None else rem
-                first_rem_override = None  # consume override once
-                px = compute_net_price(c, LEGS, IS_CREDIT, EDGE, TICK)
-                last_price = px
-                print(f"PLACER ACTION: PLACE qty={qty} price={px:.2f} ({'credit' if IS_CREDIT else 'debit'})")
-                try:
-                    place_order(c, acct_hash, LEGS, qty, IS_CREDIT, px)
-                    # After placement, refresh working ids immediately
-                    time.sleep(1.0)
-                    working_ids = list_matching_open_ids(c, acct_hash, canon)
-                except Exception as e:
-                    print("PLACER WARN: PLACE failed —", str(e)[:200])
+            time.sleep(SLEEP_SEC)
+            continue
+
+        # --- NEW MODE ---
+        # No working orders; submit an initial order
+        qty = first_rem_override if first_rem_override is not None else rem
+        first_rem_override = None
+        px = compute_net_price(c, LEGS, IS_CREDIT, EDGE, TICK)
+        last_price = px
+        print(f"PLACER ACTION: PLACE qty={qty} price={px:.2f} ({'credit' if IS_CREDIT else 'debit'})")
+        try:
+            place_order(c, acct_hash, LEGS, qty, IS_CREDIT, px)
+        except Exception as e:
+            print("PLACER WARN: PLACE failed —", str(e)[:200])
 
         time.sleep(SLEEP_SEC)
 
