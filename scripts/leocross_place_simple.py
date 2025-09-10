@@ -1,10 +1,9 @@
-# LeoCross PLACER — executes one IRON_CONDOR with cancel/replace ladder.
+# LeoCross PLACER — laddered IRON_CONDOR with true Cancel/Replace (PUT) semantics.
 # - FIXED contract count unless overridden via env QTY_OVERRIDE.
-# - No OBP checks, no balance checks.
-# - Logs ladder/price/filled/canceled to Google Sheet tab "schwab".
-# - STRICT cancel-then-place: cancels any overlapping working orders
-#   before placing a new rung.
-
+# - No OBP checks.
+# - Logs ladder/price/filled/replaced/canceled to Google Sheet tab "schwab".
+# - Maintains ONE active working order: replace its price/size each rung.
+#
 # ======= MANUAL SIZE (edit this, or override via QTY_OVERRIDE env) =======
 QTY_FIXED = 4
 
@@ -22,7 +21,8 @@ WIDTH = 5
 ET = ZoneInfo("America/New_York")
 
 STEP_WAIT = 30       # seconds to wait at each rung
-CANCEL_GRACE = 15    # seconds to wait for cancels to flush/persist
+FINAL_CANCEL = True  # if still not filled after last rung, cancel working ticket
+WINDOW_STATUSES = {"WORKING","QUEUED","OPEN","PENDING_ACTIVATION"}
 
 CREDIT_START = 2.10
 CREDIT_FLOOR = 1.90
@@ -68,7 +68,6 @@ def strike_from_osi(osi: str) -> float:
     return int(osi[-8:]) / 1000.0
 
 def iso_z(dt):
-    """UTC Zulu timestamp string for Schwab order-list query."""
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 # ===== Sheets =====
@@ -126,6 +125,18 @@ def schwab_post_json(c, url, payload, tries=4, tag=""):
         time.sleep(_backoff(i))
     raise RuntimeError(f"SCHWAB_POST_FAIL({tag}) {last}")
 
+def schwab_put_json(c, url, payload, tries=4, tag=""):
+    last=""
+    for i in range(tries):
+        try:
+            r=c.session.put(url, json=payload, timeout=20)   # replace
+            if r.status_code in (200,201,202): return r
+            last=f"HTTP_{r.status_code}:{(r.text or '')[:160]}"
+        except Exception as e:
+            last=f"{type(e).__name__}:{str(e)}"
+        time.sleep(_backoff(i))
+    raise RuntimeError(f"SCHWAB_PUT_FAIL({tag}) {last}")
+
 def schwab_delete(c, url, tries=4, tag=""):
     last=""
     for i in range(tries):
@@ -155,7 +166,7 @@ def gw_login_token():
 def gw_get_leocross():
     tok=_sanitize_token(os.environ.get("GW_TOKEN","") or "")
     def hit(t):
-        h={"Accept":"application/json","Authorization":f"Bearer {_sanitize_token(t)}","User-Agent":"gw-placer/1.0"}
+        h={"Accept":"application/json","Authorization":f"Bearer {_sanitize_token(t)}","User-Agent":"gw-placer/1.1"}
         return requests.get(f"{GW_BASE.rstrip('/')}/{GW_ENDPOINT.lstrip('/')}", headers=h, timeout=_gw_timeout())
     r=hit(tok) if tok else None
     if (r is None) or (r.status_code in (401,403)): r=hit(gw_login_token())
@@ -181,7 +192,6 @@ def mid_condor(c, legs):
 
 # ===== robust OSI from Schwab instrument =====
 def _osi_from_instrument(ins: dict) -> str | None:
-    """Fallback OSI build from structured fields when symbol isn't parseable."""
     sym = (ins.get("symbol") or "")
     try:
         return to_osi(sym)
@@ -200,7 +210,7 @@ def _osi_from_instrument(ins: dict) -> str | None:
         pass
     return None
 
-# ===== positions / orders / guards =====
+# ===== positions / orders =====
 def positions_map(c, acct_hash: str):
     url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}"
     j=schwab_get_json(c,url,params={"fields":"positions"},tag="POSITIONS")
@@ -216,46 +226,38 @@ def positions_map(c, acct_hash: str):
         out[osi_canon(osi)]=out.get(osi_canon(osi),0.0)+qty
     return out
 
-def _working_order_ids(c, acct_hash: str, canon_set, exact: bool):
-    """Return IDs for working orders that (exactly match) or (overlap any) legs."""
+def list_recent_orders(c, acct_hash: str):
     now_et = datetime.now(ET)
     start_et = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
     url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
     params = {"fromEnteredTime": iso_z(start_et), "toEnteredTime": iso_z(now_et), "maxResults": 200}
     try:
-        arr = schwab_get_json(c, url, params=params, tag="ORDERS") or []
+        return schwab_get_json(c, url, params=params, tag="ORDERS") or []
     except Exception:
         return []
-    out=[]
-    for o in arr or []:
-        st=str(o.get("status") or "").upper()
-        if st not in ("WORKING","QUEUED","PENDING_ACTIVATION","OPEN"): continue
-        got=set()
-        for leg in (o.get("orderLegCollection") or []):
-            ins=(leg.get("instrument",{}) or {})
-            osi=_osi_from_instrument(ins)
-            if osi: got.add(osi_canon(osi))
-        if not got: continue
-        match = (got==canon_set) if exact else bool(got & canon_set)
-        if match:
-            oid=str(o.get("orderId") or "")
-            if oid: out.append(oid)
-    return out
 
-def cancel_related_orders(c, acct_hash: str, canon_set, grace=CANCEL_GRACE):
-    """Cancel ANY working order that overlaps with our 4 legs; wait until none remain."""
-    t_end=time.time()+grace
-    while True:
-        ids=_working_order_ids(c, acct_hash, canon_set, exact=False)
-        if not ids: return
-        for oid in ids:
-            url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
-            try: schwab_delete(c,url,tag=f"CANCEL:{oid}")
-            except Exception as e: print(f"WARN cancel {oid}: {e}")
-        if time.time()>=t_end:
-            # best effort; exit after grace
-            return
-        time.sleep(0.8)
+def _legs_canon_from_order(o):
+    got=set()
+    for leg in (o.get("orderLegCollection") or []):
+        ins=(leg.get("instrument",{}) or {})
+        osi=_osi_from_instrument(ins)
+        if osi: got.add(osi_canon(osi))
+    return got
+
+def pick_active_and_overlaps(c, acct_hash: str, canon_set):
+    exact_id=None; active_status=""; overlaps=[]
+    for o in list_recent_orders(c, acct_hash):
+        st=str(o.get("status") or "").upper()
+        if st not in WINDOW_STATUSES: continue
+        got=_legs_canon_from_order(o)
+        if not got: continue
+        if got==canon_set and exact_id is None:
+            exact_id=str(o.get("orderId") or "")
+            active_status=st
+        elif got & canon_set:
+            oid=str(o.get("orderId") or "")
+            if oid: overlaps.append(oid)
+    return exact_id, active_status, overlaps
 
 # ===== main =====
 def main():
@@ -290,7 +292,7 @@ def main():
     svc=gbuild("sheets","v4",credentials=creds)
     sheet_id_num=ensure_header_and_get_sheetid(svc, sheet_id, SHEET_TAB, HEADERS)
 
-    # schedule gate (only if SCHEDULED)
+    # schedule gate
     if MODE=="SCHEDULED":
         now=datetime.now(ET)
         if now.weekday()>=5 or not (now.hour==16 and 8<=now.minute<=14):
@@ -384,102 +386,140 @@ def main():
             ]
         }
 
-    def order_status(oid: str) -> dict:
+    # ---- find existing candidate & clean overlaps ----
+    active_oid, active_status, overlaps = pick_active_and_overlaps(c, acct_hash, canon)
+    # cancel any *overlap* tickets (not exact); leave the exact one to replace
+    for oid in overlaps:
+        try:
+            url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
+            schwab_delete(c,url,tag=f"CANCEL_OVERLAP:{oid}")
+        except Exception as e:
+            print(f"WARN cancel overlap {oid}: {e}")
+
+    def get_status(oid: str) -> dict:
         url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
         try:
             return schwab_get_json(c,url,tag=f"STATUS:{oid}") or {}
         except Exception:
             return {}
 
-    def filled_qty_from_status(st: dict) -> int:
+    def parse_order_id_from_response(r):
         try:
-            fq = st.get("filledQuantity") or st.get("filled_quantity") or 0
-            return int(round(float(fq)))
+            j=r.json()
+            if isinstance(j,dict):
+                oid = j.get("orderId") or j.get("order_id")
+                if oid: return str(oid)
         except Exception:
-            return 0
+            pass
+        loc=r.headers.get("Location","")
+        return loc.rstrip("/").split("/")[-1] if loc else ""
 
-    def place(price: float, q: int) -> str:
-        # strict cancel-then-place for any overlapping tickets
-        cancel_related_orders(c, acct_hash, canon)
+    # --- place or replace ---
+    replacements = 0
+    canceled = 0
+    steps=[]
+    filled_total = 0
+
+    def ensure_active(price: float, to_place: int):
+        """If we have an active OID, try PUT (replace). Else POST (place). Return oid."""
+        nonlocal active_oid, replacements, canceled
+        px = clamp_tick(price)
+        if active_oid:
+            try:
+                url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{active_oid}"
+                r=schwab_put_json(c,url,order_payload(px,to_place),tag=f"REPLACE@{px:.2f}x{to_place}")
+                new_id = parse_order_id_from_response(r) or active_oid
+                if new_id != active_oid:
+                    replacements += 1
+                    active_oid = new_id
+                else:
+                    # count it as a replace anyway for traceability
+                    replacements += 1
+                return active_oid
+            except Exception as e:
+                # fallback: cancel then place
+                try:
+                    url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{active_oid}"
+                    schwab_delete(c,url,tag=f"CANCEL_FALLBACK:{active_oid}")
+                    canceled += 1
+                except Exception:
+                    pass
+                active_oid = None  # will place fresh below
+
+        # POST a new one
         url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
-        r=schwab_post_json(c,url,order_payload(price, q),tag=f"PLACE@{price:.2f}x{q}")
-        try:
-            j=r.json(); return str(j.get("orderId") or j.get("order_id") or "")
-        except Exception:
-            loc=r.headers.get("Location",""); return loc.rstrip("/").split("/")[-1] if loc else ""
+        r=schwab_post_json(c,url,order_payload(px,to_place),tag=f"PLACE@{px:.2f}x{to_place}")
+        active_oid = parse_order_id_from_response(r)
+        return active_oid
 
-    # --- ladder sequence with partial-fill tracking ---
-    steps=[]; used_price=None; oid=""; filled_total=0; canceled_total=0
-
-    def rung(price):
-        nonlocal oid, used_price, steps, filled_total, qty, canceled_total
-        used_price = clamp_tick(price)
-        to_place = max(0, qty - filled_total)
-        if to_place == 0: 
-            return "FILLED"
-        oid = place(used_price, to_place)
-        steps.append(f"{used_price:.2f}@{to_place}")
-        # wait and poll
-        t_end = time.time() + STEP_WAIT
-        last_status_txt = ""
-        while time.time() < t_end:
-            st = order_status(oid)
+    def wait_loop(secs: int):
+        nonlocal filled_total
+        t_end=time.time()+secs
+        while time.time()<t_end:
+            if not active_oid: break
+            st=get_status(active_oid)
             status = str(st.get("status") or st.get("orderStatus") or "").upper()
-            fq = filled_qty_from_status(st)
-            if fq and fq > filled_total:
-                filled_total = fq
+            fq = int(round(float(st.get("filledQuantity") or st.get("filled_quantity") or 0)))
+            if fq > filled_total: filled_total = fq
             if status == "FILLED" or filled_total >= qty:
                 return "FILLED"
-            last_status_txt = status
             time.sleep(1)
-        # timeout at this rung → cancel and count cancels
-        before = set(_working_order_ids(c, acct_hash, canon, exact=False))
-        cancel_related_orders(c, acct_hash, canon)
-        after  = set(_working_order_ids(c, acct_hash, canon, exact=False))
-        canceled_total += max(0, len(before - after))
-        return last_status_txt or "WORKING"
+        return "WORKING"
+
+    # ladder rungs
+    def rung(px):
+        nonlocal filled_total
+        to_place = max(0, qty - filled_total)
+        if to_place==0: return "FILLED"
+        ensure_active(px, to_place)
+        steps.append(f"{clamp_tick(px):.2f}@{to_place}")
+        return wait_loop(STEP_WAIT)
 
     # Step 0: start
-    start_px = (CREDIT_START if is_credit else DEBIT_START)
-    status = rung(start_px)
+    status = rung(CREDIT_START if is_credit else DEBIT_START)
     if status != "FILLED":
-        # Step 1: mid
         m1 = mid_condor(c, legs)
         if m1 is not None:
             status = rung(m1)
     if status != "FILLED":
-        # Step 2: new mid
         m2 = mid_condor(c, legs)
         if m2 is not None:
             status = rung(m2)
     if status != "FILLED":
-        # Step 3: prev mid ± 0.05 bounded
         pm = m2 if ('m2' in locals() and m2 is not None) else (m1 if ('m1' in locals()) else None)
-        step_px = clamp_tick((pm + (-0.05 if is_credit else +0.05)) if pm is not None else used_price or start_px)
+        step_px = clamp_tick((pm + (-0.05 if is_credit else +0.05)) if pm is not None else (CREDIT_START if is_credit else DEBIT_START))
         if is_credit: step_px = max(CREDIT_FLOOR, min(CREDIT_START, step_px))
         else:         step_px = max(DEBIT_START,  min(DEBIT_CEIL,   step_px))
         status = rung(step_px)
     if status != "FILLED":
-        # Step 4: bound, then cancel
         bound_px = clamp_tick(CREDIT_FLOOR if is_credit else DEBIT_CEIL)
         status = rung(bound_px)
-        cancel_related_orders(c, acct_hash, canon)
+        if FINAL_CANCEL and active_oid:
+            try:
+                url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{active_oid}"
+                schwab_delete(c,url,tag=f"CANCEL_FINAL:{active_oid}")
+                canceled += 1
+            except Exception:
+                pass
 
     # ---- final log ----
     side = "SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"
     otype = "NET_CREDIT" if is_credit else "NET_DEBIT"
     trace = "STEPS " + "→".join(steps)
     filled_str = f"FILLED {filled_total}/{qty}"
-    canceled_str = f"CANCELED {canceled_total}"
-    status_txt = (("FILLED " + trace) if (filled_total >= qty) else (status + " " + trace)) + f" | {filled_str} | {canceled_str}"
+    repl_str   = f"REPLACED {replacements}"
+    canceled_str = f"CANCELED {canceled}"
+    used_price = steps[-1].split("@",1)[0] if steps else ""
+    oid_for_log = active_oid or ""
+    status_txt = (("FILLED " + trace) if (filled_total >= qty) else (status + " " + trace)) + f" | {filled_str} | {repl_str} | {canceled_str}"
 
     row = [datetime.utcnow().isoformat()+"Z", source, "SPX", last_px,
            sig_date, "PLACE", side, qty, otype,
-           ("" if used_price is None else f"{used_price:.2f}"),
+           used_price,
            legs[0],legs[1],legs[2],legs[3],
-           oid, status_txt]
+           oid_for_log, status_txt]
     one_log(svc, sheet_id_num, sheet_id, SHEET_TAB, row)
-    print(f"FINAL {status_txt} OID={oid} PRICE_USED={used_price if used_price is not None else 'NA'}")
+    print(f"FINAL {status_txt} OID={oid_for_log} PRICE_USED={used_price if used_price else 'NA'}")
 
 # ---- entry ----
 def time_gate_ok():
