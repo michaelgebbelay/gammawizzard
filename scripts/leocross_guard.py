@@ -1,12 +1,8 @@
-# LeoCross GUARD: fetch Leo signal, compute legs, check Schwab for overlap/conflict.
-# If any overlap or conflict is detected (positions or working orders), set proceed=false.
-# Otherwise proceed=true so the placer can run.
-#
-# Outputs for GitHub Actions (written to $GITHUB_OUTPUT):
-#   proceed=true|false
-#   reason=<text>
+#!/usr/bin/env python3
+# LeoCross GUARD (stateless): derive 4 legs from GW, inspect Schwab positions & open orders,
+# and emit a single decision for the orchestrator.
 
-import os, sys, json, time, re
+import os, sys, json, re, time
 from datetime import datetime, date, timezone
 from zoneinfo import ZoneInfo
 import requests
@@ -16,22 +12,31 @@ ET = ZoneInfo("America/New_York")
 GW_BASE = "https://gandalf.gammawizard.com"
 GW_ENDPOINT = "/rapi/GetLeoCross"
 
-# ---------- tiny utils ----------
-def _sanitize_token(t: str) -> str:
-    t = (t or "").strip().strip('"').strip("'")
-    return t.split(None,1)[1] if t.lower().startswith("bearer ") else t
+QTY_TARGET = int(os.environ.get("QTY_TARGET","4") or "4")
+
+# ------------- small utils -------------
+def goutput(name: str, val: str):
+    path = os.environ.get("GITHUB_OUTPUT")
+    if path:
+        with open(path, "a") as fh:
+            fh.write(f"{name}={val}\n")
 
 def yymmdd(iso: str) -> str:
     d = date.fromisoformat((iso or "")[:10])
     return "{:%y%m%d}".format(d)
 
 def to_osi(sym: str) -> str:
-    raw = (sym or "").strip().upper().lstrip(".").replace("_","")
-    m = re.match(r'^([A-Z.$^]{1,6})(\d{6})([CP])(\d{1,5})(?:\.(\d{1,3}))?$', raw) or \
-        re.match(r'^([A-Z.$^]{1,6})(\d{6})([CP])(\d{8})$', raw)
+    raw = (sym or "").upper()
+    raw = re.sub(r'\s+', '', raw).lstrip('.')
+    raw = re.sub(r'[^A-Z0-9.$^]', '', raw)
+    m = re.match(r'^([A-Z.$^]{1,6})(\d{6})([CP])(\d{1,5})(?:\.(\d{1,3}))?$', raw) \
+        or re.match(r'^([A-Z.$^]{1,6})(\d{6})([CP])(\d{8})$', raw)
     if not m: raise ValueError("Cannot parse option symbol: " + sym)
     root, ymd, cp, strike, frac = (m.groups()+("",))[:5]
-    mills = int(strike)*1000 + (int((frac or "0").ljust(3,'0')) if frac else 0) if len(strike)<8 else int(strike)
+    if len(strike)==8 and not frac:
+        mills = int(strike)
+    else:
+        mills = int(strike)*1000 + (int((frac or "0").ljust(3,'0')) if frac else 0)
     return "{:<6s}{}{}{:08d}".format(root, ymd, cp, mills)
 
 def osi_canon(osi: str):
@@ -43,38 +48,16 @@ def strike_from_osi(osi: str) -> float:
 def iso_z(dt):
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-def goutput(name: str, val: str):
-    path = os.environ.get("GITHUB_OUTPUT")
-    if path:
-        with open(path, "a") as fh:
-            fh.write("{}={}\n".format(name, val))
-
-# ---------- GW auth & fetch ----------
-def _gw_timeout():
-    try: return int(os.environ.get("GW_TIMEOUT","30"))
-    except: return 30
-
-def gw_login_token():
-    email=os.environ.get("GW_EMAIL",""); pwd=os.environ.get("GW_PASSWORD","")
-    if not (email and pwd): raise RuntimeError("GW_LOGIN_MISSING_CREDS")
-    r=requests.post("{}/goauth/authenticateFireUser".format(GW_BASE), data={"email":email,"password":pwd}, timeout=_gw_timeout())
-    if r.status_code!=200: raise RuntimeError("GW_LOGIN_HTTP_{}:{}".format(r.status_code, (r.text or "")[:180]))
-    j=r.json(); t=j.get("token")
-    if not t: raise RuntimeError("GW_LOGIN_NO_TOKEN")
-    return t
-
-def gw_get_leocross():
-    tok=_sanitize_token(os.environ.get("GW_TOKEN","") or "")
-    def hit(t):
-        h={"Accept":"application/json","Authorization":"Bearer {}".format(_sanitize_token(t)),"User-Agent":"gw-guard/1.0"}
-        return requests.get("{}/{}".format(GW_BASE.rstrip("/"), GW_ENDPOINT.lstrip("/")), headers=h, timeout=_gw_timeout())
-    r=hit(tok) if tok else None
-    if (r is None) or (r.status_code in (401,403)): r=hit(gw_login_token())
-    if r.status_code!=200: raise RuntimeError("GW_HTTP_{}:{}".format(r.status_code, (r.text or "")[:180]))
-    return r.json()
-
-# ---------- Schwab helpers ----------
 def _backoff(i): return 0.6*(2**i)
+
+# ------------- Schwab helpers -------------
+def schwab_client():
+    app_key=os.environ["SCHWAB_APP_KEY"]; app_secret=os.environ["SCHWAB_APP_SECRET"]; token_json=os.environ["SCHWAB_TOKEN_JSON"]
+    with open("schwab_token.json","w") as f: f.write(token_json)
+    c=client_from_token_file(api_key=app_key, app_secret=app_secret, token_path="schwab_token.json")
+    r=c.get_account_numbers(); r.raise_for_status()
+    acct_hash=r.json()[0]["hashValue"]
+    return c, acct_hash
 
 def schwab_get_json(c, url, params=None, tries=6, tag=""):
     last=""
@@ -82,32 +65,51 @@ def schwab_get_json(c, url, params=None, tries=6, tag=""):
         try:
             r=c.session.get(url, params=(params or {}), timeout=20)
             if r.status_code==200: return r.json()
-            last="HTTP_{:d}:{:s}".format(r.status_code, (r.text or "")[:160])
+            last=f"HTTP_{r.status_code}:{(r.text or '')[:160]}"
         except Exception as e:
-            last="{}:{}".format(type(e).__name__, str(e))
+            last=f"{type(e).__name__}:{e}"
         time.sleep(_backoff(i))
-    raise RuntimeError("SCHWAB_GET_FAIL({}) {}".format(tag, last))
+    raise RuntimeError(f"SCHWAB_GET_FAIL({tag}) {last}")
+
+def _osi_from_instrument(ins: dict):
+    sym = (ins.get("symbol") or "")
+    try:
+        return to_osi(sym)
+    except Exception:
+        pass
+    exp = ins.get("optionExpirationDate") or ins.get("expirationDate") or ""
+    pc  = (ins.get("putCall") or ins.get("type") or "").upper()
+    strike = ins.get("strikePrice") or ins.get("strike")
+    try:
+        if exp and pc in ("CALL","PUT") and strike is not None:
+            ymd = date.fromisoformat(str(exp)[:10]).strftime("%y%m%d")
+            cp = "C" if pc.startswith("C") else "P"
+            mills = int(round(float(strike)*1000))
+            return "{:<6s}{}{}{:08d}".format("SPXW", ymd, cp, mills)
+    except Exception:
+        pass
+    return None
 
 def positions_map(c, acct_hash: str):
-    url="https://api.schwabapi.com/trader/v1/accounts/{}".format(acct_hash)
+    url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}"
     j=schwab_get_json(c,url,params={"fields":"positions"},tag="POSITIONS")
     sa=j[0]["securitiesAccount"] if isinstance(j,list) else (j.get("securitiesAccount") or j)
     out={}
     for p in (sa.get("positions") or []):
         ins=p.get("instrument",{}) or {}
-        if (ins.get("assetType") or "").upper()!="OPTION": continue
-        sym=ins.get("symbol","")
-        try: key=osi_canon(to_osi(sym))
-        except: continue
+        atype = (ins.get("assetType") or ins.get("type") or "").upper()
+        if atype != "OPTION": continue
+        osi = _osi_from_instrument(ins)
+        if not osi: continue
         qty=float(p.get("longQuantity",0))-float(p.get("shortQuantity",0))
         if abs(qty)<1e-9: continue
-        out[key]=out.get(key,0.0)+qty
+        out[osi_canon(osi)] = out.get(osi_canon(osi), 0.0) + qty
     return out
 
 def list_matching_open_ids(c, acct_hash: str, canon_set):
     now_et = datetime.now(ET)
     start_et = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
-    url="https://api.schwabapi.com/trader/v1/accounts/{}/orders".format(acct_hash)
+    url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
     params = {"fromEnteredTime": iso_z(start_et), "toEnteredTime": iso_z(now_et), "maxResults": 200}
     try:
         arr = schwab_get_json(c, url, params=params, tag="ORDERS") or []
@@ -119,20 +121,50 @@ def list_matching_open_ids(c, acct_hash: str, canon_set):
         if st not in ("WORKING","QUEUED","PENDING_ACTIVATION","OPEN"): continue
         got=set()
         for leg in (o.get("orderLegCollection") or []):
-            sym=(leg.get("instrument",{}) or {}).get("symbol","")
-            if not sym: continue
-            try: got.add(osi_canon(to_osi(sym)))
-            except: pass
+            ins=(leg.get("instrument",{}) or {})
+            sym=(ins.get("symbol") or "")
+            osi=None
+            try: osi=to_osi(sym)
+            except: osi=_osi_from_instrument(ins)
+            if osi:
+                got.add(osi_canon(osi))
         if got==canon_set:
             oid=str(o.get("orderId") or "")
             if oid: out.append(oid)
     return out
 
-# ---------- core ----------
+# ------------- GammaWizard -------------
+def _sanitize_token(t: str) -> str:
+    t = (t or "").strip().strip('"').strip("'")
+    return t.split(None,1)[1] if t.lower().startswith("bearer ") else t
+
+def _gw_timeout():
+    try: return int(os.environ.get("GW_TIMEOUT","30"))
+    except: return 30
+
+def gw_login_token():
+    email=os.environ.get("GW_EMAIL",""); pwd=os.environ.get("GW_PASSWORD","")
+    if not (email and pwd): raise RuntimeError("GW_LOGIN_MISSING_CREDS")
+    r=requests.post(f"{GW_BASE}/goauth/authenticateFireUser", data={"email":email,"password":pwd}, timeout=_gw_timeout())
+    if r.status_code!=200: raise RuntimeError(f"GW_LOGIN_HTTP_{r.status_code}:{(r.text or '')[:180]}")
+    j=r.json(); t=j.get("token")
+    if not t: raise RuntimeError("GW_LOGIN_NO_TOKEN")
+    return t
+
+def gw_get_leocross():
+    tok=_sanitize_token(os.environ.get("GW_TOKEN","") or "")
+    def hit(t):
+        h={"Accept":"application/json","Authorization":f"Bearer {_sanitize_token(t)}","User-Agent":"gw-guard/1.0"}
+        return requests.get(f"{GW_BASE.rstrip('/')}/{GW_ENDPOINT.lstrip('/')}", headers=h, timeout=_gw_timeout())
+    r=hit(tok) if tok else None
+    if (r is None) or (r.status_code in (401,403)): r=hit(gw_login_token())
+    if r.status_code!=200: raise RuntimeError(f"GW_HTTP_{r.status_code}:{(r.text or '')[:180]}")
+    return r.json()
+
 def extract_trade(j):
     if isinstance(j,dict):
         if "Trade" in j:
-            tr=j["Trade"]
+            tr=j["Trade"]; 
             return tr[-1] if isinstance(tr,list) and tr else tr if isinstance(tr,dict) else {}
         keys=("Date","TDate","Limit","CLimit","Cat1","Cat2")
         if any(k in j for k in keys): return j
@@ -146,36 +178,56 @@ def extract_trade(j):
             if t: return t
     return {}
 
+# ------------- logic -------------
 def main():
     # Schwab client
-    app_key=os.environ["SCHWAB_APP_KEY"]; app_secret=os.environ["SCHWAB_APP_SECRET"]; token_json=os.environ["SCHWAB_TOKEN_JSON"]
-    with open("schwab_token.json","w") as f: f.write(token_json)
-    c=client_from_token_file(api_key=app_key, app_secret=app_secret, token_path="schwab_token.json")
-    r=c.get_account_numbers(); r.raise_for_status()
-    acct_hash=r.json()[0]["hashValue"]
+    try:
+        c, acct_hash = schwab_client()
+    except Exception as e:
+        msg=str(e)
+        reason="SCHWAB_OAUTH_REFRESH_FAILED — rotate SCHWAB_TOKEN_JSON" if ("unsupported_token_type" in msg or "refresh_token_authentication_error" in msg) else ("SCHWAB_CLIENT_INIT_FAILED — " + msg[:200])
+        print("GUARD SKIP:", reason)
+        for k,v in {"action":"SKIP","reason":reason,"rem_qty":"","legs_json":"[]",
+                    "canon_key":"","is_credit":"", "open_order_ids":"","signal_date":""}.items():
+            goutput(k,v)
+        return 0
 
-    # GW
-    api=gw_get_leocross()
-    tr=extract_trade(api)
-    if not tr:
-        goutput("proceed","false"); goutput("reason","NO_TRADE_PAYLOAD"); print("GUARD SKIP: no trade payload")
-        return
+    # GW → trade
+    try:
+        api=gw_get_leocross(); tr=extract_trade(api)
+        if not tr:
+            print("GUARD SKIP: NO_TRADE_PAYLOAD")
+            for k,v in {"action":"SKIP","reason":"NO_TRADE_PAYLOAD","rem_qty":"","legs_json":"[]",
+                        "canon_key":"","is_credit":"", "open_order_ids":"","signal_date":""}.items():
+                goutput(k,v)
+            return 0
+    except Exception as e:
+        reason=f"GW_FETCH_FAILED — {str(e)[:200]}"
+        print("GUARD SKIP:", reason)
+        for k,v in {"action":"SKIP","reason":reason,"rem_qty":"","legs_json":"[]",
+                    "canon_key":"","is_credit":"", "open_order_ids":"","signal_date":""}.items():
+            goutput(k,v)
+        return 0
 
-    sig_date=str(tr.get("Date","")); exp_iso=str(tr.get("TDate","")); exp6=yymmdd(exp_iso)
+    sig_date=str(tr.get("Date",""))
+    exp_iso=str(tr.get("TDate","")); exp6=yymmdd(exp_iso)
     inner_put=int(float(tr.get("Limit"))); inner_call=int(float(tr.get("CLimit")))
+
     def fnum(x):
         try: return float(x)
         except: return None
     cat1=fnum(tr.get("Cat1")); cat2=fnum(tr.get("Cat2"))
     is_credit = True if (cat2 is None or cat1 is None or cat2>=cat1) else False
 
-    # legs
+    # legs (unoriented base strikes)
     p_low,p_high = inner_put-5, inner_put
     c_low,c_high = inner_call, inner_call+5
-    bp = to_osi(".SPXW{}P{}".format(exp6, p_low));  sp = to_osi(".SPXW{}P{}".format(exp6, p_high))
-    sc = to_osi(".SPXW{}C{}".format(exp6, c_low));  bc = to_osi(".SPXW{}C{}".format(exp6, c_high))
+    bp = to_osi(f".SPXW{exp6}P{p_low}")
+    sp = to_osi(f".SPXW{exp6}P{p_high}")
+    sc = to_osi(f".SPXW{exp6}C{c_low}")
+    bc = to_osi(f".SPXW{exp6}C{c_high}")
 
-    # orient so BUY legs are protective wings, SELL legs are inner strikes for credit; inverted for debit (long IC)
+    # orient so BUY legs are protective wings for credit; reverse for debit
     def orient(bp,sp,sc,bc):
         bpS=strike_from_osi(bp); spS=strike_from_osi(sp)
         scS=strike_from_osi(sc); bcS=strike_from_osi(bc)
@@ -189,54 +241,76 @@ def main():
     legs = orient(bp,sp,sc,bc)
     canon = {osi_canon(x) for x in legs}
 
-    # positions snapshot
+    # positions
     try:
         pos = positions_map(c, acct_hash)
     except Exception as e:
-        goutput("proceed","false"); goutput("reason","GUARD_FAIL_POSITIONS"); print("GUARD SKIP: positions error: {}".format(e))
-        return
+        reason=f"POSITIONS_FAILED — {str(e)[:200]}"
+        print("GUARD SKIP:", reason)
+        for k,v in {"action":"SKIP","reason":reason,"rem_qty":"","legs_json":json.dumps(legs),
+                    "canon_key":"","is_credit":("true" if is_credit else "false"),"open_order_ids":"","signal_date":sig_date}.items():
+            goutput(k,v)
+        return 0
 
-    # --- overlap rules ---
-    # 1) NO-CLOSE rule: placing BUY_TO_OPEN on a leg where you're short (<0), or SELL_TO_OPEN where you're long (>0) would "close" — skip.
-    checks=[("BUY",legs[0],-1),("SELL",legs[1],+1),("SELL",legs[2],+1),("BUY",legs[3],-1)]
-    for _, osi, sign in checks:
+    # snapshot
+    labels=[("BUY_PUT",legs[0],-1),("SELL_PUT",legs[1],+1),("SELL_CALL",legs[2],+1),("BUY_CALL",legs[3],-1)]
+    print(f"GUARD SNAPSHOT ({'CREDIT' if is_credit else 'DEBIT'}):")
+    for name, osi, sign in labels:
         cur = pos.get(osi_canon(osi), 0.0)
-        if sign<0 and cur<0:
-            goutput("proceed","false"); goutput("reason","WOULD_CLOSE_{}".format(osi)); print("GUARD SKIP: would close {}".format(osi)); return
-        if sign>0 and cur>0:
-            goutput("proceed","false"); goutput("reason","WOULD_CLOSE_{}".format(osi)); print("GUARD SKIP: would close {}".format(osi)); return
+        print(f"  {name:10s} {osi}  acct_qty={cur:+g}  sign={sign:+d}")
 
-    # 2) Any same-direction overlap on any leg (already holding part of this condor) — treat as overlap, skip.
-    overlap=False
-    if pos.get(osi_canon(legs[0]),0.0)>0: overlap=True  # already long buy-put
-    if pos.get(osi_canon(legs[3]),0.0)>0: overlap=True  # already long buy-call
-    if pos.get(osi_canon(legs[1]),0.0)<0: overlap=True  # already short sell-put
-    if pos.get(osi_canon(legs[2]),0.0)<0: overlap=True  # already short sell-call
-    if overlap:
-        goutput("proceed","false"); goutput("reason","POSITION_OVERLAP"); print("GUARD SKIP: position overlap with at least one leg")
-        return
+    # NO‑CLOSE rule + overlap classification
+    any_opposite=False; nonzero_count=0; aligned_count=0
+    for _, osi, sign in labels:
+        cur = pos.get(osi_canon(osi), 0.0)
+        if abs(cur)>1e-9: nonzero_count+=1
+        if (sign<0 and cur<0) or (sign>0 and cur>0): any_opposite=True
+        if (sign<0 and cur>=0) or (sign>0 and cur<=0):
+            if abs(cur)>1e-9: aligned_count+=1
 
-    # 3) Any working order with the same 4 legs — skip to avoid duplicates.
-    try:
-        open_ids = list_matching_open_ids(c, acct_hash, canon)
-    except Exception:
-        open_ids=[]
-    if open_ids:
-        goutput("proceed","false"); goutput("reason","WORKING_ORDER_{}".format(",".join(open_ids)))
-        print("GUARD SKIP: working matching order(s): {}".format(",".join(open_ids)))
-        return
+    open_ids = list_matching_open_ids(c, acct_hash, canon) or []
+    action=""; rem_qty=""; reason=""
 
-    # If we get here, it's safe to proceed
-    goutput("proceed","true"); goutput("reason","OK")
-    print("GUARD OK: no overlap, proceeding with placement")
+    # units open (only meaningful when all 4 aligned)
+    def condor_units_open(pos_map, legs):
+        b1 = max(0.0,  pos_map.get(osi_canon(legs[0]), 0.0))
+        b2 = max(0.0,  pos_map.get(osi_canon(legs[3]), 0.0))
+        s1 = max(0.0, -pos_map.get(osi_canon(legs[1]), 0.0))
+        s2 = max(0.0, -pos_map.get(osi_canon(legs[2]), 0.0))
+        return int(min(b1, b2, s1, s2))
 
-if __name__=="__main__":
-    try:
-        main()
-    except SystemExit:
-        raise
-    except Exception as e:
-        goutput("proceed","false")
-        goutput("reason","GUARD_UNHANDLED:{}".format(str(e)[:140]))
-        print("GUARD SKIP (unhandled): {}".format(e))
-        sys.exit(0)
+    if any_opposite:
+        action="SKIP"; reason="WOULD_CLOSE"
+    elif (nonzero_count==0) and not open_ids:
+        action="NEW"; rem_qty=str(max(0, QTY_TARGET))
+    elif (nonzero_count==4 and aligned_count==4) and not open_ids:
+        uo = condor_units_open(pos, legs)
+        if uo >= QTY_TARGET:
+            action="SKIP"; reason="AT_OR_ABOVE_TARGET"
+        else:
+            action="NEW"; rem_qty=str(QTY_TARGET - uo)
+    else:
+        action="REPRICE_EXISTING"
+        # rem_qty left blank; placer will recompute based on live positions
+        reason = "PARTIAL_OVERLAP or WORKING_ORDER"
+
+    canon_key = f"{legs[0][6:12]}:P{legs[0][-8:]}-{legs[1][-8:]}:C{legs[2][-8:]}-{legs[3][-8:]}"
+
+    # Emit outputs
+    outs = {
+        "action": action,
+        "reason": reason,
+        "rem_qty": rem_qty,
+        "legs_json": json.dumps(legs),
+        "canon_key": canon_key,
+        "is_credit": "true" if is_credit else "false",
+        "open_order_ids": ",".join(open_ids),
+        "signal_date": sig_date,
+    }
+    for k,v in outs.items(): goutput(k, v)
+
+    print(f"GUARD DECISION: action={action} rem_qty={rem_qty or 'NA'} open_order_ids={outs['open_order_ids']}")
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
