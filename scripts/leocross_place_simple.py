@@ -24,6 +24,7 @@ STEP_WAIT = 30       # seconds to wait at each rung
 FINAL_CANCEL = True  # if still not filled after last rung, cancel working ticket
 WINDOW_STATUSES = {"WORKING","QUEUED","OPEN","PENDING_ACTIVATION"}
 
+# Fixed ladders requested:
 CREDIT_START = 2.10
 CREDIT_FLOOR = 1.90
 DEBIT_START  = 1.90
@@ -149,7 +150,7 @@ def schwab_delete(c, url, tries=4, tag=""):
         time.sleep(_backoff(i))
     raise RuntimeError(f"SCHWAB_DELETE_FAIL({tag}) {last}")
 
-# ===== GW + quotes =====
+# ===== GW + quotes (mid not used now, but kept for completeness) =====
 def _gw_timeout():
     try: return int(os.environ.get("GW_TIMEOUT","30"))
     except: return 30
@@ -373,6 +374,7 @@ def main():
             ]
         }
 
+    # One active working order (replace). Cancel any overlapping partial matches first.
     active_oid, active_status, overlaps = pick_active_and_overlaps(c, acct_hash, canon)
     for oid in overlaps:
         try:
@@ -454,32 +456,36 @@ def main():
         steps.append(f"{clamp_tick(px):.2f}@{to_place}")
         return wait_loop(STEP_WAIT)
 
-    status = rung(CREDIT_START if True else DEBIT_START)
-    if status != "FILLED":
-        m1 = mid_condor(c, legs)
-        if m1 is not None: status = rung(m1)
-    if status != "FILLED":
-        m2 = mid_condor(c, legs)
-        if m2 is not None: status = rung(m2)
-    if status != "FILLED":
-        pm = m2 if ('m2' in locals() and m2 is not None) else (m1 if ('m1' in locals()) else None)
-        step_px = clamp_tick((pm - 0.05) if pm is not None else CREDIT_START)
-        step_px = max(CREDIT_FLOOR, min(CREDIT_START, step_px))
-        status = rung(step_px)
-    if status != "FILLED":
-        bound_px = clamp_tick(CREDIT_FLOOR)
-        status = rung(bound_px)
-        if FINAL_CANCEL and active_oid:
-            try:
-                url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{active_oid}"
-                schwab_delete(c,url,tag=f"CANCEL_FINAL:{active_oid}")
-                canceled += 1
-            except Exception:
-                pass
+    # ===== NEW: Simple fixed 5¢ ladder every 30s =====
+    ladder = []
+    if is_credit:
+        p = CREDIT_START
+        while p >= CREDIT_FLOOR - 1e-9:
+            ladder.append(clamp_tick(p))
+            p -= 0.05
+    else:
+        p = DEBIT_START
+        while p <= DEBIT_CEIL + 1e-9:
+            ladder.append(clamp_tick(p))
+            p += 0.05
 
-    side = "SHORT_IRON_CONDOR"
-    otype = "NET_CREDIT"
-    trace = "STEPS " + "→".join(steps)
+    status = "WORKING"
+    for px in ladder:
+        status = rung(px)
+        if status == "FILLED":
+            break
+
+    if status != "FILLED" and FINAL_CANCEL and active_oid:
+        try:
+            url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{active_oid}"
+            schwab_delete(c,url,tag=f"CANCEL_FINAL:{active_oid}")
+            canceled += 1
+        except Exception:
+            pass
+
+    side = "SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"
+    otype = "NET_CREDIT" if is_credit else "NET_DEBIT"
+    trace = "STEPS " + "→".join(steps) if steps else "STEPS"
     filled_str = f"FILLED {filled_total}/{qty}"
     repl_str   = f"REPLACED {replacements}"
     canceled_str = f"CANCELED {canceled}"
