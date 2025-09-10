@@ -7,7 +7,7 @@
 QTY_FIXED = 4
 
 import os, sys, json, time, re
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from zoneinfo import ZoneInfo
 import requests
 from schwab.auth import client_from_token_file
@@ -66,6 +66,10 @@ def osi_canon(osi: str):
 
 def strike_from_osi(osi: str) -> float:
     return int(osi[-8:]) / 1000.0
+
+def iso_z(dt):
+    """UTC Zulu timestamp string for Schwab order-list query."""
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 # ===== Sheets =====
 def ensure_header_and_get_sheetid(svc, spreadsheet_id: str, tab: str, header: list):
@@ -386,7 +390,7 @@ def main():
     steps=[]; used_price=None; oid=""; filled_total=0; canceled_total=0
 
     def rung(price):
-        nonlocal oid, used_price, steps, filled_total, qty
+        nonlocal oid, used_price, steps, filled_total, qty, canceled_total
         used_price = clamp_tick(price)
         to_place = max(0, qty - filled_total)
         if to_place == 0: 
@@ -406,13 +410,11 @@ def main():
                 return "FILLED"
             last_status_txt = status
             time.sleep(1)
-        # timeout at this rung
-        # cancel and compute cancels
+        # timeout at this rung → cancel and count cancels
         before = list_matching_open_ids(c, acct_hash, canon)
         cancel_all_and_wait(c, acct_hash, canon)
         after = list_matching_open_ids(c, acct_hash, canon)
         canceled_now = max(0, len(set(before) - set(after)))
-        nonlocal canceled_total
         canceled_total += canceled_now
         return last_status_txt or "WORKING"
 
