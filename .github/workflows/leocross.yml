@@ -7,10 +7,10 @@ on:
         description: 'PLACER_MODE: NOW | SCHEDULED'
         required: true
         default: 'SCHEDULED'
-  schedule:
-    # 4:10pm ET; placer itself enforces 16:08–16:14 when SCHEDULED
-    - cron: "10 20 * * 1-5"
-    - cron: "10 21 * * 1-5"
+  # schedule:
+  #   # 4:10pm ET; placer itself enforces 16:08–16:14 when SCHEDULED
+  #   - cron: "10 20 * * 1-5"
+  #   - cron: "10 21 * * 1-5"
 
 concurrency:
   group: leocross-min
