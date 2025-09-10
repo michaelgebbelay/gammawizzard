@@ -42,7 +42,7 @@ HEADERS = [
 
 # ===== tiny utils =====
 def clamp_tick(x: float) -> float:
-    return round(round(x / TICK) * TICK + 1e-12, 2)
+    return round(round(x / 0.05) * 0.05 + 1e-12, 2)
 
 def _sanitize_token(t: str) -> str:
     t = (t or "").strip().strip('"').strip("'")
@@ -62,7 +62,7 @@ def to_osi(sym: str) -> str:
     return f"{root:<6}{ymd}{cp}{mills:08d}"
 
 def osi_canon(osi: str):
-    return (osi[6:12], osi[12], osi[-8:])  # (yymmdd, C/P, strike8)
+    return (osi[6:12], osi[12], osi[-8:])
 
 def strike_from_osi(osi: str) -> float:
     return int(osi[-8:]) / 1000.0
@@ -129,7 +129,7 @@ def schwab_put_json(c, url, payload, tries=4, tag=""):
     last=""
     for i in range(tries):
         try:
-            r=c.session.put(url, json=payload, timeout=20)   # replace
+            r=c.session.put(url, json=payload, timeout=20)
             if r.status_code in (200,201,202): return r
             last=f"HTTP_{r.status_code}:{(r.text or '')[:160]}"
         except Exception as e:
@@ -190,7 +190,6 @@ def mid_condor(c, legs):
     net_bid=(sp_b+sc_b)-(bp_a+bc_a); net_ask=(sp_a+sc_a)-(bp_b+bc_b)
     return (net_bid+net_ask)/2.0
 
-# ===== robust OSI from Schwab instrument =====
 def _osi_from_instrument(ins: dict) -> str | None:
     sym = (ins.get("symbol") or "")
     try:
@@ -210,7 +209,6 @@ def _osi_from_instrument(ins: dict) -> str | None:
         pass
     return None
 
-# ===== positions / orders =====
 def positions_map(c, acct_hash: str):
     url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}"
     j=schwab_get_json(c,url,params={"fields":"positions"},tag="POSITIONS")
@@ -227,7 +225,7 @@ def positions_map(c, acct_hash: str):
     return out
 
 def list_recent_orders(c, acct_hash: str):
-    now_et = datetime.now(ET)
+    now_et = datetime.now(ZoneInfo("America/New_York"))
     start_et = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
     url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
     params = {"fromEnteredTime": iso_z(start_et), "toEnteredTime": iso_z(now_et), "maxResults": 200}
@@ -248,23 +246,20 @@ def pick_active_and_overlaps(c, acct_hash: str, canon_set):
     exact_id=None; active_status=""; overlaps=[]
     for o in list_recent_orders(c, acct_hash):
         st=str(o.get("status") or "").upper()
-        if st not in WINDOW_STATUSES: continue
+        if st not in {"WORKING","QUEUED","OPEN","PENDING_ACTIVATION"}: continue
         got=_legs_canon_from_order(o)
         if not got: continue
         if got==canon_set and exact_id is None:
-            exact_id=str(o.get("orderId") or "")
-            active_status=st
+            exact_id=str(o.get("orderId") or ""); active_status=st
         elif got & canon_set:
             oid=str(o.get("orderId") or "")
             if oid: overlaps.append(oid)
     return exact_id, active_status, overlaps
 
-# ===== main =====
 def main():
     MODE=(os.environ.get("PLACER_MODE","SCHEDULED") or "SCHEDULED").upper()
     source=f"SIMPLE_{MODE}"
 
-    # secrets/env
     sheet_id=os.environ["GSHEET_ID"]; sa_json=os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
     app_key=os.environ["SCHWAB_APP_KEY"]; app_secret=os.environ["SCHWAB_APP_SECRET"]; token_json=os.environ["SCHWAB_TOKEN_JSON"]
 
@@ -274,7 +269,6 @@ def main():
     r=c.get_account_numbers(); r.raise_for_status()
     acct_hash=r.json()[0]["hashValue"]
 
-    # last SPX (for log)
     def spx_last():
         for sym in ["$SPX.X","SPX","SPX.X","$SPX"]:
             try:
@@ -286,29 +280,25 @@ def main():
         return ""
     last_px=spx_last()
 
-    # Sheets client
     creds=service_account.Credentials.from_service_account_info(json.loads(sa_json),
         scopes=["https://www.googleapis.com/auth/spreadsheets"])
     svc=gbuild("sheets","v4",credentials=creds)
-    sheet_id_num=ensure_header_and_get_sheetid(svc, sheet_id, SHEET_TAB, HEADERS)
+    sheet_id_num=ensure_header_and_get_sheetid(svc, sheet_id, "schwab", HEADERS)
 
-    # schedule gate
     if MODE=="SCHEDULED":
-        now=datetime.now(ET)
+        now=datetime.now(ZoneInfo("America/New_York"))
         if now.weekday()>=5 or not (now.hour==16 and 8<=now.minute<=14):
             row=[datetime.utcnow().isoformat()+"Z", source, "SPX", last_px, "", "SKIP","","","","",
                  "","","","", "", "SKIPPED_TIME_WINDOW"]
-            one_log(svc, sheet_id_num, sheet_id, SHEET_TAB, row); print("skip window"); sys.exit(0)
+            one_log(svc, sheet_id_num, sheet_id, "schwab", row); print("skip window"); sys.exit(0)
 
-    # GW → trade
     try:
         api=gw_get_leocross()
     except Exception as e:
         row=[datetime.utcnow().isoformat()+"Z", source, "SPX", last_px, "", "ABORT","","","","",
              "","","","", "", f"ABORT_GW:{str(e)[:150]}"]
-        one_log(svc, sheet_id_num, sheet_id, SHEET_TAB, row); print(e); sys.exit(0)
+        one_log(svc, sheet_id_num, sheet_id, "schwab", row); print(e); sys.exit(0)
 
-    # extract
     def extract(j):
         if isinstance(j,dict):
             if "Trade" in j:
@@ -329,7 +319,7 @@ def main():
     if not tr:
         row=[datetime.utcnow().isoformat()+"Z", source, "SPX", last_px, "", "ABORT","","","","",
              "","","","", "", "NO_TRADE_PAYLOAD"]
-        one_log(svc, sheet_id_num, sheet_id, SHEET_TAB, row); sys.exit(0)
+        one_log(svc, sheet_id_num, sheet_id, "schwab", row); sys.exit(0)
 
     sig_date=str(tr.get("Date","")); exp_iso=str(tr.get("TDate","")); exp6=yymmdd(exp_iso)
     inner_put=int(float(tr.get("Limit"))); inner_call=int(float(tr.get("CLimit")))
@@ -339,7 +329,6 @@ def main():
     cat1=fnum(tr.get("Cat1")); cat2=fnum(tr.get("Cat2"))
     is_credit = True if (cat2 is None or cat1 is None or cat2>=cat1) else False
 
-    # legs (width 5), orient
     p_low,p_high = inner_put-5, inner_put
     c_low,c_high = inner_call, inner_call+5
     bp = to_osi(f".SPXW{exp6}P{p_low}"); sp = to_osi(f".SPXW{exp6}P{p_high}")
@@ -361,15 +350,13 @@ def main():
     side_name  = "SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"
     order_type = "NET_CREDIT" if is_credit else "NET_DEBIT"
 
-    # size
     qty = int(os.environ.get("QTY_OVERRIDE","").strip() or QTY_FIXED)
     if qty < 1:
         row=[datetime.utcnow().isoformat()+"Z", source, "SPX", last_px, sig_date, "ABORT",
              side_name, "", order_type, "",
              legs[0],legs[1],legs[2],legs[3], "", "ABORT_QTY_LT_1"]
-        one_log(svc, sheet_id_num, sheet_id, SHEET_TAB, row); print("qty<1"); sys.exit(0)
+        one_log(svc, sheet_id_num, sheet_id, "schwab", row); print("qty<1"); sys.exit(0)
 
-    # --- build order payload for given price & quantity ---
     def order_payload(price: float, q: int):
         return {
             "orderType": order_type,
@@ -386,9 +373,7 @@ def main():
             ]
         }
 
-    # ---- find existing candidate & clean overlaps ----
     active_oid, active_status, overlaps = pick_active_and_overlaps(c, acct_hash, canon)
-    # cancel any *overlap* tickets (not exact); leave the exact one to replace
     for oid in overlaps:
         try:
             url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
@@ -414,14 +399,12 @@ def main():
         loc=r.headers.get("Location","")
         return loc.rstrip("/").split("/")[-1] if loc else ""
 
-    # --- place or replace ---
     replacements = 0
     canceled = 0
     steps=[]
     filled_total = 0
 
     def ensure_active(price: float, to_place: int):
-        """If we have an active OID, try PUT (replace). Else POST (place). Return oid."""
         nonlocal active_oid, replacements, canceled
         px = clamp_tick(price)
         if active_oid:
@@ -433,20 +416,17 @@ def main():
                     replacements += 1
                     active_oid = new_id
                 else:
-                    # count it as a replace anyway for traceability
                     replacements += 1
                 return active_oid
             except Exception as e:
-                # fallback: cancel then place
                 try:
                     url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{active_oid}"
                     schwab_delete(c,url,tag=f"CANCEL_FALLBACK:{active_oid}")
                     canceled += 1
                 except Exception:
                     pass
-                active_oid = None  # will place fresh below
+                active_oid = None
 
-        # POST a new one
         url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
         r=schwab_post_json(c,url,order_payload(px,to_place),tag=f"PLACE@{px:.2f}x{to_place}")
         active_oid = parse_order_id_from_response(r)
@@ -466,7 +446,6 @@ def main():
             time.sleep(1)
         return "WORKING"
 
-    # ladder rungs
     def rung(px):
         nonlocal filled_total
         to_place = max(0, qty - filled_total)
@@ -475,24 +454,20 @@ def main():
         steps.append(f"{clamp_tick(px):.2f}@{to_place}")
         return wait_loop(STEP_WAIT)
 
-    # Step 0: start
-    status = rung(CREDIT_START if is_credit else DEBIT_START)
+    status = rung(CREDIT_START if True else DEBIT_START)
     if status != "FILLED":
         m1 = mid_condor(c, legs)
-        if m1 is not None:
-            status = rung(m1)
+        if m1 is not None: status = rung(m1)
     if status != "FILLED":
         m2 = mid_condor(c, legs)
-        if m2 is not None:
-            status = rung(m2)
+        if m2 is not None: status = rung(m2)
     if status != "FILLED":
         pm = m2 if ('m2' in locals() and m2 is not None) else (m1 if ('m1' in locals()) else None)
-        step_px = clamp_tick((pm + (-0.05 if is_credit else +0.05)) if pm is not None else (CREDIT_START if is_credit else DEBIT_START))
-        if is_credit: step_px = max(CREDIT_FLOOR, min(CREDIT_START, step_px))
-        else:         step_px = max(DEBIT_START,  min(DEBIT_CEIL,   step_px))
+        step_px = clamp_tick((pm - 0.05) if pm is not None else CREDIT_START)
+        step_px = max(CREDIT_FLOOR, min(CREDIT_START, step_px))
         status = rung(step_px)
     if status != "FILLED":
-        bound_px = clamp_tick(CREDIT_FLOOR if is_credit else DEBIT_CEIL)
+        bound_px = clamp_tick(CREDIT_FLOOR)
         status = rung(bound_px)
         if FINAL_CANCEL and active_oid:
             try:
@@ -502,9 +477,8 @@ def main():
             except Exception:
                 pass
 
-    # ---- final log ----
-    side = "SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"
-    otype = "NET_CREDIT" if is_credit else "NET_DEBIT"
+    side = "SHORT_IRON_CONDOR"
+    otype = "NET_CREDIT"
     trace = "STEPS " + "→".join(steps)
     filled_str = f"FILLED {filled_total}/{qty}"
     repl_str   = f"REPLACED {replacements}"
@@ -518,10 +492,9 @@ def main():
            used_price,
            legs[0],legs[1],legs[2],legs[3],
            oid_for_log, status_txt]
-    one_log(svc, sheet_id_num, sheet_id, SHEET_TAB, row)
+    one_log(svc, sheet_id_num, sheet_id, "schwab", row)
     print(f"FINAL {status_txt} OID={oid_for_log} PRICE_USED={used_price if used_price else 'NA'}")
 
-# ---- entry ----
 def time_gate_ok():
     now=datetime.now(ZoneInfo("America/New_York"))
     return (now.weekday()<5 and now.hour==16 and 8<=now.minute<=14)
