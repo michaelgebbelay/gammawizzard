@@ -2,6 +2,8 @@
 # - FIXED contract count unless overridden via env QTY_OVERRIDE.
 # - No OBP checks, no balance checks.
 # - Logs ladder/price/filled/canceled to Google Sheet tab "schwab".
+# - STRICT cancel-then-place: cancels any overlapping working orders
+#   before placing a new rung.
 
 # ======= MANUAL SIZE (edit this, or override via QTY_OVERRIDE env) =======
 QTY_FIXED = 4
@@ -19,10 +21,8 @@ TICK = 0.05
 WIDTH = 5
 ET = ZoneInfo("America/New_York")
 
-STEP_WAIT = 30      # seconds to wait at each rung
-CANCEL_GRACE = 12   # seconds to wait for cancels to flush
-
-WINDOW_SEC = 180    # unused unless you want an absolute timeout
+STEP_WAIT = 30       # seconds to wait at each rung
+CANCEL_GRACE = 15    # seconds to wait for cancels to flush/persist
 
 CREDIT_START = 2.10
 CREDIT_FLOOR = 1.90
@@ -179,6 +179,27 @@ def mid_condor(c, legs):
     net_bid=(sp_b+sc_b)-(bp_a+bc_a); net_ask=(sp_a+sc_a)-(bp_b+bc_b)
     return (net_bid+net_ask)/2.0
 
+# ===== robust OSI from Schwab instrument =====
+def _osi_from_instrument(ins: dict) -> str | None:
+    """Fallback OSI build from structured fields when symbol isn't parseable."""
+    sym = (ins.get("symbol") or "")
+    try:
+        return to_osi(sym)
+    except Exception:
+        pass
+    exp = ins.get("optionExpirationDate") or ins.get("expirationDate") or ""
+    pc  = (ins.get("putCall") or ins.get("type") or "").upper()
+    strike = ins.get("strikePrice") or ins.get("strike")
+    try:
+        if exp and pc in ("CALL","PUT") and strike is not None:
+            ymd = date.fromisoformat(str(exp)[:10]).strftime("%y%m%d")
+            cp = "C" if pc.startswith("C") else "P"
+            mills = int(round(float(strike)*1000))
+            return "{:<6s}{}{}{:08d}".format("SPXW", ymd, cp, mills)
+    except Exception:
+        pass
+    return None
+
 # ===== positions / orders / guards =====
 def positions_map(c, acct_hash: str):
     url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}"
@@ -188,15 +209,15 @@ def positions_map(c, acct_hash: str):
     for p in (sa.get("positions") or []):
         ins=p.get("instrument",{}) or {}
         if (ins.get("assetType") or "").upper()!="OPTION": continue
-        sym=ins.get("symbol","")
-        try: key=osi_canon(to_osi(sym))
-        except: continue
+        osi = _osi_from_instrument(ins)
+        if not osi: continue
         qty=float(p.get("longQuantity",0))-float(p.get("shortQuantity",0))
         if abs(qty)<1e-9: continue
-        out[key]=out.get(key,0.0)+qty
+        out[osi_canon(osi)]=out.get(osi_canon(osi),0.0)+qty
     return out
 
-def list_matching_open_ids(c, acct_hash: str, canon_set):
+def _working_order_ids(c, acct_hash: str, canon_set, exact: bool):
+    """Return IDs for working orders that (exactly match) or (overlap any) legs."""
     now_et = datetime.now(ET)
     start_et = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
     url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
@@ -211,29 +232,30 @@ def list_matching_open_ids(c, acct_hash: str, canon_set):
         if st not in ("WORKING","QUEUED","PENDING_ACTIVATION","OPEN"): continue
         got=set()
         for leg in (o.get("orderLegCollection") or []):
-            sym=(leg.get("instrument",{}) or {}).get("symbol","")
-            if not sym: continue
-            try: got.add(osi_canon(to_osi(sym)))
-            except: pass
-        if got==canon_set:
+            ins=(leg.get("instrument",{}) or {})
+            osi=_osi_from_instrument(ins)
+            if osi: got.add(osi_canon(osi))
+        if not got: continue
+        match = (got==canon_set) if exact else bool(got & canon_set)
+        if match:
             oid=str(o.get("orderId") or "")
             if oid: out.append(oid)
     return out
 
-def cancel_all_and_wait(c, acct_hash: str, canon_set, grace=CANCEL_GRACE):
+def cancel_related_orders(c, acct_hash: str, canon_set, grace=CANCEL_GRACE):
+    """Cancel ANY working order that overlaps with our 4 legs; wait until none remain."""
     t_end=time.time()+grace
     while True:
-        ids=list_matching_open_ids(c,acct_hash,canon_set)
+        ids=_working_order_ids(c, acct_hash, canon_set, exact=False)
         if not ids: return
         for oid in ids:
             url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
             try: schwab_delete(c,url,tag=f"CANCEL:{oid}")
             except Exception as e: print(f"WARN cancel {oid}: {e}")
         if time.time()>=t_end:
-            ids2=list_matching_open_ids(c,acct_hash,canon_set)
-            if ids2: print(f"WARN lingering orders: {','.join(ids2)}")
+            # best effort; exit after grace
             return
-        time.sleep(0.5)
+        time.sleep(0.8)
 
 # ===== main =====
 def main():
@@ -377,8 +399,8 @@ def main():
             return 0
 
     def place(price: float, q: int) -> str:
-        # Cancel/replace ladder protection
-        cancel_all_and_wait(c, acct_hash, canon)
+        # strict cancel-then-place for any overlapping tickets
+        cancel_related_orders(c, acct_hash, canon)
         url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
         r=schwab_post_json(c,url,order_payload(price, q),tag=f"PLACE@{price:.2f}x{q}")
         try:
@@ -411,11 +433,10 @@ def main():
             last_status_txt = status
             time.sleep(1)
         # timeout at this rung → cancel and count cancels
-        before = list_matching_open_ids(c, acct_hash, canon)
-        cancel_all_and_wait(c, acct_hash, canon)
-        after = list_matching_open_ids(c, acct_hash, canon)
-        canceled_now = max(0, len(set(before) - set(after)))
-        canceled_total += canceled_now
+        before = set(_working_order_ids(c, acct_hash, canon, exact=False))
+        cancel_related_orders(c, acct_hash, canon)
+        after  = set(_working_order_ids(c, acct_hash, canon, exact=False))
+        canceled_total += max(0, len(before - after))
         return last_status_txt or "WORKING"
 
     # Step 0: start
@@ -442,7 +463,7 @@ def main():
         # Step 4: bound, then cancel
         bound_px = clamp_tick(CREDIT_FLOOR if is_credit else DEBIT_CEIL)
         status = rung(bound_px)
-        cancel_all_and_wait(c, acct_hash, canon)
+        cancel_related_orders(c, acct_hash, canon)
 
     # ---- final log ----
     side = "SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"
