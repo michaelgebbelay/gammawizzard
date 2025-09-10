@@ -6,19 +6,21 @@ on:
       mode:
         description: 'PLACER_MODE: NOW | SCHEDULED'
         required: true
-        default: 'SCHEDULED'
-  # If you want the daily schedule, uncomment and let the orchestrator gate the exact window.
+        default: 'NOW'
+  # If you later want GitHub-native scheduling, uncomment:
   # schedule:
-  #   - cron: "10 20 * * 1-5"  # 16:10 ET
+  #   # ~4:10pm ET; the placer itself enforces the 16:08–16:14 window when SCHEDULED
+  #   - cron: "10 20 * * 1-5"
+  #   - cron: "12 20 * * 1-5"
 
 concurrency:
-  group: leocross-${{ github.workflow }}-${{ github.ref }}-${{ github.event.inputs.mode || 'SCHEDULED' }}
-  cancel-in-progress: ${{ github.event.inputs.mode != 'NOW' }}
+  group: leocross-min
+  cancel-in-progress: true
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v4
 
@@ -31,59 +33,50 @@ jobs:
           python -m pip install --upgrade pip
           pip install --quiet schwab-py requests google-api-python-client google-auth google-auth-httplib2
 
-      # ---------- GUARD ----------
-      - id: guard
-        name: LeoCross guard
+      # Optional: debounce if external scheduler misfires within 90s (uncomment to use)
+      # - name: Debounce (skip if a recent run exists)
+      #   env:
+      #     GH_TOKEN: ${{ github.token }}
+      #   run: |
+      #     python - <<'PY'
+      #     import os, sys, json, datetime, urllib.request
+      #     repo = os.environ['GITHUB_REPOSITORY']
+      #     wf   = os.environ['GITHUB_WORKFLOW']
+      #     run_id = os.environ['GITHUB_RUN_ID']
+      #     req = urllib.request.Request(f"https://api.github.com/repos/{repo}/actions/workflows",
+      #                                  headers={"Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+      #                                           "Accept":"application/vnd.github+json"})
+      #     workflows = json.load(urllib.request.urlopen(req)).get('workflows', [])
+      #     wid = next((w['id'] for w in workflows if w.get('name')==wf), None)
+      #     if not wid: sys.exit(0)
+      #     req = urllib.request.Request(
+      #       f"https://api.github.com/repos/{repo}/actions/workflows/{wid}/runs?event=workflow_dispatch&per_page=10",
+      #       headers={"Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+      #                "Accept":"application/vnd.github+json"})
+      #     runs = json.load(urllib.request.urlopen(req)).get('workflow_runs', [])
+      #     cutoff = datetime.datetime.utcnow() - datetime.timedelta(seconds=90)
+      #     for r in runs:
+      #       if str(r.get('id')) == run_id: continue
+      #       t = datetime.datetime.strptime(r['created_at'], "%Y-%m-%dT%H:%M:%SZ")
+      #       if t > cutoff:
+      #         print(f"Debounce: recent run {r['id']} at {r['created_at']}. Exiting.")
+      #         sys.exit(78)
+      #     PY
+
+      - name: LeoCross orchestrator (guard + run)
         env:
-          # Mode
           PLACER_MODE: ${{ github.event.inputs.mode != '' && github.event.inputs.mode || 'SCHEDULED' }}
-
           # Schwab
-          SCHWAB_APP_KEY:     ${{ secrets.SCHWAB_APP_KEY }}
-          SCHWAB_APP_SECRET:  ${{ secrets.SCHWAB_APP_SECRET }}
-          SCHWAB_TOKEN_JSON:  ${{ secrets.SCHWAB_TOKEN_JSON }}
-
+          SCHWAB_APP_KEY: ${{ secrets.SCHWAB_APP_KEY }}
+          SCHWAB_APP_SECRET: ${{ secrets.SCHWAB_APP_SECRET }}
+          SCHWAB_TOKEN_JSON: ${{ secrets.SCHWAB_TOKEN_JSON }}
+          # Sheets
+          GSHEET_ID: ${{ secrets.GSHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           # GammaWizard
           GW_TOKEN:    ${{ secrets.GW_TOKEN }}
           GW_EMAIL:    ${{ secrets.GW_EMAIL }}
           GW_PASSWORD: ${{ secrets.GW_PASSWORD }}
-
-          # Target units
-          QTY_TARGET: "4"
-
-          # Logging
-          PYTHONUNBUFFERED: "1"
-        run: |
-          python scripts/leocross_guard.py
-
-      # ---------- ORCHESTRATOR (routes → PLACER) ----------
-      - name: LeoCross orchestrator
-        if: ${{ steps.guard.outputs.action != 'SKIP' }}
-        env:
-          # Guard outputs
-          ACTION:           ${{ steps.guard.outputs.action }}
-          REASON:           ${{ steps.guard.outputs.reason }}
-          REM_QTY:          ${{ steps.guard.outputs.rem_qty }}
-          LEGS_JSON:        ${{ steps.guard.outputs.legs_json }}
-          CANON_KEY:        ${{ steps.guard.outputs.canon_key }}
-          IS_CREDIT:        ${{ steps.guard.outputs.is_credit }}
-          OPEN_ORDER_IDS:   ${{ steps.guard.outputs.open_order_ids }}
-          SIGNAL_DATE:      ${{ steps.guard.outputs.signal_date }}
-
-          # Mode & target
-          PLACER_MODE:      ${{ github.event.inputs.mode != '' && github.event.inputs.mode || 'SCHEDULED' }}
-          QTY_TARGET:       "4"
-          PLACER_TIMEOUT_SEC: "180"
-
-          # Schwab
-          SCHWAB_APP_KEY:     ${{ secrets.SCHWAB_APP_KEY }}
-          SCHWAB_APP_SECRET:  ${{ secrets.SCHWAB_APP_SECRET }}
-          SCHWAB_TOKEN_JSON:  ${{ secrets.SCHWAB_TOKEN_JSON }}
-
-          # Optional Sheets (non-fatal if missing)
-          GSHEET_ID: ${{ secrets.GSHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-
           PYTHONUNBUFFERED: "1"
         run: |
           python scripts/leocross_orchestrator.py
