@@ -3,9 +3,9 @@
 # - Allows only clean account or full 4-leg alignment (top-up).
 # - Logs decision to Sheets tab "guard".
 # - Calls placer with QTY_OVERRIDE for remaining units.
-# - Duplicate-main sentinel prevents repeated runs if the file is accidentally concatenated.
+# - Duplicate-main sentinel prevents repeated runs if file is ever concatenated.
 
-QTY_TARGET = 4  # target units per trade
+QTY_TARGET = 4  # target units per trade (condors)
 
 import os, sys, json, time, re, pathlib
 from datetime import datetime, date, timezone
@@ -20,6 +20,7 @@ GW_BASE = "https://gandalf.gammawizard.com"
 GW_ENDPOINT = "/rapi/GetLeoCross"
 GUARD_ONLY = (os.environ.get("GUARD_ONLY","0").strip().lower() in ("1","true","yes","y"))
 
+# ===== Sheets helpers =====
 GUARD_TAB = "guard"
 GUARD_HEADERS = [
     "ts","source","symbol","signal_date","decision","detail","open_units","rem_qty",
@@ -34,29 +35,39 @@ def ensure_header_and_get_sheetid(svc, spreadsheet_id: str, tab: str, header: li
         if sh["properties"]["title"] == tab:
             sheet_id_num = sh["properties"]["sheetId"]; break
     if sheet_id_num is None:
-        svc.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id,
-            body={"requests":[{"addSheet":{"properties":{"title":tab}}}]}).execute()
+        svc.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"requests":[{"addSheet":{"properties":{"title":tab}}}]}
+        ).execute()
         meta = svc.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
         sheet_id_num = next(sh["properties"]["sheetId"] for sh in meta["sheets"] if sh["properties"]["title"]==tab)
     got = svc.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=f"{tab}!1:1").execute().get("values",[])
     if not got or got[0] != header:
-        svc.spreadsheets().values().update(spreadsheetId=spreadsheet_id, range=f"{tab}!1:1",
-            valueInputOption="USER_ENTERED", body={"values":[header]}).execute()
+        svc.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id, range=f"{tab}!1:1",
+            valueInputOption="USER_ENTERED", body={"values":[header]}
+        ).execute()
     return sheet_id_num
 
 def top_insert(svc, spreadsheet_id: str, sheet_id_num: int):
-    svc.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id,
-        body={"requests":[{"insertDimension":{"range":{"sheetId":sheet_id_num,"dimension":"ROWS","startIndex":1,"endIndex":2},
-                                               "inheritFromBefore": False}}]}).execute()
+    svc.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={"requests":[{"insertDimension":{
+            "range":{"sheetId":sheet_id_num,"dimension":"ROWS","startIndex":1,"endIndex":2},
+            "inheritFromBefore": False}}]}
+    ).execute()
 
 def guard_log(svc, sheet_id_num, spreadsheet_id: str, row_vals: list):
     try:
         top_insert(svc, spreadsheet_id, sheet_id_num)
-        svc.spreadsheets().values().update(spreadsheetId=spreadsheet_id, range=f"{GUARD_TAB}!A2",
-            valueInputOption="USER_ENTERED", body={"values":[row_vals]}).execute()
+        svc.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id, range=f"{GUARD_TAB}!A2",
+            valueInputOption="USER_ENTERED", body={"values":[row_vals]}
+        ).execute()
     except Exception as e:
         print("ORCH WARN: guard log failed — {}".format(str(e)[:200]))
 
+# ===== utils =====
 def yymmdd(iso: str) -> str:
     d = date.fromisoformat((iso or "")[:10])
     return "{:%y%m%d}".format(d)
@@ -69,7 +80,10 @@ def to_osi(sym: str) -> str:
         or re.match(r'^([A-Z.$^]{1,6})(\d{6})([CP])(\d{8})$', raw)
     if not m: raise ValueError("Cannot parse option symbol: " + sym)
     root, ymd, cp, strike, frac = (m.groups()+("",))[:5]
-    mills = int(strike)*1000 + (int((frac or "0").ljust(3,'0')) if frac else 0) if len(strike)<8 else int(strike)
+    if len(strike)==8 and not frac:
+        mills = int(strike)
+    else:
+        mills = int(strike)*1000 + (int((frac or "0").ljust(3,'0')) if frac else 0)
     return "{:<6s}{}{}{:08d}".format(root, ymd, cp, mills)
 
 def osi_canon(osi: str):
@@ -83,6 +97,7 @@ def iso_z(dt):
 
 def _backoff(i): return 0.6*(2**i)
 
+# ===== Schwab helpers =====
 def schwab_get_json(c, url, params=None, tries=6, tag=""):
     last=""
     for i in range(tries):
@@ -95,10 +110,13 @@ def schwab_get_json(c, url, params=None, tries=6, tag=""):
         time.sleep(_backoff(i))
     raise RuntimeError("SCHWAB_GET_FAIL({}) {}".format(tag, last))
 
-def _osi_from_instrument(ins: dict) -> str | None:
+def _osi_from_instrument(ins: dict):
+    """Robust OSI from Schwab instrument; falls back to structured fields when needed."""
     sym = (ins.get("symbol") or "")
-    try: return to_osi(sym)
-    except Exception: pass
+    try:
+        return to_osi(sym)
+    except Exception:
+        pass
     exp = ins.get("optionExpirationDate") or ins.get("expirationDate") or ""
     pc  = (ins.get("putCall") or ins.get("type") or "").upper()
     strike = ins.get("strikePrice") or ins.get("strike")
@@ -113,33 +131,36 @@ def _osi_from_instrument(ins: dict) -> str | None:
     return None
 
 def positions_map(c, acct_hash: str):
-    url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}"
+    """Return {canon: net_qty} for all options. Positive=long, negative=short."""
+    url="https://api.schwabapi.com/trader/v1/accounts/{}".format(acct_hash)
     j=schwab_get_json(c,url,params={"fields":"positions"},tag="POSITIONS")
     sa=j[0]["securitiesAccount"] if isinstance(j,list) else (j.get("securitiesAccount") or j)
     out={}
     for p in (sa.get("positions") or []):
         ins=p.get("instrument",{}) or {}
-        if (ins.get("assetType") or ins.get("type") or "").upper()!="OPTION": continue
-        osi=_osi_from_instrument(ins)
+        atype = (ins.get("assetType") or ins.get("type") or "").upper()
+        if atype != "OPTION": continue
+        osi = _osi_from_instrument(ins)
         if not osi: continue
         qty=float(p.get("longQuantity",0))-float(p.get("shortQuantity",0))
         if abs(qty)<1e-9: continue
-        out[osi_canon(osi)]=out.get(osi_canon(osi),0.0)+qty
+        out[osi_canon(osi)] = out.get(osi_canon(osi), 0.0) + qty
     return out
 
+# ===== GW =====
 def _gw_timeout():
     try: return int(os.environ.get("GW_TIMEOUT","30"))
     except: return 30
 
 def _sanitize_token(t: str) -> str:
-    t=(t or "").strip().strip('"').strip("'")
+    t = (t or "").strip().strip('"').strip("'")
     return t.split(None,1)[1] if t.lower().startswith("bearer ") else t
 
 def gw_login_token():
     email=os.environ.get("GW_EMAIL",""); pwd=os.environ.get("GW_PASSWORD","")
     if not (email and pwd): raise RuntimeError("GW_LOGIN_MISSING_CREDS")
-    r=requests.post(f"{GW_BASE}/goauth/authenticateFireUser", data={"email":email,"password":pwd}, timeout=_gw_timeout())
-    if r.status_code!=200: raise RuntimeError(f"GW_LOGIN_HTTP_{r.status_code}:{(r.text or '')[:180]}")
+    r=requests.post("{}/goauth/authenticateFireUser".format(GW_BASE), data={"email":email,"password":pwd}, timeout=_gw_timeout())
+    if r.status_code!=200: raise RuntimeError("GW_LOGIN_HTTP_{}:{}".format(r.status_code, (r.text or "")[:180]))
     j=r.json(); t=j.get("token")
     if not t: raise RuntimeError("GW_LOGIN_NO_TOKEN")
     return t
@@ -147,17 +168,18 @@ def gw_login_token():
 def gw_get_leocross():
     tok=_sanitize_token(os.environ.get("GW_TOKEN","") or "")
     def hit(t):
-        h={"Accept":"application/json","Authorization":f"Bearer {_sanitize_token(t)}","User-Agent":"gw-orchestrator/1.4"}
-        return requests.get(f"{GW_BASE.rstrip('/')}/{GW_ENDPOINT.lstrip('/')}", headers=h, timeout=_gw_timeout())
+        h={"Accept":"application/json","Authorization":"Bearer {}".format(_sanitize_token(t)),"User-Agent":"gw-orchestrator/1.4"}
+        return requests.get("{}/{}".format(GW_BASE.rstrip("/"), GW_ENDPOINT.lstrip("/")), headers=h, timeout=_gw_timeout())
     r=hit(tok) if tok else None
     if (r is None) or (r.status_code in (401,403)): r=hit(gw_login_token())
-    if r.status_code!=200: raise RuntimeError(f"GW_HTTP_{r.status_code}:{(r.text or '')[:180]}")
+    if r.status_code!=200: raise RuntimeError("GW_HTTP_{}:{}".format(r.status_code, (r.text or "")[:180]))
     return r.json()
 
 def extract_trade(j):
     if isinstance(j,dict):
         if "Trade" in j:
-            tr=j["Trade"]; return tr[-1] if isinstance(tr,list) and tr else tr if isinstance(tr,dict) else {}
+            tr=j["Trade"]; 
+            return tr[-1] if isinstance(tr,list) and tr else tr if isinstance(tr,dict) else {}
         keys=("Date","TDate","Limit","CLimit","Cat1","Cat2")
         if any(k in j for k in keys): return j
         for v in j.values():
@@ -170,20 +192,22 @@ def extract_trade(j):
             if t: return t
     return {}
 
+# ===== condor math =====
 def condor_units_open(pos_map, legs):
-    b1 = max(0.0,  pos_map.get(osi_canon(legs[0]), 0.0))
-    b2 = max(0.0,  pos_map.get(osi_canon(legs[3]), 0.0))
-    s1 = max(0.0, -pos_map.get(osi_canon(legs[1]), 0.0))
-    s2 = max(0.0, -pos_map.get(osi_canon(legs[2]), 0.0))
+    b1 = max(0.0,  pos_map.get(osi_canon(legs[0]), 0.0))  # long put wing
+    b2 = max(0.0,  pos_map.get(osi_canon(legs[3]), 0.0))  # long call wing
+    s1 = max(0.0, -pos_map.get(osi_canon(legs[1]), 0.0))  # short put inner
+    s2 = max(0.0, -pos_map.get(osi_canon(legs[2]), 0.0))  # short call inner
     return int(min(b1, b2, s1, s2))
 
 def print_guard_snapshot(pos, legs, is_credit):
-    labels=[("BUY_PUT",legs[0],-1),("SELL_PUT",legs[1],+1),("SELL_CALL",legs[2],+1),("BUY_CALL",legs[3],-1)]
-    print(f"ORCH GUARD SNAPSHOT ({'CREDIT' if is_credit else 'DEBIT'}):")
+    labels = [("BUY_PUT",legs[0],-1),("SELL_PUT",legs[1],+1),("SELL_CALL",legs[2],+1),("BUY_CALL",legs[3],-1)]
+    print("ORCH GUARD SNAPSHOT ({}):".format("CREDIT" if is_credit else "DEBIT"))
     for name, osi, sign in labels:
-        can=osi_canon(osi); cur=pos.get(can,0.0)
-        print(f"  {name:10s} {osi}  acct_qty={cur:+g}  sign={sign:+d}")
+        can = osi_canon(osi); cur = pos.get(can, 0.0)
+        print("  {:10s} {}  acct_qty={:+g}  sign={:+d}".format(name, osi, cur, sign))
 
+# ===== main =====
 def main():
     # Sheets init (non-fatal)
     svc=None; sheet_id=None; guard_sheet_id=None
@@ -293,7 +317,7 @@ def main():
             log("SKIP","AT_OR_ABOVE_TARGET", legs, acct_snapshot, units_open, 0); return 0
         log("ALLOW","TOP_UP", legs, acct_snapshot, units_open, rem_qty)
     else:
-        details="; ".join([f\"{l} {o} acct_qty={q:+g}\" for (l,o,q) in present_legs])
+        details="; ".join([f"{l} {o} acct_qty={q:+g}" for (l,o,q) in present_legs])
         print(f"ORCH SKIP: PARTIAL_OVERLAP — {details}")
         log("SKIP",f"PARTIAL_OVERLAP — {details}", legs, acct_snapshot, "", ""); return 0
 
