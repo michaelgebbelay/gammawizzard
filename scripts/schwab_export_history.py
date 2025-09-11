@@ -1,27 +1,18 @@
-# Schwab → Google Sheets exporter
+# Schwab → Google Sheets exporter (batched writes)
 # - Pulls recent orders and execution fills
-# - Writes to 2 tabs: "orders" (one row per order), "fills" (one row per execution event)
+# - Writes to 2 tabs: "orders" (one row per order), "fills" (one row per execution)
 # - Idempotent: skips orders already present in the Sheet
-#
-# Secrets (env):
-#   SCHWAB_APP_KEY, SCHWAB_APP_SECRET, SCHWAB_TOKEN_JSON
-#   GSHEET_ID, GOOGLE_SERVICE_ACCOUNT_JSON
-# Optional (env):
-#   DAYS_BACK (default 10), SYMBOL_FILTER (default "SPX")
-#
-# Sheet schemas:
-#   orders: ts_entered, ts_last, order_id, status, qty, filled_qty, side, order_type, limit_price,
-#           complex, buy_put, sell_put, sell_call, buy_call, fills_count, source
-#   fills : ts_fill, order_id, qty_this_fill, net_est, legs_json
+# - BATCHED: only 2 writes per tab (insert N rows once, then values.update once)
 
 import os, sys, json, time, re
 from datetime import datetime, timedelta, date, timezone
 from zoneinfo import ZoneInfo
-import requests
 
-from schwab.auth import client_from_token_file
-from google.oauth2 import service_account
+import requests
 from googleapiclient.discovery import build as gbuild
+from googleapiclient.errors import HttpError
+from google.oauth2 import service_account
+from schwab.auth import client_from_token_file
 
 ET = ZoneInfo("America/New_York")
 
@@ -39,7 +30,7 @@ FILLS_HEADERS = [
     "ts_fill","order_id","qty_this_fill","net_est","legs_json"
 ]
 
-# ---------- small utils ----------
+# ---------- utilities ----------
 def iso_z(dt):
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -54,11 +45,9 @@ def _b64_or_raw_to_file(secret: str, path: str):
         pass
     open(path,"w").write(s)
 
-def _sanitize_token(t: str) -> str:
-    t = (t or "").strip().strip('"').strip("'")
-    return t.split(None,1)[1] if t.lower().startswith("bearer ") else t
-
-def _backoff(i): return 0.6*(2**i)
+def _backoff(i): 
+    # 0.6, 1.2, 2.4, 4.8, 9.6 ...
+    return 0.6*(2**i)
 
 def yymmdd(iso: str) -> str:
     d = date.fromisoformat((iso or "")[:10])
@@ -85,7 +74,7 @@ def strike_from_osi(osi: str) -> float:
     return int(osi[-8:]) / 1000.0
 
 def _osi_from_instrument(ins: dict) -> str | None:
-    """Build robust OSI from Schwab instrument; fallback to structured fields."""
+    """Robust OSI from Schwab instrument; fallback to structured fields."""
     sym = (ins.get("symbol") or "")
     try:
         return to_osi(sym)
@@ -122,26 +111,51 @@ def ensure_header_and_get_sheetid(svc, spreadsheet_id: str, tab: str, header: li
             valueInputOption="USER_ENTERED", body={"values":[header]}).execute()
     return sheet_id_num
 
-def top_insert(svc, spreadsheet_id: str, sheet_id_num: int):
-    svc.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id,
-        body={"requests":[{"insertDimension":{"range":{"sheetId":sheet_id_num,"dimension":"ROWS","startIndex":1,"endIndex":2},
-                                               "inheritFromBefore": False}}]}).execute()
-
-def append_top(svc, sheet_id_num, spreadsheet_id: str, tab: str, row_vals: list):
-    top_insert(svc, spreadsheet_id, sheet_id_num)
-    svc.spreadsheets().values().update(spreadsheetId=spreadsheet_id, range=f"{tab}!A2",
-        valueInputOption="USER_ENTERED", body={"values":[row_vals]}).execute()
-
 def get_existing_order_ids(svc, spreadsheet_id: str, tab: str) -> set:
+    # Column C is order_id (1-based). Pull a large slice once.
     try:
-        # Column C is order_id per our schema (1-based index)
-        resp = svc.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=f"{tab}!C2:C100000").execute()
+        resp = svc.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id, range=f"{tab}!C2:C100000"
+        ).execute()
         vals = resp.get("values", [])
         return { (r[0] if r else "").strip() for r in vals if r }
     except Exception:
         return set()
 
-# ---------- Schwab HTTP helpers ----------
+def sheets_write_with_retry(fn, *args, **kwargs):
+    # Small helper to tolerate a bursty minute — one retry after a wait
+    try:
+        return fn(*args, **kwargs).execute()
+    except HttpError as e:
+        if e.resp.status == 429:
+            time.sleep(30)
+            return fn(*args, **kwargs).execute()
+        raise
+
+def bulk_insert_top(svc, spreadsheet_id: str, sheet_id_num: int, tab: str, rows: list[list]):
+    """Insert N rows at row 2 and write all values in a single shot."""
+    if not rows:
+        return
+    n = len(rows)
+    # One write: insert a block of rows at the top
+    sheets_write_with_retry(
+        svc.spreadsheets().batchUpdate,
+        spreadsheetId=spreadsheet_id,
+        body={"requests":[{"insertDimension":{
+            "range":{"sheetId":sheet_id_num,"dimension":"ROWS","startIndex":1,"endIndex":1+n},
+            "inheritFromBefore": False
+        }}]}
+    )
+    # Second write: put all values
+    sheets_write_with_retry(
+        svc.spreadsheets().values().update,
+        spreadsheetId=spreadsheet_id,
+        range=f"{tab}!A2",
+        valueInputOption="USER_ENTERED",
+        body={"values": rows}
+    )
+
+# ---------- Schwab HTTP ----------
 def schwab_get_json(c, url, params=None, tries=5, tag=""):
     last=""
     for i in range(tries):
@@ -189,34 +203,35 @@ def main():
     params = {"fromEnteredTime": iso_z(start), "toEnteredTime": iso_z(now), "maxResults": 500}
     orders = schwab_get_json(c, url, params=params, tag="ORDERS") or []
 
-    count_orders=0; count_fills=0
+    # Build in-memory rows to batch-write
+    order_rows = []
+    fill_rows  = []
 
     for o in orders:
-        # Filter: option complex orders only; and by symbol root
         legs = (o.get("orderLegCollection") or [])
-        if not legs: continue
+        if not legs: 
+            continue
+        # Only option orders (ignore equities, etc.)
         if not any(((leg.get("instrument") or {}).get("assetType","").upper() == "OPTION") for leg in legs):
             continue
-        # Root filter (cheap)
+
+        # Filter by root symbol presence (cheap)
         if symbol_filter:
             ok_any=False
             for leg in legs:
-                ins=(leg.get("instrument") or {})
-                sym=(ins.get("symbol") or "")
+                sym=((leg.get("instrument") or {}).get("symbol") or "")
                 if symbol_filter in sym.upper():
                     ok_any=True; break
             if not ok_any:
                 continue
 
         order_id = str(o.get("orderId") or "")
-        if not order_id: continue
+        if not order_id:
+            continue
 
-        if order_id in existing:
-            # already logged
-            pass
-        else:
-            # build legs OSI in canonical order: buy_put, sell_put, sell_call, buy_call
-            # collect all leg OSIs + instructions
+        # --- ORDERS ROW (only once per order) ---
+        if order_id not in existing:
+            # Collect OSIs & instructions
             leg_objs=[]
             for leg in legs:
                 ins=(leg.get("instrument") or {})
@@ -224,17 +239,15 @@ def main():
                 if not osi: continue
                 instr=(leg.get("instruction") or "").upper()
                 leg_objs.append((osi, instr))
-            # separate P / C
+
+            # Sort legs P/C and by strike to produce canonical IC order
             puts = [x for x in leg_objs if x[0][12]=="P"]
             calls= [x for x in leg_objs if x[0][12]=="C"]
-            # order by strike
             puts.sort(key=lambda x: strike_from_osi(x[0]))
             calls.sort(key=lambda x: strike_from_osi(x[0]))
-            # infer buy/sell per instruction
+
             def pick_puts():
                 if len(puts)>=2:
-                    # lower strike is wing; for credit, wing is BUY
-                    # but we just place by instruction labels
                     bp = next((p[0] for p in puts if "BUY"  in p[1]), puts[0][0])
                     sp = next((p[0] for p in puts if "SELL" in p[1]), puts[-1][0])
                     return bp, sp
@@ -245,10 +258,11 @@ def main():
                 if len(calls)>=2:
                     bc = next((c[0] for c in calls if "BUY"  in c[1]), calls[-1][0])
                     sc = next((c[0] for c in calls if "SELL" in c[1]), calls[0][0])
-                    return sc, bc   # return (sell_call, buy_call) for readability below
+                    return sc, bc  # (sell_call, buy_call)
                 elif len(calls)==1:
                     return calls[0][0], ""
                 return "",""
+
             bp, sp = pick_puts()
             sc, bc = pick_calls()
 
@@ -256,11 +270,10 @@ def main():
             qty    = int(round(float(o.get("quantity") or 0)))
             fqty   = int(round(float(o.get("filledQuantity") or 0)))
             side   = (o.get("complexOrderStrategyType") or o.get("orderStrategyType") or "").upper()
-            order_type = (o.get("orderType") or "").upper()     # NET_CREDIT / NET_DEBIT / LIMIT etc
+            order_type = (o.get("orderType") or "").upper()
             price  = o.get("price") if isinstance(o.get("price"), (int,float,str)) else ""
             complex_name = (o.get("complexOrderStrategyType") or "").upper()
 
-            # timestamps (best-effort in API)
             ts_entered = o.get("enteredTime") or o.get("enteredTimeUTC") or o.get("orderEnteredTime") or ""
             ts_last    = o.get("closeTime") or o.get("lastUpdateTime") or ts_entered or ""
 
@@ -270,15 +283,15 @@ def main():
                    bp, sp, sc, bc,
                    len(o.get("orderActivityCollection") or []),
                    "SCHWAB_API"]
-            append_top(svc, orders_sid, sheet_id, ORDERS_TAB, row)
+            order_rows.append(row)
             existing.add(order_id)
-            count_orders += 1
 
-        # Fills: one row per execution event
+        # --- FILLS ROWS (zero or more per order) ---
         acts = (o.get("orderActivityCollection") or [])
-        if not acts: continue
+        if not acts:
+            continue
 
-        # map legId -> instruction to compute net_est
+        # legId -> instruction map for net estimate
         leg_instr = {}
         for idx, leg in enumerate(legs):
             lid = leg.get("legId")
@@ -287,8 +300,9 @@ def main():
 
         for a in acts:
             et = (a.get("executionLegs") or [])
-            if not et: continue
-            # qty in this event (min across legs)
+            if not et: 
+                continue
+            # qty in this event
             try:
                 qty_this = int(min([int(round(float(x.get("quantity") or 0))) for x in et if (x.get("quantity") is not None)]))
             except Exception:
@@ -297,7 +311,8 @@ def main():
             net = 0.0; have_any=False
             for x in et:
                 px = x.get("price")
-                if px is None: continue
+                if px is None: 
+                    continue
                 try:
                     px = float(px)
                 except Exception:
@@ -309,14 +324,17 @@ def main():
                 elif "BUY" in instr:
                     net -= px; have_any=True
             net_str = ("" if not have_any else f"{net:.2f}")
-            # fill ts (prefer explicit time on execution leg)
             ts = (et[0].get("time") or a.get("time") or a.get("activityTs") or "")
-            legs_json = json.dumps(et)[:950]  # avoid cell bloat
-            rowf=[ts, str(o.get("orderId") or ""), qty_this, net_str, legs_json]
-            append_top(svc, fills_sid, sheet_id, FILLS_TAB, rowf)
-            count_fills += 1
+            legs_json = json.dumps(et)[:950]  # avoid huge cell
+            fill_rows.append([ts, order_id, qty_this, net_str, legs_json])
 
-    print(f"EXPORT DONE: inserted {count_orders} orders, {count_fills} fills")
+    # ---- BATCH WRITES ----
+    if order_rows:
+        bulk_insert_top(svc, sheet_id, orders_sid, ORDERS_TAB, order_rows)
+    if fill_rows:
+        bulk_insert_top(svc, sheet_id, fills_sid, FILLS_TAB,  fill_rows)
+
+    print(f"EXPORT DONE: inserted {len(order_rows)} orders, {len(fill_rows)} fills")
 
 if __name__=="__main__":
     sys.exit(main())
