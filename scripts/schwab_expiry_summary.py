@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-# Schwab → Google Sheets: TRADE transactions grouped by option EXPIRATION DATE.
-# - Only uses Schwab/TOS data (no estimates). Uses transaction["netAmount"] (fees included).
-# - Calls Schwab transactions endpoint with ONLY start/end; we filter locally (avoids 400s).
+# Schwab → Google Sheets: Option transactions grouped by option EXPIRATION DATE.
+# - Uses Schwab/TOS data only (no estimates). Uses transaction["netAmount"] and fee rows.
+# - Calls Schwab transactions endpoint with ONLY start/end to avoid 400s.
 # - Produces two tabs:
-#     sw_txn_raw         : one row per Schwab transaction (TRADE)
-#     sw_expiry_summary  : totals by option expiration (YYYY-MM-DD)
+#     sw_txn_raw         : one row per transaction (TRADE/ASSIGNMENT/EXERCISE that includes option legs)
+#     sw_expiry_summary  : totals by expiration (YYYY-MM-DD)
 #
 # Env:
 #   GSHEET_ID, GOOGLE_SERVICE_ACCOUNT_JSON
 #   SCHWAB_APP_KEY, SCHWAB_APP_SECRET, SCHWAB_TOKEN_JSON
-#   DAYS_BACK (e.g. "14"), SYMBOL_FILTER (e.g. "SPX" or "")
-#   DEBUG (optional: "1" to print diagnostics)
+#   DAYS_BACK (e.g. "14", max 60)
+#   DEBUG (optional "1" for diagnostics)
 
 import os, sys, json, base64, collections
 from datetime import datetime, timedelta, timezone, date
@@ -33,7 +33,7 @@ RAW_TAB = "sw_txn_raw"
 SUM_TAB = "sw_expiry_summary"
 
 RAW_HEADERS = [
-    "ts_trade_utc","order_id","net_amount","commissions","fees_other",
+    "ts_trade_utc","order_id","type","net_amount","commissions","fees_other",
     "legs_count","exp_ymd","underlyings","leg_instructions","account_id"
 ]
 SUM_HEADERS = [
@@ -110,7 +110,7 @@ def schwab_client():
 
 # ------------- Transactions fetch -------------
 def clamp_days_back(n: int) -> int:
-    # Schwab "transactions" allows up to ~60-day windows. Keep simple: cap to 60.
+    # Schwab transactions allows up to ~60-day windows. Keep simple: cap to 60.
     return max(1, min(60, n))
 
 def fetch_trades_for_acct(c, acct_hash: str, start_dt: datetime, end_dt: datetime) -> List[Dict[str,Any]]:
@@ -141,10 +141,12 @@ def fetch_all_trades(c, acct_hashes: List[str], days_back: int) -> List[Dict[str
     if DEBUG:
         typs = collections.Counter([str(x.get("type","")).upper() for x in all_tx])
         print(f"DEBUG: window {start_dt.isoformat()} → {end_dt.isoformat()}  raw_count={len(all_tx)} type_hist={dict(typs)}")
-    # Keep only TRADE
-    trades = [x for x in all_tx if str(x.get("type","")).upper() == "TRADE"]
+    # Keep only types we care about; many brokers record assignments/exercises separately
+    keep_types = {"TRADE","OPTION_ASSIGNMENT","OPTION_EXERCISE"}
+    trades = [x for x in all_tx if str(x.get("type","")).upper() in keep_types]
     if DEBUG:
-        print(f"DEBUG: kept TRADE count={len(trades)}")
+        typs_k = collections.Counter([str(x.get("type","")).upper() for x in trades])
+        print(f"DEBUG: kept types={dict(typs_k)} kept_count={len(trades)}")
     return trades
 
 # ------------- Option helpers -------------
@@ -210,35 +212,16 @@ def item_instruction(item: Dict[str,Any]) -> str:
     except Exception:
         return ""
 
-def item_matches_filter(item: Dict[str,Any], want: str) -> bool:
-    if not want: return True
-    ins = item.get("instrument") or {}
-    fields = [
-        ins.get("symbol") or "",
-        ins.get("underlyingSymbol") or "",
-        ins.get("description") or "",
-        str(ins.get("securityId") or ""),
-        str(item.get("description") or "")
-    ]
-    joined = " ".join(fields).upper()
-    return want in joined
-
-# ------------- Transform & aggregate -------------
-def transform_raw_rows(trades: List[Dict[str,Any]], symbol_contains: str) -> Tuple[List[List[Any]], List[List[Any]]]:
+# ------------- Transform & aggregate (no symbol filter at all) -------------
+def transform_raw_rows(trades: List[Dict[str,Any]]) -> Tuple[List[List[Any]], List[List[Any]]]:
     raw_rows: List[List[Any]] = []
     by_exp: Dict[str, Dict[str,Any]] = {}
-
-    want = (symbol_contains or "").strip().upper()
-
     kept = 0
+
     for tx in trades:
         items_all = extract_items(tx)
         items = [i for i in items_all if is_option_item(i)]
         if not items:
-            continue
-
-        # robust client-side filter (symbol, underlyingSymbol, description, etc.)
-        if want and not any(item_matches_filter(i, want) for i in items):
             continue
 
         # Expiration: require all option legs share the same date
@@ -287,7 +270,7 @@ def transform_raw_rows(trades: List[Dict[str,Any]], symbol_contains: str) -> Tup
             pass
 
         raw_rows.append([
-            ts_norm, order_id, net, commissions, other_fees,
+            ts_norm, order_id, str(tx.get("type","")).upper(), net, commissions, other_fees,
             len(items), exp_ymd, unds_txt, "; ".join(leg_instr), str(tx.get("_acctHash") or tx.get("accountId") or tx.get("account") or "")
         ])
 
@@ -336,7 +319,6 @@ def main() -> int:
         days_back = int((os.environ.get("DAYS_BACK","14") or "14").strip())
     except Exception:
         days_back = 14
-    #symbol_filter = os.environ.get("SYMBOL_FILTER","").strip()
 
     # Schwab client across all accounts on this token
     try:
@@ -345,7 +327,7 @@ def main() -> int:
         print(f"ABORT: Schwab client init failed — {e}")
         return 1
 
-    # Fetch trades
+    # Fetch transactions
     try:
         trades = fetch_all_trades(c, acct_hashes, days_back)
     except Exception as e:
@@ -353,7 +335,7 @@ def main() -> int:
         return 1
 
     # Transform
-    raw_rows, sum_rows = transform_raw_rows(trades, symbol_filter)
+    raw_rows, sum_rows = transform_raw_rows(trades)
 
     # Sheets write
     try:
