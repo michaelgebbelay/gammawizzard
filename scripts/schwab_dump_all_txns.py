@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
 """
-Schwab → Sheets raw transaction dump (no filters).
-- Auth to Schwab using your token JSON secret.
-- Fetch transactions for DAYS_BACK with resilient parameter shapes.
-- Flatten to clean columns (no JSON blobs).
-- Single write to tab 'sw_txn_raw' to avoid Sheets rate limits.
+Schwab → Sheets raw transaction dump (no filters), robust to Schwab ZonedDateTime requirements.
+
+- Uses startDate/endDate as ZonedDateTime (tries ET with offset, ET w/o colon, and UTC Z).
+- Chunks the pull window to avoid server-side limits.
+- Flattens to columns (no JSON blobs) to keep 'text-to-columns' style.
+- Single overwrite write to 'sw_txn_raw' to avoid Sheets rate limits.
+
+Env:
+  GSHEET_ID, GOOGLE_SERVICE_ACCOUNT_JSON
+  SCHWAB_APP_KEY, SCHWAB_APP_SECRET, SCHWAB_TOKEN_JSON (JSON or base64(JSON))
+  DAYS_BACK (optional, default 60)
 """
 
-import os, sys, json, base64, re
+import os, sys, json, base64, re, time
 from datetime import datetime, timedelta, timezone, date
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
+from zoneinfo import ZoneInfo
 import requests
 from schwab.auth import client_from_token_file
 from google.oauth2 import service_account
@@ -23,15 +30,15 @@ RAW_HEADERS = [
     "ts", "txn_id", "type", "sub_type", "description",
     # instrument
     "symbol", "underlying", "exp_primary", "strike", "put_call",
-    # economics (from Schwab only; no estimates)
+    # economics (Schwab fields only; no estimates)
     "quantity", "price", "amount", "net_amount", "commissions", "fees_other",
     # misc
     "source"
 ]
 
-def iso_z(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+ET = ZoneInfo("America/New_York")
 
+# ---------- Sheets helpers ----------
 def sheets_client():
     sid = os.environ["GSHEET_ID"]
     sa_json = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
@@ -60,14 +67,14 @@ def ensure_tab_with_header(svc, sid: str, tab: str, headers: List[str]) -> None:
         ).execute()
 
 def overwrite_rows(svc, sid: str, tab: str, headers: List[str], rows: List[List[Any]]) -> None:
-    body = {"values":[headers] + rows}
     svc.spreadsheets().values().update(
         spreadsheetId=sid,
         range=f"{tab}!A1",
         valueInputOption="USER_ENTERED",
-        body=body
+        body={"values":[headers] + rows}
     ).execute()
 
+# ---------- Schwab auth ----------
 def decode_token_to_path() -> str:
     token_env = os.environ.get("SCHWAB_TOKEN_JSON","") or ""
     token_path = "schwab_token.json"
@@ -85,18 +92,82 @@ def schwab_client():
     token_path = decode_token_to_path()
     app_key = os.environ["SCHWAB_APP_KEY"]
     app_secret = os.environ["SCHWAB_APP_SECRET"]
-    # Positional args to avoid package keyword drift
+    # Use positional form (pkg sometimes changes keyword names)
     c = client_from_token_file(token_path, app_key, app_secret)
     r = c.get_account_numbers(); r.raise_for_status()
     acct_hash = r.json()[0]["hashValue"]
     return c, acct_hash
 
+# ---------- time/format helpers ----------
+def start_of_day(dt: datetime, tz=ET) -> datetime:
+    return dt.astimezone(tz).replace(hour=0, minute=0, second=0, microsecond=0)
+
+def end_of_day(dt: datetime, tz=ET) -> datetime:
+    return dt.astimezone(tz).replace(hour=23, minute=59, second=59, microsecond=0)
+
+def fmt_et_with_colon(dt: datetime) -> str:
+    # 2025-09-12T00:00:00-04:00
+    local = dt.astimezone(ET)
+    s = local.strftime("%Y-%m-%dT%H:%M:%S%z")  # -0400
+    return f"{s[:-2]}:{s[-2:]}"               # -> -04:00
+
+def fmt_et_no_colon(dt: datetime) -> str:
+    # 2025-09-12T00:00:00-0400
+    return dt.astimezone(ET).strftime("%Y-%m-%dT%H:%M:%S%z")
+
+def fmt_utc_z(dt: datetime) -> str:
+    # 2025-09-12T00:00:00Z
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+# ---------- transaction fetch (robust param shapes + chunking) ----------
+def get_txns_chunk(c, acct_hash: str, dt0: datetime, dt1: datetime) -> List[Dict[str, Any]]:
+    """
+    Try the 3 most common ZonedDateTime shapes Schwab accepts:
+      1) ET with colon offset:  2025-09-12T00:00:00-04:00
+      2) ET without colon:      2025-09-12T00:00:00-0400
+      3) UTC Z:                 2025-09-12T00:00:00Z
+    """
+    url = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/transactions"
+    shapes = [
+        ("ET_COLON",  fmt_et_with_colon(start_of_day(dt0)), fmt_et_with_colon(end_of_day(dt1))),
+        ("ET_NOCOL",  fmt_et_no_colon(start_of_day(dt0)),   fmt_et_no_colon(end_of_day(dt1))),
+        ("UTC_Z",     fmt_utc_z(start_of_day(dt0)),         fmt_utc_z(end_of_day(dt1))),
+    ]
+    last_err = ""
+    for tag, s0, s1 in shapes:
+        params = {"startDate": s0, "endDate": s1}
+        try:
+            r = c.session.get(url, params=params, timeout=30)
+            if r.status_code == 200:
+                j = r.json()
+                if isinstance(j, list): return j
+                if isinstance(j, dict) and "transactions" in j: return j.get("transactions") or []
+                return []
+            last_err = f"{r.status_code}:{(r.text or '')[:160]}"
+            print(f"NOTE: txns shape={tag} → {last_err}")
+        except Exception as e:
+            last_err = f"EXC:{e}"
+            print(f"NOTE: txns shape={tag} exception: {e}")
+        time.sleep(0.4)
+    raise RuntimeError(f"transactions fetch failed for chunk — {last_err}")
+
+def get_txns_resilient(c, acct_hash: str, start_dt: datetime, end_dt: datetime) -> List[Dict[str, Any]]:
+    # chunk by ~30 days to stay friendly
+    txns: List[Dict[str, Any]] = []
+    cur = start_dt
+    step = timedelta(days=30)
+    while cur <= end_dt:
+        chunk_end = min(cur + step, end_dt)
+        txns += get_txns_chunk(c, acct_hash, cur, chunk_end)
+        cur = chunk_end + timedelta(seconds=1)
+    return txns
+
+# ---------- parsing/flattening ----------
 def safe_float(x) -> Optional[float]:
     try: return float(x)
     except: return None
 
 def parse_exp_from_symbol(sym: str) -> Optional[str]:
-    # Accept OSI-ish symbols like 'SPXW  250910P06500000'
     if not sym: return None
     s = sym.strip().upper()
     m = re.search(r"(20\d{2}-\d{2}-\d{2})", s)
@@ -123,6 +194,7 @@ def explode_txn(txn: Dict[str, Any]) -> List[List[Any]]:
     subtype = str(txn.get("subType") or "")
     desc = str(txn.get("description") or "")
 
+    # commissions & other fees
     fees_total = 0.0
     comm_total = 0.0
     if isinstance(txn.get("fees"), dict):
@@ -176,47 +248,7 @@ def explode_txn(txn: Dict[str, Any]) -> List[List[Any]]:
 
     return out
 
-def get_txns_resilient(c, acct_hash: str, start_dt: datetime, end_dt: datetime) -> List[Dict[str, Any]]:
-    base = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/transactions"
-
-    def try_get(params: Optional[Dict[str, str]]):
-        try:
-            r = c.session.get(base, params=(params or {}), timeout=25)
-            if r.status_code == 200:
-                j = r.json()
-                if isinstance(j, list): return j
-                if isinstance(j, dict) and "transactions" in j: return j.get("transactions") or []
-                return []
-            print(f"NOTE: txns params={params} → {r.status_code}:{(r.text or '')[:160]}")
-            return None
-        except Exception as e:
-            print(f"NOTE: txns exception params={params}: {e}")
-            return None
-
-    # Try shapes commonly accepted across tenants
-    for params in (
-        {"fromEnteredTime": iso_z(start_dt), "toEnteredTime": iso_z(end_dt)},
-        {"startDate": start_dt.date().isoformat(), "endDate": end_dt.date().isoformat()},
-        None,
-    ):
-        j = try_get(params)
-        if j is not None:
-            if params is None:
-                # client-side window filter if needed
-                out=[]
-                for t in j:
-                    ts = str(t.get("transactionDate") or t.get("time") or t.get("date") or "")
-                    try:
-                        dt = datetime.fromisoformat(ts.replace("Z","+00:00"))
-                        if start_dt <= dt <= end_dt:
-                            out.append(t)
-                    except Exception:
-                        out.append(t)
-                return out
-            return j
-
-    raise RuntimeError("transactions fetch failed (all parameter shapes rejected)")
-
+# ---------- main ----------
 def main() -> int:
     # Sheets
     try:
