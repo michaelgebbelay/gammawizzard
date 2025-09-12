@@ -22,6 +22,27 @@ jobs:
           python -m pip install --upgrade pip
           pip install --quiet google-api-python-client google-auth google-auth-httplib2
 
+      # Optional: quick sanity check that we can auth + see sheet tabs (helps debug)
+      - name: Preflight – list sheet tabs
+        env:
+          GSHEET_ID: ${{ secrets.GSHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          python - <<'PY'
+          import os, json
+          from google.oauth2 import service_account
+          from googleapiclient.discovery import build
+          sid=os.environ["GSHEET_ID"]
+          creds=service_account.Credentials.from_service_account_info(
+              json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]),
+              scopes=["https://www.googleapis.com/auth/spreadsheets"]
+          )
+          svc=build("sheets","v4",credentials=creds)
+          meta=svc.spreadsheets().get(spreadsheetId=sid).execute()
+          tabs=[s["properties"]["title"] for s in meta.get("sheets",[])]
+          print("TABS:", ", ".join(tabs))
+          PY
+
       - name: Read sw_txn_raw → write sw_summary_by_expiry
         env:
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
