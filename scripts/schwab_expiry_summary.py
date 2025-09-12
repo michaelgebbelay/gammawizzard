@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # Schwab → Google Sheets: Option transactions grouped by option EXPIRATION DATE.
-# - Uses Schwab/TOS data only (no estimates). Uses transaction["netAmount"] and fee rows.
-# - Calls Schwab transactions endpoint with ONLY start/end to avoid 400s.
+# - Uses Schwab/TOS data only (no estimates). Uses transaction["netAmount"] + fee rows.
+# - Calls Schwab "transactions" with ONLY start/end (avoids 400s).
+# - Keeps ANY transaction that: (a) contains ≥1 option leg (found recursively), AND (b) has netAmount.
 # - Produces two tabs:
-#     sw_txn_raw         : one row per transaction (TRADE/ASSIGNMENT/EXERCISE that includes option legs)
+#     sw_txn_raw         : one row per transaction kept
 #     sw_expiry_summary  : totals by expiration (YYYY-MM-DD)
 #
 # Env:
@@ -141,18 +142,30 @@ def fetch_all_trades(c, acct_hashes: List[str], days_back: int) -> List[Dict[str
     if DEBUG:
         typs = collections.Counter([str(x.get("type","")).upper() for x in all_tx])
         print(f"DEBUG: window {start_dt.isoformat()} → {end_dt.isoformat()}  raw_count={len(all_tx)} type_hist={dict(typs)}")
-    # Keep only types we care about; many brokers record assignments/exercises separately
-    keep_types = {"TRADE","OPTION_ASSIGNMENT","OPTION_EXERCISE"}
-    trades = [x for x in all_tx if str(x.get("type","")).upper() in keep_types]
-    if DEBUG:
-        typs_k = collections.Counter([str(x.get("type","")).upper() for x in trades])
-        print(f"DEBUG: kept types={dict(typs_k)} kept_count={len(trades)}")
-    return trades
+    return all_tx
 
-# ------------- Option helpers -------------
-def _first(items: List[Any]) -> Any:
-    return items[0] if items else None
+# ------------- Recursive option leg discovery -------------
+def iter_dicts(obj):
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            yield from iter_dicts(v)
+    elif isinstance(obj, list):
+        for it in obj:
+            yield from iter_dicts(it)
 
+def extract_option_items_recursive(tx: Dict[str,Any]) -> List[Dict[str,Any]]:
+    items: List[Dict[str,Any]] = []
+    for d in iter_dicts(tx):
+        if not isinstance(d, dict): continue
+        ins = d.get("instrument")
+        if not isinstance(ins, dict): continue
+        at = (ins.get("assetType") or ins.get("type") or "").upper()
+        if at == "OPTION":
+            items.append(d)
+    return items
+
+# ------------- Helpers for fields -------------
 def to_date_ymd(d: Any) -> Optional[str]:
     if not d: return None
     s = str(d)
@@ -161,17 +174,6 @@ def to_date_ymd(d: Any) -> Optional[str]:
         return f"{int(y):04d}-{int(m):02d}-{int(dd):02d}"
     except Exception:
         return None
-
-def extract_items(tx: Dict[str,Any]) -> List[Dict[str,Any]]:
-    items = tx.get("transactionItems")
-    if isinstance(items, list): return items
-    it = tx.get("transactionItem")
-    return it if isinstance(it, list) else ([] if it is None else [it])
-
-def is_option_item(item: Dict[str,Any]) -> bool:
-    ins = item.get("instrument") or {}
-    at = (ins.get("assetType") or ins.get("type") or "").upper()
-    return at == "OPTION"
 
 def item_expiry_ymd(item: Dict[str,Any]) -> Optional[str]:
     ins = item.get("instrument") or {}
@@ -212,23 +214,39 @@ def item_instruction(item: Dict[str,Any]) -> str:
     except Exception:
         return ""
 
-# ------------- Transform & aggregate (no symbol filter at all) -------------
-def transform_raw_rows(trades: List[Dict[str,Any]]) -> Tuple[List[List[Any]], List[List[Any]]]:
+def norm_ts_to_utc_iso(ts: Any) -> str:
+    s = str(ts or "")
+    if not s: return ""
+    try:
+        return datetime.fromisoformat(s.replace("+0000","+00:00")).astimezone(UTC).isoformat()
+    except Exception:
+        return s
+
+# ------------- Transform & aggregate -------------
+def transform_raw_rows(all_tx: List[Dict[str,Any]]) -> Tuple[List[List[Any]], List[List[Any]]]:
     raw_rows: List[List[Any]] = []
     by_exp: Dict[str, Dict[str,Any]] = {}
-    kept = 0
 
-    for tx in trades:
-        items_all = extract_items(tx)
-        items = [i for i in items_all if is_option_item(i)]
+    kept = 0
+    sample_dumped = False
+
+    for tx in all_tx:
+        items = extract_option_items_recursive(tx)
         if not items:
             continue
 
-        # Expiration: require all option legs share the same date
+        # Must have Schwab's authoritative netAmount, else skip (no estimates).
+        if tx.get("netAmount") is None:
+            if DEBUG and not sample_dumped:
+                print("DEBUG: found option legs but no netAmount; example keys:", list(tx.keys()))
+                sample_dumped = True
+            continue
+
+        # Expiration: if all option legs share same date, use it, else bucket as MIXED_OR_UNKNOWN
         exps = { item_expiry_ymd(i) for i in items }
         exps.discard(None)
         if len(exps) == 1:
-            exp_ymd = _first(list(exps))
+            exp_ymd = next(iter(exps))
             mixed_flag = ""
         else:
             exp_ymd = "MIXED_OR_UNKNOWN"
@@ -247,7 +265,7 @@ def transform_raw_rows(trades: List[Dict[str,Any]]) -> Tuple[List[List[Any]], Li
             instr = item_instruction(i)
             leg_instr.append(f"{instr} {pc} {strike}")
 
-        # Schwab amounts (authoritative)
+        # Amounts and fees
         net = float(tx.get("netAmount") or 0.0)
         fees_list = tx.get("fees") or []
         commissions = 0.0
@@ -255,23 +273,21 @@ def transform_raw_rows(trades: List[Dict[str,Any]]) -> Tuple[List[List[Any]], Li
         for f in fees_list:
             amt = float(f.get("amount") or 0.0)
             code = (f.get("code") or "").lower()
-            if "commission" in code:
+            desc = (f.get("description") or "").lower()
+            if ("commission" in code) or ("commission" in desc):
                 commissions += amt
             else:
                 other_fees += amt
 
         order_id = tx.get("orderId") or tx.get("orderNumber") or tx.get("transactionId") or ""
+        tstype = str(tx.get("type","")).upper()
         ts = tx.get("transactionDate") or tx.get("transactionDateTime") or tx.get("time") or tx.get("closeDate")
-        ts = str(ts or "")
-        ts_norm = ts
-        try:
-            ts_norm = datetime.fromisoformat(ts.replace("+0000","+00:00")).astimezone(UTC).isoformat()
-        except Exception:
-            pass
+        ts_norm = norm_ts_to_utc_iso(ts)
+        acct = str(tx.get("_acctHash") or tx.get("accountId") or tx.get("account") or "")
 
         raw_rows.append([
-            ts_norm, order_id, str(tx.get("type","")).upper(), net, commissions, other_fees,
-            len(items), exp_ymd, unds_txt, "; ".join(leg_instr), str(tx.get("_acctHash") or tx.get("accountId") or tx.get("account") or "")
+            ts_norm, order_id, tstype, net, commissions, other_fees,
+            len(items), exp_ymd, unds_txt, "; ".join(leg_instr), acct
         ])
 
         bucket = by_exp.setdefault(exp_ymd, {
@@ -292,6 +308,16 @@ def transform_raw_rows(trades: List[Dict[str,Any]]) -> Tuple[List[List[Any]], Li
 
     if DEBUG:
         print(f"DEBUG: transform kept rows={kept}")
+        if kept == 0 and all_tx:
+            # dump a tiny skeleton of first 2 tx to see structure
+            def skel(x):
+                return {
+                    "keys": list(x.keys()),
+                    "type": x.get("type"),
+                    "has_netAmount": ("netAmount" in x),
+                    "has_items": any("instrument" in d for d in iter_dicts(x))
+                }
+            print("DEBUG: sample tx skeletons:", [skel(all_tx[i]) for i in range(min(2,len(all_tx)))])
 
     # Build summary rows (unknowns at bottom)
     def key_exp(k: str):
@@ -307,7 +333,7 @@ def transform_raw_rows(trades: List[Dict[str,Any]]) -> Tuple[List[List[Any]], Li
             round(b["total_net"], 2),
             round(b["comm"], 2),
             round(b["fees"], 2),
-            ",".join(sorted(b["underlyings"])) if b["underlyings"] else "",
+            ",".join(sorted(b["underlyings"])) if b["underlylings"] if False else ",".join(sorted(b["underlyings"])) if b["underlyings"] else "",
             "; ".join(sorted(b["notes"])) if b["notes"] else ""
         ])
 
@@ -329,13 +355,13 @@ def main() -> int:
 
     # Fetch transactions
     try:
-        trades = fetch_all_trades(c, acct_hashes, days_back)
+        all_tx = fetch_all_trades(c, acct_hashes, days_back)
     except Exception as e:
         print(f"ABORT: transactions fetch failed — {e}")
         return 1
 
     # Transform
-    raw_rows, sum_rows = transform_raw_rows(trades)
+    raw_rows, sum_rows = transform_raw_rows(all_tx)
 
     # Sheets write
     try:
