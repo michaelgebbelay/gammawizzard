@@ -1,0 +1,30 @@
+name: Sheets: Summarize Schwab Txns (by Expiry)
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # 8:05pm ET each weekday (00:05 UTC Tue–Sat)
+    - cron: "5 0 * * 2-6"
+
+jobs:
+  summarize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install --quiet google-api-python-client google-auth google-auth-httplib2
+
+      - name: Read sw_txn_raw → write sw_summary_by_expiry
+        env:
+          GSHEET_ID: ${{ secrets.GSHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          python scripts/schwab_summarize_txns.py
