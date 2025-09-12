@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Schwab → Google Sheets: TRADE transactions grouped by option EXPIRATION DATE.
-# - Only uses TOS/Schwab data (no estimates). Uses transaction["netAmount"] (fees included).
-# - Calls Schwab transactions endpoint with ONLY start/end; we filter locally (avoids 400 "Unexpected parameter").
+# - Only uses Schwab/TOS data (no estimates). Uses transaction["netAmount"] (fees included).
+# - Calls Schwab transactions endpoint with ONLY start/end; we filter locally (avoids 400s).
 # - Produces two tabs:
 #     sw_txn_raw         : one row per Schwab transaction (TRADE)
 #     sw_expiry_summary  : totals by option expiration (YYYY-MM-DD)
@@ -11,12 +11,16 @@
 #   SCHWAB_APP_KEY, SCHWAB_APP_SECRET, SCHWAB_TOKEN_JSON
 #   DAYS_BACK (e.g. "14"), SYMBOL_FILTER (e.g. "SPX" or "")
 
-import os, sys, json, base64, math, time
+import os, sys, json, base64
 from datetime import datetime, timedelta, timezone, date
 from typing import Any, Dict, List, Tuple, Optional
 
 from schwab.auth import client_from_token_file
-from schwab.client import Client
+# type hints only
+try:
+    from schwab.client import Client  # noqa: F401
+except Exception:
+    Client = Any  # type: ignore
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build as gbuild
@@ -47,8 +51,7 @@ def sheets_client() -> Tuple[Any, str]:
     return svc, sheet_id
 
 def write_tab_overwrite(svc, spreadsheet_id: str, tab_name: str, header: List[str], rows: List[List[Any]]):
-    # Write entire tab in one request. If the sheet doesn't exist, create it.
-    # Then write header+rows starting at A1.
+    # Create sheet if missing, then write header+rows in a single call
     try:
         meta = svc.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
         titles = [s["properties"]["title"] for s in meta.get("sheets",[])]
@@ -84,47 +87,49 @@ def _token_to_file_from_env() -> str:
             f.write(token_env)
     return path
 
-def schwab_client() -> Tuple[Client, str]:
+def schwab_client():
+    """Return (client, acct_hash). Handles both modern and legacy function signatures."""
     token_path = _token_to_file_from_env()
-    c = client_from_token_file(
-        api_key=os.environ["SCHWAB_APP_KEY"],
-        api_secret=os.environ["SCHWAB_APP_SECRET"],
-        token_path=token_path
-    )
+    # Try modern signature with keyword args
+    try:
+        c = client_from_token_file(
+            api_key=os.environ["SCHWAB_APP_KEY"],
+            app_secret=os.environ["SCHWAB_APP_SECRET"],  # <-- correct arg name
+            token_path=token_path
+        )
+    except TypeError:
+        # Fallback to legacy positional signature
+        c = client_from_token_file(token_path, os.environ["SCHWAB_APP_KEY"], os.environ["SCHWAB_APP_SECRET"])
     r = c.get_account_numbers(); r.raise_for_status()
     acct_hash = r.json()[0]["hashValue"]
     return c, acct_hash
 
 # ------------- Transactions fetch -------------
 def clamp_days_back(n: int) -> int:
-    # Schwab "transactions" allows up to 60-day windows. Keep simple: cap to 60.
+    # Schwab "transactions" allows up to ~60-day windows. Keep simple: cap to 60.
     return max(1, min(60, n))
 
-def fetch_trades(c: Client, acct_hash: str, days_back: int) -> List[Dict[str,Any]]:
+def fetch_trades(c, acct_hash: str, days_back: int) -> List[Dict[str,Any]]:
     end_dt = datetime.now(UTC)
     start_dt = end_dt - timedelta(days=clamp_days_back(days_back))
 
-    # IMPORTANT: only pass start/end. No symbol, no types filter => avoids "Unexpected parameter".
-    # We will filter to type == TRADE locally.
-    r = c.get_transactions(
-        acct_hash,
-        start_date=start_dt,
-        end_date=end_dt
-        # DO NOT pass transaction_types or symbol; many accounts get HTTP_400 with those.
-    )
+    # IMPORTANT: only pass start/end. No symbol, no type filters => avoids 400 "Unexpected parameter".
+    try:
+        r = c.get_transactions(acct_hash, start_date=start_dt, end_date=end_dt)
+    except TypeError:
+        # Some versions want dates, not datetimes
+        r = c.get_transactions(acct_hash, start_date=start_dt.date(), end_date=end_dt.date())
+
     r.raise_for_status()
     data = r.json()
-    # Schwab can return either list or object with "transactions" key depending on endpoint;
-    # be robust:
     if isinstance(data, dict) and "transactions" in data:
         arr = data["transactions"]
     elif isinstance(data, list):
         arr = data
     else:
         arr = []
-    # Keep only TRADE
-    out = [x for x in arr if str(x.get("type","")).upper() == "TRADE"]
-    return out
+    # Keep only TRADE records
+    return [x for x in arr if str(x.get("type","")).upper() == "TRADE"]
 
 # ------------- Option helpers -------------
 def _first(items: List[Any]) -> Any:
@@ -134,14 +139,12 @@ def to_date_ymd(d: Any) -> Optional[str]:
     if not d: return None
     s = str(d)
     try:
-        # permit "2025-09-10T00:00:00+0000" or "2025-09-10"
         y, m, dd = s[:10].split("-")
         return f"{int(y):04d}-{int(m):02d}-{int(dd):02d}"
     except Exception:
         return None
 
 def extract_items(tx: Dict[str,Any]) -> List[Dict[str,Any]]:
-    # Schwab uses "transactionItems" or "transactionItem"
     items = tx.get("transactionItems")
     if isinstance(items, list): return items
     it = tx.get("transactionItem")
@@ -154,23 +157,17 @@ def is_option_item(item: Dict[str,Any]) -> bool:
 
 def item_expiry_ymd(item: Dict[str,Any]) -> Optional[str]:
     ins = item.get("instrument") or {}
-    # preferred field
     exp = ins.get("optionExpirationDate") or ins.get("expirationDate")
     ymd = to_date_ymd(exp)
     if ymd: return ymd
-    # fallback parse from symbol if present, e.g. "SPXW  250910P06500000"
-    sym = ins.get("symbol") or ""
-    sym = "".join(sym.split())
-    # try to locate YYMMDD after root (6..12 chars)
+    # fallback parse from symbol, e.g. "SPXW  250910P06500000"
+    sym = (ins.get("symbol") or "").replace(" ", "")
     try:
-        # search for 6-digit date in the string
         import re
         m = re.search(r'(\d{6})[CP]\d{5,8}', sym)
         if m:
             s = m.group(1)
-            y = 2000 + int(s[0:2])
-            mth = int(s[2:4])
-            dd = int(s[4:6])
+            y = 2000 + int(s[0:2]); mth = int(s[2:4]); dd = int(s[4:6])
             return f"{y:04d}-{mth:02d}-{dd:02d}"
     except Exception:
         pass
@@ -178,19 +175,16 @@ def item_expiry_ymd(item: Dict[str,Any]) -> Optional[str]:
 
 def item_underlying(item: Dict[str,Any]) -> str:
     ins = item.get("instrument") or {}
-    # many returns have "underlyingSymbol" or we can infer from symbol prefix
     u = ins.get("underlyingSymbol")
     if u: return str(u)
     sym = (ins.get("symbol") or "").strip()
     if not sym: return ""
-    # take leading letters until first digit as a rough root
     i = 0
     while i < len(sym) and not sym[i].isdigit():
         i += 1
     return sym[:i].strip()
 
 def item_instruction(item: Dict[str,Any]) -> str:
-    # BUY/SELL from item; fallback to quantity sign if available
     instr = (item.get("instruction") or "").upper()
     if instr: return instr
     qty = item.get("amount") or item.get("quantity")
@@ -202,11 +196,6 @@ def item_instruction(item: Dict[str,Any]) -> str:
 
 # ------------- Transform & aggregate -------------
 def transform_raw_rows(trades: List[Dict[str,Any]], symbol_contains: str) -> Tuple[List[List[Any]], List[List[Any]]]:
-    """
-    Returns (raw_rows, summary_rows).
-    - raw_rows: one per transaction
-    - summary_rows: one per expiration date
-    """
     raw_rows: List[List[Any]] = []
     by_exp: Dict[str, Dict[str,Any]] = {}
 
@@ -215,16 +204,15 @@ def transform_raw_rows(trades: List[Dict[str,Any]], symbol_contains: str) -> Tup
     for tx in trades:
         items = [i for i in extract_items(tx) if is_option_item(i)]
         if not items:
-            # not options → skip (you can include equities if desired)
             continue
 
-        # optional client-side symbol filter: if none of the legs contains want, skip
+        # client-side contains filter on leg symbols (optional)
         if want:
             leg_syms = [ (i.get("instrument") or {}).get("symbol","") for i in items ]
             if not any(want in (s or "").upper() for s in leg_syms):
                 continue
 
-        # Expiry: require all option legs share the same date; otherwise label mixed
+        # Expiration: require all option legs share the same date
         exps = { item_expiry_ymd(i) for i in items }
         exps.discard(None)
         if len(exps) == 1:
@@ -234,11 +222,11 @@ def transform_raw_rows(trades: List[Dict[str,Any]], symbol_contains: str) -> Tup
             exp_ymd = "MIXED_OR_UNKNOWN"
             mixed_flag = "MIXED_EXPIRY"
 
-        # Underlyings set (unique)
+        # Underlyings (set)
         unds = sorted({ item_underlying(i) for i in items if item_underlying(i) })
         unds_txt = ",".join(unds) if unds else ""
 
-        # Instructions list for visibility (BUY/SELL PUT/CALL detection not strictly needed)
+        # Instructions (for visibility)
         leg_instr = []
         for i in items:
             ins = (i.get("instrument") or {})
@@ -247,10 +235,8 @@ def transform_raw_rows(trades: List[Dict[str,Any]], symbol_contains: str) -> Tup
             instr = item_instruction(i)
             leg_instr.append(f"{instr} {pc} {strike}")
 
-        # Monetary fields from Schwab (authoritative; includes fees)
+        # Schwab amounts (authoritative)
         net = float(tx.get("netAmount") or 0.0)
-
-        # fees come as list entries; we’ll split "commissions" vs "other" for readability
         fees_list = tx.get("fees") or []
         commissions = 0.0
         other_fees = 0.0
@@ -262,25 +248,20 @@ def transform_raw_rows(trades: List[Dict[str,Any]], symbol_contains: str) -> Tup
             else:
                 other_fees += amt
 
-        # Misc IDs/timestamps
         order_id = tx.get("orderId") or tx.get("orderNumber") or tx.get("transactionId") or ""
         ts = tx.get("transactionDate") or tx.get("transactionDateTime") or tx.get("time") or tx.get("closeDate")
         ts = str(ts or "")
-        # Try to normalize to ISO if possible
         ts_norm = ts
         try:
-            # sample form: "2025-09-10T14:13:52+0000"
             ts_norm = datetime.fromisoformat(ts.replace("+0000","+00:00")).astimezone(UTC).isoformat()
         except Exception:
             pass
 
-        # Build raw row
         raw_rows.append([
             ts_norm, order_id, net, commissions, other_fees,
             len(items), exp_ymd, unds_txt, "; ".join(leg_instr), str(tx.get("accountId") or tx.get("account") or "")
         ])
 
-        # Aggregate by expiration date
         bucket = by_exp.setdefault(exp_ymd, {
             "txn_count": 0,
             "total_net": 0.0,
@@ -293,17 +274,14 @@ def transform_raw_rows(trades: List[Dict[str,Any]], symbol_contains: str) -> Tup
         bucket["total_net"] += net
         bucket["comm"] += commissions
         bucket["fees"] += other_fees
-        for u in unds:
-            bucket["underlyings"].add(u)
-        if mixed_flag:
-            bucket["notes"].add(mixed_flag)
+        for u in unds: bucket["underlyings"].add(u)
+        if mixed_flag: bucket["notes"].add(mixed_flag)
 
-    # Build summary rows
-    # Sort expirations so MOS: unknown/mixed at bottom
+    # Build summary rows (unknowns at bottom)
     def key_exp(k: str):
-        if k and k[0].isdigit():
-            return (0, k)
+        if k and k[0].isdigit(): return (0, k)
         return (1, k)
+
     summary_rows: List[List[Any]] = []
     for exp in sorted(by_exp.keys(), key=key_exp):
         b = by_exp[exp]
@@ -321,11 +299,10 @@ def transform_raw_rows(trades: List[Dict[str,Any]], symbol_contains: str) -> Tup
 
 # ------------- main -------------
 def main() -> int:
-    days_back = 14
     try:
-        days_back = int(os.environ.get("DAYS_BACK","14").strip() or "14")
+        days_back = int((os.environ.get("DAYS_BACK","14") or "14").strip())
     except Exception:
-        pass
+        days_back = 14
     symbol_filter = os.environ.get("SYMBOL_FILTER","").strip()
 
     # Schwab client
