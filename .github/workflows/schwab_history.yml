@@ -4,29 +4,21 @@ on:
   workflow_dispatch:
     inputs:
       days_back:
-        description: "Days of history to pull"
+        description: "How many days of history to pull (max 60 at once)"
         required: false
         default: "14"
       symbol_filter:
-        description: "Underlying filter (e.g., SPX; empty = all options)"
+        description: "Optional contains-string filter (e.g. SPX). Leave blank for all."
         required: false
         default: "SPX"
   schedule:
-    # 8:00pm ET on U.S. weekdays:
-    # - 00:00 UTC (during EDT) = 8pm ET
-    # - 01:00 UTC (during EST) = 8pm ET
+    # 8:00pm ET (00:00 UTC is shown here; adjust if you want another time)
     - cron: "0 0 * * 2-6"
-    - cron: "0 1 * * 2-6"
-
-concurrency:
-  group: schwab-trades-to-sheets
-  cancel-in-progress: true
 
 jobs:
   export:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-
     steps:
       - uses: actions/checkout@v4
 
