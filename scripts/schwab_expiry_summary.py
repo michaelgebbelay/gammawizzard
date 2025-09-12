@@ -10,15 +10,15 @@
 #   GSHEET_ID, GOOGLE_SERVICE_ACCOUNT_JSON
 #   SCHWAB_APP_KEY, SCHWAB_APP_SECRET, SCHWAB_TOKEN_JSON
 #   DAYS_BACK (e.g. "14"), SYMBOL_FILTER (e.g. "SPX" or "")
+#   DEBUG (optional: "1" to print diagnostics)
 
-import os, sys, json, base64
+import os, sys, json, base64, collections
 from datetime import datetime, timedelta, timezone, date
 from typing import Any, Dict, List, Tuple, Optional
 
 from schwab.auth import client_from_token_file
-# type hints only
 try:
-    from schwab.client import Client  # noqa: F401
+    from schwab.client import Client  # type: ignore
 except Exception:
     Client = Any  # type: ignore
 
@@ -26,6 +26,7 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build as gbuild
 
 UTC = timezone.utc
+DEBUG = (os.environ.get("DEBUG","0").strip().lower() in ("1","true","yes","y"))
 
 # ------------- Google Sheets helpers -------------
 RAW_TAB = "sw_txn_raw"
@@ -88,38 +89,36 @@ def _token_to_file_from_env() -> str:
     return path
 
 def schwab_client():
-    """Return (client, acct_hash). Handles both modern and legacy function signatures."""
+    """Return (client, acct_hashes: List[str]). Handles both modern and legacy signatures."""
     token_path = _token_to_file_from_env()
     # Try modern signature with keyword args
     try:
         c = client_from_token_file(
             api_key=os.environ["SCHWAB_APP_KEY"],
-            app_secret=os.environ["SCHWAB_APP_SECRET"],  # <-- correct arg name
+            app_secret=os.environ["SCHWAB_APP_SECRET"],  # correct kwarg for current schwab-py
             token_path=token_path
         )
     except TypeError:
         # Fallback to legacy positional signature
         c = client_from_token_file(token_path, os.environ["SCHWAB_APP_KEY"], os.environ["SCHWAB_APP_SECRET"])
     r = c.get_account_numbers(); r.raise_for_status()
-    acct_hash = r.json()[0]["hashValue"]
-    return c, acct_hash
+    arr = r.json()
+    acct_hashes = [x.get("hashValue") for x in (arr if isinstance(arr,list) else [arr]) if x.get("hashValue")]
+    if not acct_hashes:
+        raise RuntimeError("No Schwab accounts returned for this token.")
+    return c, acct_hashes
 
 # ------------- Transactions fetch -------------
 def clamp_days_back(n: int) -> int:
     # Schwab "transactions" allows up to ~60-day windows. Keep simple: cap to 60.
     return max(1, min(60, n))
 
-def fetch_trades(c, acct_hash: str, days_back: int) -> List[Dict[str,Any]]:
-    end_dt = datetime.now(UTC)
-    start_dt = end_dt - timedelta(days=clamp_days_back(days_back))
-
-    # IMPORTANT: only pass start/end. No symbol, no type filters => avoids 400 "Unexpected parameter".
+def fetch_trades_for_acct(c, acct_hash: str, start_dt: datetime, end_dt: datetime) -> List[Dict[str,Any]]:
+    # IMPORTANT: only pass start/end. No symbol/type filters => avoids 400 "Unexpected parameter".
     try:
         r = c.get_transactions(acct_hash, start_date=start_dt, end_date=end_dt)
     except TypeError:
-        # Some versions want dates, not datetimes
         r = c.get_transactions(acct_hash, start_date=start_dt.date(), end_date=end_dt.date())
-
     r.raise_for_status()
     data = r.json()
     if isinstance(data, dict) and "transactions" in data:
@@ -128,8 +127,25 @@ def fetch_trades(c, acct_hash: str, days_back: int) -> List[Dict[str,Any]]:
         arr = data
     else:
         arr = []
-    # Keep only TRADE records
-    return [x for x in arr if str(x.get("type","")).upper() == "TRADE"]
+    return arr
+
+def fetch_all_trades(c, acct_hashes: List[str], days_back: int) -> List[Dict[str,Any]]:
+    end_dt = datetime.now(UTC)
+    start_dt = end_dt - timedelta(days=clamp_days_back(days_back))
+    all_tx: List[Dict[str,Any]] = []
+    for h in acct_hashes:
+        tx = fetch_trades_for_acct(c, h, start_dt, end_dt)
+        for t in tx:
+            t["_acctHash"] = h
+        all_tx.extend(tx)
+    if DEBUG:
+        typs = collections.Counter([str(x.get("type","")).upper() for x in all_tx])
+        print(f"DEBUG: window {start_dt.isoformat()} → {end_dt.isoformat()}  raw_count={len(all_tx)} type_hist={dict(typs)}")
+    # Keep only TRADE
+    trades = [x for x in all_tx if str(x.get("type","")).upper() == "TRADE"]
+    if DEBUG:
+        print(f"DEBUG: kept TRADE count={len(trades)}")
+    return trades
 
 # ------------- Option helpers -------------
 def _first(items: List[Any]) -> Any:
@@ -194,6 +210,19 @@ def item_instruction(item: Dict[str,Any]) -> str:
     except Exception:
         return ""
 
+def item_matches_filter(item: Dict[str,Any], want: str) -> bool:
+    if not want: return True
+    ins = item.get("instrument") or {}
+    fields = [
+        ins.get("symbol") or "",
+        ins.get("underlyingSymbol") or "",
+        ins.get("description") or "",
+        str(ins.get("securityId") or ""),
+        str(item.get("description") or "")
+    ]
+    joined = " ".join(fields).upper()
+    return want in joined
+
 # ------------- Transform & aggregate -------------
 def transform_raw_rows(trades: List[Dict[str,Any]], symbol_contains: str) -> Tuple[List[List[Any]], List[List[Any]]]:
     raw_rows: List[List[Any]] = []
@@ -201,16 +230,16 @@ def transform_raw_rows(trades: List[Dict[str,Any]], symbol_contains: str) -> Tup
 
     want = (symbol_contains or "").strip().upper()
 
+    kept = 0
     for tx in trades:
-        items = [i for i in extract_items(tx) if is_option_item(i)]
+        items_all = extract_items(tx)
+        items = [i for i in items_all if is_option_item(i)]
         if not items:
             continue
 
-        # client-side contains filter on leg symbols (optional)
-        if want:
-            leg_syms = [ (i.get("instrument") or {}).get("symbol","") for i in items ]
-            if not any(want in (s or "").upper() for s in leg_syms):
-                continue
+        # robust client-side filter (symbol, underlyingSymbol, description, etc.)
+        if want and not any(item_matches_filter(i, want) for i in items):
+            continue
 
         # Expiration: require all option legs share the same date
         exps = { item_expiry_ymd(i) for i in items }
@@ -259,7 +288,7 @@ def transform_raw_rows(trades: List[Dict[str,Any]], symbol_contains: str) -> Tup
 
         raw_rows.append([
             ts_norm, order_id, net, commissions, other_fees,
-            len(items), exp_ymd, unds_txt, "; ".join(leg_instr), str(tx.get("accountId") or tx.get("account") or "")
+            len(items), exp_ymd, unds_txt, "; ".join(leg_instr), str(tx.get("_acctHash") or tx.get("accountId") or tx.get("account") or "")
         ])
 
         bucket = by_exp.setdefault(exp_ymd, {
@@ -276,6 +305,10 @@ def transform_raw_rows(trades: List[Dict[str,Any]], symbol_contains: str) -> Tup
         bucket["fees"] += other_fees
         for u in unds: bucket["underlyings"].add(u)
         if mixed_flag: bucket["notes"].add(mixed_flag)
+        kept += 1
+
+    if DEBUG:
+        print(f"DEBUG: transform kept rows={kept}")
 
     # Build summary rows (unknowns at bottom)
     def key_exp(k: str):
@@ -305,16 +338,16 @@ def main() -> int:
         days_back = 14
     symbol_filter = os.environ.get("SYMBOL_FILTER","").strip()
 
-    # Schwab client
+    # Schwab client across all accounts on this token
     try:
-        c, acct_hash = schwab_client()
+        c, acct_hashes = schwab_client()
     except Exception as e:
         print(f"ABORT: Schwab client init failed — {e}")
         return 1
 
     # Fetch trades
     try:
-        trades = fetch_trades(c, acct_hash, days_back)
+        trades = fetch_all_trades(c, acct_hashes, days_back)
     except Exception as e:
         print(f"ABORT: transactions fetch failed — {e}")
         return 1
