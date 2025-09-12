@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
-# Sheets summarizer:
-# - Reads sw_txn_raw (dumped by schwab_dump_all_txns.py).
-# - If tab missing or empty → writes empty sw_summary_by_expiry and exits OK.
-# - Only summarizes rows with has_option==1 AND a single clear exp_primary (YYYY-MM-DD).
-# - Uses Schwab-provided net_amount/commissions/fees_other exactly (no estimates).
-# - Writes summary in ONE update (avoids rate limits).
+# Summarize sw_txn_raw by option expiry (no estimates; uses Schwab net/fees exactly).
+# Gracefully handles missing/empty raw tab.
 
 import os, sys, json
 from typing import Any, List, Dict
@@ -41,10 +37,7 @@ def ensure_tab_exists(svc, sid, tab: str):
         ).execute()
 
 def read_tab(svc, sid: str, tab: str) -> List[List[Any]]:
-    # Caller ensures tab exists
-    resp = svc.spreadsheets().values().get(
-        spreadsheetId=sid, range=f"{tab}!A1:ZZ"
-    ).execute()
+    resp = svc.spreadsheets().values().get(spreadsheetId=sid, range=f"{tab}!A1:ZZ").execute()
     return resp.get("values", []) or []
 
 def write_tab_overwrite(svc, sid: str, tab: str, header: List[str], rows: List[List[Any]]):
@@ -72,15 +65,8 @@ def main() -> int:
         print(f"ABORT: Sheets init failed — {e}")
         return 1
 
-    # If raw tab missing → create empty raw, write empty summary, exit cleanly
-    tabs = list_tabs(svc, sid)
-    if RAW_TAB not in tabs:
-        print(f"INFO: {RAW_TAB} not found; creating it and writing empty summary.")
-        ensure_tab_exists(svc, sid, RAW_TAB)
-        write_tab_overwrite(svc, sid, SUM_TAB, SUM_HEADERS, [])
-        print("OK: wrote 0 summary rows (no raw data).")
-        return 0
-
+    # ensure raw tab exists
+    ensure_tab_exists(svc, sid, RAW_TAB)
     data = read_tab(svc, sid, RAW_TAB)
     if not data or len(data) < 2:
         write_tab_overwrite(svc, sid, SUM_TAB, SUM_HEADERS, [])
@@ -90,40 +76,27 @@ def main() -> int:
     header = data[0]
     rows   = data[1:]
 
-    # Column positions expected from schwab_dump_all_txns.py
-    i_hasopt = idx(header, "has_option")
-    i_exp    = idx(header, "exp_primary")
-    i_net    = idx(header, "net_amount")
-    i_comm   = idx(header, "commissions")
-    i_fees   = idx(header, "fees_other")
+    i_hasopt = header.index("symbol") if "symbol" in header else -1  # proxy; we infer option by exp present
+    i_exp    = header.index("exp_primary") if "exp_primary" in header else -1
+    i_net    = header.index("net_amount") if "net_amount" in header else -1
+    i_comm   = header.index("commissions") if "commissions" in header else -1
+    i_fees   = header.index("fees_other") if "fees_other" in header else -1
 
-    # If the dump hasn't been run yet (or old columns), don't blow up.
-    if min(i_hasopt, i_exp, i_net, i_comm, i_fees) < 0:
-        print("WARN: sw_txn_raw missing required columns; writing empty summary.")
+    if min(i_exp, i_net, i_comm, i_fees) < 0:
         write_tab_overwrite(svc, sid, SUM_TAB, SUM_HEADERS, [])
-        print("OK: wrote 0 summary rows.")
+        print("WARN: sw_txn_raw missing required columns; wrote 0 summary rows.")
         return 0
 
     buckets: Dict[str, Dict[str, float]] = {}
-
     for r in rows:
-        # bounds checks
-        if max(i_hasopt, i_exp, i_net, i_comm, i_fees) >= len(r):
+        if max(i_exp, i_net, i_comm, i_fees) >= len(r):
             continue
-        try:
-            hasopt = int(str(r[i_hasopt]).strip() or "0")
-        except:
-            hasopt = 0
-        exp = str(r[i_exp]).strip()
-        if hasopt != 1:
-            continue
+        exp = str(r[i_exp]).strip() if r[i_exp] else ""
         if not exp or exp == "MIXED_OR_UNKNOWN":
             continue
-
         net  = to_float(r[i_net])
         comm = to_float(r[i_comm])
         fees = to_float(r[i_fees])
-
         b = buckets.setdefault(exp, {"n":0,"net":0.0,"comm":0.0,"fees":0.0})
         b["n"]    += 1
         b["net"]  += net
@@ -134,14 +107,7 @@ def main() -> int:
     for exp in sorted(buckets.keys()):
         b = buckets[exp]
         net_after = b["net"] - b["comm"] - b["fees"]
-        out_rows.append([
-            exp,
-            int(b["n"]),
-            round(b["net"], 2),
-            round(b["comm"], 2),
-            round(b["fees"], 2),
-            round(net_after, 2)
-        ])
+        out_rows.append([exp, int(b["n"]), round(b["net"],2), round(b["comm"],2), round(b["fees"],2), round(net_after,2)])
 
     write_tab_overwrite(svc, sid, SUM_TAB, SUM_HEADERS, out_rows)
     print(f"OK: wrote {len(out_rows)} expiry rows into {SUM_TAB}.")
