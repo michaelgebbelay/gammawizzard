@@ -336,7 +336,7 @@ def main() -> int:
         days_back = int((os.environ.get("DAYS_BACK","14") or "14").strip())
     except Exception:
         days_back = 14
-    symbol_filter = os.environ.get("SYMBOL_FILTER","").strip()
+    #symbol_filter = os.environ.get("SYMBOL_FILTER","").strip()
 
     # Schwab client across all accounts on this token
     try:
