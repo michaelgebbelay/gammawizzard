@@ -1,21 +1,20 @@
-name: Schwab → Sheets (Dump All Txns)
+name: Schwab → Sheets (Dump + Summarize)
 
 on:
   workflow_dispatch:
     inputs:
-      start_date:
-        description: "Optional YYYY-MM-DD (inclusive). If set, we pull from here to today in 60d windows."
-        required: false
-        default: ""
       days_back:
-        description: "If start_date is blank, pull this many days back (max 60)."
+        description: "Days of history to pull (default 60)"
         required: false
         default: "60"
+  schedule:
+    # 8:00pm ET (00:00 UTC Tue–Sat)
+    - cron: "0 0 * * 2-6"
 
 jobs:
-  dump:
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -28,22 +27,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install --quiet schwab-py requests google-api-python-client google-auth google-auth-httplib2
 
-      - name: Dump all Schwab txns → Google Sheets (sw_txn_raw)
+      - name: Dump Schwab transactions → sw_txn_raw
         env:
-          # Sheets
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-
-          # Schwab
           SCHWAB_APP_KEY: ${{ secrets.SCHWAB_APP_KEY }}
           SCHWAB_APP_SECRET: ${{ secrets.SCHWAB_APP_SECRET }}
           SCHWAB_TOKEN_JSON: ${{ secrets.SCHWAB_TOKEN_JSON }}
-
-          # Controls: choose either START_DATE or DAYS_BACK
-          START_DATE: ${{ github.event.inputs.start_date }}
-          DAYS_BACK: ${{ github.event.inputs.days_back }}
-
-          # Optional debug logs
-          DEBUG: "0"
+          DAYS_BACK: ${{ github.event.inputs.days_back != '' && github.event.inputs.days_back || '60' }}
         run: |
           python scripts/schwab_dump_all_txns.py
+
+      - name: Summarize sw_txn_raw → sw_summary_by_expiry
+        env:
+          GSHEET_ID: ${{ secrets.GSHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          python scripts/schwab_summarize_txns.py
