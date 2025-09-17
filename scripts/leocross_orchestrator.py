@@ -1,28 +1,33 @@
 #!/usr/bin/env python3
-# VERSION: 2025-09-17 ShortIC width-by-equity (1 lot); LongIC unchanged
-__version__ = "4.0.0"
+# VERSION: 2025-09-17 v4.1.0 — Guard-bypass option added.
+# - Short IC (credit): width = 5 * floor(opening_cash/4000); qty = 1
+# - Long  IC (debit):  legacy 5-wide; qty = floor(opening_cash / PER_UNIT)
+# - BYPASS_GUARD: skip NO-CLOSE & PARTIAL-OVERLAP checks, and force rem_qty (default 1 or BYPASS_QTY)
+__version__ = "4.1.0"
 
 # LeoCross ORCHESTRATOR — strict overlap guard + dynamic sizing from opening cash.
-# - Short IC (credit): width = 5 * floor(opening_cash/4000), qty target = 1
-# - Long IC (debit):   legacy 5-wide, qty = floor(opening_cash / PER_UNIT)
-# - Blocks if any leg would "close" something already in the account.
-# - If all 4 legs already present, tops up to target.
-# - If partial overlap (1–3 legs present), SKIP.
+# - Blocks if any leg would "close" something already in the account (unless BYPASS_GUARD=true).
+# - If all 4 legs present and aligned, tops up to target (unless BYPASS_GUARD=true).
 # - Logs every decision to Google Sheet tab "guard".
 # - Invokes placer with QTY_OVERRIDE=<remainder> to execute ladder with true replace semantics.
 
-PER_UNIT = 5000  # <<< legacy debit sizing: contracts = floor(opening_cash / PER_UNIT)
+PER_UNIT = 5000  # legacy debit sizing: contracts = floor(opening_cash / PER_UNIT)
 
-# ---- Short IC knobs (env-overridable; defaults match your rule) ----
 import os, sys, json, time, re
 from datetime import datetime, date, timezone
 from zoneinfo import ZoneInfo
 import requests
 from schwab.auth import client_from_token_file
 
+# ----- env knobs -----
 SHORT_IC_PER_DOLLARS = int(os.environ.get("SHORT_IC_PER_DOLLARS", "4000"))  # $4k → +5 width
 SHORT_IC_WIDTH_INC   = int(os.environ.get("SHORT_IC_WIDTH_INC",   "5"))     # points per step
 SHORT_IC_MIN_WIDTH   = int(os.environ.get("SHORT_IC_MIN_WIDTH",   "5"))     # clamp ≥ 5
+
+def _truthy(s: str) -> bool:
+    return str(s or "").strip().lower() in {"1","true","t","yes","y","on"}
+BYPASS_GUARD = _truthy(os.environ.get("BYPASS_GUARD",""))
+BYPASS_QTY   = os.environ.get("BYPASS_QTY","").strip()  # optional; defaults to 1 when bypassing
 
 # Google Sheets
 from google.oauth2 import service_account
@@ -77,8 +82,7 @@ def yymmdd(iso: str) -> str:
 
 def to_osi(sym: str) -> str:
     raw = (sym or "").upper()
-    raw = re.sub(r'\s+', '', raw)
-    raw = raw.lstrip('.')
+    raw = re.sub(r'\s+', '', raw).lstrip('.')
     raw = re.sub(r'[^A-Z0-9.$^]', '', raw)
     m = re.match(r'^([A-Z.$^]{1,6})(\d{6})([CP])(\d{1,5})(?:\.(\d{1,3}))?$', raw) \
         or re.match(r'^([A-Z.$^]{1,6})(\d{6})([CP])(\d{8})$', raw)
@@ -195,7 +199,7 @@ def opening_cash_for_account(c, acct_number: str):
         oc = pick(curr,"cashBalance","cashAvailableForTrading","liquidationValue")
     return oc
 
-# ===== short IC width =====
+# ===== width =====
 def calc_short_ic_width(opening_cash: float | int) -> int:
     steps = int(max(0, float(opening_cash) // SHORT_IC_PER_DOLLARS))
     return max(SHORT_IC_MIN_WIDTH, SHORT_IC_WIDTH_INC * steps)
@@ -208,9 +212,10 @@ def condor_units_open(pos_map, legs):
     s2 = max(0.0, -pos_map.get(osi_canon(legs[2]), 0.0))  # short inner call
     return int(min(b1, b2, s1, s2))
 
-def print_guard_snapshot(pos, legs, is_credit, width_used):
+def print_guard_snapshot(pos, legs, is_credit, width_used, bypass):
     labels = [("BUY_PUT",legs[0],-1),("SELL_PUT",legs[1],+1),("SELL_CALL",legs[2],+1),("BUY_CALL",legs[3],-1)]
-    print("ORCH GUARD SNAPSHOT ({} width={}):".format("CREDIT" if is_credit else "DEBIT", width_used))
+    tag = "CREDIT" if is_credit else "DEBIT"
+    print("ORCH GUARD SNAPSHOT ({} width={} BYPASS={}):".format(tag, width_used, "ON" if bypass else "OFF"))
     for name, osi, sign in labels:
         can = osi_canon(osi); cur = pos.get(can, 0.0)
         print("  {:10s} {}  acct_qty={:+g}  sign={:+d}".format(name, osi, cur, sign))
@@ -307,7 +312,7 @@ def main():
         return 1
 
     print("ORCH START RUN_ID={} SHA={}".format(os.environ.get("GITHUB_RUN_ID",""), os.environ.get("GITHUB_SHA","")[:7]))
-    print_guard_snapshot(pos, legs, is_credit, width)
+    print_guard_snapshot(pos, legs, is_credit, width, BYPASS_GUARD)
 
     # snapshot quantities (for logging)
     bpq = pos.get(osi_canon(legs[0]), 0.0)
@@ -318,12 +323,13 @@ def main():
 
     # ---- STRICT NO‑CLOSE check ----
     checks=[("BUY",legs[0],-1),("SELL",legs[1],+1),("SELL",legs[2],+1),("BUY",legs[3],-1)]
-    for label, osi, sign in checks:
-        cur = pos.get(osi_canon(osi), 0.0)
-        if (sign<0 and cur<0) or (sign>0 and cur>0):
-            details="WOULD_CLOSE {} acct_qty={:+g}".format(osi, cur)
-            print("ORCH SKIP:", details); log("SKIP", details, legs, acct_snapshot, "", "")
-            return 0
+    if not BYPASS_GUARD:
+        for label, osi, sign in checks:
+            cur = pos.get(osi_canon(osi), 0.0)
+            if (sign<0 and cur<0) or (sign>0 and cur>0):
+                details="WOULD_CLOSE {} acct_qty={:+g}".format(osi, cur)
+                print("ORCH SKIP:", details); log("SKIP", details, legs, acct_snapshot, "", "")
+                return 0
 
     # ---- PARTIAL OVERLAP rule ----
     nonzero = sum(1 for _, osi, _ in checks if abs(pos.get(osi_canon(osi),0.0))>1e-9)
@@ -331,7 +337,7 @@ def main():
                   if ((sign<0 and pos.get(osi_canon(osi),0.0)>=0) or
                       (sign>0 and pos.get(osi_canon(osi),0.0)<=0)) and
                       abs(pos.get(osi_canon(osi),0.0))>1e-9)
-    if 0 < nonzero < 4:
+    if not BYPASS_GUARD and 0 < nonzero < 4:
         present = ["{} {} acct_qty={:+g}".format(l, o, pos.get(osi_canon(o),0.0)) for (l,o,_) in checks if abs(pos.get(osi_canon(o),0.0))>1e-9]
         details="PARTIAL_OVERLAP — " + "; ".join(present)
         print("ORCH SKIP:", details); log("SKIP", details, legs, acct_snapshot, "", "")
@@ -344,24 +350,33 @@ def main():
         target_units = int(max(0, oc // PER_UNIT))  # legacy debit sizing
 
     # ---- compute remainder ----
-    if nonzero==0:
+    if BYPASS_GUARD:
+        # ignore existing units; force place BYPASS_QTY (default 1)
+        try:
+            rem_qty = int(BYPASS_QTY) if BYPASS_QTY else 1
+        except:
+            rem_qty = 1
         units_open = 0
-    elif nonzero==4 and aligned==4:
-        units_open = condor_units_open(pos, legs)
+        decision = "ALLOW_BYPASS"
+        detail = f"BYPASS_GUARD=1 width={width} open_cash={oc:.2f} target={target_units} rem_qty={rem_qty}"
     else:
-        units_open = 0
-
-    rem_qty = max(0, target_units - units_open)
-
-    detail = ("short_ic width={} open_cash={:.2f} target={} units_open={} rem_qty={}"
-              if is_credit else
-              "long_ic width=5 open_cash={:.2f} per_unit={} target={} units_open={} rem_qty={}").format(
-                  width, oc, target_units, units_open, rem_qty) if is_credit else \
-              "long_ic width=5 open_cash={:.2f} per_unit={} target={} units_open={} rem_qty={}".format(
-                  oc, PER_UNIT, target_units, units_open, rem_qty)
+        if nonzero==0:
+            units_open = 0
+        elif nonzero==4 and aligned==4:
+            units_open = condor_units_open(pos, legs)
+        else:
+            units_open = 0
+        rem_qty = max(0, target_units - units_open)
+        decision = ("ALLOW" if rem_qty>0 else "SKIP")
+        detail = ("short_ic width={} open_cash={:.2f} target={} units_open={} rem_qty={}"
+                  if is_credit else
+                  "long_ic width=5 open_cash={:.2f} per_unit={} target={} units_open={} rem_qty={}").format(
+                      width, oc, target_units, units_open, rem_qty) if is_credit else \
+                  "long_ic width=5 open_cash={:.2f} per_unit={} target={} units_open={} rem_qty={}".format(
+                      oc, PER_UNIT, target_units, units_open, rem_qty)
 
     print("ORCH SIZE", detail)
-    log(("ALLOW" if rem_qty>0 else "SKIP"), detail, legs, acct_snapshot, units_open, rem_qty)
+    log(decision, detail, legs, acct_snapshot, (0 if BYPASS_GUARD else units_open), rem_qty)
 
     if rem_qty == 0:
         print("ORCH SKIP: At/above target; no remainder to place.")
@@ -369,7 +384,7 @@ def main():
 
     # ---- call placer with override ----
     env = dict(os.environ)
-    env["QTY_OVERRIDE"] = str(rem_qty)  # for Short IC this will be "1"
+    env["QTY_OVERRIDE"] = str(rem_qty)
     rc = os.spawnve(os.P_WAIT, sys.executable, [sys.executable, "scripts/leocross_place_simple.py"], env)
     return rc
 
@@ -394,7 +409,7 @@ def gw_login_token():
 def gw_get_leocross():
     tok=_sanitize_token(os.environ.get("GW_TOKEN","") or "")
     def hit(t):
-        h={"Accept":"application/json","Authorization":"Bearer {}".format(_sanitize_token(t)),"User-Agent":"gw-orchestrator/1.5"}
+        h={"Accept":"application/json","Authorization":"Bearer {}".format(_sanitize_token(t)),"User-Agent":"gw-orchestrator/1.6"}
         return requests.get("{}/{}".format(GW_BASE.rstrip("/"), GW_ENDPOINT.lstrip("/")), headers=h, timeout=_gw_timeout())
     r=hit(tok) if tok else None
     if (r is None) or (r.status_code in (401,403)): r=hit(gw_login_token())
