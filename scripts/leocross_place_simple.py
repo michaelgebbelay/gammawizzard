@@ -21,16 +21,16 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build as gbuild
 
 # ===== constants =====
-TICK = 0.05
+TICK = 0.10
 ET = ZoneInfo("America/New_York")
 
-STEP_WAIT = 30       # seconds to wait at each rung
+STEP_WAIT = 10       # seconds to wait at each rung
 FINAL_CANCEL = True  # if still not filled after last rung, cancel working ticket
 WINDOW_STATUSES = {"WORKING","QUEUED","OPEN","PENDING_ACTIVATION"}
 
 # Fixed ladders requested (unchanged):
-CREDIT_START = 2.10
-CREDIT_FLOOR = 1.90
+CREDIT_START = 12.60
+CREDIT_FLOOR = 8.60
 DEBIT_START  = 1.90
 DEBIT_CEIL   = 2.10
 
