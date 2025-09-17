@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
-# VERSION: 2025-09-17 ShortIC width-by-equity (1 lot); LongIC unchanged
-__version__ = "2.4.0"
+# VERSION: 2025-09-17 v2.5.0 — Short IC credit ladder scales with width:
+#   start = 1.80 * (width/5), step = -0.20 every 10s, stop after $4.00 drop (>= $0.05).
+#   Long IC (debit) ladder unchanged.
+
+__version__ = "2.5.0"
 
 # LeoCross PLACER — laddered IRON_CONDOR with true Cancel/Replace (PUT) semantics.
-# - Short IC (credit): dynamic width by opening cash; qty default 1 unless QTY_OVERRIDE set.
+# - Short IC (credit): dynamic width-by-equity (from orchestrator/this file), qty default 1 unless QTY_OVERRIDE set.
+#   Ladder start/step/stop as above.
 # - Long IC (debit): legacy 5‑wide; qty from QTY_OVERRIDE or QTY_FIXED.
-# - No OBP checks.
 # - Logs ladder/price/filled/replaced/canceled to Google Sheet tab "schwab".
 # - Maintains ONE active working order: replace its price/size each rung.
 
 # ======= MANUAL SIZE (edit this, or override via QTY_OVERRIDE env) =======
-QTY_FIXED = 4
+QTY_FIXED = 4  # used only for Long IC unless QTY_OVERRIDE provided
 
 import os, sys, json, time, re
 from datetime import datetime, date, timezone
@@ -21,23 +24,29 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build as gbuild
 
 # ===== constants =====
-TICK = 0.10
+TICK = 0.05
 ET = ZoneInfo("America/New_York")
 
-STEP_WAIT = 10       # seconds to wait at each rung
+# Waits: Short IC faster per your spec
+STEP_WAIT_CREDIT = int(os.environ.get("STEP_WAIT_CREDIT", "10"))  # seconds between rungs (credit)
+STEP_WAIT_DEBIT  = int(os.environ.get("STEP_WAIT_DEBIT",  "30"))  # unchanged (debit)
 FINAL_CANCEL = True  # if still not filled after last rung, cancel working ticket
 WINDOW_STATUSES = {"WORKING","QUEUED","OPEN","PENDING_ACTIVATION"}
 
-# Fixed ladders requested (unchanged):
-CREDIT_START = 12.60
-CREDIT_FLOOR = 8.60
-DEBIT_START  = 1.90
-DEBIT_CEIL   = 2.10
+# ===== Debit ladders (unchanged) =====
+DEBIT_START  = float(os.environ.get("DEBIT_START", "1.90"))
+DEBIT_CEIL   = float(os.environ.get("DEBIT_CEIL",  "2.10"))
+DEBIT_STEP   = float(os.environ.get("DEBIT_STEP",  "0.05"))
 
-# Short IC sizing knobs (env-overridable)
-SHORT_IC_PER_DOLLARS = int(os.environ.get("SHORT_IC_PER_DOLLARS", "4000"))
-SHORT_IC_WIDTH_INC   = int(os.environ.get("SHORT_IC_WIDTH_INC",   "5"))
-SHORT_IC_MIN_WIDTH   = int(os.environ.get("SHORT_IC_MIN_WIDTH",   "5"))
+# ===== Short IC sizing knobs (width) =====
+SHORT_IC_PER_DOLLARS = int(os.environ.get("SHORT_IC_PER_DOLLARS", "4000"))  # $4k → +5 width
+SHORT_IC_WIDTH_INC   = int(os.environ.get("SHORT_IC_WIDTH_INC",   "5"))     # points per step
+SHORT_IC_MIN_WIDTH   = int(os.environ.get("SHORT_IC_MIN_WIDTH",   "5"))     # clamp ≥ 5
+
+# ===== Short IC ladder knobs (new dynamic credit ladder) =====
+CREDIT_PER5_START = float(os.environ.get("CREDIT_PER5_START", "1.80"))  # $ per 5pt width
+CREDIT_STEP       = float(os.environ.get("CREDIT_STEP",       "0.20"))  # down 20¢ each rung
+CREDIT_RANGE      = float(os.environ.get("CREDIT_RANGE",      "4.00"))  # stop after $4 total drop
 
 GW_BASE = "https://gandalf.gammawizard.com"
 GW_ENDPOINT = "/rapi/GetLeoCross"
@@ -226,7 +235,7 @@ def gw_login_token():
 def gw_get_leocross():
     tok=_sanitize_token(os.environ.get("GW_TOKEN","") or "")
     def hit(t):
-        h={"Accept":"application/json","Authorization":f"Bearer {_sanitize_token(t)}","User-Agent":"gw-placer/1.2"}
+        h={"Accept":"application/json","Authorization":f"Bearer {_sanitize_token(t)}","User-Agent":"gw-placer/1.3"}
         return requests.get(f"{GW_BASE.rstrip('/')}/{GW_ENDPOINT.lstrip('/')}", headers=h, timeout=_gw_timeout())
     r=hit(tok) if tok else None
     if (r is None) or (r.status_code in (401,403)): r=hit(gw_login_token())
@@ -519,32 +528,45 @@ def main():
             time.sleep(1)
         return "WORKING"
 
-    def rung(px):
+    def rung(px, secs):
         nonlocal filled_total
         to_place = max(0, qty - filled_total)
         if to_place==0: return "FILLED"
         ensure_active(px, to_place)
         steps.append(f"{clamp_tick(px):.2f}@{to_place}")
-        return wait_loop(STEP_WAIT)
+        return wait_loop(secs)
 
-    # ===== 5¢ ladder every 30s (unchanged) =====
-    ladder = []
-    if is_credit:
-        p = CREDIT_START
-        while p >= CREDIT_FLOOR - 1e-9:
-            ladder.append(clamp_tick(p))
-            p -= 0.05
-    else:
-        p = DEBIT_START
-        while p <= DEBIT_CEIL + 1e-9:
-            ladder.append(clamp_tick(p))
-            p += 0.05
-
+    # ===== Build ladder =====
     status = "WORKING"
-    for px in ladder:
-        status = rung(px)
-        if status == "FILLED":
-            break
+    if is_credit:
+        units = max(1, int(round(width / 5)))  # width is multiple of 5; fallback to >=1
+        start = clamp_tick(units * CREDIT_PER5_START)
+        stop  = clamp_tick(max(0.05, start - CREDIT_RANGE))
+        step  = CREDIT_STEP
+        secs  = STEP_WAIT_CREDIT
+
+        px = start
+        ladder = []
+        # Include both start and stop; descending
+        while px >= stop - 1e-9:
+            ladder.append(clamp_tick(px))
+            px = px - step
+        for price in ladder:
+            status = rung(price, secs)
+            if status == "FILLED":
+                break
+    else:
+        # Debit ladder unchanged
+        start = clamp_tick(DEBIT_START); stop = clamp_tick(DEBIT_CEIL); step = DEBIT_STEP; secs = STEP_WAIT_DEBIT
+        px = start
+        ladder = []
+        while px <= stop + 1e-9:
+            ladder.append(clamp_tick(px))
+            px = px + step
+        for price in ladder:
+            status = rung(price, secs)
+            if status == "FILLED":
+                break
 
     if status != "FILLED" and FINAL_CANCEL and active_oid:
         try:
@@ -562,8 +584,13 @@ def main():
     canceled_str = f"CANCELED {canceled}"
     used_price = steps[-1].split("@",1)[0] if steps else ""
     oid_for_log = active_oid or ""
+    if is_credit:
+        ladder_note = f"credit_ladder start={start:.2f} step={CREDIT_STEP:.2f} stop={stop:.2f} width={width} oc={oc if oc is not None else 'NA'}"
+    else:
+        ladder_note = f"debit_ladder {DEBIT_START:.2f}→{DEBIT_CEIL:.2f} step={DEBIT_STEP:.2f} width={width}"
+
     status_txt = (("FILLED " + trace) if (filled_total >= qty) else (status + " " + trace)) + \
-                 f" | {filled_str} | {repl_str} | {canceled_str} | width={width} oc={oc if oc is not None else 'NA'}"
+                 f" | {filled_str} | {repl_str} | {canceled_str} | {ladder_note}"
 
     row = [datetime.utcnow().isoformat()+"Z", source, "SPX", last_px,
            sig_date, "PLACE", side, qty, otype,
