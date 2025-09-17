@@ -1,18 +1,28 @@
+#!/usr/bin/env python3
+# VERSION: 2025-09-17 ShortIC width-by-equity (1 lot); LongIC unchanged
+__version__ = "4.0.0"
+
 # LeoCross ORCHESTRATOR — strict overlap guard + dynamic sizing from opening cash.
-# - Computes target units: floor(opening_cash / PER_UNIT).
+# - Short IC (credit): width = 5 * floor(opening_cash/4000), qty target = 1
+# - Long IC (debit):   legacy 5-wide, qty = floor(opening_cash / PER_UNIT)
 # - Blocks if any leg would "close" something already in the account.
 # - If all 4 legs already present, tops up to target.
 # - If partial overlap (1–3 legs present), SKIP.
 # - Logs every decision to Google Sheet tab "guard".
 # - Invokes placer with QTY_OVERRIDE=<remainder> to execute ladder with true replace semantics.
 
-PER_UNIT = 5000  # <<< contracts = floor(opening_cash / PER_UNIT)
+PER_UNIT = 5000  # <<< legacy debit sizing: contracts = floor(opening_cash / PER_UNIT)
 
+# ---- Short IC knobs (env-overridable; defaults match your rule) ----
 import os, sys, json, time, re
 from datetime import datetime, date, timezone
 from zoneinfo import ZoneInfo
 import requests
 from schwab.auth import client_from_token_file
+
+SHORT_IC_PER_DOLLARS = int(os.environ.get("SHORT_IC_PER_DOLLARS", "4000"))  # $4k → +5 width
+SHORT_IC_WIDTH_INC   = int(os.environ.get("SHORT_IC_WIDTH_INC",   "5"))     # points per step
+SHORT_IC_MIN_WIDTH   = int(os.environ.get("SHORT_IC_MIN_WIDTH",   "5"))     # clamp ≥ 5
 
 # Google Sheets
 from google.oauth2 import service_account
@@ -139,67 +149,7 @@ def positions_map(c, acct_hash: str):
         out[osi_canon(osi)] = out.get(osi_canon(osi), 0.0) + qty
     return out
 
-# ===== GammaWizard =====
-def _gw_timeout():
-    try: return int(os.environ.get("GW_TIMEOUT","30"))
-    except: return 30
-
-def _sanitize_token(t: str) -> str:
-    t = (t or "").strip().strip('"').strip("'")
-    return t.split(None,1)[1] if t.lower().startswith("bearer ") else t
-
-def gw_login_token():
-    email=os.environ.get("GW_EMAIL",""); pwd=os.environ.get("GW_PASSWORD","")
-    if not (email and pwd): raise RuntimeError("GW_LOGIN_MISSING_CREDS")
-    r=requests.post("{}/goauth/authenticateFireUser".format(GW_BASE), data={"email":email,"password":pwd}, timeout=_gw_timeout())
-    if r.status_code!=200: raise RuntimeError("GW_LOGIN_HTTP_{}:{}".format(r.status_code, (r.text or "")[:180]))
-    j=r.json(); t=j.get("token")
-    if not t: raise RuntimeError("GW_LOGIN_NO_TOKEN")
-    return t
-
-def gw_get_leocross():
-    tok=_sanitize_token(os.environ.get("GW_TOKEN","") or "")
-    def hit(t):
-        h={"Accept":"application/json","Authorization":"Bearer {}".format(_sanitize_token(t)),"User-Agent":"gw-orchestrator/1.4"}
-        return requests.get("{}/{}".format(GW_BASE.rstrip("/"), GW_ENDPOINT.lstrip("/")), headers=h, timeout=_gw_timeout())
-    r=hit(tok) if tok else None
-    if (r is None) or (r.status_code in (401,403)): r=hit(gw_login_token())
-    if r.status_code!=200: raise RuntimeError("GW_HTTP_{}:{}".format(r.status_code, (r.text or "")[:180]))
-    return r.json()
-
-def extract_trade(j):
-    if isinstance(j,dict):
-        if "Trade" in j:
-            tr=j["Trade"]
-            return tr[-1] if isinstance(tr,list) and tr else tr if isinstance(tr,dict) else {}
-        keys=("Date","TDate","Limit","CLimit","Cat1","Cat2")
-        if any(k in j for k in keys): return j
-        for v in j.values():
-            if isinstance(v,(dict,list)):
-                t=extract_trade(v)
-                if t: return t
-    if isinstance(j,list):
-        for it in reversed(j):
-            t=extract_trade(it)
-            if t: return t
-    return {}
-
-# ===== condor helpers =====
-def condor_units_open(pos_map, legs):
-    b1 = max(0.0,  pos_map.get(osi_canon(legs[0]), 0.0))  # long wing put
-    b2 = max(0.0,  pos_map.get(osi_canon(legs[3]), 0.0))  # long wing call
-    s1 = max(0.0, -pos_map.get(osi_canon(legs[1]), 0.0))  # short inner put
-    s2 = max(0.0, -pos_map.get(osi_canon(legs[2]), 0.0))  # short inner call
-    return int(min(b1, b2, s1, s2))
-
-def print_guard_snapshot(pos, legs, is_credit):
-    labels = [("BUY_PUT",legs[0],-1),("SELL_PUT",legs[1],+1),("SELL_CALL",legs[2],+1),("BUY_CALL",legs[3],-1)]
-    print("ORCH GUARD SNAPSHOT ({}):".format("CREDIT" if is_credit else "DEBIT"))
-    for name, osi, sign in labels:
-        can = osi_canon(osi); cur = pos.get(can, 0.0)
-        print("  {:10s} {}  acct_qty={:+g}  sign={:+d}".format(name, osi, cur, sign))
-
-# ===== opening cash (initialBalances) =====
+# ===== opening cash + account =====
 def get_primary_acct(c):
     r=c.get_account_numbers(); r.raise_for_status()
     first=r.json()[0]
@@ -245,6 +195,26 @@ def opening_cash_for_account(c, acct_number: str):
         oc = pick(curr,"cashBalance","cashAvailableForTrading","liquidationValue")
     return oc
 
+# ===== short IC width =====
+def calc_short_ic_width(opening_cash: float | int) -> int:
+    steps = int(max(0, float(opening_cash) // SHORT_IC_PER_DOLLARS))
+    return max(SHORT_IC_MIN_WIDTH, SHORT_IC_WIDTH_INC * steps)
+
+# ===== condor helpers =====
+def condor_units_open(pos_map, legs):
+    b1 = max(0.0,  pos_map.get(osi_canon(legs[0]), 0.0))  # long wing put
+    b2 = max(0.0,  pos_map.get(osi_canon(legs[3]), 0.0))  # long wing call
+    s1 = max(0.0, -pos_map.get(osi_canon(legs[1]), 0.0))  # short inner put
+    s2 = max(0.0, -pos_map.get(osi_canon(legs[2]), 0.0))  # short inner call
+    return int(min(b1, b2, s1, s2))
+
+def print_guard_snapshot(pos, legs, is_credit, width_used):
+    labels = [("BUY_PUT",legs[0],-1),("SELL_PUT",legs[1],+1),("SELL_CALL",legs[2],+1),("BUY_CALL",legs[3],-1)]
+    print("ORCH GUARD SNAPSHOT ({} width={}):".format("CREDIT" if is_credit else "DEBIT", width_used))
+    for name, osi, sign in labels:
+        can = osi_canon(osi); cur = pos.get(can, 0.0)
+        print("  {:10s} {}  acct_qty={:+g}  sign={:+d}".format(name, osi, cur, sign))
+
 # ===== main =====
 def main():
     # Sheets init (non-fatal)
@@ -280,7 +250,7 @@ def main():
         print("ORCH ABORT:", reason); log("ABORT", reason)
         return 1
 
-    # ---- Leo signal → legs ----
+    # ---- Leo signal → prelim ----
     try:
         api=gw_get_leocross()
         tr=extract_trade(api)
@@ -300,13 +270,21 @@ def main():
     cat1=fnum(tr.get("Cat1")); cat2=fnum(tr.get("Cat2"))
     is_credit = True if (cat2 is None or cat1 is None or cat2>=cat1) else False
 
-    # Build planned legs (width 5)
-    p_low,p_high = inner_put-5, inner_put
-    c_low,c_high = inner_call, inner_call+5
-    bp = to_osi(".SPXW{}P{}".format(exp6, p_low))   # BUY_TO_OPEN
-    sp = to_osi(".SPXW{}P{}".format(exp6, p_high))  # SELL_TO_OPEN
-    sc = to_osi(".SPXW{}C{}".format(exp6, c_low))   # SELL_TO_OPEN
-    bc = to_osi(".SPXW{}C{}".format(exp6, c_high))  # BUY_TO_OPEN
+    # ---- opening cash early (needed for Short IC width) ----
+    oc = opening_cash_for_account(c, acct_num)
+    if oc is None:
+        reason="OPENING_CASH_UNAVAILABLE — aborting to avoid wrong size/width."
+        print("ORCH ABORT:", reason); log("ABORT", reason)
+        return 1
+
+    # Build planned legs (width depends on side)
+    width = calc_short_ic_width(oc) if is_credit else 5
+    p_low,p_high = inner_put - width, inner_put
+    c_low,c_high = inner_call, inner_call + width
+    bp = to_osi(".SPX{}{}{}".format("W",exp6, f"P{p_low}"))   # BUY_TO_OPEN
+    sp = to_osi(".SPX{}{}{}".format("W",exp6, f"P{p_high}"))  # SELL_TO_OPEN
+    sc = to_osi(".SPX{}{}{}".format("W",exp6, f"C{c_low}"))   # SELL_TO_OPEN
+    bc = to_osi(".SPX{}{}{}".format("W",exp6, f"C{c_high}"))  # BUY_TO_OPEN
 
     def orient(bp,sp,sc,bc):
         bpS=strike_from_osi(bp); spS=strike_from_osi(sp)
@@ -329,7 +307,7 @@ def main():
         return 1
 
     print("ORCH START RUN_ID={} SHA={}".format(os.environ.get("GITHUB_RUN_ID",""), os.environ.get("GITHUB_SHA","")[:7]))
-    print_guard_snapshot(pos, legs, is_credit)
+    print_guard_snapshot(pos, legs, is_credit, width)
 
     # snapshot quantities (for logging)
     bpq = pos.get(osi_canon(legs[0]), 0.0)
@@ -359,15 +337,11 @@ def main():
         print("ORCH SKIP:", details); log("SKIP", details, legs, acct_snapshot, "", "")
         return 0
 
-    # ---- opening cash → target units ----
-    oc = opening_cash_for_account(c, acct_num)
-    if oc is None:
-        reason="OPENING_CASH_UNAVAILABLE — aborting to avoid wrong size."
-        print("ORCH ABORT:", reason); log("ABORT", reason, legs, acct_snapshot, "", "")
-        return 1
-
-    target_units = int(max(0, oc // PER_UNIT))  # floor
-    # If you want a hard cap, e.g., max 10, add: target_units = min(target_units, 10)
+    # ---- target units ----
+    if is_credit:
+        target_units = 1    # SHORT IC: single contract only
+    else:
+        target_units = int(max(0, oc // PER_UNIT))  # legacy debit sizing
 
     # ---- compute remainder ----
     if nonzero==0:
@@ -375,12 +349,17 @@ def main():
     elif nonzero==4 and aligned==4:
         units_open = condor_units_open(pos, legs)
     else:
-        # shouldn't happen due to earlier branch
         units_open = 0
 
     rem_qty = max(0, target_units - units_open)
 
-    detail = "open_cash={:.2f} per_unit={} target={} units_open={} rem_qty={}".format(oc, PER_UNIT, target_units, units_open, rem_qty)
+    detail = ("short_ic width={} open_cash={:.2f} target={} units_open={} rem_qty={}"
+              if is_credit else
+              "long_ic width=5 open_cash={:.2f} per_unit={} target={} units_open={} rem_qty={}").format(
+                  width, oc, target_units, units_open, rem_qty) if is_credit else \
+              "long_ic width=5 open_cash={:.2f} per_unit={} target={} units_open={} rem_qty={}".format(
+                  oc, PER_UNIT, target_units, units_open, rem_qty)
+
     print("ORCH SIZE", detail)
     log(("ALLOW" if rem_qty>0 else "SKIP"), detail, legs, acct_snapshot, units_open, rem_qty)
 
@@ -390,9 +369,54 @@ def main():
 
     # ---- call placer with override ----
     env = dict(os.environ)
-    env["QTY_OVERRIDE"] = str(rem_qty)
+    env["QTY_OVERRIDE"] = str(rem_qty)  # for Short IC this will be "1"
     rc = os.spawnve(os.P_WAIT, sys.executable, [sys.executable, "scripts/leocross_place_simple.py"], env)
     return rc
+
+# ===== GW helpers (kept at end to match your existing structure) =====
+def _gw_timeout():
+    try: return int(os.environ.get("GW_TIMEOUT","30"))
+    except: return 30
+
+def _sanitize_token(t: str) -> str:
+    t = (t or "").strip().strip('"').strip("'")
+    return t.split(None,1)[1] if t.lower().startswith("bearer ") else t
+
+def gw_login_token():
+    email=os.environ.get("GW_EMAIL",""); pwd=os.environ.get("GW_PASSWORD","")
+    if not (email and pwd): raise RuntimeError("GW_LOGIN_MISSING_CREDS")
+    r=requests.post("{}/goauth/authenticateFireUser".format(GW_BASE), data={"email":email,"password":pwd}, timeout=_gw_timeout())
+    if r.status_code!=200: raise RuntimeError("GW_LOGIN_HTTP_{}:{}".format(r.status_code, (r.text or "")[:180]))
+    j=r.json(); t=j.get("token")
+    if not t: raise RuntimeError("GW_LOGIN_NO_TOKEN")
+    return t
+
+def gw_get_leocross():
+    tok=_sanitize_token(os.environ.get("GW_TOKEN","") or "")
+    def hit(t):
+        h={"Accept":"application/json","Authorization":"Bearer {}".format(_sanitize_token(t)),"User-Agent":"gw-orchestrator/1.5"}
+        return requests.get("{}/{}".format(GW_BASE.rstrip("/"), GW_ENDPOINT.lstrip("/")), headers=h, timeout=_gw_timeout())
+    r=hit(tok) if tok else None
+    if (r is None) or (r.status_code in (401,403)): r=hit(gw_login_token())
+    if r.status_code!=200: raise RuntimeError("GW_HTTP_{}:{}".format(r.status_code, (r.text or "")[:180]))
+    return r.json()
+
+def extract_trade(j):
+    if isinstance(j,dict):
+        if "Trade" in j:
+            tr=j["Trade"]
+            return tr[-1] if isinstance(tr,list) and tr else tr if isinstance(tr,dict) else {}
+        keys=("Date","TDate","Limit","CLimit","Cat1","Cat2")
+        if any(k in j for k in keys): return j
+        for v in j.values():
+            if isinstance(v,(dict,list)):
+                t=extract_trade(v)
+                if t: return t
+    if isinstance(j,list):
+        for it in reversed(j):
+            t=extract_trade(it)
+            if t: return t
+    return {}
 
 if __name__ == "__main__":
     sys.exit(main())
