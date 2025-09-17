@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# VERSION: 2025-09-17 ShortIC width-by-equity (1 lot); LongIC unchanged
+__version__ = "3.2.0"
+
 # LeoCross GUARD (stateless): derive 4 legs from GW, inspect Schwab positions & open orders,
 # and emit a single decision for the orchestrator.
 
@@ -7,6 +10,11 @@ from datetime import datetime, date, timezone
 from zoneinfo import ZoneInfo
 import requests
 from schwab.auth import client_from_token_file
+
+# ----- Config knobs (sane defaults) -----
+SHORT_IC_PER_DOLLARS = int(os.environ.get("SHORT_IC_PER_DOLLARS", "4000"))  # $4k per +5 width
+SHORT_IC_WIDTH_INC   = int(os.environ.get("SHORT_IC_WIDTH_INC",   "5"))     # +5 points each step
+SHORT_IC_MIN_WIDTH   = int(os.environ.get("SHORT_IC_MIN_WIDTH",   "5"))     # clamp ≥ 5
 
 ET = ZoneInfo("America/New_York")
 GW_BASE = "https://gandalf.gammawizard.com"
@@ -50,14 +58,28 @@ def iso_z(dt):
 
 def _backoff(i): return 0.6*(2**i)
 
+# ------------- Sizing helpers -------------
+def calc_short_ic_width(opening_cash: float | int) -> int:
+    """Width = 5 * floor(opening_cash / 4000), clamped to at least 5."""
+    try:
+        oc = float(opening_cash)
+    except Exception:
+        oc = 0.0
+    steps = int(max(0, oc // SHORT_IC_PER_DOLLARS))
+    width = max(SHORT_IC_MIN_WIDTH, SHORT_IC_WIDTH_INC * steps)
+    # keep SPX multiples; SHORT_IC_WIDTH_INC is already multiple of 5
+    return int(width)
+
 # ------------- Schwab helpers -------------
 def schwab_client():
     app_key=os.environ["SCHWAB_APP_KEY"]; app_secret=os.environ["SCHWAB_APP_SECRET"]; token_json=os.environ["SCHWAB_TOKEN_JSON"]
     with open("schwab_token.json","w") as f: f.write(token_json)
     c=client_from_token_file(api_key=app_key, app_secret=app_secret, token_path="schwab_token.json")
     r=c.get_account_numbers(); r.raise_for_status()
-    acct_hash=r.json()[0]["hashValue"]
-    return c, acct_hash
+    acct_info=r.json()[0]
+    acct_hash=str(acct_info["hashValue"])
+    acct_num =str(acct_info.get("accountNumber") or acct_info.get("account_number") or "")
+    return c, acct_hash, acct_num
 
 def schwab_get_json(c, url, params=None, tries=6, tag=""):
     last=""
@@ -133,6 +155,47 @@ def list_matching_open_ids(c, acct_hash: str, canon_set):
             if oid: out.append(oid)
     return out
 
+# ------------- opening cash (for width) -------------
+def opening_cash_for_account(c, acct_number: str):
+    r = c.get_accounts(); r.raise_for_status()
+    data = r.json()
+    accs = data if isinstance(data, list) else [data]
+
+    def pick(d,*ks):
+        for k in ks:
+            v = (d or {}).get(k)
+            if isinstance(v,(int,float)): return float(v)
+
+    def hunt(a):
+        acct_id=None; initial={}; current={}
+        stack=[a]
+        while stack:
+            x=stack.pop()
+            if isinstance(x,dict):
+                if acct_id is None and x.get("accountNumber"): acct_id=str(x["accountNumber"])
+                if "initialBalances" in x and isinstance(x["initialBalances"], dict): initial=x["initialBalances"]
+                if "currentBalances" in x and isinstance(x["currentBalances"], dict): current=x["currentBalances"]
+                for v in x.values():
+                    if isinstance(v,(dict,list)): stack.append(v)
+            elif isinstance(x,list):
+                stack.extend(x)
+        return acct_id, initial, current
+
+    chosen=None
+    for a in accs:
+        aid, init, curr = hunt(a)
+        if acct_number and aid == acct_number:
+            chosen=(init,curr); break
+        if chosen is None:
+            chosen=(init,curr)
+
+    if not chosen: return None
+    init, curr = chosen
+    oc = pick(init,"cashBalance","cashAvailableForTrading","liquidationValue")
+    if oc is None:
+        oc = pick(curr,"cashBalance","cashAvailableForTrading","liquidationValue")
+    return oc
+
 # ------------- GammaWizard -------------
 def _sanitize_token(t: str) -> str:
     t = (t or "").strip().strip('"').strip("'")
@@ -154,7 +217,7 @@ def gw_login_token():
 def gw_get_leocross():
     tok=_sanitize_token(os.environ.get("GW_TOKEN","") or "")
     def hit(t):
-        h={"Accept":"application/json","Authorization":f"Bearer {_sanitize_token(t)}","User-Agent":"gw-guard/1.0"}
+        h={"Accept":"application/json","Authorization":f"Bearer {_sanitize_token(t)}","User-Agent":"gw-guard/1.1"}
         return requests.get(f"{GW_BASE.rstrip('/')}/{GW_ENDPOINT.lstrip('/')}", headers=h, timeout=_gw_timeout())
     r=hit(tok) if tok else None
     if (r is None) or (r.status_code in (401,403)): r=hit(gw_login_token())
@@ -182,7 +245,7 @@ def extract_trade(j):
 def main():
     # Schwab client
     try:
-        c, acct_hash = schwab_client()
+        c, acct_hash, acct_num = schwab_client()
     except Exception as e:
         msg=str(e)
         reason="SCHWAB_OAUTH_REFRESH_FAILED — rotate SCHWAB_TOKEN_JSON" if ("unsupported_token_type" in msg or "refresh_token_authentication_error" in msg) else ("SCHWAB_CLIENT_INIT_FAILED — " + msg[:200])
@@ -219,9 +282,21 @@ def main():
     cat1=fnum(tr.get("Cat1")); cat2=fnum(tr.get("Cat2"))
     is_credit = True if (cat2 is None or cat1 is None or cat2>=cat1) else False
 
+    # determine width
+    oc = opening_cash_for_account(c, acct_num)
+    if is_credit and oc is None:
+        reason="OPENING_CASH_UNAVAILABLE — cannot compute Short IC width."
+        print("GUARD SKIP:", reason)
+        for k,v in {"action":"SKIP","reason":reason,"rem_qty":"","legs_json":"[]",
+                    "canon_key":"","is_credit":"true","open_order_ids":"","signal_date":sig_date}.items():
+            goutput(k,v)
+        return 0
+
+    width = calc_short_ic_width(oc) if is_credit else 5
+
     # legs (unoriented base strikes)
-    p_low,p_high = inner_put-5, inner_put
-    c_low,c_high = inner_call, inner_call+5
+    p_low,p_high = inner_put - width, inner_put
+    c_low,c_high = inner_call, inner_call + width
     bp = to_osi(f".SPXW{exp6}P{p_low}")
     sp = to_osi(f".SPXW{exp6}P{p_high}")
     sc = to_osi(f".SPXW{exp6}C{c_low}")
@@ -254,7 +329,7 @@ def main():
 
     # snapshot
     labels=[("BUY_PUT",legs[0],-1),("SELL_PUT",legs[1],+1),("SELL_CALL",legs[2],+1),("BUY_CALL",legs[3],-1)]
-    print(f"GUARD SNAPSHOT ({'CREDIT' if is_credit else 'DEBIT'}):")
+    print(f"GUARD SNAPSHOT ({'CREDIT' if is_credit else 'DEBIT'} width={width}):")
     for name, osi, sign in labels:
         cur = pos.get(osi_canon(osi), 0.0)
         print(f"  {name:10s} {osi}  acct_qty={cur:+g}  sign={sign:+d}")
@@ -279,19 +354,20 @@ def main():
         s2 = max(0.0, -pos_map.get(osi_canon(legs[2]), 0.0))
         return int(min(b1, b2, s1, s2))
 
+    target_qty = 1 if is_credit else max(0, QTY_TARGET)
+
     if any_opposite:
         action="SKIP"; reason="WOULD_CLOSE"
     elif (nonzero_count==0) and not open_ids:
-        action="NEW"; rem_qty=str(max(0, QTY_TARGET))
+        action="NEW"; rem_qty=str(target_qty)
     elif (nonzero_count==4 and aligned_count==4) and not open_ids:
         uo = condor_units_open(pos, legs)
-        if uo >= QTY_TARGET:
+        if uo >= target_qty:
             action="SKIP"; reason="AT_OR_ABOVE_TARGET"
         else:
-            action="NEW"; rem_qty=str(QTY_TARGET - uo)
+            action="NEW"; rem_qty=str(target_qty - uo)
     else:
         action="REPRICE_EXISTING"
-        # rem_qty left blank; placer will recompute based on live positions
         reason = "PARTIAL_OVERLAP or WORKING_ORDER"
 
     canon_key = f"{legs[0][6:12]}:P{legs[0][-8:]}-{legs[1][-8:]}:C{legs[2][-8:]}-{legs[3][-8:]}"
@@ -309,7 +385,7 @@ def main():
     }
     for k,v in outs.items(): goutput(k, v)
 
-    print(f"GUARD DECISION: action={action} rem_qty={rem_qty or 'NA'} open_order_ids={outs['open_order_ids']}")
+    print(f"GUARD DECISION: action={action} rem_qty={rem_qty or 'NA'} width={width} open_order_ids={outs['open_order_ids']}")
     return 0
 
 if __name__ == "__main__":
