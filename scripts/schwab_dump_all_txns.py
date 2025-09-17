@@ -2,10 +2,12 @@
 """
 Schwab → Sheets raw transaction dump (no filters), robust to Schwab ZonedDateTime requirements.
 
-- Uses startDate/endDate as ZonedDateTime (tries ET with offset, ET w/o colon, and UTC Z).
-- Chunks the pull window to avoid server-side limits.
+- Uses startDate/endDate as ZonedDateTime (tries ET with colon, ET w/o colon, and UTC Z).
+- Chunks the pull window by ET calendar days with NO overlap.
+- Accepts 204 (empty) without failing.
 - Flattens to columns (no JSON blobs) to keep 'text-to-columns' style.
-- Single overwrite write to 'sw_txn_raw' to avoid Sheets rate limits.
+- Clears and overwrites 'sw_txn_raw' in one write to avoid Sheets rate limits.
+- Accepts GOOGLE_SERVICE_ACCOUNT_JSON and SCHWAB_TOKEN_JSON as raw JSON or base64(JSON).
 
 Env:
   GSHEET_ID, GOOGLE_SERVICE_ACCOUNT_JSON
@@ -15,10 +17,9 @@ Env:
 
 import os, sys, json, base64, re, time
 from datetime import datetime, timedelta, timezone, date
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from zoneinfo import ZoneInfo
-import requests
 from schwab.auth import client_from_token_file
 from google.oauth2 import service_account
 from googleapiclient.discovery import build as gbuild
@@ -38,86 +39,109 @@ RAW_HEADERS = [
 
 ET = ZoneInfo("America/New_York")
 
+
 # ---------- Sheets helpers ----------
 def sheets_client():
     sid = os.environ["GSHEET_ID"]
     sa_json = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+
+    # Accept raw JSON or base64(JSON)
+    try:
+        dec = base64.b64decode(sa_json).decode("utf-8")
+        if dec.strip().startswith("{"):
+            sa_json = dec
+    except Exception:
+        pass
+
     creds = service_account.Credentials.from_service_account_info(
         json.loads(sa_json),
         scopes=["https://www.googleapis.com/auth/spreadsheets"]
     )
-    svc = gbuild("sheets","v4",credentials=creds)
+    svc = gbuild("sheets", "v4", credentials=creds)
     return svc, sid
+
 
 def ensure_tab_with_header(svc, sid: str, tab: str, headers: List[str]) -> None:
     meta = svc.spreadsheets().get(spreadsheetId=sid).execute()
-    tabs = [s["properties"]["title"] for s in meta.get("sheets",[])]
+    tabs = [s["properties"]["title"] for s in meta.get("sheets", [])]
     if tab not in tabs:
         svc.spreadsheets().batchUpdate(
             spreadsheetId=sid,
-            body={"requests":[{"addSheet":{"properties":{"title":tab}}}]}
+            body={"requests": [{"addSheet": {"properties": {"title": tab}}}]}
         ).execute()
-    got = svc.spreadsheets().values().get(spreadsheetId=sid, range=f"{tab}!1:1").execute().get("values",[])
+    got = svc.spreadsheets().values().get(spreadsheetId=sid, range=f"{tab}!1:1").execute().get("values", [])
     if not got or got[0] != headers:
         svc.spreadsheets().values().update(
             spreadsheetId=sid,
             range=f"{tab}!A1",
             valueInputOption="USER_ENTERED",
-            body={"values":[headers]}
+            body={"values": [headers]}
         ).execute()
 
+
 def overwrite_rows(svc, sid: str, tab: str, headers: List[str], rows: List[List[Any]]) -> None:
+    # Clear entire tab to avoid stale tails from previous runs
+    svc.spreadsheets().values().clear(spreadsheetId=sid, range=tab).execute()
     svc.spreadsheets().values().update(
         spreadsheetId=sid,
         range=f"{tab}!A1",
         valueInputOption="USER_ENTERED",
-        body={"values":[headers] + rows}
+        body={"values": [headers] + rows}
     ).execute()
+
 
 # ---------- Schwab auth ----------
 def decode_token_to_path() -> str:
-    token_env = os.environ.get("SCHWAB_TOKEN_JSON","") or ""
+    token_env = os.environ.get("SCHWAB_TOKEN_JSON", "") or ""
     token_path = "schwab_token.json"
     if token_env:
         try:
             dec = base64.b64decode(token_env).decode("utf-8")
-            if dec.strip().startswith("{"): token_env = dec
+            if dec.strip().startswith("{"):
+                token_env = dec
         except Exception:
             pass
-        with open(token_path,"w") as f:
+        with open(token_path, "w") as f:
             f.write(token_env)
     return token_path
+
 
 def schwab_client():
     token_path = decode_token_to_path()
     app_key = os.environ["SCHWAB_APP_KEY"]
     app_secret = os.environ["SCHWAB_APP_SECRET"]
-    # Use positional form (pkg sometimes changes keyword names)
     c = client_from_token_file(token_path, app_key, app_secret)
-    r = c.get_account_numbers(); r.raise_for_status()
+    r = c.get_account_numbers()
+    r.raise_for_status()
     acct_hash = r.json()[0]["hashValue"]
     return c, acct_hash
+
 
 # ---------- time/format helpers ----------
 def start_of_day(dt: datetime, tz=ET) -> datetime:
     return dt.astimezone(tz).replace(hour=0, minute=0, second=0, microsecond=0)
 
+
 def end_of_day(dt: datetime, tz=ET) -> datetime:
     return dt.astimezone(tz).replace(hour=23, minute=59, second=59, microsecond=0)
+
 
 def fmt_et_with_colon(dt: datetime) -> str:
     # 2025-09-12T00:00:00-04:00
     local = dt.astimezone(ET)
     s = local.strftime("%Y-%m-%dT%H:%M:%S%z")  # -0400
-    return f"{s[:-2]}:{s[-2:]}"               # -> -04:00
+    return f"{s[:-2]}:{s[-2:]}"  # -> -04:00
+
 
 def fmt_et_no_colon(dt: datetime) -> str:
     # 2025-09-12T00:00:00-0400
     return dt.astimezone(ET).strftime("%Y-%m-%dT%H:%M:%S%z")
 
+
 def fmt_utc_z(dt: datetime) -> str:
     # 2025-09-12T00:00:00Z
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
 
 # ---------- transaction fetch (robust param shapes + chunking) ----------
 def get_txns_chunk(c, acct_hash: str, dt0: datetime, dt1: datetime) -> List[Dict[str, Any]]:
@@ -126,12 +150,13 @@ def get_txns_chunk(c, acct_hash: str, dt0: datetime, dt1: datetime) -> List[Dict
       1) ET with colon offset:  2025-09-12T00:00:00-04:00
       2) ET without colon:      2025-09-12T00:00:00-0400
       3) UTC Z:                 2025-09-12T00:00:00Z
+    Accept 204 as "no transactions".
     """
     url = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/transactions"
     shapes = [
-        ("ET_COLON",  fmt_et_with_colon(start_of_day(dt0)), fmt_et_with_colon(end_of_day(dt1))),
-        ("ET_NOCOL",  fmt_et_no_colon(start_of_day(dt0)),   fmt_et_no_colon(end_of_day(dt1))),
-        ("UTC_Z",     fmt_utc_z(start_of_day(dt0)),         fmt_utc_z(end_of_day(dt1))),
+        ("ET_COLON", fmt_et_with_colon(start_of_day(dt0)), fmt_et_with_colon(end_of_day(dt1))),
+        ("ET_NOCOL", fmt_et_no_colon(start_of_day(dt0)),   fmt_et_no_colon(end_of_day(dt1))),
+        ("UTC_Z",    fmt_utc_z(start_of_day(dt0)),         fmt_utc_z(end_of_day(dt1))),
     ]
     last_err = ""
     for tag, s0, s1 in shapes:
@@ -140,9 +165,13 @@ def get_txns_chunk(c, acct_hash: str, dt0: datetime, dt1: datetime) -> List[Dict
             r = c.session.get(url, params=params, timeout=30)
             if r.status_code == 200:
                 j = r.json()
-                if isinstance(j, list): return j
-                if isinstance(j, dict) and "transactions" in j: return j.get("transactions") or []
+                if isinstance(j, list):
+                    return j
+                if isinstance(j, dict) and "transactions" in j:
+                    return j.get("transactions") or []
                 return []
+            if r.status_code == 204:
+                return []  # valid empty
             last_err = f"{r.status_code}:{(r.text or '')[:160]}"
             print(f"NOTE: txns shape={tag} → {last_err}")
         except Exception as e:
@@ -151,39 +180,64 @@ def get_txns_chunk(c, acct_hash: str, dt0: datetime, dt1: datetime) -> List[Dict
         time.sleep(0.4)
     raise RuntimeError(f"transactions fetch failed for chunk — {last_err}")
 
+
 def get_txns_resilient(c, acct_hash: str, start_dt: datetime, end_dt: datetime) -> List[Dict[str, Any]]:
-    # chunk by ~30 days to stay friendly
+    """
+    Pull in non-overlapping 30-day blocks using ET calendar days.
+    """
     txns: List[Dict[str, Any]] = []
-    cur = start_dt
-    step = timedelta(days=30)
-    while cur <= end_dt:
-        chunk_end = min(cur + step, end_dt)
-        txns += get_txns_chunk(c, acct_hash, cur, chunk_end)
-        cur = chunk_end + timedelta(seconds=1)
+    cur_day = start_dt.astimezone(ET).date()
+    end_day = end_dt.astimezone(ET).date()
+
+    while cur_day <= end_day:
+        # inclusive block: cur_day .. cur_day+29 (or end_day)
+        chunk_end_day = min(cur_day + timedelta(days=29), end_day)
+
+        # any tz-aware placeholders; get_txns_chunk normalizes to ET day bounds
+        dt0 = datetime.combine(cur_day, datetime.min.time(), tzinfo=timezone.utc)
+        dt1 = datetime.combine(chunk_end_day, datetime.min.time(), tzinfo=timezone.utc)
+
+        print(f"Pulling {cur_day} → {chunk_end_day} (ET)…")
+        txns += get_txns_chunk(c, acct_hash, dt0, dt1)
+
+        cur_day = chunk_end_day + timedelta(days=1)  # advance to next day (no overlap)
+
     return txns
+
 
 # ---------- parsing/flattening ----------
 def safe_float(x) -> Optional[float]:
-    try: return float(x)
-    except: return None
+    try:
+        return float(x)
+    except Exception:
+        return None
+
 
 def parse_exp_from_symbol(sym: str) -> Optional[str]:
-    if not sym: return None
+    if not sym:
+        return None
     s = sym.strip().upper()
     m = re.search(r"(20\d{2}-\d{2}-\d{2})", s)
-    if m: return m.group(1)
+    if m:
+        return m.group(1)
     m = re.search(r"\D(\d{6})[CP]\d", s)  # yymmdd
     if m:
-        try: return datetime.strptime(m.group(1), "%y%m%d").date().isoformat()
-        except: return None
+        try:
+            return datetime.strptime(m.group(1), "%y%m%d").date().isoformat()
+        except Exception:
+            return None
     return None
 
+
 def to_underlying(sym: str) -> Optional[str]:
-    if not sym: return None
-    s = sym.strip().upper().lstrip(".").replace("  "," ")
-    if s.startswith("SPXW") or s.startswith("SPX"): return "SPX"
+    if not sym:
+        return None
+    s = sym.strip().upper().lstrip(".").replace("  ", " ")
+    if s.startswith("SPXW") or s.startswith("SPX"):
+        return "SPX"
     m = re.match(r"([A-Z.$^]{1,6})", s)
     return m.group(1) if m else None
+
 
 def explode_txn(txn: Dict[str, Any]) -> List[List[Any]]:
     out: List[List[Any]] = []
@@ -198,25 +252,30 @@ def explode_txn(txn: Dict[str, Any]) -> List[List[Any]]:
     fees_total = 0.0
     comm_total = 0.0
     if isinstance(txn.get("fees"), dict):
-        for k,v in (txn["fees"] or {}).items():
+        for k, v in (txn["fees"] or {}).items():
             val = safe_float(v) or 0.0
-            if "comm" in k.lower(): comm_total += val
-            else:                   fees_total += val
+            if "comm" in k.lower():
+                comm_total += val
+            else:
+                fees_total += val
     elif isinstance(txn.get("fees"), list):
         for f in txn["fees"]:
             val = safe_float(f.get("amount")) or 0.0
             name = str(f.get("feeType") or f.get("type") or "")
-            if "comm" in name.lower(): comm_total += val
-            else:                      fees_total += val
+            if "comm" in name.lower():
+                comm_total += val
+            else:
+                fees_total += val
 
     items = txn.get("transactionItems") or txn.get("transactionItem") or []
-    if isinstance(items, dict): items = [items]
+    if isinstance(items, dict):
+        items = [items]
 
     if not items:
         net_amount = safe_float(txn.get("netAmount"))
         row = [ts, txn_id, ttype, subtype, desc,
                "", "", "", "", "",
-               "", "", "", (net_amount if net_amount is not None else ""), round(comm_total,2) or "", round(fees_total,2) or "",
+               "", "", "", (net_amount if net_amount is not None else ""), round(comm_total, 2) or "", round(fees_total, 2) or "",
                "schwab_txn"]
         out.append(row)
         return out
@@ -232,8 +291,10 @@ def explode_txn(txn: Dict[str, Any]) -> List[List[Any]]:
         exp = (it.get("instrument") or {}).get("optionExpirationDate")
         exp_primary = None
         if exp:
-            try: exp_primary = str(date.fromisoformat(str(exp)[:10]))
-            except: exp_primary = None
+            try:
+                exp_primary = str(date.fromisoformat(str(exp)[:10]))
+            except Exception:
+                exp_primary = None
         if not exp_primary:
             exp_primary = parse_exp_from_symbol(symbol)
         underlying = to_underlying(symbol)
@@ -242,11 +303,12 @@ def explode_txn(txn: Dict[str, Any]) -> List[List[Any]]:
         row = [ts, txn_id, ttype, subtype, desc,
                symbol, underlying or "", exp_primary or "", (strike if strike is not None else ""), pc,
                (qty if qty is not None else ""), (price if price is not None else ""), (amount if amount is not None else ""),
-               (net_amount if net_amount is not None else ""), round(comm_total,2) or "", round(fees_total,2) or "",
+               (net_amount if net_amount is not None else ""), round(comm_total, 2) or "", round(fees_total, 2) or "",
                "schwab_txn"]
         out.append(row)
 
     return out
+
 
 # ---------- main ----------
 def main() -> int:
@@ -272,7 +334,7 @@ def main() -> int:
     # Window
     try:
         days_back = int((os.environ.get("DAYS_BACK") or "60").strip())
-    except:
+    except Exception:
         days_back = 60
     end_dt = datetime.now(timezone.utc)
     start_dt = end_dt - timedelta(days=days_back)
@@ -291,6 +353,7 @@ def main() -> int:
     overwrite_rows(svc, sid, RAW_TAB, RAW_HEADERS, rows)
     print(f"OK: wrote {len(rows)} rows to {RAW_TAB}.")
     return 0
+
 
 if __name__ == "__main__":
     sys.exit(main())
