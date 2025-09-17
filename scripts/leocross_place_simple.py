@@ -1,9 +1,14 @@
+#!/usr/bin/env python3
+# VERSION: 2025-09-17 ShortIC width-by-equity (1 lot); LongIC unchanged
+__version__ = "2.4.0"
+
 # LeoCross PLACER — laddered IRON_CONDOR with true Cancel/Replace (PUT) semantics.
-# - FIXED contract count unless overridden via env QTY_OVERRIDE.
+# - Short IC (credit): dynamic width by opening cash; qty default 1 unless QTY_OVERRIDE set.
+# - Long IC (debit): legacy 5‑wide; qty from QTY_OVERRIDE or QTY_FIXED.
 # - No OBP checks.
 # - Logs ladder/price/filled/replaced/canceled to Google Sheet tab "schwab".
 # - Maintains ONE active working order: replace its price/size each rung.
-#
+
 # ======= MANUAL SIZE (edit this, or override via QTY_OVERRIDE env) =======
 QTY_FIXED = 4
 
@@ -17,18 +22,22 @@ from googleapiclient.discovery import build as gbuild
 
 # ===== constants =====
 TICK = 0.05
-WIDTH = 5
 ET = ZoneInfo("America/New_York")
 
 STEP_WAIT = 30       # seconds to wait at each rung
 FINAL_CANCEL = True  # if still not filled after last rung, cancel working ticket
 WINDOW_STATUSES = {"WORKING","QUEUED","OPEN","PENDING_ACTIVATION"}
 
-# Fixed ladders requested:
+# Fixed ladders requested (unchanged):
 CREDIT_START = 2.10
 CREDIT_FLOOR = 1.90
 DEBIT_START  = 1.90
 DEBIT_CEIL   = 2.10
+
+# Short IC sizing knobs (env-overridable)
+SHORT_IC_PER_DOLLARS = int(os.environ.get("SHORT_IC_PER_DOLLARS", "4000"))
+SHORT_IC_WIDTH_INC   = int(os.environ.get("SHORT_IC_WIDTH_INC",   "5"))
+SHORT_IC_MIN_WIDTH   = int(os.environ.get("SHORT_IC_MIN_WIDTH",   "5"))
 
 GW_BASE = "https://gandalf.gammawizard.com"
 GW_ENDPOINT = "/rapi/GetLeoCross"
@@ -150,6 +159,56 @@ def schwab_delete(c, url, tries=4, tag=""):
         time.sleep(_backoff(i))
     raise RuntimeError(f"SCHWAB_DELETE_FAIL({tag}) {last}")
 
+# ===== Account helpers =====
+def get_primary_acct(c):
+    r=c.get_account_numbers(); r.raise_for_status()
+    first=r.json()[0]
+    return str(first.get("accountNumber")), str(first.get("hashValue"))
+
+def opening_cash_for_account(c, acct_number: str):
+    r = c.get_accounts(); r.raise_for_status()
+    data = r.json()
+    accs = data if isinstance(data, list) else [data]
+
+    def pick(d,*ks):
+        for k in ks:
+            v = (d or {}).get(k)
+            if isinstance(v,(int,float)): return float(v)
+
+    def hunt(a):
+        acct_id=None; initial={}; current={}
+        stack=[a]
+        while stack:
+            x=stack.pop()
+            if isinstance(x,dict):
+                if acct_id is None and x.get("accountNumber"): acct_id=str(x["accountNumber"])
+                if "initialBalances" in x and isinstance(x["initialBalances"], dict): initial=x["initialBalances"]
+                if "currentBalances" in x and isinstance(x["currentBalances"], dict): current=x["currentBalances"]
+                for v in x.values():
+                    if isinstance(v,(dict,list)): stack.append(v)
+            elif isinstance(x,list):
+                stack.extend(x)
+        return acct_id, initial, current
+
+    chosen=None
+    for a in accs:
+        aid, init, curr = hunt(a)
+        if acct_number and aid == acct_number:
+            chosen=(init,curr); break
+        if chosen is None:
+            chosen=(init,curr)
+
+    if not chosen: return None
+    init, curr = chosen
+    oc = pick(init,"cashBalance","cashAvailableForTrading","liquidationValue")
+    if oc is None:
+        oc = pick(curr,"cashBalance","cashAvailableForTrading","liquidationValue")
+    return oc
+
+def calc_short_ic_width(opening_cash: float | int) -> int:
+    steps = int(max(0, float(opening_cash) // SHORT_IC_PER_DOLLARS))
+    return max(SHORT_IC_MIN_WIDTH, SHORT_IC_WIDTH_INC * steps)
+
 # ===== GW + quotes (mid not used now, but kept for completeness) =====
 def _gw_timeout():
     try: return int(os.environ.get("GW_TIMEOUT","30"))
@@ -167,7 +226,7 @@ def gw_login_token():
 def gw_get_leocross():
     tok=_sanitize_token(os.environ.get("GW_TOKEN","") or "")
     def hit(t):
-        h={"Accept":"application/json","Authorization":f"Bearer {_sanitize_token(t)}","User-Agent":"gw-placer/1.1"}
+        h={"Accept":"application/json","Authorization":f"Bearer {_sanitize_token(t)}","User-Agent":"gw-placer/1.2"}
         return requests.get(f"{GW_BASE.rstrip('/')}/{GW_ENDPOINT.lstrip('/')}", headers=h, timeout=_gw_timeout())
     r=hit(tok) if tok else None
     if (r is None) or (r.status_code in (401,403)): r=hit(gw_login_token())
@@ -257,6 +316,16 @@ def pick_active_and_overlaps(c, acct_hash: str, canon_set):
             if oid: overlaps.append(oid)
     return exact_id, active_status, overlaps
 
+def calc_width_for_side(is_credit: bool, opening_cash: float) -> int:
+    return (max(SHORT_IC_MIN_WIDTH, SHORT_IC_WIDTH_INC * int(opening_cash // SHORT_IC_PER_DOLLARS))
+            if is_credit else 5)
+
+def get_qty(is_credit: bool, qty_override: str) -> int:
+    if qty_override:
+        try: return max(0, int(qty_override))
+        except: return 0
+    return 1 if is_credit else QTY_FIXED
+
 def main():
     MODE=(os.environ.get("PLACER_MODE","SCHEDULED") or "SCHEDULED").upper()
     source=f"SIMPLE_{MODE}"
@@ -267,8 +336,8 @@ def main():
     with open("schwab_token.json","w") as f: f.write(token_json)
     c=client_from_token_file(api_key=app_key, app_secret=app_secret, token_path="schwab_token.json")
 
-    r=c.get_account_numbers(); r.raise_for_status()
-    acct_hash=r.json()[0]["hashValue"]
+    acct_num, acct_hash = get_primary_acct(c)
+    oc = opening_cash_for_account(c, acct_num)
 
     def spx_last():
         for sym in ["$SPX.X","SPX","SPX.X","$SPX"]:
@@ -330,8 +399,10 @@ def main():
     cat1=fnum(tr.get("Cat1")); cat2=fnum(tr.get("Cat2"))
     is_credit = True if (cat2 is None or cat1 is None or cat2>=cat1) else False
 
-    p_low,p_high = inner_put-5, inner_put
-    c_low,c_high = inner_call, inner_call+5
+    # ---- build legs with proper width ----
+    width = calc_width_for_side(is_credit, oc if oc is not None else 0)
+    p_low,p_high = inner_put-width, inner_put
+    c_low,c_high = inner_call, inner_call+width
     bp = to_osi(f".SPXW{exp6}P{p_low}"); sp = to_osi(f".SPXW{exp6}P{p_high}")
     sc = to_osi(f".SPXW{exp6}C{c_low}"); bc = to_osi(f".SPXW{exp6}C{c_high}")
 
@@ -351,7 +422,7 @@ def main():
     side_name  = "SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"
     order_type = "NET_CREDIT" if is_credit else "NET_DEBIT"
 
-    qty = int(os.environ.get("QTY_OVERRIDE","").strip() or QTY_FIXED)
+    qty = get_qty(is_credit, os.environ.get("QTY_OVERRIDE","").strip())
     if qty < 1:
         row=[datetime.utcnow().isoformat()+"Z", source, "SPX", last_px, sig_date, "ABORT",
              side_name, "", order_type, "",
@@ -362,7 +433,7 @@ def main():
         return {
             "orderType": order_type,
             "session": "NORMAL",
-            "price": f"{price:.2f}",
+            "price": f"{clamp_tick(price):.2f}",
             "duration": "DAY",
             "orderStrategyType": "SINGLE",
             "complexOrderStrategyType": "IRON_CONDOR",
@@ -456,7 +527,7 @@ def main():
         steps.append(f"{clamp_tick(px):.2f}@{to_place}")
         return wait_loop(STEP_WAIT)
 
-    # ===== NEW: Simple fixed 5¢ ladder every 30s =====
+    # ===== 5¢ ladder every 30s (unchanged) =====
     ladder = []
     if is_credit:
         p = CREDIT_START
@@ -491,7 +562,8 @@ def main():
     canceled_str = f"CANCELED {canceled}"
     used_price = steps[-1].split("@",1)[0] if steps else ""
     oid_for_log = active_oid or ""
-    status_txt = (("FILLED " + trace) if (filled_total >= qty) else (status + " " + trace)) + f" | {filled_str} | {repl_str} | {canceled_str}"
+    status_txt = (("FILLED " + trace) if (filled_total >= qty) else (status + " " + trace)) + \
+                 f" | {filled_str} | {repl_str} | {canceled_str} | width={width} oc={oc if oc is not None else 'NA'}"
 
     row = [datetime.utcnow().isoformat()+"Z", source, "SPX", last_px,
            sig_date, "PLACE", side, qty, otype,
