@@ -39,9 +39,9 @@ jobs:
           python scripts/schwab_dump_all_txns.py
 
       # Enable this once your summarize script is ready
-      # - name: Summarize sw_txn_raw → sw_summary_by_expiry
-      #   env:
-      #     GSHEET_ID: ${{ secrets.GSHEET_ID }}
-      #     GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-      #   run: |
-      #     python scripts/schwab_summarize_txns.py
+      - name: Summarize sw_txn_raw → sw_summary_by_expiry
+        env:
+          GSHEET_ID: ${{ secrets.GSHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          python scripts/schwab_summarize_txns.py
