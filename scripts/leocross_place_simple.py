@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-# VERSION: 2025-09-17 v2.5.0 — Short IC credit ladder scales with width:
-#   start = 1.80 * (width/5), step = -0.20 every 10s, stop after $4.00 drop (>= $0.05).
+# VERSION: 2025-10-05 v2.6.0 — Short IC sizing = 15-wide & 12k-per-contract ladder:
+#   start = max($4.80, $2 * width/5), step = -$0.05 every 10s, floor $4.80.
 #   Long IC (debit) ladder unchanged.
 
-__version__ = "2.5.0"
+__version__ = "2.6.0"
 
 # LeoCross PLACER — laddered IRON_CONDOR with true Cancel/Replace (PUT) semantics.
-# - Short IC (credit): dynamic width-by-equity (from orchestrator/this file), qty default 1 unless QTY_OVERRIDE set.
-#   Ladder start/step/stop as above.
+# - Short IC (credit): fixed-width (default 15) & qty = ceil(open_cash/12k) unless QTY_OVERRIDE.
+#   Ladder start/step/floor as above.
 # - Long IC (debit): legacy 5‑wide; qty from QTY_OVERRIDE or QTY_FIXED.
 # - Logs ladder/price/filled/replaced/canceled to Google Sheet tab "schwab".
 # - Maintains ONE active working order: replace its price/size each rung.
@@ -15,7 +15,7 @@ __version__ = "2.5.0"
 # ======= MANUAL SIZE (edit this, or override via QTY_OVERRIDE env) =======
 QTY_FIXED = 4  # used only for Long IC unless QTY_OVERRIDE provided
 
-import os, sys, json, time, re
+import os, sys, json, time, re, math
 from datetime import datetime, date, timezone
 from zoneinfo import ZoneInfo
 import requests
@@ -38,15 +38,15 @@ DEBIT_START  = float(os.environ.get("DEBIT_START", "1.90"))
 DEBIT_CEIL   = float(os.environ.get("DEBIT_CEIL",  "2.10"))
 DEBIT_STEP   = float(os.environ.get("DEBIT_STEP",  "0.05"))
 
-# ===== Short IC sizing knobs (width) =====
-SHORT_IC_PER_DOLLARS = int(os.environ.get("SHORT_IC_PER_DOLLARS", "4000"))  # $4k → +5 width
-SHORT_IC_WIDTH_INC   = int(os.environ.get("SHORT_IC_WIDTH_INC",   "5"))     # points per step
-SHORT_IC_MIN_WIDTH   = int(os.environ.get("SHORT_IC_MIN_WIDTH",   "5"))     # clamp ≥ 5
+# ===== Short IC sizing knobs =====
+CREDIT_DOLLARS_PER_CONTRACT = float(os.environ.get("CREDIT_DOLLARS_PER_CONTRACT", "12000"))
+CREDIT_SPREAD_WIDTH         = int(os.environ.get("CREDIT_SPREAD_WIDTH", "15"))
+CREDIT_MIN_WIDTH            = 5
 
-# ===== Short IC ladder knobs (new dynamic credit ladder) =====
-CREDIT_PER5_START = float(os.environ.get("CREDIT_PER5_START", "1.80"))  # $ per 5pt width
-CREDIT_STEP       = float(os.environ.get("CREDIT_STEP",       "0.20"))  # down 20¢ each rung
-CREDIT_RANGE      = float(os.environ.get("CREDIT_RANGE",      "4.00"))  # stop after $4 total drop
+# ===== Short IC ladder knobs =====
+CREDIT_PER5_START = float(os.environ.get("CREDIT_PER5_START", "2.00"))  # $ per 5pt width
+CREDIT_STEP       = float(os.environ.get("CREDIT_STEP",       "0.05"))  # down 5¢ each rung
+CREDIT_FLOOR      = float(os.environ.get("CREDIT_FLOOR",      "4.80"))  # never go below this
 
 GW_BASE = "https://gandalf.gammawizard.com"
 GW_ENDPOINT = "/rapi/GetLeoCross"
@@ -215,8 +215,8 @@ def opening_cash_for_account(c, acct_number: str):
     return oc
 
 def calc_short_ic_width(opening_cash: float | int) -> int:
-    steps = int(max(0, float(opening_cash) // SHORT_IC_PER_DOLLARS))
-    return max(SHORT_IC_MIN_WIDTH, SHORT_IC_WIDTH_INC * steps)
+    """Backwards-compatible helper; width no longer depends on cash."""
+    return _credit_width()
 
 # ===== GW + quotes (mid not used now, but kept for completeness) =====
 def _gw_timeout():
@@ -325,15 +325,29 @@ def pick_active_and_overlaps(c, acct_hash: str, canon_set):
             if oid: overlaps.append(oid)
     return exact_id, active_status, overlaps
 
-def calc_width_for_side(is_credit: bool, opening_cash: float) -> int:
-    return (max(SHORT_IC_MIN_WIDTH, SHORT_IC_WIDTH_INC * int(opening_cash // SHORT_IC_PER_DOLLARS))
-            if is_credit else 5)
+def _credit_width() -> int:
+    width = max(CREDIT_MIN_WIDTH, int(CREDIT_SPREAD_WIDTH))
+    return int(math.ceil(width / 5.0) * 5)
 
-def get_qty(is_credit: bool, qty_override: str) -> int:
+def calc_width_for_side(is_credit: bool, opening_cash: float) -> int:
+    return _credit_width() if is_credit else 5
+
+def calc_credit_contracts(opening_cash: float | int) -> int:
+    try:
+        oc = float(opening_cash)
+    except Exception:
+        oc = 0.0
+    denom = CREDIT_DOLLARS_PER_CONTRACT if CREDIT_DOLLARS_PER_CONTRACT > 0 else 1.0
+    units = math.ceil(max(0.0, oc) / denom)
+    return max(1, int(units))
+
+def get_qty(is_credit: bool, qty_override: str, opening_cash: float | None) -> int:
     if qty_override:
         try: return max(0, int(qty_override))
         except: return 0
-    return 1 if is_credit else QTY_FIXED
+    if is_credit:
+        return calc_credit_contracts(opening_cash if opening_cash is not None else 0)
+    return QTY_FIXED
 
 def main():
     MODE=(os.environ.get("PLACER_MODE","SCHEDULED") or "SCHEDULED").upper()
@@ -431,7 +445,7 @@ def main():
     side_name  = "SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"
     order_type = "NET_CREDIT" if is_credit else "NET_DEBIT"
 
-    qty = get_qty(is_credit, os.environ.get("QTY_OVERRIDE","").strip())
+    qty = get_qty(is_credit, os.environ.get("QTY_OVERRIDE","").strip(), oc)
     if qty < 1:
         row=[datetime.utcnow().isoformat()+"Z", source, "SPX", last_px, sig_date, "ABORT",
              side_name, "", order_type, "",
@@ -539,9 +553,9 @@ def main():
     # ===== Build ladder =====
     status = "WORKING"
     if is_credit:
-        units = max(1, int(round(width / 5)))  # width is multiple of 5; fallback to >=1
-        start = clamp_tick(units * CREDIT_PER5_START)
-        stop  = clamp_tick(max(0.05, start - CREDIT_RANGE))
+        units = max(1.0, width / 5.0)
+        start = clamp_tick(max(CREDIT_FLOOR, units * CREDIT_PER5_START))
+        stop  = clamp_tick(min(start, max(CREDIT_FLOOR, 0.05)))
         step  = CREDIT_STEP
         secs  = STEP_WAIT_CREDIT
 
@@ -585,7 +599,9 @@ def main():
     used_price = steps[-1].split("@",1)[0] if steps else ""
     oid_for_log = active_oid or ""
     if is_credit:
-        ladder_note = f"credit_ladder start={start:.2f} step={CREDIT_STEP:.2f} stop={stop:.2f} width={width} oc={oc if oc is not None else 'NA'}"
+        ladder_note = ("credit_ladder start={:.2f} step={:.2f} floor={:.2f} width={} oc={}"
+                       .format(start, CREDIT_STEP, CREDIT_FLOOR,
+                               width, oc if oc is not None else 'NA'))
     else:
         ladder_note = f"debit_ladder {DEBIT_START:.2f}→{DEBIT_CEIL:.2f} step={DEBIT_STEP:.2f} width={width}"
 

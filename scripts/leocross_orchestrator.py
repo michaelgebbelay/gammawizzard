@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-# VERSION: 2025-09-17 v4.1.0 — Guard-bypass option added.
-# - Short IC (credit): width = 5 * floor(opening_cash/4000); qty = 1
+# VERSION: 2025-10-05 v4.2.0 — Short IC uses fixed 15-wide & 12k-per-contract sizing.
+# - Short IC (credit): width = 15 (configurable); qty = ceil(opening_cash/12k, min 1)
 # - Long  IC (debit):  legacy 5-wide; qty = floor(opening_cash / PER_UNIT)
 # - BYPASS_GUARD: skip NO-CLOSE & PARTIAL-OVERLAP checks, and force rem_qty (default 1 or BYPASS_QTY)
-__version__ = "4.1.0"
+__version__ = "4.2.0"
 
 # LeoCross ORCHESTRATOR — strict overlap guard + dynamic sizing from opening cash.
 # - Blocks if any leg would "close" something already in the account (unless BYPASS_GUARD=true).
@@ -13,16 +13,16 @@ __version__ = "4.1.0"
 
 PER_UNIT = 5000  # legacy debit sizing: contracts = floor(opening_cash / PER_UNIT)
 
-import os, sys, json, time, re
+import os, sys, json, time, re, math
 from datetime import datetime, date, timezone
 from zoneinfo import ZoneInfo
 import requests
 from schwab.auth import client_from_token_file
 
 # ----- env knobs -----
-SHORT_IC_PER_DOLLARS = int(os.environ.get("SHORT_IC_PER_DOLLARS", "4000"))  # $4k → +5 width
-SHORT_IC_WIDTH_INC   = int(os.environ.get("SHORT_IC_WIDTH_INC",   "5"))     # points per step
-SHORT_IC_MIN_WIDTH   = int(os.environ.get("SHORT_IC_MIN_WIDTH",   "5"))     # clamp ≥ 5
+CREDIT_DOLLARS_PER_CONTRACT = float(os.environ.get("CREDIT_DOLLARS_PER_CONTRACT", "12000"))
+CREDIT_SPREAD_WIDTH         = int(os.environ.get("CREDIT_SPREAD_WIDTH", "15"))
+CREDIT_MIN_WIDTH            = 5
 
 def _truthy(s: str) -> bool:
     return str(s or "").strip().lower() in {"1","true","t","yes","y","on"}
@@ -201,8 +201,17 @@ def opening_cash_for_account(c, acct_number: str):
 
 # ===== width =====
 def calc_short_ic_width(opening_cash: float | int) -> int:
-    steps = int(max(0, float(opening_cash) // SHORT_IC_PER_DOLLARS))
-    return max(SHORT_IC_MIN_WIDTH, SHORT_IC_WIDTH_INC * steps)
+    width = max(CREDIT_MIN_WIDTH, int(CREDIT_SPREAD_WIDTH))
+    return int(math.ceil(width / 5.0) * 5)
+
+def calc_short_ic_contracts(opening_cash: float | int) -> int:
+    try:
+        oc = float(opening_cash)
+    except Exception:
+        oc = 0.0
+    denom = CREDIT_DOLLARS_PER_CONTRACT if CREDIT_DOLLARS_PER_CONTRACT > 0 else 1.0
+    units = math.ceil(max(0.0, oc) / denom)
+    return max(1, int(units))
 
 # ===== condor helpers =====
 def condor_units_open(pos_map, legs):
@@ -345,7 +354,7 @@ def main():
 
     # ---- target units ----
     if is_credit:
-        target_units = 1    # SHORT IC: single contract only
+        target_units = calc_short_ic_contracts(oc)
     else:
         target_units = int(max(0, oc // PER_UNIT))  # legacy debit sizing
 
