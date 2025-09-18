@@ -1,24 +1,14 @@
 #!/usr/bin/env python3
 """
-Summarize trades by expiry with a persistent accumulator.
+Summarize trades by expiry from sw_txn_raw (ledger-only rows strongly preferred).
 
-Fixes:
-- Safe access for ragged rows (no IndexError).
-- TRADE-only.
-- Dedup key includes execution timestamp so separate same-price fills survive.
-- Credits positive: premium_gross = -Σ(amount)  (amount from dumper uses SELL qty negative).
-- Fees allocated per order across expiries by |amount|.
-- premium_net = premium_gross - fees_alloc
-- contracts_abs = Σ|quantity| (so 6 ICs → 24)
-
-Tabs:
-  RAW:  sw_txn_raw           (input; overwritten each run)
-  ACC:  sw_txn_accum         (persistent, deduped TRADE legs)
-  OUT:  sw_summary_by_expiry (rebuilt each run, newest expiries first)
-
-Env:
-  GSHEET_ID, GOOGLE_SERVICE_ACCOUNT_JSON
-  ACC_RESET (optional "1"/"true")
+Fixes vs prior summarize script:
+- Fees are **summed** per order across unique ledger activities (uses RAW column `ledger_id` if present;
+  otherwise falls back to (orderId, ts) pairs). This avoids multiplying fees by leg count or dropping them.
+- Keeps TRADE-only.
+- Dedup key includes `ts` so identical price/size fills remain separate.
+- Credits positive: `premium_gross = -Σ(amount)`.
+- fees_alloc proportional to |amount| per (exp, underlying) bucket.
 """
 
 import os, json, base64
@@ -147,7 +137,7 @@ def main() -> int:
         print("ABORT: sw_txn_raw empty or missing.")
         return 1
 
-    need = ["ts","txn_id","type","description","symbol","underlying","exp_primary",
+    need = ["ts","txn_id","type","symbol","underlying","exp_primary",
             "strike","put_call","quantity","price","amount","commissions","fees_other","net_amount","source"]
     miss = [c for c in need if c not in raw_header]
     if miss:
@@ -156,18 +146,10 @@ def main() -> int:
     idx_raw = idxmap(raw_header)
 
     # TRADE-only from RAW (safe access)
-    skipped_short = 0
     def is_trade(r: List[str]) -> bool:
-        t = norm_str(cell(r, idx_raw, "type")).upper()
-        return t == "TRADE"
-    raw_trade = []
-    for r in raw_rows:
-        try:
-            if is_trade(r): raw_trade.append(r)
-        except Exception:
-            skipped_short += 1
-    if skipped_short:
-        print(f"NOTE: skipped {skipped_short} short/invalid rows in {RAW_TAB}.")
+        return norm_str(cell(r, idx_raw, "type")).upper() == "TRADE"
+
+    raw_trade = [r for r in raw_rows if is_trade(r)]
 
     # Ensure/optionally reset accumulator (same header as RAW)
     acc_reset = (os.environ.get("ACC_RESET","").lower() in ("1","true","yes"))
@@ -180,8 +162,8 @@ def main() -> int:
     if not acc_header:
         ensure_tab_with_header(svc, sid, ACC_TAB, raw_header)
         acc_header, acc_rows_all = raw_header, []
-    idx_acc = idxmap(acc_header)
 
+    idx_acc = idxmap(acc_header)
     def acc_is_trade(r: List[str]) -> bool:
         t = norm_str(cell(r, idx_acc, "type")).upper() if "type" in idx_acc else "TRADE"
         return t == "TRADE"
@@ -195,7 +177,7 @@ def main() -> int:
     dedup_rows = []
     for r in raw_trade:
         k = leg_key(idx_raw, r)
-        if k in tmp_seen: 
+        if k in tmp_seen:
             continue
         tmp_seen.add(k)
         if k in seen:
@@ -211,25 +193,30 @@ def main() -> int:
 
     # Aggregate from full ACC
     idx = idx_acc
-    def g(row, name): 
+    def g(row, name):
         return cell(row, idx, name)
 
     agg: Dict[Tuple[str,str], Dict[str,Any]] = {}
     orders_by_bucket: Dict[Tuple[str,str], set] = defaultdict(set)
-    fees_by_txn: Dict[str, float] = defaultdict(float)
-    exp_weight_by_txn: Dict[str, Dict[Tuple[str,str], float]] = defaultdict(lambda: defaultdict(float))
+
+    # --- fee handling: sum per order across unique ledger entries ---
+    # Prefer RAW column 'ledger_id'; else use (txn_id, ts) to avoid multiplying by leg count.
+    fees_total_by_order: Dict[str, float] = defaultdict(float)
+    fee_seen = set()  # (orderId, ledger_id)
+    exp_weight_by_order: Dict[str, Dict[Tuple[str,str], float]] = defaultdict(lambda: defaultdict(float))
 
     for r in acc_rows:
         exp  = norm_str(g(r, "exp_primary"))
         und  = normalize_underlying(g(r, "underlying"))
-        if not exp:
-            continue
+        if not exp: continue
 
-        txn_id = norm_str(g(r, "txn_id"))
+        oid    = norm_str(g(r, "txn_id"))
         qty    = to_float(g(r, "quantity")) or 0.0
         amt    = to_float(g(r, "amount")) or 0.0    # SELL negative, BUY positive
         comm   = to_float(g(r, "commissions")) or 0.0
         fees   = to_float(g(r, "fees_other")) or 0.0
+        ts     = norm_str(g(r, "ts"))
+        ledger_id = norm_str(g(r, "ledger_id")) or ts  # fallback to time when missing
 
         bucket = (exp, und)
         if bucket not in agg:
@@ -240,20 +227,20 @@ def main() -> int:
         agg[bucket]["qty_abs"] += abs(qty)
         agg[bucket]["premium_amount_sum"] += amt
 
-        if txn_id:
-            orders_by_bucket[bucket].add(txn_id)
-            # Use max(comm+fees) seen per orderId to avoid multiplying fees by leg count
-            fees_by_txn[txn_id] = max(fees_by_txn[txn_id], (comm + fees))
-            exp_weight_by_txn[txn_id][bucket] += abs(amt)
+        if oid:
+            orders_by_bucket[bucket].add(oid)
+            key = (oid, ledger_id)
+            if key not in fee_seen:
+                fee_seen.add(key)
+                fees_total_by_order[oid] += (comm + fees)
+            exp_weight_by_order[oid][bucket] += abs(amt)
 
     # Allocate order fees across expiries proportionally to |amount|
-    for txn_id, fee_total in fees_by_txn.items():
-        if fee_total <= 0:
-            continue
-        weights = exp_weight_by_txn.get(txn_id, {})
+    for oid, fee_total in fees_total_by_order.items():
+        if fee_total <= 0: continue
+        weights = exp_weight_by_order.get(oid, {})
         denom = sum(weights.values())
         if denom <= 0:
-            # Spread evenly if we somehow have zero weights
             if not weights: continue
             share = fee_total / len(weights)
             for bucket in weights.keys():
@@ -270,7 +257,6 @@ def main() -> int:
         legs = vals["legs"]
         qty_net = round(vals["qty_net"], 6)
         qty_abs = round(vals["qty_abs"], 2)
-        # Amounts from dumper: credits < 0 → flip sign to show received premium as positive
         premium_gross = round(-vals["premium_amount_sum"], 2)
         fees_alloc = round(vals["fees_alloc"], 2)
         premium_net = round(premium_gross - fees_alloc, 2)
