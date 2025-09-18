@@ -360,11 +360,11 @@ def main():
 
     # ---- compute remainder ----
     if BYPASS_GUARD:
-        # ignore existing units; force place BYPASS_QTY (default 1)
+        # ignore existing units; if BYPASS_QTY empty, place full target
         try:
-            rem_qty = int(BYPASS_QTY) if BYPASS_QTY else 1
-        except:
-            rem_qty = 1
+            rem_qty = int(BYPASS_QTY) if BYPASS_QTY else int(target_units)
+        except Exception:
+            rem_qty = int(target_units)
         units_open = 0
         decision = "ALLOW_BYPASS"
         detail = f"BYPASS_GUARD=1 width={width} open_cash={oc:.2f} target={target_units} rem_qty={rem_qty}"
