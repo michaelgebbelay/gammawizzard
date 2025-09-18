@@ -15,7 +15,7 @@ __version__ = "2.6.0"
 # ======= MANUAL SIZE (edit this, or override via QTY_OVERRIDE env) =======
 QTY_FIXED = 4  # used only for Long IC unless QTY_OVERRIDE provided
 
-import os, sys, json, time, re, math
+import os, sys, json, time, re, math, random
 from datetime import datetime, date, timezone
 from zoneinfo import ZoneInfo
 import requests
@@ -32,6 +32,10 @@ STEP_WAIT_CREDIT = int(os.environ.get("STEP_WAIT_CREDIT", "10"))  # seconds betw
 STEP_WAIT_DEBIT  = int(os.environ.get("STEP_WAIT_DEBIT",  "30"))  # unchanged (debit)
 FINAL_CANCEL = True  # if still not filled after last rung, cancel working ticket
 WINDOW_STATUSES = {"WORKING","QUEUED","OPEN","PENDING_ACTIVATION"}
+
+REPLACE_MODE = (os.environ.get("REPLACE_MODE", "REPLACE") or "REPLACE").upper()
+MAX_LADDER_CYCLES = int(os.environ.get("MAX_LADDER_CYCLES", "3") or "3")
+RESET_TO_START = str(os.environ.get("RESET_TO_START", "1") or "1").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 # ===== Debit ladders (unchanged) =====
 DEBIT_START  = float(os.environ.get("DEBIT_START", "1.90"))
