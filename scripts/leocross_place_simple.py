@@ -593,42 +593,68 @@ def main():
         steps.append(f"{clamp_tick(px):.2f}@{to_place}")
         return wait_loop(secs)
 
-    # ===== Build ladder =====
+    # ===== Build ladder (with cycles) =====
     status = "WORKING"
-    if is_credit:
-        units = max(1.0, width / 5.0)
-        start = clamp_tick(max(CREDIT_FLOOR, units * CREDIT_PER5_START))
-        stop  = clamp_tick(min(start, max(CREDIT_FLOOR, 0.05)))
-        step  = CREDIT_STEP
-        secs  = STEP_WAIT_CREDIT
+    cycles = 0
+    # filled_total is already defined above; ensure it starts at 0 for this run
+    filled_total = 0
 
-        px = start
-        ladder = []
-        # Include both start and stop; descending
-        while px >= stop - 1e-9:
-            ladder.append(clamp_tick(px))
-            px = px - step
+    while cycles < MAX_LADDER_CYCLES and filled_total < qty:
+        if is_credit:
+            units = max(1.0, width / 5.0)
+            start = clamp_tick(max(CREDIT_FLOOR, units * CREDIT_PER5_START))
+            stop  = clamp_tick(CREDIT_FLOOR)
+            step  = CREDIT_STEP
+            secs  = STEP_WAIT_CREDIT
+
+            ladder = []
+            # restart at start each cycle if RESET_TO_START, else sit at floor quickly
+            px = start if (RESET_TO_START or cycles == 0) else stop
+            while px >= stop - 1e-9:
+                ladder.append(clamp_tick(px))
+                px -= step
+            if not ladder:
+                ladder = [stop]
+        else:
+            start = clamp_tick(DEBIT_START)
+            stop  = clamp_tick(DEBIT_CEIL)
+            step  = DEBIT_STEP
+            secs  = STEP_WAIT_DEBIT
+
+            ladder = []
+            px = start
+            while px <= stop + 1e-9:
+                ladder.append(clamp_tick(px))
+                px += step
+            if not ladder:
+                ladder = [start]
+
+        # walk the ladder
         for price in ladder:
             status = rung(price, secs)
             if status == "FILLED":
                 break
-    else:
-        # Debit ladder unchanged
-        start = clamp_tick(DEBIT_START); stop = clamp_tick(DEBIT_CEIL); step = DEBIT_STEP; secs = STEP_WAIT_DEBIT
-        px = start
-        ladder = []
-        while px <= stop + 1e-9:
-            ladder.append(clamp_tick(px))
-            px = px + step
-        for price in ladder:
-            status = rung(price, secs)
-            if status == "FILLED":
-                break
 
+        if filled_total >= qty:
+            break  # done!
+
+        # Not filled — cancel any working order before next cycle
+        if active_oid:
+            try:
+                url = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{active_oid}"
+                schwab_delete(c, url, tag=f"CANCEL_CYCLE:{active_oid}")
+                canceled += 1
+            except Exception:
+                pass
+            active_oid = None
+
+        cycles += 1
+
+    # final cleanup if still working
     if status != "FILLED" and FINAL_CANCEL and active_oid:
         try:
-            url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{active_oid}"
-            schwab_delete(c,url,tag=f"CANCEL_FINAL:{active_oid}")
+            url = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{active_oid}"
+            schwab_delete(c, url, tag=f"CANCEL_FINAL:{active_oid}")
             canceled += 1
         except Exception:
             pass
