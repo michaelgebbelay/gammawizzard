@@ -2,17 +2,23 @@
 """
 Summarize trades by expiry with a persistent accumulator.
 
+Fixes:
+- Safe access for ragged rows (no IndexError).
 - TRADE-only.
-- Dedup key includes execution timestamp to preserve distinct fills.
-- premium_gross = Σ(amount)  (credits positive, debits negative)
-- fees_alloc allocated per order across expiries by |amount|
+- Dedup key includes execution timestamp so separate same-price fills survive.
+- Credits positive: premium_gross = -Σ(amount)  (amount from dumper uses SELL qty negative).
+- Fees allocated per order across expiries by |amount|.
 - premium_net = premium_gross - fees_alloc
 - contracts_abs = Σ|quantity| (so 6 ICs → 24)
 
 Tabs:
-  RAW:  sw_txn_raw
-  ACC:  sw_txn_accum
-  OUT:  sw_summary_by_expiry
+  RAW:  sw_txn_raw           (input; overwritten each run)
+  ACC:  sw_txn_accum         (persistent, deduped TRADE legs)
+  OUT:  sw_summary_by_expiry (rebuilt each run, newest expiries first)
+
+Env:
+  GSHEET_ID, GOOGLE_SERVICE_ACCOUNT_JSON
+  ACC_RESET (optional "1"/"true")
 """
 
 import os, json, base64
@@ -55,7 +61,7 @@ def ensure_tab_with_header(svc, sid: str, tab: str, headers: List[str]) -> int:
         meta = svc.spreadsheets().get(spreadsheetId=sid).execute()
         ids = {s["properties"]["title"]: s["properties"]["sheetId"] for s in meta.get("sheets", [])}
     sheet_id = ids[tab]
-    got = svc.spreadsheets().values().get(spreadsheetId=sid, range=f"{tab}!1:1").execute().get("values", [])
+    got = svc.spreadsheets().values().get(spreadsheetId=sid, range=f"{tab}!A1:ZZ").execute().get("values", [])
     if not got or got[0] != headers:
         svc.spreadsheets().values().update(
             spreadsheetId=sid, range=f"{tab}!A1",
@@ -110,19 +116,23 @@ def normalize_underlying(u: str) -> str:
     u = (u or "").upper()
     return "SPX" if u.startswith("SPX") else (u or "UNK")
 
+def idxmap(header: List[str]) -> Dict[str,int]:
+    return {name:i for i,name in enumerate(header)}
+
+def cell(row: List[str], idx: Dict[str,int], name: str, default: str = "") -> str:
+    i = idx.get(name, -1)
+    return row[i] if 0 <= i < len(row) else default
+
 def leg_key(idx: Dict[str,int], row: List[str]) -> Tuple:
-    """Include ts so identical price/size fills at the same level remain separate."""
-    def g(name: str) -> str:
-        i = idx.get(name, -1)
-        return row[i] if 0 <= i < len(row) else ""
-    txn_id = norm_str(g("txn_id"))
-    ts     = norm_str(g("ts"))
-    symbol = norm_str(g("symbol")).upper()
-    qty    = to_float(g("quantity")) or 0.0
-    price  = to_float(g("price")) or 0.0
-    exp    = norm_str(g("exp_primary"))
-    pc     = norm_str(g("put_call")).upper()
-    strike = norm_str(g("strike"))
+    """Uniqueness key for TRADE legs. Include ts so identical price/size fills remain separate."""
+    txn_id = norm_str(cell(row, idx, "txn_id"))
+    ts     = norm_str(cell(row, idx, "ts"))
+    symbol = norm_str(cell(row, idx, "symbol")).upper()
+    qty    = to_float(cell(row, idx, "quantity")) or 0.0
+    price  = to_float(cell(row, idx, "price")) or 0.0
+    exp    = norm_str(cell(row, idx, "exp_primary"))
+    pc     = norm_str(cell(row, idx, "put_call")).upper()
+    strike = norm_str(cell(row, idx, "strike"))
     if txn_id:
         return ("ID", txn_id, ts, symbol, round(qty,6), round(price,6), exp, pc, strike)
     else:
@@ -143,13 +153,21 @@ def main() -> int:
     if miss:
         print(f"ABORT: missing columns in {RAW_TAB}: {miss}")
         return 1
-    idx_raw = {name:i for i,name in enumerate(raw_header)}
+    idx_raw = idxmap(raw_header)
 
-    # TRADE-only from RAW
+    # TRADE-only from RAW (safe access)
+    skipped_short = 0
     def is_trade(r: List[str]) -> bool:
-        t = norm_str(r[idx_raw["type"]]).upper()
+        t = norm_str(cell(r, idx_raw, "type")).upper()
         return t == "TRADE"
-    raw_trade = [r for r in raw_rows if is_trade(r)]
+    raw_trade = []
+    for r in raw_rows:
+        try:
+            if is_trade(r): raw_trade.append(r)
+        except Exception:
+            skipped_short += 1
+    if skipped_short:
+        print(f"NOTE: skipped {skipped_short} short/invalid rows in {RAW_TAB}.")
 
     # Ensure/optionally reset accumulator (same header as RAW)
     acc_reset = (os.environ.get("ACC_RESET","").lower() in ("1","true","yes"))
@@ -162,10 +180,10 @@ def main() -> int:
     if not acc_header:
         ensure_tab_with_header(svc, sid, ACC_TAB, raw_header)
         acc_header, acc_rows_all = raw_header, []
-    idx_acc = {name:i for i,name in enumerate(acc_header)}
+    idx_acc = idxmap(acc_header)
 
     def acc_is_trade(r: List[str]) -> bool:
-        t = norm_str(r[idx_acc["type"]]).upper() if "type" in idx_acc else "TRADE"
+        t = norm_str(cell(r, idx_acc, "type")).upper() if "type" in idx_acc else "TRADE"
         return t == "TRADE"
     acc_rows = [r for r in acc_rows_all if acc_is_trade(r)]
 
@@ -188,13 +206,13 @@ def main() -> int:
     if dedup_rows:
         append_rows(svc, sid, ACC_TAB, dedup_rows)
         acc_header, acc_rows_all = read_tab(svc, sid, ACC_TAB)
-        idx_acc = {name:i for i,name in enumerate(acc_header)}
+        idx_acc = idxmap(acc_header)
         acc_rows = [r for r in acc_rows_all if acc_is_trade(r)]
 
     # Aggregate from full ACC
-    idx = {name:i for i,name in enumerate(acc_header)}
+    idx = idx_acc
     def g(row, name): 
-        i = idx[name]; return row[i] if i < len(row) else ""
+        return cell(row, idx, name)
 
     agg: Dict[Tuple[str,str], Dict[str,Any]] = {}
     orders_by_bucket: Dict[Tuple[str,str], set] = defaultdict(set)
@@ -204,12 +222,12 @@ def main() -> int:
     for r in acc_rows:
         exp  = norm_str(g(r, "exp_primary"))
         und  = normalize_underlying(g(r, "underlying"))
-        if not exp: 
+        if not exp:
             continue
 
         txn_id = norm_str(g(r, "txn_id"))
         qty    = to_float(g(r, "quantity")) or 0.0
-        amt    = to_float(g(r, "amount")) or 0.0
+        amt    = to_float(g(r, "amount")) or 0.0    # SELL negative, BUY positive
         comm   = to_float(g(r, "commissions")) or 0.0
         fees   = to_float(g(r, "fees_other")) or 0.0
 
@@ -224,16 +242,18 @@ def main() -> int:
 
         if txn_id:
             orders_by_bucket[bucket].add(txn_id)
+            # Use max(comm+fees) seen per orderId to avoid multiplying fees by leg count
             fees_by_txn[txn_id] = max(fees_by_txn[txn_id], (comm + fees))
             exp_weight_by_txn[txn_id][bucket] += abs(amt)
 
-    # Allocate order fees
+    # Allocate order fees across expiries proportionally to |amount|
     for txn_id, fee_total in fees_by_txn.items():
-        if fee_total <= 0: 
+        if fee_total <= 0:
             continue
         weights = exp_weight_by_txn.get(txn_id, {})
         denom = sum(weights.values())
         if denom <= 0:
+            # Spread evenly if we somehow have zero weights
             if not weights: continue
             share = fee_total / len(weights)
             for bucket in weights.keys():
@@ -250,7 +270,8 @@ def main() -> int:
         legs = vals["legs"]
         qty_net = round(vals["qty_net"], 6)
         qty_abs = round(vals["qty_abs"], 2)
-        premium_gross = round(vals["premium_amount_sum"], 2)  # credits positive
+        # Amounts from dumper: credits < 0 → flip sign to show received premium as positive
+        premium_gross = round(-vals["premium_amount_sum"], 2)
         fees_alloc = round(vals["fees_alloc"], 2)
         premium_net = round(premium_gross - fees_alloc, 2)
         out_rows.append([exp, und, num_orders, legs, qty_net, qty_abs, premium_gross, fees_alloc, premium_net])
