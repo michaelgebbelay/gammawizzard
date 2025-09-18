@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
-# VERSION: 2025-09-17 ShortIC width-by-equity (1 lot); LongIC unchanged
-__version__ = "3.2.0"
+# VERSION: 2025-10-05 ShortIC fixed-width + contracts-per-equity sizing
+__version__ = "3.3.0"
 
 # LeoCross GUARD (stateless): derive 4 legs from GW, inspect Schwab positions & open orders,
 # and emit a single decision for the orchestrator.
 
-import os, sys, json, re, time
+import os, sys, json, re, time, math
 from datetime import datetime, date, timezone
 from zoneinfo import ZoneInfo
 import requests
 from schwab.auth import client_from_token_file
 
-# ----- Config knobs (sane defaults) -----
-SHORT_IC_PER_DOLLARS = int(os.environ.get("SHORT_IC_PER_DOLLARS", "4000"))  # $4k per +5 width
-SHORT_IC_WIDTH_INC   = int(os.environ.get("SHORT_IC_WIDTH_INC",   "5"))     # +5 points each step
-SHORT_IC_MIN_WIDTH   = int(os.environ.get("SHORT_IC_MIN_WIDTH",   "5"))     # clamp ≥ 5
+# ----- Config knobs (credit spreads) -----
+CREDIT_DOLLARS_PER_CONTRACT = float(os.environ.get("CREDIT_DOLLARS_PER_CONTRACT", "12000"))
+CREDIT_SPREAD_WIDTH         = int(os.environ.get("CREDIT_SPREAD_WIDTH", "15"))
+CREDIT_MIN_WIDTH            = 5  # SPX strikes trade in 5-point increments
 
 ET = ZoneInfo("America/New_York")
 GW_BASE = "https://gandalf.gammawizard.com"
@@ -58,17 +58,23 @@ def iso_z(dt):
 
 def _backoff(i): return 0.6*(2**i)
 
-# ------------- Sizing helpers -------------
+def _credit_width() -> int:
+    width = max(CREDIT_MIN_WIDTH, int(CREDIT_SPREAD_WIDTH))
+    # round to nearest 5 upward to stay on SPX grid
+    return int(math.ceil(width / 5.0) * 5)
+
 def calc_short_ic_width(opening_cash: float | int) -> int:
-    """Width = 5 * floor(opening_cash / 4000), clamped to at least 5."""
+    """Retained for compatibility: ignores cash and returns configured credit width."""
+    return _credit_width()
+
+def calc_short_ic_contracts(opening_cash: float | int) -> int:
     try:
         oc = float(opening_cash)
     except Exception:
         oc = 0.0
-    steps = int(max(0, oc // SHORT_IC_PER_DOLLARS))
-    width = max(SHORT_IC_MIN_WIDTH, SHORT_IC_WIDTH_INC * steps)
-    # keep SPX multiples; SHORT_IC_WIDTH_INC is already multiple of 5
-    return int(width)
+    denom = CREDIT_DOLLARS_PER_CONTRACT if CREDIT_DOLLARS_PER_CONTRACT > 0 else 1.0
+    units = math.ceil(max(0.0, oc) / denom)
+    return max(1, int(units))
 
 # ------------- Schwab helpers -------------
 def schwab_client():
@@ -354,7 +360,7 @@ def main():
         s2 = max(0.0, -pos_map.get(osi_canon(legs[2]), 0.0))
         return int(min(b1, b2, s1, s2))
 
-    target_qty = 1 if is_credit else max(0, QTY_TARGET)
+    target_qty = calc_short_ic_contracts(oc) if is_credit else max(0, QTY_TARGET)
 
     if any_opposite:
         action="SKIP"; reason="WOULD_CLOSE"
