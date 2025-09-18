@@ -291,17 +291,11 @@ def rows_from_order(order: Dict[str, Any], meta: Dict[str, Any]) -> List[List[An
     return rows
 
 def best_order_for_txn(c, acct_hash: str, order_id: str, ts_dt: Optional[datetime], desc: str) -> Optional[Dict[str, Any]]:
-    # Prefer direct hit by orderId; if missing, search a narrow window.
-    if order_id:
-        o = get_order_by_id(c, acct_hash, order_id)
-        if o: return o
-    if not ts_dt: return None
-    t0 = ts_dt - timedelta(days=1); t1 = ts_dt + timedelta(days=1)
-    cands = list_orders_window(c, acct_hash, t0, t1)
-    for o in cands:
-        if (o.get("status") or "").upper() == "FILLED":
-            return o
-    return cands[0] if cands else None
+    # Only return an order when we have an explicit orderId.
+    if not order_id:
+        return None
+    o = get_order_by_id(c, acct_hash, order_id)
+    return o
 
 # ---------- transaction flattening ----------
 def explode_txn_from_items(txn: Dict[str, Any]) -> Tuple[List[List[Any]], Dict[str, Any]]:
@@ -389,23 +383,22 @@ def explode_txn(c, acct_hash: str, txn: Dict[str, Any]) -> List[List[Any]]:
     oid_hint = (meta.get("order_id") or "").strip()
 
     if ttype == "TRADE":
-        # If we've already emitted this order, skip without calling the API again.
-        if oid_hint and oid_hint in _orders_emitted:
-            return []
-
-        order = best_order_for_txn(
-            c, acct_hash, oid_hint,
-            parse_ts(meta.get("ts")), meta.get("desc","")
-        )
-        if order:
-            effective_oid = str(order.get("orderId") or oid_hint or "")
-            if effective_oid:
+        # Only enrich when we truly know the order id; no guessing.
+        if oid_hint:
+            if oid_hint in _orders_emitted:
+                return []
+            order = best_order_for_txn(
+                c, acct_hash, oid_hint,
+                parse_ts(meta.get("ts")), meta.get("desc","")
+            )
+            if order:
+                effective_oid = str(order.get("orderId") or oid_hint)
                 if effective_oid in _orders_emitted:
                     return []
                 _orders_emitted.add(effective_oid)
-            exec_rows = rows_from_order(order, meta)
-            if exec_rows:
-                return exec_rows
+                exec_rows = rows_from_order(order, meta)
+                if exec_rows:
+                    return exec_rows
     return rows
 
 # ---------- main ----------
