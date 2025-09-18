@@ -1,19 +1,28 @@
 #!/usr/bin/env python3
 """
-Summarize trades by expiry from sw_txn_raw (ledger-only rows strongly preferred).
+Summarize P/L by expiration — ledger-first (correct cash), no re-allocation.
 
-Fixes vs prior summarize script:
-- Fees are **summed** per order across unique ledger activities (uses RAW column `ledger_id` if present;
-  otherwise falls back to (orderId, ts) pairs). This avoids multiplying fees by leg count or dropping them.
-- Keeps TRADE-only.
-- Dedup key includes `ts` so identical price/size fills remain separate.
-- Credits positive: `premium_gross = -Σ(amount)`.
-- fees_alloc proportional to |amount| per (exp, underlying) bucket.
+What this does
+--------------
+- Uses only rows sourced from Schwab's ledger (`source == "schwab_txn"`) and `type == "TRADE"`.
+- premium_net  = Σ net_amount                (already includes per-fill commissions & fees)
+- fees_alloc   = Σ (commissions + fees_other)
+- premium_gross= premium_net + fees_alloc     (since net = gross - fees)
+- legs         = distinct symbols per (exp, underlying)
+- num_orders   = distinct txn_id per (exp, underlying)
+- contracts_abs= Σ |quantity| (ledger is one row per contract fill)
+- contracts_net= Σ quantity
+
+Tabs
+----
+RAW: sw_txn_raw            (input)
+ACC: sw_txn_accum          (filtered ledger-only trades; for audit)
+OUT: sw_summary_by_expiry  (rebuilt each run)
 """
 
 import os, json, base64
-from collections import defaultdict
 from typing import Any, Dict, List, Tuple, Optional
+from collections import defaultdict
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build as gbuild
@@ -43,6 +52,11 @@ def sheets_client():
     )
     return gbuild("sheets","v4",credentials=creds), sid
 
+def read_tab(svc, sid: str, tab: str):
+    res = svc.spreadsheets().values().get(spreadsheetId=sid, range=f"{tab}!A1:ZZ").execute()
+    vals = res.get("values", [])
+    return (vals[0], vals[1:]) if vals else ([], [])
+
 def ensure_tab_with_header(svc, sid: str, tab: str, headers: List[str]) -> int:
     meta = svc.spreadsheets().get(spreadsheetId=sid).execute()
     ids = {s["properties"]["title"]: s["properties"]["sheetId"] for s in meta.get("sheets", [])}
@@ -51,7 +65,7 @@ def ensure_tab_with_header(svc, sid: str, tab: str, headers: List[str]) -> int:
         meta = svc.spreadsheets().get(spreadsheetId=sid).execute()
         ids = {s["properties"]["title"]: s["properties"]["sheetId"] for s in meta.get("sheets", [])}
     sheet_id = ids[tab]
-    got = svc.spreadsheets().values().get(spreadsheetId=sid, range=f"{tab}!A1:ZZ").execute().get("values", [])
+    got = svc.spreadsheets().values().get(spreadsheetId=sid, range=f"{tab}!1:1").execute().get("values",[])
     if not got or got[0] != headers:
         svc.spreadsheets().values().update(
             spreadsheetId=sid, range=f"{tab}!A1",
@@ -60,22 +74,15 @@ def ensure_tab_with_header(svc, sid: str, tab: str, headers: List[str]) -> int:
         ).execute()
     return sheet_id
 
-def read_tab(svc, sid: str, tab: str) -> Tuple[List[str], List[List[str]]]:
-    res = svc.spreadsheets().values().get(spreadsheetId=sid, range=f"{tab}!A1:ZZ").execute()
-    vals = res.get("values", [])
-    if not vals: return [], []
-    return vals[0], vals[1:]
-
-def append_rows(svc, sid: str, tab: str, rows: List[List[Any]]) -> None:
-    if not rows: return
-    svc.spreadsheets().values().append(
-        spreadsheetId=sid, range=f"{tab}!A1",
-        valueInputOption="RAW", insertDataOption="INSERT_ROWS",
-        body={"values": rows}
-    ).execute()
-
 def clear_tab(svc, sid: str, tab: str) -> None:
     svc.spreadsheets().values().clear(spreadsheetId=sid, range=tab).execute()
+
+def write_tab(svc, sid: str, tab: str, headers: List[str], rows: List[List[Any]]) -> None:
+    svc.spreadsheets().values().update(
+        spreadsheetId=sid, range=f"{tab}!A1",
+        valueInputOption="RAW",
+        body={"values":[headers] + rows}
+    ).execute()
 
 def format_out_columns(svc, sid: str, sheet_id: int) -> None:
     numeric = [2,3,4,5,6,7,8]
@@ -92,41 +99,23 @@ def format_out_columns(svc, sid: str, sheet_id: int) -> None:
         svc.spreadsheets().batchUpdate(spreadsheetId=sid, body={"requests":reqs}).execute()
 
 # ---------- helpers ----------
-def to_float(x) -> Optional[float]:
-    if x is None: return None
-    s = str(x).strip()
-    if s == "": return None
-    try: return float(s.replace(",",""))
-    except Exception: return None
-
-def norm_str(x) -> str:
-    return "" if x is None else str(x).strip()
-
-def normalize_underlying(u: str) -> str:
-    u = (u or "").upper()
-    return "SPX" if u.startswith("SPX") else (u or "UNK")
-
 def idxmap(header: List[str]) -> Dict[str,int]:
     return {name:i for i,name in enumerate(header)}
 
-def cell(row: List[str], idx: Dict[str,int], name: str, default: str = "") -> str:
+def to_float(x) -> Optional[float]:
+    try:
+        s = str(x).strip()
+        if s == "": return None
+        return float(s.replace(",",""))
+    except Exception:
+        return None
+
+def norm(x) -> str:
+    return "" if x is None else str(x).strip()
+
+def get(row: List[str], idx: Dict[str,int], name: str, default: str="") -> str:
     i = idx.get(name, -1)
     return row[i] if 0 <= i < len(row) else default
-
-def leg_key(idx: Dict[str,int], row: List[str]) -> Tuple:
-    """Uniqueness key for TRADE legs. Include ts so identical price/size fills remain separate."""
-    txn_id = norm_str(cell(row, idx, "txn_id"))
-    ts     = norm_str(cell(row, idx, "ts"))
-    symbol = norm_str(cell(row, idx, "symbol")).upper()
-    qty    = to_float(cell(row, idx, "quantity")) or 0.0
-    price  = to_float(cell(row, idx, "price")) or 0.0
-    exp    = norm_str(cell(row, idx, "exp_primary"))
-    pc     = norm_str(cell(row, idx, "put_call")).upper()
-    strike = norm_str(cell(row, idx, "strike"))
-    if txn_id:
-        return ("ID", txn_id, ts, symbol, round(qty,6), round(price,6), exp, pc, strike)
-    else:
-        return ("TS", ts, symbol, round(qty,6), round(price,6), exp, pc, strike)
 
 # ---------- main ----------
 def main() -> int:
@@ -137,141 +126,82 @@ def main() -> int:
         print("ABORT: sw_txn_raw empty or missing.")
         return 1
 
-    need = ["ts","txn_id","type","symbol","underlying","exp_primary",
-            "strike","put_call","quantity","price","amount","commissions","fees_other","net_amount","source"]
-    miss = [c for c in need if c not in raw_header]
-    if miss:
-        print(f"ABORT: missing columns in {RAW_TAB}: {miss}")
+    need = ["ts","txn_id","type","description","symbol","underlying","exp_primary",
+            "strike","put_call","quantity","price","amount","net_amount","commissions","fees_other","source"]
+    missing = [c for c in need if c not in raw_header]
+    if missing:
+        print(f"ABORT: missing in {RAW_TAB}: {missing}")
         return 1
-    idx_raw = idxmap(raw_header)
 
-    # TRADE-only from RAW (safe access)
-    def is_trade(r: List[str]) -> bool:
-        return norm_str(cell(r, idx_raw, "type")).upper() == "TRADE"
+    idx = idxmap(raw_header)
 
-    raw_trade = [r for r in raw_rows if is_trade(r)]
-
-    # Ensure/optionally reset accumulator (same header as RAW)
-    acc_reset = (os.environ.get("ACC_RESET","").lower() in ("1","true","yes"))
-    acc_sheet_id = ensure_tab_with_header(svc, sid, ACC_TAB, raw_header)
-    if acc_reset:
-        clear_tab(svc, sid, ACC_TAB)
-        ensure_tab_with_header(svc, sid, ACC_TAB, raw_header)
-
-    acc_header, acc_rows_all = read_tab(svc, sid, ACC_TAB)
-    if not acc_header:
-        ensure_tab_with_header(svc, sid, ACC_TAB, raw_header)
-        acc_header, acc_rows_all = raw_header, []
-
-    idx_acc = idxmap(acc_header)
-    def acc_is_trade(r: List[str]) -> bool:
-        t = norm_str(cell(r, idx_acc, "type")).upper() if "type" in idx_acc else "TRADE"
-        return t == "TRADE"
-    acc_rows = [r for r in acc_rows_all if acc_is_trade(r)]
-
-    # Build seen set from ACC
-    seen = set(leg_key(idx_acc, r) for r in acc_rows)
-
-    # Dedupe RAW in-window and append only new legs
-    tmp_seen = set()
-    dedup_rows = []
-    for r in raw_trade:
-        k = leg_key(idx_raw, r)
-        if k in tmp_seen:
+    # ----- filter to clean ledger-only trade rows -----
+    clean: List[List[str]] = []
+    for r in raw_rows:
+        if norm(get(r, idx, "source")).lower() != "schwab_txn":
             continue
-        tmp_seen.add(k)
-        if k in seen:
+        if norm(get(r, idx, "type")).upper() != "TRADE":
             continue
-        dedup_rows.append(r)
-        seen.add(k)
+        # keep only rows that have an expiration and an option symbol
+        if not norm(get(r, idx, "exp_primary")) or not norm(get(r, idx, "symbol")):
+            continue
+        clean.append(r)
 
-    if dedup_rows:
-        append_rows(svc, sid, ACC_TAB, dedup_rows)
-        acc_header, acc_rows_all = read_tab(svc, sid, ACC_TAB)
-        idx_acc = idxmap(acc_header)
-        acc_rows = [r for r in acc_rows_all if acc_is_trade(r)]
+    # Write ACC as an auditable filtered view
+    ensure_tab_with_header(svc, sid, ACC_TAB, raw_header)
+    write_tab(svc, sid, ACC_TAB, raw_header, clean)
 
-    # Aggregate from full ACC
-    idx = idx_acc
-    def g(row, name):
-        return cell(row, idx, name)
+    # ----- aggregate by (exp_primary, underlying) -----
+    buckets: Dict[Tuple[str,str], Dict[str,Any]] = defaultdict(lambda: {
+        "orders": set(),
+        "symbols": set(),
+        "contracts_net": 0.0,
+        "contracts_abs": 0.0,
+        "premium_net": 0.0,
+        "fees_alloc": 0.0
+    })
 
-    agg: Dict[Tuple[str,str], Dict[str,Any]] = {}
-    orders_by_bucket: Dict[Tuple[str,str], set] = defaultdict(set)
+    for r in clean:
+        exp = norm(get(r, idx, "exp_primary"))
+        und = norm(get(r, idx, "underlying")).upper()
+        if und.startswith("SPX"): und = "SPX"
+        b = buckets[(exp, und)]
 
-    # --- fee handling: sum per order across unique ledger entries ---
-    # Prefer RAW column 'ledger_id'; else use (txn_id, ts) to avoid multiplying by leg count.
-    fees_total_by_order: Dict[str, float] = defaultdict(float)
-    fee_seen = set()  # (orderId, ledger_id)
-    exp_weight_by_order: Dict[str, Dict[Tuple[str,str], float]] = defaultdict(lambda: defaultdict(float))
+        b["orders"].add(norm(get(r, idx, "txn_id")))
+        b["symbols"].add(norm(get(r, idx, "symbol")).upper())
 
-    for r in acc_rows:
-        exp  = norm_str(g(r, "exp_primary"))
-        und  = normalize_underlying(g(r, "underlying"))
-        if not exp: continue
+        q = to_float(get(r, idx, "quantity")) or 0.0
+        b["contracts_net"] += q
+        b["contracts_abs"] += abs(q)
 
-        oid    = norm_str(g(r, "txn_id"))
-        qty    = to_float(g(r, "quantity")) or 0.0
-        amt    = to_float(g(r, "amount")) or 0.0    # SELL negative, BUY positive
-        comm   = to_float(g(r, "commissions")) or 0.0
-        fees   = to_float(g(r, "fees_other")) or 0.0
-        ts     = norm_str(g(r, "ts"))
-        ledger_id = norm_str(g(r, "ledger_id")) or ts  # fallback to time when missing
+        b["premium_net"] += to_float(get(r, idx, "net_amount")) or 0.0
+        c = to_float(get(r, idx, "commissions")) or 0.0
+        f = to_float(get(r, idx, "fees_other")) or 0.0
+        b["fees_alloc"] += (c + f)
 
-        bucket = (exp, und)
-        if bucket not in agg:
-            agg[bucket] = {"legs":0,"qty_net":0.0,"qty_abs":0.0,"premium_amount_sum":0.0,"fees_alloc":0.0}
-
-        agg[bucket]["legs"] += 1
-        agg[bucket]["qty_net"] += qty
-        agg[bucket]["qty_abs"] += abs(qty)
-        agg[bucket]["premium_amount_sum"] += amt
-
-        if oid:
-            orders_by_bucket[bucket].add(oid)
-            key = (oid, ledger_id)
-            if key not in fee_seen:
-                fee_seen.add(key)
-                fees_total_by_order[oid] += (comm + fees)
-            exp_weight_by_order[oid][bucket] += abs(amt)
-
-    # Allocate order fees across expiries proportionally to |amount|
-    for oid, fee_total in fees_total_by_order.items():
-        if fee_total <= 0: continue
-        weights = exp_weight_by_order.get(oid, {})
-        denom = sum(weights.values())
-        if denom <= 0:
-            if not weights: continue
-            share = fee_total / len(weights)
-            for bucket in weights.keys():
-                if bucket in agg: agg[bucket]["fees_alloc"] += share
-        else:
-            for bucket, w in weights.items():
-                if bucket in agg: agg[bucket]["fees_alloc"] += fee_total * (w/denom)
-
-    # Build OUT rows (newest expiries first)
     out_rows: List[List[Any]] = []
-    for (exp, und) in sorted(agg.keys(), key=lambda b: (b[0], b[1]), reverse=True):
-        vals = agg[(exp, und)]
-        num_orders = len(orders_by_bucket.get((exp,und), set()))
-        legs = vals["legs"]
-        qty_net = round(vals["qty_net"], 6)
-        qty_abs = round(vals["qty_abs"], 2)
-        premium_gross = round(-vals["premium_amount_sum"], 2)
-        fees_alloc = round(vals["fees_alloc"], 2)
-        premium_net = round(premium_gross - fees_alloc, 2)
-        out_rows.append([exp, und, num_orders, legs, qty_net, qty_abs, premium_gross, fees_alloc, premium_net])
+    for (exp, und), s in sorted(buckets.items(), key=lambda kv: kv[0], reverse=True):
+        premium_net = round(s["premium_net"], 2)
+        fees_alloc  = round(s["fees_alloc"], 2)
+        premium_gross = round(premium_net + fees_alloc, 2)
+        out_rows.append([
+            exp, und,
+            len(s["orders"]),
+            len(s["symbols"]),
+            round(s["contracts_net"], 6),
+            round(s["contracts_abs"], 2),
+            premium_gross,
+            fees_alloc,
+            premium_net
+        ])
 
+    # write OUT
     out_sheet_id = ensure_tab_with_header(svc, sid, OUT_TAB, OUT_HEADERS)
     clear_tab(svc, sid, OUT_TAB)
-    svc.spreadsheets().values().update(
-        spreadsheetId=sid, range=f"{OUT_TAB}!A1",
-        valueInputOption="RAW",
-        body={"values":[OUT_HEADERS] + out_rows}
-    ).execute()
+    write_tab(svc, sid, OUT_TAB, OUT_HEADERS, out_rows)
     format_out_columns(svc, sid, out_sheet_id)
 
-    print(f"OK: accumulator += {len(dedup_rows)} new TRADE legs; wrote {len(out_rows)} summary rows.")
+    print(f"OK: wrote {len(out_rows)} summary rows from {len(clean)} ledger trade rows.")
     return 0
 
 if __name__ == "__main__":
