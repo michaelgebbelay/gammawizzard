@@ -304,7 +304,8 @@ def explode_txn_from_items(txn: Dict[str, Any]) -> Tuple[List[List[Any]], Dict[s
     ts = (txn.get("transactionDate") or txn.get("time") or txn.get("date") or "")
     transaction_id = str(txn.get("transactionId") or "")
     order_id = str(txn.get("orderId") or "")
-    txn_id_for_sheet = transaction_id or order_id
+    # Prefer orderId so all partial fills of a single order share the same key
+    txn_id_for_sheet = order_id or transaction_id
     ttype = str(txn.get("type") or txn.get("transactionType") or "")
     subtype = str(txn.get("subType") or "")
     desc = str(txn.get("description") or "")
