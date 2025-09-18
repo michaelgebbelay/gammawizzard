@@ -32,6 +32,9 @@ STEP_WAIT_CREDIT = int(os.environ.get("STEP_WAIT_CREDIT", "10"))  # seconds betw
 STEP_WAIT_DEBIT  = int(os.environ.get("STEP_WAIT_DEBIT",  "30"))  # unchanged (debit)
 FINAL_CANCEL = True  # if still not filled after last rung, cancel working ticket
 WINDOW_STATUSES = {"WORKING","QUEUED","OPEN","PENDING_ACTIVATION"}
+REPLACE_MODE = (os.environ.get("REPLACE_MODE", "REPLACE") or "REPLACE").upper()
+if REPLACE_MODE not in {"REPLACE", "CANCEL_REPLACE"}:
+    REPLACE_MODE = "REPLACE"
 
 REPLACE_MODE = (os.environ.get("REPLACE_MODE", "REPLACE") or "REPLACE").upper()
 MAX_LADDER_CYCLES = int(os.environ.get("MAX_LADDER_CYCLES", "3") or "3")
@@ -535,29 +538,37 @@ def main():
     def ensure_active(price: float, to_place: int):
         nonlocal active_oid, replacements, canceled
         px = clamp_tick(price)
-        if active_oid:
+        for attempt in range(6):
             try:
-                url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{active_oid}"
-                r=schwab_put_json(c,url,order_payload(px,to_place),tag=f"REPLACE@{px:.2f}x{to_place}")
-                new_id = parse_order_id_from_response(r) or active_oid
-                if new_id != active_oid:
+                # Try a true REPLACE when we have an active order and mode allows it
+                if active_oid and REPLACE_MODE == "REPLACE":
+                    url = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{active_oid}"
+                    r = schwab_put_json(c, url, order_payload(px, to_place), tag=f"REPLACE@{px:.2f}x{to_place}")
+                    new_id = parse_order_id_from_response(r) or active_oid
                     replacements += 1
                     active_oid = new_id
-                else:
-                    replacements += 1
-                return active_oid
-            except Exception as e:
-                try:
-                    url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{active_oid}"
-                    schwab_delete(c,url,tag=f"CANCEL_FALLBACK:{active_oid}")
-                    canceled += 1
-                except Exception:
-                    pass
-                active_oid = None
+                    return active_oid
 
-        url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
-        r=schwab_post_json(c,url,order_payload(px,to_place),tag=f"PLACE@{px:.2f}x{to_place}")
-        active_oid = parse_order_id_from_response(r)
+                # CANCEL_REPLACE mode or no active order: cancel then place
+                if active_oid and REPLACE_MODE == "CANCEL_REPLACE":
+                    try:
+                        url = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{active_oid}"
+                        schwab_delete(c, url, tag=f"CANCEL_STEP:{active_oid}")
+                        canceled += 1
+                    except Exception:
+                        pass
+                    active_oid = None
+
+                url = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
+                r = schwab_post_json(c, url, order_payload(px, to_place), tag=f"PLACE@{px:.2f}x{to_place}")
+                active_oid = parse_order_id_from_response(r)
+                return active_oid
+
+            except Exception:
+                time.sleep(min(10.0, 0.5 * (2 ** attempt)))
+                continue
+
+        # If we exhausted retries, let caller continue; wait_loop will see no active order
         return active_oid
 
     def wait_loop(secs: int):
