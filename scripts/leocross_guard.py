@@ -5,7 +5,7 @@ __version__ = "3.3.0"
 # LeoCross GUARD (stateless): derive 4 legs from GW, inspect Schwab positions & open orders,
 # and emit a single decision for the orchestrator.
 
-import os, sys, json, re, time, math
+import os, sys, json, re, time, math, random
 from datetime import datetime, date, timezone
 from zoneinfo import ZoneInfo
 import requests
@@ -56,8 +56,6 @@ def strike_from_osi(osi: str) -> float:
 def iso_z(dt):
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-def _backoff(i): return 0.6*(2**i)
-
 def _credit_width() -> int:
     width = max(CREDIT_MIN_WIDTH, int(CREDIT_SPREAD_WIDTH))
     # round to nearest 5 upward to stay on SPX grid
@@ -87,16 +85,31 @@ def schwab_client():
     acct_num =str(acct_info.get("accountNumber") or acct_info.get("account_number") or "")
     return c, acct_hash, acct_num
 
+def _sleep_for_429(r, attempt):
+    ra = r.headers.get("Retry-After")
+    if ra:
+        try:
+            return max(1.0, float(ra))
+        except Exception:
+            pass
+    # exponential backoff + small jitter
+    return min(10.0, 0.5 * (2 ** attempt)) + random.uniform(0.0, 0.25)
+
+
 def schwab_get_json(c, url, params=None, tries=6, tag=""):
-    last=""
+    last = ""
     for i in range(tries):
         try:
-            r=c.session.get(url, params=(params or {}), timeout=20)
-            if r.status_code==200: return r.json()
-            last=f"HTTP_{r.status_code}:{(r.text or '')[:160]}"
+            r = c.session.get(url, params=(params or {}), timeout=20)
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code == 429:
+                time.sleep(_sleep_for_429(r, i))
+                continue
+            last = f"HTTP_{r.status_code}:{(r.text or '')[:160]}"
         except Exception as e:
-            last=f"{type(e).__name__}:{e}"
-        time.sleep(_backoff(i))
+            last = f"{type(e).__name__}:{str(e)}"
+        time.sleep(0.5 * (2 ** i))
     raise RuntimeError(f"SCHWAB_GET_FAIL({tag}) {last}")
 
 def _osi_from_instrument(ins: dict):

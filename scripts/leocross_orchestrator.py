@@ -13,7 +13,7 @@ __version__ = "4.2.0"
 
 PER_UNIT = 5000  # legacy debit sizing: contracts = floor(opening_cash / PER_UNIT)
 
-import os, sys, json, time, re, math
+import os, sys, json, time, re, math, random
 from datetime import datetime, date, timezone
 from zoneinfo import ZoneInfo
 import requests
@@ -103,20 +103,33 @@ def strike_from_osi(osi: str) -> float:
 def iso_z(dt):
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-def _backoff(i): return 0.6*(2**i)
-
 # ===== Schwab helpers =====
+def _sleep_for_429(r, attempt):
+    ra = r.headers.get("Retry-After")
+    if ra:
+        try:
+            return max(1.0, float(ra))
+        except Exception:
+            pass
+    # exponential backoff + small jitter
+    return min(10.0, 0.5 * (2 ** attempt)) + random.uniform(0.0, 0.25)
+
+
 def schwab_get_json(c, url, params=None, tries=6, tag=""):
-    last=""
+    last = ""
     for i in range(tries):
         try:
-            r=c.session.get(url, params=(params or {}), timeout=20)
-            if r.status_code==200: return r.json()
-            last="HTTP_{:d}:{:s}".format(r.status_code, (r.text or "")[:160])
+            r = c.session.get(url, params=(params or {}), timeout=20)
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code == 429:
+                time.sleep(_sleep_for_429(r, i))
+                continue
+            last = f"HTTP_{r.status_code}:{(r.text or '')[:160]}"
         except Exception as e:
-            last="{}:{}".format(type(e).__name__, str(e))
-        time.sleep(_backoff(i))
-    raise RuntimeError("SCHWAB_GET_FAIL({}) {}".format(tag, last))
+            last = f"{type(e).__name__}:{str(e)}"
+        time.sleep(0.5 * (2 ** i))
+    raise RuntimeError(f"SCHWAB_GET_FAIL({tag}) {last}")
 
 def _osi_from_instrument(ins: dict) -> str | None:
     sym = (ins.get("symbol") or "")

@@ -122,54 +122,82 @@ def one_log(svc, sheet_id_num, spreadsheet_id: str, tab: str, row_vals: list):
         valueInputOption="USER_ENTERED", body={"values":[row_vals]}).execute()
 
 # ===== Schwab hardened HTTP =====
-def _backoff(i): return 0.5*(2**i)
+def _sleep_for_429(r, attempt):
+    ra = r.headers.get("Retry-After")
+    if ra:
+        try:
+            return max(1.0, float(ra))
+        except Exception:
+            pass
+    # exponential backoff + small jitter
+    return min(10.0, 0.5 * (2 ** attempt)) + random.uniform(0.0, 0.25)
 
-def schwab_get_json(c, url, params=None, tries=5, tag=""):
-    last=""
+
+def schwab_get_json(c, url, params=None, tries=6, tag=""):
+    last = ""
     for i in range(tries):
         try:
-            r=c.session.get(url, params=(params or {}), timeout=20)
-            if r.status_code==200: return r.json()
-            last=f"HTTP_{r.status_code}:{(r.text or '')[:160]}"
+            r = c.session.get(url, params=(params or {}), timeout=20)
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code == 429:
+                time.sleep(_sleep_for_429(r, i))
+                continue
+            last = f"HTTP_{r.status_code}:{(r.text or '')[:160]}"
         except Exception as e:
-            last=f"{type(e).__name__}:{str(e)}"
-        time.sleep(_backoff(i))
+            last = f"{type(e).__name__}:{str(e)}"
+        time.sleep(0.5 * (2 ** i))
     raise RuntimeError(f"SCHWAB_GET_FAIL({tag}) {last}")
 
-def schwab_post_json(c, url, payload, tries=4, tag=""):
-    last=""
+
+def schwab_post_json(c, url, payload, tries=6, tag=""):
+    last = ""
     for i in range(tries):
         try:
-            r=c.session.post(url, json=payload, timeout=20)
-            if r.status_code in (200,201,202): return r
-            last=f"HTTP_{r.status_code}:{(r.text or '')[:160]}"
+            r = c.session.post(url, json=payload, timeout=20)
+            if r.status_code in (200, 201, 202):
+                return r
+            if r.status_code == 429:
+                time.sleep(_sleep_for_429(r, i))
+                continue
+            last = f"HTTP_{r.status_code}:{(r.text or '')[:160]}"
         except Exception as e:
-            last=f"{type(e).__name__}:{str(e)}"
-        time.sleep(_backoff(i))
+            last = f"{type(e).__name__}:{str(e)}"
+        time.sleep(0.5 * (2 ** i))
     raise RuntimeError(f"SCHWAB_POST_FAIL({tag}) {last}")
 
-def schwab_put_json(c, url, payload, tries=4, tag=""):
-    last=""
+
+def schwab_put_json(c, url, payload, tries=6, tag=""):
+    last = ""
     for i in range(tries):
         try:
-            r=c.session.put(url, json=payload, timeout=20)
-            if r.status_code in (200,201,202): return r
-            last=f"HTTP_{r.status_code}:{(r.text or '')[:160]}"
+            r = c.session.put(url, json=payload, timeout=20)
+            if r.status_code in (200, 201, 202):
+                return r
+            if r.status_code == 429:
+                time.sleep(_sleep_for_429(r, i))
+                continue
+            last = f"HTTP_{r.status_code}:{(r.text or '')[:160]}"
         except Exception as e:
-            last=f"{type(e).__name__}:{str(e)}"
-        time.sleep(_backoff(i))
+            last = f"{type(e).__name__}:{str(e)}"
+        time.sleep(0.5 * (2 ** i))
     raise RuntimeError(f"SCHWAB_PUT_FAIL({tag}) {last}")
 
-def schwab_delete(c, url, tries=4, tag=""):
-    last=""
+
+def schwab_delete(c, url, tries=6, tag=""):
+    last = ""
     for i in range(tries):
         try:
-            r=c.session.delete(url, timeout=20)
-            if r.status_code in (200,201,202,204): return r
-            last=f"HTTP_{r.status_code}:{(r.text or '')[:160]}"
+            r = c.session.delete(url, timeout=20)
+            if r.status_code in (200, 201, 202, 204):
+                return r
+            if r.status_code == 429:
+                time.sleep(_sleep_for_429(r, i))
+                continue
+            last = f"HTTP_{r.status_code}:{(r.text or '')[:160]}"
         except Exception as e:
-            last=f"{type(e).__name__}:{str(e)}"
-        time.sleep(_backoff(i))
+            last = f"{type(e).__name__}:{str(e)}"
+        time.sleep(0.5 * (2 ** i))
     raise RuntimeError(f"SCHWAB_DELETE_FAIL({tag}) {last}")
 
 # ===== Account helpers =====
