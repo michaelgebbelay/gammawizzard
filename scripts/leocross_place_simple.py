@@ -53,7 +53,7 @@ ACTIVE_STATUSES   = WINDOW_STATUSES | {"PENDING_CANCEL","CANCEL_REQUESTED","PEND
 CANCEL_SETTLE_SECS = float(os.environ.get("CANCEL_SETTLE_SECS","3.0"))
 
 # --- FAST LATE-DAY PROFILE (hard-coded; ignores YAML env) ---
-REPLACE_MODE            = "REPLACE"   # use PUT replace (we already accept 204)
+REPLACE_MODE            = "CANCEL_REPLACE"   # use PUT replace (we already accept 204)
 DISCRETE_CREDIT_LADDER  = "6,5.70,5.50,5.40,5.30,5.25,5.20,5.15,5.10,5.05,5.00"
 CYCLES_WITH_REFRESH     = 1           # exactly one pass
 STEP_WAIT_CREDIT        = 2.0         # ~22s waiting across 11 rungs; whole pass < 3 minutes incl API
