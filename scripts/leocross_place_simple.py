@@ -36,6 +36,8 @@ CREDIT_FLOOR      = float(os.environ.get("CREDIT_FLOOR",      "4.80"))
 REPLACE_MODE      = (os.environ.get("REPLACE_MODE", "REPLACE") or "REPLACE").upper()   # or "CANCEL_REPLACE"
 MAX_LADDER_CYCLES = int(os.environ.get("MAX_LADDER_CYCLES", "3") or "3")
 RESET_TO_START    = str(os.environ.get("RESET_TO_START", "1") or "1").strip().lower() in {"1","true","yes","y","on"}
+DISCRETE_CREDIT_LADDER = os.environ.get("DISCRETE_CREDIT_LADDER","").strip()
+CYCLES_WITH_REFRESH    = int(os.environ.get("CYCLES_WITH_REFRESH","3") or "3")
 VERBOSE           = str(os.environ.get("VERBOSE","1")).strip().lower() in {"1","true","yes","y","on"}
 MAX_RUNTIME_SECS  = int(os.environ.get("MAX_RUNTIME_SECS","900") or "900")
 WINDOW_STATUSES   = {"WORKING","QUEUED","OPEN","PENDING_ACTIVATION","ACCEPTED","RECEIVED"}
@@ -112,6 +114,18 @@ def one_log(svc, sheet_id_num, spreadsheet_id: str, tab: str, row_vals: list):
     top_insert(svc, spreadsheet_id, sheet_id_num)
     svc.spreadsheets().values().update(spreadsheetId=spreadsheet_id, range=f"{tab}!A2",
         valueInputOption="USER_ENTERED", body={"values":[row_vals]}).execute()
+
+def _parse_discrete_list(s: str):
+    # Accept comma or whitespace separated; clamp each to 0.05 tick
+    out=[]
+    for tok in re.split(r'[\s,]+', s):
+        if not tok:
+            continue
+        try:
+            out.append(clamp_tick(float(tok)))
+        except Exception:
+            pass
+    return out
 
 # ===== Schwab hardened HTTP (429-aware) =====
 def _sleep_for_429(r, attempt):
@@ -468,6 +482,21 @@ def main():
         except Exception as e:
             print(f"WARN cancel overlap {oid}: {e}")
 
+    # Best-effort cleanup if the runner sends SIGTERM/SIGINT
+    import signal
+    def _on_term(signum, frame):
+        try:
+            if active_oid:
+                url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{active_oid}"
+                schwab_delete(c, url, tag=f"SIG_CANCEL:{active_oid}")
+                vprint(f"SIG_CANCEL OID={active_oid}")
+        except Exception as e:
+            print(f"WARN SIG cleanup failed: {e}")
+        finally:
+            sys.exit(128+signum)
+    signal.signal(signal.SIGTERM, _on_term)
+    signal.signal(signal.SIGINT,  _on_term)
+
     def get_status(oid: str) -> dict:
         url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
         try:
@@ -583,26 +612,101 @@ def main():
         vprint(f"RUNG_DONE status={st} filled={filled_total}/{qty} active_oid={active_oid or 'NA'}")
         return st
 
+    def refresh_from_leo():
+        """Cancel overlaps already done; just rebuild legs from a fresh Leo payload."""
+        nonlocal legs, canon, width, is_credit, side_name, order_type
+        try:
+            api = gw_get_leocross()
+            tr  = extract(api)
+            if not tr:
+                vprint("REFRESH_FROM_LEO: NO_TRADE_PAYLOAD — keeping prior legs")
+                return
+
+            def fnum(x):
+                try:
+                    return float(x)
+                except Exception:
+                    return None
+
+            cat1 = fnum(tr.get("Cat1"))
+            cat2 = fnum(tr.get("Cat2"))
+            new_is_credit = True if (cat2 is None or cat1 is None or cat2 >= cat1) else False
+            if not new_is_credit:
+                vprint("REFRESH_FROM_LEO: signal flipped to DEBIT — stopping")
+                raise SystemExit(0)
+
+            exp6 = yymmdd(str(tr.get("TDate", "")))
+            inner_put = int(float(tr.get("Limit")))
+            inner_call = int(float(tr.get("CLimit")))
+            new_width = calc_width_for_side(new_is_credit, oc if oc is not None else 0)
+            p_low, p_high = inner_put - new_width, inner_put
+            c_low, c_high = inner_call, inner_call + new_width
+            bp = to_osi(f".SPXW{exp6}P{p_low}")
+            sp = to_osi(f".SPXW{exp6}P{p_high}")
+            sc = to_osi(f".SPXW{exp6}C{c_low}")
+            bc = to_osi(f".SPXW{exp6}C{c_high}")
+
+            def orient(bp_sym, sp_sym, sc_sym, bc_sym):
+                bpS = strike_from_osi(bp_sym)
+                spS = strike_from_osi(sp_sym)
+                scS = strike_from_osi(sc_sym)
+                bcS = strike_from_osi(bc_sym)
+                if new_is_credit:
+                    if bpS > spS:
+                        bp_sym, sp_sym = sp_sym, bp_sym
+                    if scS > bcS:
+                        sc_sym, bc_sym = bc_sym, sc_sym
+                else:
+                    if bpS < spS:
+                        bp_sym, sp_sym = sp_sym, bp_sym
+                    if bcS > scS:
+                        sc_sym, bc_sym = bc_sym, sc_sym
+                return [bp_sym, sp_sym, sc_sym, bc_sym]
+
+            legs = orient(bp, sp, sc, bc)
+            canon = {osi_canon(x) for x in legs}
+            width = new_width
+            is_credit = new_is_credit
+            side_name = "SHORT_IRON_CONDOR"
+            order_type = "NET_CREDIT"
+            vprint(f"REFRESH_FROM_LEO: width={width} legs={legs}")
+        except SystemExit:
+            raise
+        except Exception as e:
+            vprint(f"REFRESH_FROM_LEO failed: {e} — continuing with current legs")
+
     # ===== Build ladder (cycled) =====
     status = "WORKING"
     cycles = 0
 
-    while cycles < MAX_LADDER_CYCLES and filled_total < qty:
-        if is_credit:
-            units = max(1.0, width / 5.0)
-            start = clamp_tick(max(CREDIT_FLOOR, units * CREDIT_PER5_START))
-            stop  = clamp_tick(CREDIT_FLOOR)
-            step  = CREDIT_STEP
-            secs  = STEP_WAIT_CREDIT
-            px0   = start if (RESET_TO_START or cycles == 0) else stop
+    _max_cycles = CYCLES_WITH_REFRESH if (is_credit and DISCRETE_CREDIT_LADDER) else MAX_LADDER_CYCLES
 
-            ladder = []
-            px = px0
-            while px >= stop - 1e-9:
-                ladder.append(clamp_tick(px))
-                px -= step
-            if not ladder: ladder = [stop]
-            vprint(f"CYCLE {cycles+1}/{MAX_LADDER_CYCLES} CREDIT ladder {ladder[0]:.2f}→{ladder[-1]:.2f} (width={width})")
+    while cycles < _max_cycles and filled_total < qty:
+        ladder = None
+        if is_credit:
+            secs = STEP_WAIT_CREDIT
+            discrete = _parse_discrete_list(DISCRETE_CREDIT_LADDER) if DISCRETE_CREDIT_LADDER else []
+            if discrete:
+                ladder = discrete
+                vprint(f"CYCLE {cycles+1}/{_max_cycles} CREDIT ladder {ladder[0]:.2f}…{ladder[-1]:.2f} (discrete)")
+            elif DISCRETE_CREDIT_LADDER:
+                vprint("DISCRETE_CREDIT_LADDER is empty — defaulting to start/step/floor")
+
+            if ladder is None:
+                units = max(1.0, width / 5.0)
+                start = clamp_tick(max(CREDIT_FLOOR, units * CREDIT_PER5_START))
+                stop  = clamp_tick(CREDIT_FLOOR)
+                step  = CREDIT_STEP
+                px0   = start if (RESET_TO_START or cycles == 0) else stop
+
+                ladder = []
+                px = px0
+                while px >= stop - 1e-9:
+                    ladder.append(clamp_tick(px))
+                    px -= step
+                if not ladder:
+                    ladder = [stop]
+                vprint(f"CYCLE {cycles+1}/{_max_cycles} CREDIT ladder {ladder[0]:.2f}→{ladder[-1]:.2f} (width={width})")
         else:
             start = clamp_tick(float(os.environ.get("DEBIT_START","1.90")))
             stop  = clamp_tick(float(os.environ.get("DEBIT_CEIL","2.10")))
@@ -612,8 +716,9 @@ def main():
             ladder = []
             while px <= stop + 1e-9:
                 ladder.append(clamp_tick(px)); px += step
-            if not ladder: ladder = [start]
-            vprint(f"CYCLE {cycles+1}/{MAX_LADDER_CYCLES} DEBIT ladder {ladder[0]:.2f}→{ladder[-1]:.2f}")
+            if not ladder:
+                ladder = [start]
+            vprint(f"CYCLE {cycles+1}/{_max_cycles} DEBIT ladder {ladder[0]:.2f}→{ladder[-1]:.2f}")
 
         for price in ladder:
             status = rung(price, secs)
@@ -635,6 +740,9 @@ def main():
             active_oid = None
 
         cycles += 1
+        # For your spec: after each pass, re-fetch Leo and rebuild legs
+        if is_credit and DISCRETE_CREDIT_LADDER and filled_total < qty:
+            refresh_from_leo()
 
     # final cleanup if still working
     if status not in ("FILLED",) and FINAL_CANCEL and active_oid:
