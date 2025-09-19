@@ -515,12 +515,21 @@ def main():
             try:
                 if active_oid and REPLACE_MODE == "REPLACE":
                     url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{active_oid}"
-                    r=schwab_put_json(c, url, order_payload(px,to_place), tag=f"REPLACE@{px:.2f}x{to_place}")
-                    new_id = parse_order_id_from_response(r) or active_oid
-                    replacements += 1
-                    active_oid = new_id
-                    vprint(f"REPLACE → OID={active_oid} @ {px:.2f} x{to_place}")
-                    return active_oid
+                    try:
+                        r=schwab_put_json(c, url, order_payload(px,to_place), tag=f"REPLACE@{px:.2f}x{to_place}")
+                        new_id = parse_order_id_from_response(r) or active_oid
+                        replacements += 1
+                        active_oid = new_id
+                        vprint(f"REPLACE → OID={active_oid} @ {px:.2f} x{to_place}")
+                        return active_oid
+                    except Exception as e:
+                        vprint(f"REPLACE failed ({e}); falling back to CANCEL_REPLACE")
+                        try:
+                            schwab_delete(c, url, tag=f"CANCEL_STEP:{active_oid}")
+                            canceled += 1
+                        except Exception:
+                            pass
+                        active_oid = None
 
                 if active_oid and REPLACE_MODE == "CANCEL_REPLACE":
                     try:
