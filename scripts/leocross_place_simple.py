@@ -17,8 +17,15 @@ from googleapiclient.discovery import build as gbuild
 TICK = 0.05
 ET = ZoneInfo("America/New_York")
 
-STEP_WAIT_CREDIT = int(os.environ.get("STEP_WAIT_CREDIT", "10"))
-STEP_WAIT_DEBIT  = int(os.environ.get("STEP_WAIT_DEBIT",  "30"))
+def _as_float(env_name: str, default: str) -> float:
+    raw = os.environ.get(env_name, default)
+    try:
+        return float(raw)
+    except Exception:
+        return float(default)
+
+STEP_WAIT_CREDIT = _as_float("STEP_WAIT_CREDIT", "10")
+STEP_WAIT_DEBIT  = _as_float("STEP_WAIT_DEBIT",  "30")
 FINAL_CANCEL     = True
 
 # Sizing knobs
@@ -39,7 +46,7 @@ RESET_TO_START    = str(os.environ.get("RESET_TO_START", "1") or "1").strip().lo
 DISCRETE_CREDIT_LADDER = os.environ.get("DISCRETE_CREDIT_LADDER","").strip()
 CYCLES_WITH_REFRESH    = int(os.environ.get("CYCLES_WITH_REFRESH","3") or "3")
 VERBOSE           = str(os.environ.get("VERBOSE","1")).strip().lower() in {"1","true","yes","y","on"}
-MAX_RUNTIME_SECS  = int(os.environ.get("MAX_RUNTIME_SECS","900") or "900")
+MAX_RUNTIME_SECS  = _as_float("MAX_RUNTIME_SECS","900")
 WINDOW_STATUSES   = {"WORKING","QUEUED","OPEN","PENDING_ACTIVATION","ACCEPTED","RECEIVED"}
 
 GW_BASE = "https://gandalf.gammawizard.com"
