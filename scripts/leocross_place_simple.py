@@ -6,7 +6,7 @@
 # - Default mode MANUAL; SCHEDULED gate only if explicitly set
 
 import os, sys, json, time, re, math, random
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timezone, timedelta
 from zoneinfo import ZoneInfo
 import requests
 from schwab.auth import client_from_token_file
