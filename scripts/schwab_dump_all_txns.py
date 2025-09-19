@@ -14,6 +14,8 @@ Env:
   GSHEET_ID, GOOGLE_SERVICE_ACCOUNT_JSON
   SCHWAB_APP_KEY, SCHWAB_APP_SECRET, SCHWAB_TOKEN_JSON
   DAYS_BACK (default 5)
+    • Safe to run an initial catch-up (e.g. DAYS_BACK=120) and then smaller windows.
+      Existing rows are merged/deduped by ledger leg when writing to Sheets.
 
 Output tab: sw_txn_raw with RAW_HEADERS below
 """
@@ -81,6 +83,74 @@ def overwrite_rows(svc, sid: str, tab: str, headers: List[str], rows: List[List[
         valueInputOption="RAW",
         body={"values":[headers] + rows}
     ).execute()
+
+
+def read_existing_rows(
+    svc, sid: str, tab: str, headers: List[str]
+) -> List[List[Any]]:
+    """Return existing rows (without header), normalised to header length."""
+    resp = svc.spreadsheets().values().get(
+        spreadsheetId=sid,
+        range=f"{tab}!A2:{chr(ord('A') + len(headers) - 1)}",
+    ).execute()
+    rows = resp.get("values", [])
+    norm: List[List[Any]] = []
+    for r in rows:
+        cur = list(r)
+        if len(cur) < len(headers):
+            cur.extend([""] * (len(headers) - len(cur)))
+        else:
+            cur = cur[: len(headers)]
+        norm.append(cur)
+    return norm
+
+
+def merge_rows(existing: List[List[Any]], new: List[List[Any]], headers: List[str]) -> List[List[Any]]:
+    """Merge ``existing`` with ``new`` rows, using ledger + leg fields as key."""
+
+    def idx(col: str) -> int:
+        try:
+            return headers.index(col)
+        except ValueError:
+            return -1
+
+    i_ledger = idx("ledger_id")
+    i_symbol = idx("symbol")
+    i_qty = idx("quantity")
+    i_price = idx("price")
+    i_amt = idx("amount")
+    i_ts = idx("ts")
+
+    def key_for(row: List[Any]) -> tuple:
+        ledger = (row[i_ledger].strip() if i_ledger >= 0 and i_ledger < len(row) else "")
+        symbol = row[i_symbol] if i_symbol >= 0 and i_symbol < len(row) else ""
+        qty = row[i_qty] if i_qty >= 0 and i_qty < len(row) else ""
+        price = row[i_price] if i_price >= 0 and i_price < len(row) else ""
+        amt = row[i_amt] if i_amt >= 0 and i_amt < len(row) else ""
+        if ledger:
+            return ("ledger", ledger, symbol, qty, price, amt)
+        return tuple(row)
+
+    merged = {}
+    for r in existing:
+        merged[key_for(r)] = r
+    for r in new:
+        merged[key_for(r)] = r
+
+    def ts_sort_key(row: List[Any]):
+        if i_ts < 0 or i_ts >= len(row):
+            return datetime.min
+        raw = str(row[i_ts]).strip()
+        if not raw:
+            return datetime.min
+        try:
+            return datetime.fromisoformat(raw)
+        except Exception:
+            return datetime.min
+
+    merged_rows = list(merged.values())
+    merged_rows.sort(key=ts_sort_key, reverse=True)
+    return merged_rows
 
 # ---------- Schwab auth ----------
 def decode_token_to_path() -> str:
@@ -342,9 +412,13 @@ def main() -> int:
             tid = t.get("transactionId") or t.get("orderId") or "<?>"
             print(f"NOTE: failed to parse ledger {tid}: {exc}")
 
-    overwrite_rows(svc, sid, RAW_TAB, RAW_HEADERS, all_rows)
+    existing_rows = read_existing_rows(svc, sid, RAW_TAB, RAW_HEADERS)
+    merged_rows = merge_rows(existing_rows, all_rows, RAW_HEADERS)
+    overwrite_rows(svc, sid, RAW_TAB, RAW_HEADERS, merged_rows)
     write_simple_summary_from_raw(svc, sid)
-    print(f"OK: wrote {len(all_rows)} rows from {len(txns)} ledger activities to {RAW_TAB}.")
+    print(
+        f"OK: merged {len(all_rows)} rows from {len(txns)} ledger activities into {RAW_TAB}."
+    )
     return 0
 
 if __name__ == "__main__":
