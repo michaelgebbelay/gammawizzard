@@ -806,8 +806,8 @@ def main():
             active_oid = None
 
         cycles += 1
-        # For your spec: after each pass, re-fetch Leo and rebuild legs
-        if is_credit and DISCRETE_CREDIT_LADDER and filled_total < qty and cycles < _max_cycles:
+        # For your spec: two passes total; always refresh from Leo between passes
+        if filled_total < qty and cycles < _max_cycles:
             refresh_from_leo()
 
     # final cleanup if still working
