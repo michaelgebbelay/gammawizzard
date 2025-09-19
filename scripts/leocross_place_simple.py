@@ -44,7 +44,6 @@ REPLACE_MODE      = (os.environ.get("REPLACE_MODE", "REPLACE") or "REPLACE").upp
 MAX_LADDER_CYCLES = int(os.environ.get("MAX_LADDER_CYCLES", "3") or "3")
 RESET_TO_START    = str(os.environ.get("RESET_TO_START", "1") or "1").strip().lower() in {"1","true","yes","y","on"}
 DISCRETE_CREDIT_LADDER = os.environ.get("DISCRETE_CREDIT_LADDER","").strip()
-CYCLES_WITH_REFRESH    = int(os.environ.get("CYCLES_WITH_REFRESH","3") or "3")
 VERBOSE           = str(os.environ.get("VERBOSE","1")).strip().lower() in {"1","true","yes","y","on"}
 MAX_RUNTIME_SECS  = _as_float("MAX_RUNTIME_SECS","900")
 WINDOW_STATUSES   = {"WORKING","QUEUED","OPEN","PENDING_ACTIVATION","ACCEPTED","RECEIVED"}
@@ -52,17 +51,21 @@ WINDOW_STATUSES   = {"WORKING","QUEUED","OPEN","PENDING_ACTIVATION","ACCEPTED","
 ACTIVE_STATUSES   = WINDOW_STATUSES | {"PENDING_CANCEL","CANCEL_REQUESTED","PENDING_REPLACE"}
 CANCEL_SETTLE_SECS = float(os.environ.get("CANCEL_SETTLE_SECS","3.0"))
 
-# --- FAST 90s WINDOW, ANCHORED TO NBBO BID ---
-REPLACE_MODE            = "CANCEL_REPLACE"     # robust; 0.5s rung + 1.0s settle ≈ 1.5s per rung
-STEP_WAIT_CREDIT        = 0.5
-MAX_RUNTIME_SECS        = 90.0
-CYCLES_WITH_REFRESH     = 1
-CANCEL_SETTLE_SECS      = 1.0
+# --- 4:13 FAST PLAN — 3 rungs × 10s, two passes with Leo refresh ---
+REPLACE_MODE            = "CANCEL_REPLACE"
+ANCHOR_WAIT_SECS        = float(os.environ.get("ANCHOR_WAIT_SECS","10"))  # per‑rung wait
+STEP_WAIT_CREDIT        = ANCHOR_WAIT_SECS
+STEP_WAIT_DEBIT         = ANCHOR_WAIT_SECS
+MAX_LADDER_CYCLES       = int(os.environ.get("MAX_LADDER_CYCLES","2"))    # exactly two passes
+MAX_RUNTIME_SECS        = float(os.environ.get("MAX_RUNTIME_SECS","110")) # give room for cancel/refresh
+CANCEL_SETTLE_SECS      = float(os.environ.get("CANCEL_SETTLE_SECS","0.8"))
 VERBOSE                 = True
 
-# Use anchored ladder instead of absolute DISCRETE_CREDIT_LADDER
-ANCHOR_MODE             = "BID"                 # or "MID"
-ANCHOR_OFFSETS          = [0.00,0.05,0.10,0.15,0.20,0.25,0.30,0.35,0.40,0.45,0.50]  # credit gets worse as we go
+# Anchoring & rung plan
+DEBIT_ANCHOR_MODE       = (os.environ.get("DEBIT_ANCHOR_MODE","BID") or "BID").upper()  # "BID" or "ASK"
+# Credit (sell):  bid+0.05 → bid → bid-0.05
+CREDIT_RUNG_DELTAS      = [ +0.05, 0.00, -0.05 ]
+DEBIT_RUNG_DELTAS_ASK   = [ -0.05, 0.00, +0.05 ]  # ask-0.05 → ask → ask+0.05
 
 GW_BASE = "https://gandalf.gammawizard.com"
 GW_ENDPOINT = "/rapi/GetLeoCross"
@@ -501,10 +504,12 @@ def main():
         one_log(svc, sheet_id_num, sheet_id, "schwab", row); print("qty<1"); sys.exit(0)
 
     print(f"PLACER START mode={MODE} is_credit={is_credit} width={width} qty={qty} oc={oc}")
+    discrete_credit_ladder = _parse_discrete_list(DISCRETE_CREDIT_LADDER) if (is_credit and DISCRETE_CREDIT_LADDER) else []
     if is_credit:
-        units=max(1.0,width/5.0)
-        s=max(CREDIT_FLOOR, units*CREDIT_PER5_START)
-        print(f"LADDER CONFIG start≈{clamp_tick(s):.2f} floor={CREDIT_FLOOR:.2f} step={CREDIT_STEP:.2f} wait={STEP_WAIT_CREDIT}s cycles={MAX_LADDER_CYCLES} replace={REPLACE_MODE}")
+        if discrete_credit_ladder:
+            print(f"LADDER CONFIG discrete={discrete_credit_ladder} wait={STEP_WAIT_CREDIT}s cycles={MAX_LADDER_CYCLES} replace={REPLACE_MODE}")
+        else:
+            print(f"LADDER CONFIG anchored credit rung_deltas={CREDIT_RUNG_DELTAS} wait={STEP_WAIT_CREDIT}s cycles={MAX_LADDER_CYCLES} replace={REPLACE_MODE}")
 
     def get_status(oid: str) -> dict:
         url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
@@ -738,26 +743,36 @@ def main():
     status = "WORKING"
     cycles = 0
 
-    _max_cycles = CYCLES_WITH_REFRESH if (is_credit and DISCRETE_CREDIT_LADDER) else MAX_LADDER_CYCLES
+    _max_cycles = MAX_LADDER_CYCLES
 
     while cycles < _max_cycles and filled_total < qty:
         ladder = None
-        if is_credit:
-            secs = STEP_WAIT_CREDIT
-            # Anchor to live NBBO at start of the cycle
-            nbbo_bid, nbbo_ask, nbbo_mid = condor_nbbo(c, legs)
-            if nbbo_bid is not None:
-                base = nbbo_bid if ANCHOR_MODE.upper() == "BID" else nbbo_mid
-                if base is not None:
-                    ladder = [clamp_tick(max(CREDIT_FLOOR, base - o)) for o in ANCHOR_OFFSETS]
-                    # ensure strictly descending and de-duped
-                    ladder = sorted(set(ladder), reverse=True)
-                    if ladder:
-                        vprint(f"CYCLE {cycles+1}/{_max_cycles} CREDIT ladder (anchored) base={base:.2f} → {ladder[0]:.2f}…{ladder[-1]:.2f}")
-            elif DISCRETE_CREDIT_LADDER:
-                vprint("DISCRETE_CREDIT_LADDER is empty — defaulting to start/step/floor")
+        secs = STEP_WAIT_CREDIT if is_credit else STEP_WAIT_DEBIT
 
-            if ladder is None:
+        if is_credit:
+            if discrete_credit_ladder:
+                ladder = [clamp_tick(px) for px in discrete_credit_ladder]
+                if ladder:
+                    vprint(f"CYCLE {cycles+1}/{_max_cycles} CREDIT ladder (discrete) {ladder[0]:.2f}→{ladder[-1]:.2f}")
+            else:
+                nbbo_bid, nbbo_ask, nbbo_mid = condor_nbbo(c, legs)
+                base = nbbo_bid
+                if base is not None:
+                    anchored = []
+                    for delta in CREDIT_RUNG_DELTAS:
+                        rung_px = clamp_tick(max(CREDIT_FLOOR, base + delta))
+                        if not anchored or not math.isclose(anchored[-1], rung_px, abs_tol=1e-9):
+                            anchored.append(rung_px)
+                    ladder = anchored
+                    if ladder:
+                        vprint(
+                            f"CYCLE {cycles+1}/{_max_cycles} CREDIT ladder (anchored) base={base:.2f} → "
+                            f"{' → '.join(f'{p:.2f}' for p in ladder)}"
+                        )
+                if ladder is None and DISCRETE_CREDIT_LADDER:
+                    vprint("DISCRETE_CREDIT_LADDER is empty — defaulting to start/step/floor")
+
+            if not ladder:
                 units = max(1.0, width / 5.0)
                 start = clamp_tick(max(CREDIT_FLOOR, units * CREDIT_PER5_START))
                 stop  = clamp_tick(CREDIT_FLOOR)
@@ -773,17 +788,31 @@ def main():
                     ladder = [stop]
                 vprint(f"CYCLE {cycles+1}/{_max_cycles} CREDIT ladder {ladder[0]:.2f}→{ladder[-1]:.2f} (width={width})")
         else:
-            start = clamp_tick(float(os.environ.get("DEBIT_START","1.90")))
-            stop  = clamp_tick(float(os.environ.get("DEBIT_CEIL","2.10")))
-            step  = float(os.environ.get("DEBIT_STEP","0.05"))
-            secs  = STEP_WAIT_DEBIT
-            px = start
             ladder = []
-            while px <= stop + 1e-9:
-                ladder.append(clamp_tick(px)); px += step
+            if DEBIT_ANCHOR_MODE == "ASK":
+                nbbo_bid, nbbo_ask, nbbo_mid = condor_nbbo(c, legs)
+                base = nbbo_ask
+                if base is not None:
+                    for delta in DEBIT_RUNG_DELTAS_ASK:
+                        rung_px = clamp_tick(max(TICK, base + delta))
+                        if not ladder or not math.isclose(ladder[-1], rung_px, abs_tol=1e-9):
+                            ladder.append(rung_px)
+                    if ladder:
+                        vprint(
+                            f"CYCLE {cycles+1}/{_max_cycles} DEBIT ladder (anchored ASK) base={base:.2f} → "
+                            f"{' → '.join(f'{p:.2f}' for p in ladder)}"
+                        )
+
             if not ladder:
-                ladder = [start]
-            vprint(f"CYCLE {cycles+1}/{_max_cycles} DEBIT ladder {ladder[0]:.2f}→{ladder[-1]:.2f}")
+                start = clamp_tick(float(os.environ.get("DEBIT_START","1.90")))
+                stop  = clamp_tick(float(os.environ.get("DEBIT_CEIL","2.10")))
+                step  = float(os.environ.get("DEBIT_STEP","0.05"))
+                px = start
+                while px <= stop + 1e-9:
+                    ladder.append(clamp_tick(px)); px += step
+                if not ladder:
+                    ladder = [start]
+                vprint(f"CYCLE {cycles+1}/{_max_cycles} DEBIT ladder {ladder[0]:.2f}→{ladder[-1]:.2f}")
 
         for price in ladder:
             status = rung(price, secs)
@@ -807,7 +836,7 @@ def main():
 
         cycles += 1
         # For your spec: after each pass, re-fetch Leo and rebuild legs
-        if is_credit and DISCRETE_CREDIT_LADDER and filled_total < qty and cycles < _max_cycles:
+        if is_credit and filled_total < qty and cycles < _max_cycles:
             refresh_from_leo()
 
     # final cleanup if still working
