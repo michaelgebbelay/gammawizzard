@@ -13,7 +13,7 @@ Schwab → Sheets RAW loader (LEDGER-ONLY, per-fill fees, no duplicates).
 Env:
   GSHEET_ID, GOOGLE_SERVICE_ACCOUNT_JSON
   SCHWAB_APP_KEY, SCHWAB_APP_SECRET, SCHWAB_TOKEN_JSON
-  DAYS_BACK (default 60)
+  DAYS_BACK (default 5)
 
 Output tab: sw_txn_raw with RAW_HEADERS below
 """
@@ -317,9 +317,9 @@ def main() -> int:
         return 1
 
     try:
-        days_back = int((os.environ.get("DAYS_BACK") or "60").strip())
+        days_back = int((os.environ.get("DAYS_BACK") or "5").strip())
     except Exception:
-        days_back = 60
+        days_back = 5
     end_dt = datetime.now(timezone.utc)
     start_dt = end_dt - timedelta(days=days_back)
 

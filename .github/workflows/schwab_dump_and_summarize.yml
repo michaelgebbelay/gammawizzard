@@ -4,16 +4,16 @@ on:
   workflow_dispatch:
     inputs:
       days_back:
-        description: "Days of history to pull (default 60)"
+        description: "Days of history to pull (default 5)"
         required: false
-        default: "60"
+        default: "5"
       acc_reset:
         description: "Reset accumulator this run? (1=yes, 0=no)"
         required: false
         default: "0"
   schedule:
-    # 8:00pm ET (00:00 UTC Tue–Sat)
-    - cron: "0 0 * * 2-6"
+    # 8:00pm ET (00:00 UTC every day)
+    - cron: "0 0 * * *"
 
 concurrency:
   group: schwab-sheets
@@ -42,7 +42,7 @@ jobs:
           SCHWAB_APP_KEY: ${{ secrets.SCHWAB_APP_KEY }}
           SCHWAB_APP_SECRET: ${{ secrets.SCHWAB_APP_SECRET }}
           SCHWAB_TOKEN_JSON: ${{ secrets.SCHWAB_TOKEN_JSON }}
-          DAYS_BACK: ${{ github.event.inputs.days_back != '' && github.event.inputs.days_back || '60' }}
+          DAYS_BACK: ${{ github.event.inputs.days_back != '' && github.event.inputs.days_back || '5' }}
         run: |
           python scripts/schwab_dump_all_txns.py
 
