@@ -52,6 +52,15 @@ WINDOW_STATUSES   = {"WORKING","QUEUED","OPEN","PENDING_ACTIVATION","ACCEPTED","
 ACTIVE_STATUSES   = WINDOW_STATUSES | {"PENDING_CANCEL","CANCEL_REQUESTED","PENDING_REPLACE"}
 CANCEL_SETTLE_SECS = float(os.environ.get("CANCEL_SETTLE_SECS","3.0"))
 
+# --- FAST LATE-DAY PROFILE (hard-coded; ignores YAML env) ---
+REPLACE_MODE            = "REPLACE"   # use PUT replace (we already accept 204)
+DISCRETE_CREDIT_LADDER  = "6,5.70,5.50,5.40,5.30,5.25,5.20,5.15,5.10,5.05,5.00"
+CYCLES_WITH_REFRESH     = 1           # exactly one pass
+STEP_WAIT_CREDIT        = 2.0         # ~22s waiting across 11 rungs; whole pass < 3 minutes incl API
+MAX_RUNTIME_SECS        = 170.0       # hard stop under 3 minutes
+CANCEL_SETTLE_SECS      = 1.0         # short settle after DELETE (mostly unused in REPLACE mode)
+VERBOSE                 = True        # keep logs chatty while tuning
+
 GW_BASE = "https://gandalf.gammawizard.com"
 GW_ENDPOINT = "/rapi/GetLeoCross"
 
