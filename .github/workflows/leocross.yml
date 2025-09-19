@@ -63,7 +63,10 @@ jobs:
           CREDIT_STEP: "0.05"
           RESET_TO_START: "1"
           CANCEL_SETTLE_SECS: "0.5"
+          # New/updated knobs for the fast two-pass plan
           MAX_LADDER_CYCLES: "2"
+          ANCHOR_WAIT_SECS:  "10"
+          DEBIT_ANCHOR_MODE: "BID"
           PYTHONUNBUFFERED: "1"
         run: |
           python scripts/leocross_orchestrator.py
