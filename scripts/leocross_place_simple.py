@@ -672,7 +672,7 @@ def main():
         return st
 
     def refresh_from_leo():
-        """Cancel overlaps already done; just rebuild legs from a fresh Leo payload."""
+        """Rebuild legs from a fresh Leo payload (handles both credit/debit)."""
         nonlocal legs, canon, width, is_credit, side_name, order_type
         try:
             api = gw_get_leocross()
@@ -682,17 +682,11 @@ def main():
                 return
 
             def fnum(x):
-                try:
-                    return float(x)
-                except Exception:
-                    return None
+                try: return float(x)
+                except Exception: return None
 
-            cat1 = fnum(tr.get("Cat1"))
-            cat2 = fnum(tr.get("Cat2"))
+            cat1 = fnum(tr.get("Cat1")); cat2 = fnum(tr.get("Cat2"))
             new_is_credit = True if (cat2 is None or cat1 is None or cat2 >= cat1) else False
-            if not new_is_credit:
-                vprint("REFRESH_FROM_LEO: signal flipped to DEBIT — stopping")
-                raise SystemExit(0)
 
             exp6 = yymmdd(str(tr.get("TDate", "")))
             inner_put = int(float(tr.get("Limit")))
@@ -711,23 +705,19 @@ def main():
                 scS = strike_from_osi(sc_sym)
                 bcS = strike_from_osi(bc_sym)
                 if new_is_credit:
-                    if bpS > spS:
-                        bp_sym, sp_sym = sp_sym, bp_sym
-                    if scS > bcS:
-                        sc_sym, bc_sym = bc_sym, sc_sym
+                    if bpS > spS: bp_sym, sp_sym = sp_sym, bp_sym
+                    if scS > bcS: sc_sym, bc_sym = bc_sym, sc_sym
                 else:
-                    if bpS < spS:
-                        bp_sym, sp_sym = sp_sym, bp_sym
-                    if bcS > scS:
-                        sc_sym, bc_sym = bc_sym, sc_sym
+                    if bpS < spS: bp_sym, sp_sym = sp_sym, bp_sym
+                    if bcS > scS: sc_sym, bc_sym = bc_sym, sc_sym
                 return [bp_sym, sp_sym, sc_sym, bc_sym]
 
             legs = orient(bp, sp, sc, bc)
             canon = {osi_canon(x) for x in legs}
             width = new_width
             is_credit = new_is_credit
-            side_name = "SHORT_IRON_CONDOR"
-            order_type = "NET_CREDIT"
+            side_name = "SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"
+            order_type = "NET_CREDIT" if is_credit else "NET_DEBIT"
             vprint(f"REFRESH_FROM_LEO: width={width} legs={legs}")
         except SystemExit:
             raise
