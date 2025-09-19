@@ -13,16 +13,25 @@ from googleapiclient.discovery import build as gbuild
 SUMMARY_TAB = "sw_txn_summary"
 SUMMARY_FORMULA = dedent(
     """\
-    =ARRAYFORMULA({
-      "exp_primary","net_amount_sum";
-      SORT(
-        QUERY(sw_txn_raw!A:Q,
+    =LET(
+      raw,
+        QUERY(
+          sw_txn_raw!A:Q,
           "select H, sum(N) where H is not null group by H label sum(N) ''",
           1
         ),
-        1, TRUE
-      )
-    })
+      cutoff,
+        TEXT(TODAY() - 1, "yyyy-mm-dd"),
+      filtered,
+        IF(
+          ROWS(raw),
+          IFERROR(FILTER(raw, INDEX(raw,,1) <= cutoff), {}),
+          {}
+        ),
+      sorted,
+        IF(ROWS(filtered), SORT(filtered, 1, TRUE), filtered),
+      VSTACK({"exp_primary","net_amount_sum"}, sorted)
+    )
     """
 ).strip()
 

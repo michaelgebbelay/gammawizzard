@@ -224,6 +224,35 @@ def parse_sheet_datetime(value: str) -> Optional[datetime]:
         return None
 
 
+def et_today_date() -> date:
+    return datetime.now(ET).date()
+
+
+def et_yesterday_date() -> date:
+    return et_today_date() - timedelta(days=1)
+
+
+def parse_sheet_date(value) -> Optional[date]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        raw = str(value).strip()
+        if not raw:
+            return None
+        try:
+            dt = datetime.fromisoformat(_iso_fix(raw))
+        except Exception:
+            try:
+                return date.fromisoformat(raw)
+            except Exception:
+                return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(ET)
+    return dt.date()
+
+
 def max_drawdown(pnls: List[float]) -> float:
     running = 0.0
     peak = 0.0
@@ -296,6 +325,7 @@ def build_performance_summary_rows(values: List[List[Any]]) -> List[List[Any]]:
 
     i_ledger = header.index("ledger_id") if "ledger_id" in header else -1
     i_txn = header.index("txn_id") if "txn_id" in header else -1
+    i_exp = header.index("exp_primary") if "exp_primary" in header else -1
 
     trades: Dict[str, Dict[str, Any]] = {}
     for row in values[1:]:
@@ -316,36 +346,69 @@ def build_performance_summary_rows(values: List[List[Any]]) -> List[List[Any]]:
         ts_raw = row[i_ts] if 0 <= i_ts < len(row) else ""
         dt = parse_sheet_datetime(ts_raw)
 
-        entry = trades.setdefault(ledger, {"net": None, "ts": None})
+        exp_raw = row[i_exp] if 0 <= i_exp < len(row) else ""
+        exp_date = parse_sheet_date(exp_raw)
+
+        entry = trades.setdefault(ledger, {"net": None, "ts": None, "exp": None})
         entry["net"] = net
         if dt is not None:
             if entry["ts"] is None or dt < entry["ts"]:
                 entry["ts"] = dt
+        if exp_date is not None and entry.get("exp") is None:
+            entry["exp"] = exp_date
 
-    trade_list = [
-        {
-            "ledger": k,
-            "net": v["net"],
-            "ts": v["ts"],
-        }
-        for k, v in trades.items()
-        if v["net"] is not None
-    ]
+    trade_list = []
+    for k, v in trades.items():
+        if v.get("net") is None:
+            continue
+        ts = v.get("ts")
+        if isinstance(ts, datetime):
+            ts_et = ts.astimezone(ET) if ts.tzinfo else ts
+            ts_date = ts_et.date()
+        else:
+            ts_date = None
+        exp_date = v.get("exp") if isinstance(v.get("exp"), date) else None
+        trade_date = exp_date or ts_date
+        trade_list.append(
+            {
+                "ledger": k,
+                "net": float(v["net"]),
+                "ts": ts,
+                "exp": exp_date,
+                "date": trade_date,
+            }
+        )
     if not trade_list:
         return [["Monthly performance"], ["No trade data available"]]
 
-    trade_list.sort(key=lambda item: (item["ts"] or datetime.min, item["ledger"]))
+    trade_list.sort(key=lambda item: (item.get("date") or date.min, item["ledger"]))
 
-    pnls = [float(t["net"]) for t in trade_list]
+    cutoff_date = et_yesterday_date()
+
+    filtered_trades = []
+    for t in trade_list:
+        exp_date = t.get("exp")
+        trade_date = t.get("date")
+        if isinstance(exp_date, date):
+            if exp_date > cutoff_date:
+                continue
+        elif isinstance(trade_date, date) and trade_date > cutoff_date:
+            continue
+        filtered_trades.append(t)
+
+    if not filtered_trades:
+        return [["Monthly performance"], ["No trade data available"]]
+
+    pnls = [float(t["net"]) for t in filtered_trades]
 
     monthly: Dict[Tuple[int, int], float] = {}
     years: List[int] = []
-    for t in trade_list:
-        ts = t.get("ts")
-        if not isinstance(ts, datetime):
+    for t in filtered_trades:
+        trade_date = t.get("date")
+        if not isinstance(trade_date, date):
             continue
-        year = ts.year
-        month = ts.month
+        year = trade_date.year
+        month = trade_date.month
         monthly[(year, month)] = round(monthly.get((year, month), 0.0) + float(t["net"]), 2)
         if year not in years:
             years.append(year)
@@ -378,8 +441,8 @@ def build_performance_summary_rows(values: List[List[Any]]) -> List[List[Any]]:
     now_et = datetime.now(ET)
     pnls_ytd = [
         float(t["net"])
-        for t in trade_list
-        if isinstance(t.get("ts"), datetime) and t["ts"].year == now_et.year
+        for t in filtered_trades
+        if isinstance(t.get("date"), date) and t["date"].year == now_et.year
     ]
     stats_ytd = compute_stats(pnls_ytd)
 
@@ -578,27 +641,23 @@ def write_simple_summary_from_raw(svc, sid, src_tab=RAW_TAB, out_tab="sw_txn_sum
         return
 
     # Group sum(net_amount) by exp_primary
-    sums = {}
+    cutoff_date = et_yesterday_date()
+    sums: Dict[date, float] = {}
     for r in values[1:]:
         # pad row so indexing is safe
         if len(r) < max(i_exp, i_net) + 1:
             continue
-        exp = (r[i_exp] or "").strip()
-        if not exp:
+        exp_raw = r[i_exp] if i_exp < len(r) else ""
+        exp_date = parse_sheet_date(exp_raw)
+        if exp_date is None:
+            continue
+        if exp_date > cutoff_date:
             continue
         net = safe_float(r[i_net]) or 0.0
-        sums[exp] = round(sums.get(exp, 0.0) + net, 2)
+        sums[exp_date] = round(sums.get(exp_date, 0.0) + net, 2)
 
-    summary_rows = [[k, v] for k, v in sums.items()]
-
-    def _to_dt(x: str):
-        try:
-            return datetime.fromisoformat(str(x).strip())
-        except Exception:
-            # Push blanks / bad values to the bottom
-            return datetime.min
-
-    summary_rows.sort(key=lambda r: _to_dt(r[0]), reverse=True)
+    summary_entries = sorted(sums.items(), key=lambda item: item[0], reverse=True)
+    summary_rows = [[dt.isoformat(), total] for dt, total in summary_entries]
 
     overwrite_rows(svc, sid, out_tab, headers, summary_rows)
 
