@@ -64,6 +64,9 @@ jobs:
           CREDIT_STEP: "0.05"
           RESET_TO_START: "1"
           STEP_WAIT_CREDIT: "10"
+          MAX_RUNTIME_SECS: "900"
+          DISCRETE_CREDIT_LADDER: "6,5.70,5.50,5.40,5.30,5.25,5.20,5.15,5.10,5.05,5.00"
+          CYCLES_WITH_REFRESH: "3"
           MAX_LADDER_CYCLES: "3"
           PYTHONUNBUFFERED: "1"
         run: |
