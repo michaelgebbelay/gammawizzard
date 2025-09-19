@@ -71,6 +71,10 @@ def ensure_tab_with_header(svc, sid: str, tab: str, headers: List[str]) -> None:
         ).execute()
 
 def overwrite_rows(svc, sid: str, tab: str, headers: List[str], rows: List[List[Any]]) -> None:
+    svc.spreadsheets().values().clear(
+        spreadsheetId=sid,
+        range=tab,
+    ).execute()
     svc.spreadsheets().values().update(
         spreadsheetId=sid,
         range=f"{tab}!A1",
