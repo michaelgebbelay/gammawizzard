@@ -283,8 +283,18 @@ def write_simple_summary_from_raw(svc, sid, src_tab=RAW_TAB, out_tab="sw_txn_sum
         net = safe_float(r[i_net]) or 0.0
         sums[exp] = round(sums.get(exp, 0.0) + net, 2)
 
-    rows = [[k, v] for k, v in sorted(sums.items(), key=lambda kv: kv[0])]
-    overwrite_rows(svc, sid, out_tab, headers, rows)
+    summary_rows = [[k, v] for k, v in sums.items()]
+
+    def _to_dt(x: str):
+        try:
+            return datetime.fromisoformat(str(x).strip())
+        except Exception:
+            # Push blanks / bad values to the bottom
+            return datetime.min
+
+    summary_rows.sort(key=lambda r: _to_dt(r[0]), reverse=True)
+
+    overwrite_rows(svc, sid, out_tab, headers, summary_rows)
 
 
 # ---------- main ----------
