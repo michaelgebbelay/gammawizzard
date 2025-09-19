@@ -158,7 +158,7 @@ def schwab_put_json(c, url, payload, tries=6, tag=""):
     for i in range(tries):
         try:
             r = c.session.put(url, json=payload, timeout=20)
-            if r.status_code in (200, 201, 202):
+            if r.status_code in (200, 201, 202, 204):
                 return r
             if r.status_code == 429:
                 time.sleep(_sleep_for_429(r, i)); continue
