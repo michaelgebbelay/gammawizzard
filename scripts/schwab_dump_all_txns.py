@@ -20,6 +20,7 @@ Env:
 Output tab: sw_txn_raw with RAW_HEADERS below
 """
 
+import calendar
 import os, sys, json, base64, re, time
 from datetime import datetime, timedelta, timezone, date
 from typing import Any, Dict, List, Optional, Tuple
@@ -32,6 +33,9 @@ from googleapiclient.discovery import build as gbuild
 ET = ZoneInfo("America/New_York")
 
 RAW_TAB = "sw_txn_raw"
+PERF_TAB = "sw_performance_summary"
+EDGE_RISK_UNIT = 100.0
+
 RAW_HEADERS = [
     "ts","txn_id","type","sub_type","description",
     "symbol","underlying","exp_primary","strike","put_call",
@@ -70,6 +74,16 @@ def ensure_tab_with_header(svc, sid: str, tab: str, headers: List[str]) -> None:
             spreadsheetId=sid, range=f"{tab}!A1",
             valueInputOption="RAW",
             body={"values":[headers]}
+        ).execute()
+
+
+def ensure_tab_exists(svc, sid: str, tab: str) -> None:
+    meta = svc.spreadsheets().get(spreadsheetId=sid).execute()
+    titles = {s["properties"]["title"] for s in meta.get("sheets", [])}
+    if tab not in titles:
+        svc.spreadsheets().batchUpdate(
+            spreadsheetId=sid,
+            body={"requests": [{"addSheet": {"properties": {"title": tab}}}]},
         ).execute()
 
 def overwrite_rows(svc, sid: str, tab: str, headers: List[str], rows: List[List[Any]]) -> None:
@@ -196,6 +210,223 @@ def fmt_ts_utc_to_et(s: str) -> str:
 def safe_float(x) -> Optional[float]:
     try: return float(x)
     except Exception: return None
+
+
+def parse_sheet_datetime(value: str) -> Optional[datetime]:
+    if not value:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(_iso_fix(raw))
+    except Exception:
+        return None
+
+
+def max_drawdown(pnls: List[float]) -> float:
+    running = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    for pnl in pnls:
+        running += pnl
+        if running > peak:
+            peak = running
+        drawdown = peak - running
+        if drawdown > max_dd:
+            max_dd = drawdown
+    return round(max_dd, 2)
+
+
+def compute_stats(pnls: List[float]) -> Dict[str, Any]:
+    count = len(pnls)
+    total = round(sum(pnls), 2)
+    wins = sum(1 for v in pnls if v > 0)
+    win_rate = (wins / count * 100.0) if count else 0.0
+    edge = (total / (count * EDGE_RISK_UNIT)) if count else 0.0
+    dd = max_drawdown(pnls) if count else 0.0
+    factor = (total / dd) if dd else 0.0
+    return {
+        "count": count,
+        "total": total,
+        "wins": wins,
+        "win_rate": win_rate,
+        "edge": edge,
+        "max_drawdown": round(dd, 2),
+        "factor": round(factor, 2) if factor else 0.0,
+    }
+
+
+def fmt_number(val: Optional[float]) -> str:
+    if val is None:
+        return "NA"
+    try:
+        fval = float(val)
+    except Exception:
+        return str(val)
+    if abs(fval) < 1e-9:
+        fval = 0.0
+    if abs(fval - round(fval)) < 1e-9:
+        return str(int(round(fval)))
+    return f"{fval:.2f}"
+
+
+def fmt_edge(val: float) -> str:
+    text = f"{val:.7f}"
+    text = text.rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def fmt_percent(val: float) -> str:
+    text = f"{val:.2f}"
+    text = text.rstrip("0").rstrip(".")
+    return f"{text}%"
+
+
+def build_performance_summary_rows(values: List[List[Any]]) -> List[List[Any]]:
+    if len(values) <= 1:
+        return [["Monthly performance"], ["No trade data available"]]
+
+    header = values[0]
+    try:
+        i_ts = header.index("ts")
+        i_net = header.index("net_amount")
+    except ValueError:
+        return [["Monthly performance"], ["Missing expected columns"]]
+
+    i_ledger = header.index("ledger_id") if "ledger_id" in header else -1
+    i_txn = header.index("txn_id") if "txn_id" in header else -1
+
+    trades: Dict[str, Dict[str, Any]] = {}
+    for row in values[1:]:
+        if max(i_ts, i_net, i_ledger, i_txn) >= len(row):
+            row = list(row) + [""] * (max(i_ts, i_net, i_ledger, i_txn) + 1 - len(row))
+        ledger = ""
+        if 0 <= i_ledger < len(row):
+            ledger = str(row[i_ledger]).strip()
+        if not ledger and 0 <= i_txn < len(row):
+            ledger = str(row[i_txn]).strip()
+        if not ledger:
+            continue
+
+        net = safe_float(row[i_net]) if 0 <= i_net < len(row) else None
+        if net is None:
+            continue
+
+        ts_raw = row[i_ts] if 0 <= i_ts < len(row) else ""
+        dt = parse_sheet_datetime(ts_raw)
+
+        entry = trades.setdefault(ledger, {"net": None, "ts": None})
+        entry["net"] = net
+        if dt is not None:
+            if entry["ts"] is None or dt < entry["ts"]:
+                entry["ts"] = dt
+
+    trade_list = [
+        {
+            "ledger": k,
+            "net": v["net"],
+            "ts": v["ts"],
+        }
+        for k, v in trades.items()
+        if v["net"] is not None
+    ]
+    if not trade_list:
+        return [["Monthly performance"], ["No trade data available"]]
+
+    trade_list.sort(key=lambda item: (item["ts"] or datetime.min, item["ledger"]))
+
+    pnls = [float(t["net"]) for t in trade_list]
+
+    monthly: Dict[Tuple[int, int], float] = {}
+    years: List[int] = []
+    for t in trade_list:
+        ts = t.get("ts")
+        if not isinstance(ts, datetime):
+            continue
+        year = ts.year
+        month = ts.month
+        monthly[(year, month)] = round(monthly.get((year, month), 0.0) + float(t["net"]), 2)
+        if year not in years:
+            years.append(year)
+
+    years.sort()
+    if not years:
+        years = []
+    years_to_show = years[-2:] if len(years) > 2 else years
+
+    rows: List[List[Any]] = [["Monthly performance"]]
+    if years_to_show:
+        header_row = ["Month"] + [str(y) for y in years_to_show]
+        rows.append(header_row)
+        for m in range(1, 13):
+            row = [calendar.month_abbr[m]]
+            for y in years_to_show:
+                val = monthly.get((y, m))
+                row.append(val if val is not None else "NA")
+            rows.append(row)
+    else:
+        rows.append(["Month"])
+        rows.append(["(no dated trades)"])
+
+    rows.append([])
+
+    stats_all = compute_stats(pnls)
+    stats_last10 = compute_stats(pnls[-10:])
+    stats_last20 = compute_stats(pnls[-20:])
+
+    now_et = datetime.now(ET)
+    pnls_ytd = [
+        float(t["net"])
+        for t in trade_list
+        if isinstance(t.get("ts"), datetime) and t["ts"].year == now_et.year
+    ]
+    stats_ytd = compute_stats(pnls_ytd)
+
+    def stats_block(label: str, stats: Dict[str, Any]) -> List[List[str]]:
+        if not stats.get("count"):
+            return [[f"Total profit {label} = N/A (no trades)"]]
+        total = fmt_number(stats["total"])
+        edge = fmt_edge(float(stats["edge"]))
+        dd = fmt_number(stats["max_drawdown"])
+        factor = fmt_number(stats["factor"])
+        win = fmt_percent(float(stats["win_rate"]))
+        return [
+            [f"Total profit {label} = {total} Edge= {edge} Max Drawdown = {dd}"],
+            [f"Factor = {factor} Win rate = {win}"],
+        ]
+
+    rows.extend(stats_block("last 10 trades", stats_last10))
+    rows.extend(stats_block("last 20 trades", stats_last20))
+    rows.extend(stats_block("Year To Date", stats_ytd))
+
+    if stats_all.get("count"):
+        rows.append([])
+        hist_win = fmt_percent(float(stats_all["win_rate"]))
+        hist_win_display = hist_win[:-1] if hist_win.endswith("%") else hist_win
+        rows.append([f"Historical Win rate: {hist_win_display}"])
+        total_all = fmt_number(stats_all["total"])
+        total_dd = fmt_number(stats_all["max_drawdown"])
+        rows.append([f"Total Profit: {total_all} Total Max DD = {total_dd}"])
+    else:
+        rows.append(["No historical trade data available."])
+
+    return rows
+
+
+def write_performance_summary_from_raw(svc, sid: str, values: List[List[Any]], tab: str = PERF_TAB):
+    ensure_tab_exists(svc, sid, tab)
+    rows = build_performance_summary_rows(values)
+    svc.spreadsheets().values().clear(
+        spreadsheetId=sid,
+        range=tab,
+    ).execute()
+    svc.spreadsheets().values().update(
+        spreadsheetId=sid,
+        range=f"{tab}!A1",
+        valueInputOption="USER_ENTERED",
+        body={"values": rows},
+    ).execute()
 
 def to_underlying(sym: str, underlying_hint: str = "") -> str:
     u = (underlying_hint or "").upper()
@@ -331,6 +562,7 @@ def write_simple_summary_from_raw(svc, sid, src_tab=RAW_TAB, out_tab="sw_txn_sum
     # Ensure tab + header even if empty
     headers = ["exp_primary", "net_amount_sum"]
     ensure_tab_with_header(svc, sid, out_tab, headers)
+    write_performance_summary_from_raw(svc, sid, values)
     if len(values) <= 1:
         overwrite_rows(svc, sid, out_tab, headers, [])
         return
