@@ -24,9 +24,10 @@ def _as_float(env_name: str, default: str) -> float:
     except Exception:
         return float(default)
 
-STEP_WAIT_CREDIT = _as_float("STEP_WAIT_CREDIT", "10")
-STEP_WAIT_DEBIT  = _as_float("STEP_WAIT_DEBIT",  "30")
-FINAL_CANCEL     = True
+STEP_WAIT_CREDIT    = _as_float("STEP_WAIT_CREDIT", "10")
+STEP_WAIT_DEBIT     = _as_float("STEP_WAIT_DEBIT",  "30")
+FINAL_CANCEL        = True
+CANCEL_SETTLE_SECS  = _as_float("CANCEL_SETTLE_SECS", "0")
 
 # Sizing knobs
 CREDIT_DOLLARS_PER_CONTRACT = float(os.environ.get("CREDIT_DOLLARS_PER_CONTRACT", "12000"))
@@ -477,7 +478,8 @@ def main():
     if is_credit:
         units=max(1.0,width/5.0)
         s=max(CREDIT_FLOOR, units*CREDIT_PER5_START)
-        print(f"LADDER CONFIG start≈{clamp_tick(s):.2f} floor={CREDIT_FLOOR:.2f} step={CREDIT_STEP:.2f} wait={STEP_WAIT_CREDIT}s cycles={MAX_LADDER_CYCLES} replace={REPLACE_MODE}")
+        settle_txt = f" settle={CANCEL_SETTLE_SECS:.2f}s" if CANCEL_SETTLE_SECS > 0 else ""
+        print(f"LADDER CONFIG start≈{clamp_tick(s):.2f} floor={CREDIT_FLOOR:.2f} step={CREDIT_STEP:.2f} wait={STEP_WAIT_CREDIT}s cycles={MAX_LADDER_CYCLES} replace={REPLACE_MODE}{settle_txt}")
 
     # One active working order (replace). Cancel any overlapping partial matches first.
     active_oid, active_status, overlaps = pick_active_and_overlaps(c, acct_hash, canon)
@@ -544,6 +546,11 @@ def main():
             ]
         }
 
+    def cancel_settle_wait(label: str):
+        if CANCEL_SETTLE_SECS > 0:
+            vprint(f"CANCEL_SETTLE {label} sleep {CANCEL_SETTLE_SECS:.2f}s")
+            time.sleep(CANCEL_SETTLE_SECS)
+
     def ensure_active(price: float, to_place: int):
         nonlocal active_oid, replacements, canceled
         px = clamp_tick(price)
@@ -563,6 +570,7 @@ def main():
                         try:
                             schwab_delete(c, url, tag=f"CANCEL_STEP:{active_oid}")
                             canceled += 1
+                            cancel_settle_wait("REPLACE_FALLBACK")
                         except Exception:
                             pass
                         active_oid = None
@@ -573,6 +581,7 @@ def main():
                         schwab_delete(c, url, tag=f"CANCEL_STEP:{active_oid}")
                         canceled += 1
                         vprint(f"CANCEL_STEP OID={active_oid}")
+                        cancel_settle_wait("CANCEL_REPLACE")
                     except Exception:
                         pass
                     active_oid = None
@@ -742,6 +751,7 @@ def main():
                 schwab_delete(c, url, tag=f"CANCEL_CYCLE:{active_oid}")
                 canceled += 1
                 vprint(f"CANCEL_CYCLE OID={active_oid}")
+                cancel_settle_wait("CANCEL_CYCLE")
             except Exception:
                 pass
             active_oid = None
@@ -758,6 +768,7 @@ def main():
             schwab_delete(c, url, tag=f"CANCEL_FINAL:{active_oid}")
             canceled += 1
             vprint(f"CANCEL_FINAL OID={active_oid}")
+            cancel_settle_wait("CANCEL_FINAL")
         except Exception:
             pass
 
