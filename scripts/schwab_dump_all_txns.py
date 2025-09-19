@@ -247,6 +247,46 @@ def rows_from_ledger_txn(txn: Dict[str, Any]) -> List[List[Any]]:
 
     return rows
 
+
+def write_simple_summary_from_raw(svc, sid, src_tab=RAW_TAB, out_tab="sw_txn_summary"):
+    # Pull raw values
+    resp = svc.spreadsheets().values().get(
+        spreadsheetId=sid, range=f"{src_tab}!A1:Q"
+    ).execute()
+    values = resp.get("values", [])
+    # Ensure tab + header even if empty
+    headers = ["exp_primary", "net_amount_sum"]
+    ensure_tab_with_header(svc, sid, out_tab, headers)
+    if len(values) <= 1:
+        overwrite_rows(svc, sid, out_tab, headers, [])
+        return
+
+    header = values[0]
+    # robust lookup by name
+    try:
+        i_exp = header.index("exp_primary")
+        i_net = header.index("net_amount")
+    except ValueError:
+        # If headers are off, just leave summary empty rather than crashing
+        overwrite_rows(svc, sid, out_tab, headers, [])
+        return
+
+    # Group sum(net_amount) by exp_primary
+    sums = {}
+    for r in values[1:]:
+        # pad row so indexing is safe
+        if len(r) < max(i_exp, i_net) + 1:
+            continue
+        exp = (r[i_exp] or "").strip()
+        if not exp:
+            continue
+        net = safe_float(r[i_net]) or 0.0
+        sums[exp] = round(sums.get(exp, 0.0) + net, 2)
+
+    rows = [[k, v] for k, v in sorted(sums.items(), key=lambda kv: kv[0])]
+    overwrite_rows(svc, sid, out_tab, headers, rows)
+
+
 # ---------- main ----------
 def main() -> int:
     try:
@@ -289,6 +329,7 @@ def main() -> int:
             print(f"NOTE: failed to parse ledger {tid}: {exc}")
 
     overwrite_rows(svc, sid, RAW_TAB, RAW_HEADERS, all_rows)
+    write_simple_summary_from_raw(svc, sid)
     print(f"OK: wrote {len(all_rows)} rows from {len(txns)} ledger activities to {RAW_TAB}.")
     return 0
 
