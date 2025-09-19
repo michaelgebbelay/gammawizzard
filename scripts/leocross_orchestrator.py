@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
-# VERSION: 2025-10-06 v4.3.2 — Orchestrator
-# - BYPASS_GUARD uses target_units when BYPASS_QTY not provided
-# - Forces PLACER_MODE=MANUAL so ladder runs immediately (no time gate)
-# - Logs to GSheet 'guard' tab
-# - Spawns placer with QTY_OVERRIDE=<rem_qty>
+# VERSION: 2025-10-07 v4.4.0 — Orchestrator
+# - Default FAST_HOLD_SECONDS=0 (start immediately when you trigger at 16:13)
+# - Logs guard snapshot and calls placer with QTY_OVERRIDE
 
 import os, sys, json, time, re, math
 from datetime import datetime, date, timezone, timedelta
@@ -13,10 +11,7 @@ from schwab.auth import client_from_token_file
 from google.oauth2 import service_account
 from googleapiclient.discovery import build as gbuild
 
-# ===== Runtime knobs =====
-PER_UNIT = 5000  # legacy debit sizing: contracts = floor(opening_cash / PER_UNIT)
-
-# Env knobs
+PER_UNIT = 5000
 CREDIT_DOLLARS_PER_CONTRACT = float(os.environ.get("CREDIT_DOLLARS_PER_CONTRACT", "12000"))
 CREDIT_SPREAD_WIDTH         = int(os.environ.get("CREDIT_SPREAD_WIDTH", "15"))
 CREDIT_MIN_WIDTH            = 5
@@ -25,15 +20,14 @@ def _truthy(s: str) -> bool:
     return str(s or "").strip().lower() in {"1","true","t","yes","y","on"}
 
 BYPASS_GUARD = _truthy(os.environ.get("BYPASS_GUARD",""))
-BYPASS_QTY   = os.environ.get("BYPASS_QTY","").strip()  # if empty, we use target_units
+BYPASS_QTY   = os.environ.get("BYPASS_QTY","").strip()
 
-# Google Sheets
 ET = ZoneInfo("America/New_York")
 GW_BASE = "https://gandalf.gammawizard.com"
 GW_ENDPOINT = "/rapi/GetLeoCross"
-FAST_HOLD_SECONDS = 30          # trigger at 16:13:00 → hold ~30s
-GW_WARM_TIMEOUT   = 6           # seconds for the warm read at 16:13
-GW_REFRESH_TIMEOUT= 3           # seconds for the quick refresh at 16:13:30
+FAST_HOLD_SECONDS = int(os.environ.get("FAST_HOLD_SECONDS","0"))  # was 30; now default 0
+GW_WARM_TIMEOUT   = 6
+GW_REFRESH_TIMEOUT= 3
 
 GUARD_TAB = "guard"
 GUARD_HEADERS = [
@@ -42,7 +36,6 @@ GUARD_HEADERS = [
     "acct_qty_bp","acct_qty_sp","acct_qty_sc","acct_qty_bc"
 ]
 
-# ===== Utils =====
 def yymmdd(iso: str) -> str:
     d = date.fromisoformat((iso or "")[:10])
     return "{:%y%m%d}".format(d)
@@ -69,13 +62,13 @@ def iso_z(dt):
 
 def _backoff(i): return 0.6*(2**i)
 
-# ===== Sheets helpers =====
+# Sheets helpers (same as before)
 def ensure_header_and_get_sheetid(svc, spreadsheet_id: str, tab: str, header: list):
     meta = svc.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-    sheet_id_num = None
+    sheet_id_num=None
     for sh in meta["sheets"]:
         if sh["properties"]["title"] == tab:
-            sheet_id_num = sh["properties"]["sheetId"]; break
+            sheet_id_num=sh["properties"]["sheetId"]; break
     if sheet_id_num is None:
         svc.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id,
             body={"requests":[{"addSheet":{"properties":{"title":tab}}}]}).execute()
@@ -100,25 +93,23 @@ def guard_log(svc, sheet_id_num, spreadsheet_id: str, row_vals: list):
     except Exception as e:
         print("ORCH WARN: guard log failed — {}".format(str(e)[:200]))
 
-# ===== Schwab helpers =====
+# Schwab + positions (same as before)
 def schwab_get_json(c, url, params=None, tries=6, tag=""):
     last=""
     for i in range(tries):
         try:
             r=c.session.get(url, params=(params or {}), timeout=20)
             if r.status_code==200: return r.json()
-            last="HTTP_{:d}:{:s}".format(r.status_code, (r.text or "")[:160])
+            last=f"HTTP_{r.status_code}:{(r.text or '')[:160]}"
         except Exception as e:
-            last="{}:{}".format(type(e).__name__, str(e))
+            last=f"{type(e).__name__}:{str(e)}"
         time.sleep(_backoff(i))
-    raise RuntimeError("SCHWAB_GET_FAIL({}) {}".format(tag, last))
+    raise RuntimeError(f"SCHWAB_GET_FAIL({tag}) {last}")
 
 def _osi_from_instrument(ins: dict) -> str | None:
     sym = (ins.get("symbol") or "")
-    try:
-        return to_osi(sym)
-    except Exception:
-        pass
+    try: return to_osi(sym)
+    except Exception: pass
     exp = ins.get("optionExpirationDate") or ins.get("expirationDate") or ""
     pc  = (ins.get("putCall") or ins.get("type") or "").upper()
     strike = ins.get("strikePrice") or ins.get("strike")
@@ -128,12 +119,11 @@ def _osi_from_instrument(ins: dict) -> str | None:
             cp = "C" if pc.startswith("C") else "P"
             mills = int(round(float(strike)*1000))
             return "{:<6s}{}{}{:08d}".format("SPXW", ymd, cp, mills)
-    except Exception:
-        pass
+    except Exception: pass
     return None
 
 def positions_map(c, acct_hash: str):
-    url="https://api.schwabapi.com/trader/v1/accounts/{}".format(acct_hash)
+    url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}"
     j=schwab_get_json(c,url,params={"fields":"positions"},tag="POSITIONS")
     sa=j[0]["securitiesAccount"] if isinstance(j,list) else (j.get("securitiesAccount") or j)
     out={}
@@ -148,7 +138,6 @@ def positions_map(c, acct_hash: str):
         out[osi_canon(osi)] = out.get(osi_canon(osi), 0.0) + qty
     return out
 
-# ===== opening cash + account =====
 def get_primary_acct(c):
     r=c.get_account_numbers(); r.raise_for_status()
     first=r.json()[0]
@@ -158,12 +147,10 @@ def opening_cash_for_account(c, acct_number: str):
     r = c.get_accounts(); r.raise_for_status()
     data = r.json()
     accs = data if isinstance(data, list) else [data]
-
     def pick(d,*ks):
         for k in ks:
             v = (d or {}).get(k)
             if isinstance(v,(int,float)): return float(v)
-
     def hunt(a):
         acct_id=None; initial={}; current={}
         stack=[a]
@@ -175,40 +162,30 @@ def opening_cash_for_account(c, acct_number: str):
                 if "currentBalances" in x and isinstance(x["currentBalances"], dict): current=x["currentBalances"]
                 for v in x.values():
                     if isinstance(v,(dict,list)): stack.append(v)
-            elif isinstance(x,list):
-                stack.extend(x)
+            elif isinstance(x,list): stack.extend(x)
         return acct_id, initial, current
-
     chosen=None
     for a in accs:
         aid, init, curr = hunt(a)
-        if acct_number and aid == acct_number:
-            chosen=(init,curr); break
-        if chosen is None:
-            chosen=(init,curr)
-
+        if acct_number and aid == acct_number: chosen=(init,curr); break
+        if chosen is None: chosen=(init,curr)
     if not chosen: return None
     init, curr = chosen
     oc = pick(init,"cashBalance","cashAvailableForTrading","liquidationValue")
-    if oc is None:
-        oc = pick(curr,"cashBalance","cashAvailableForTrading","liquidationValue")
+    if oc is None: oc = pick(curr,"cashBalance","cashAvailableForTrading","liquidationValue")
     return oc
 
-# ===== width & sizing =====
 def calc_short_ic_width(opening_cash: float | int) -> int:
     width = max(CREDIT_MIN_WIDTH, int(CREDIT_SPREAD_WIDTH))
     return int(math.ceil(width / 5.0) * 5)
 
 def calc_short_ic_contracts(opening_cash: float | int) -> int:
-    try:
-        oc = float(opening_cash)
-    except Exception:
-        oc = 0.0
+    try: oc = float(opening_cash)
+    except Exception: oc = 0.0
     denom = CREDIT_DOLLARS_PER_CONTRACT if CREDIT_DOLLARS_PER_CONTRACT > 0 else 1.0
     units = math.ceil(max(0.0, oc) / denom)
     return max(1, int(units))
 
-# ===== condor helpers =====
 def condor_units_open(pos_map, legs):
     b1 = max(0.0,  pos_map.get(osi_canon(legs[0]), 0.0))
     b2 = max(0.0,  pos_map.get(osi_canon(legs[3]), 0.0))
@@ -217,27 +194,27 @@ def condor_units_open(pos_map, legs):
     return int(min(b1, b2, s1, s2))
 
 def print_guard_snapshot(pos, legs, is_credit, width_used, bypass):
-    labels = [("BUY_PUT",legs[0],-1),("SELL_PUT",legs[1],+1),("SELL_CALL",legs[2],+1),("BUY_CALL",legs[3],-1)]
-    tag = "CREDIT" if is_credit else "DEBIT"
-    print("ORCH GUARD SNAPSHOT ({} width={} BYPASS={}):".format(tag, width_used, "ON" if bypass else "OFF"))
+    labels=[("BUY_PUT",legs[0],-1),("SELL_PUT",legs[1],+1),("SELL_CALL",legs[2],+1),("BUY_CALL",legs[3],-1)]
+    tag="CREDIT" if is_credit else "DEBIT"
+    print(f"ORCH GUARD SNAPSHOT ({tag} width={width_used} BYPASS={'ON' if bypass else 'OFF'}):")
     for name, osi, sign in labels:
-        can = osi_canon(osi); cur = pos.get(can, 0.0)
-        print("  {:10s} {}  acct_qty={:+g}  sign={:+d}".format(name, osi, cur, sign))
+        can=osi_canon(osi); cur=pos.get(can,0.0)
+        print(f"  {name:10s} {osi}  acct_qty={cur:+g}  sign={sign:+d}")
 
-# ===== GW helpers =====
+# GW helpers (same as before)
 def _gw_timeout():
     try: return int(os.environ.get("GW_TIMEOUT","30"))
     except: return 30
 
 def _sanitize_token(t: str) -> str:
-    t = (t or "").strip().strip('"').strip("'")
+    t=(t or "").strip().strip('"').strip("'")
     return t.split(None,1)[1] if t.lower().startswith("bearer ") else t
 
 def gw_login_token():
     email=os.environ.get("GW_EMAIL",""); pwd=os.environ.get("GW_PASSWORD","")
     if not (email and pwd): raise RuntimeError("GW_LOGIN_MISSING_CREDS")
-    r=requests.post("{}/goauth/authenticateFireUser".format(GW_BASE), data={"email":email,"password":pwd}, timeout=_gw_timeout())
-    if r.status_code!=200: raise RuntimeError("GW_LOGIN_HTTP_{}:{}".format(r.status_code, (r.text or "")[:180]))
+    r=requests.post(f"{GW_BASE}/goauth/authenticateFireUser", data={"email":email,"password":pwd}, timeout=_gw_timeout())
+    if r.status_code!=200: raise RuntimeError(f"GW_LOGIN_HTTP_{r.status_code}:{(r.text or '')[:180]}")
     j=r.json(); t=j.get("token")
     if not t: raise RuntimeError("GW_LOGIN_NO_TOKEN")
     return t
@@ -245,17 +222,17 @@ def gw_login_token():
 def gw_get_leocross():
     tok=_sanitize_token(os.environ.get("GW_TOKEN","") or "")
     def hit(t):
-        h={"Accept":"application/json","Authorization":"Bearer {}".format(_sanitize_token(t)),"User-Agent":"gw-orchestrator/1.6"}
-        return requests.get("{}/{}".format(GW_BASE.rstrip("/"), GW_ENDPOINT.lstrip("/")), headers=h, timeout=_gw_timeout())
+        h={"Accept":"application/json","Authorization":f"Bearer {_sanitize_token(t)}","User-Agent":"gw-orchestrator/1.6"}
+        return requests.get(f"{GW_BASE.rstrip('/')}/{GW_ENDPOINT.lstrip('/')}", headers=h, timeout=_gw_timeout())
     r=hit(tok) if tok else None
     if (r is None) or (r.status_code in (401,403)): r=hit(gw_login_token())
-    if r.status_code!=200: raise RuntimeError("GW_HTTP_{}:{}".format(r.status_code, (r.text or "")[:180]))
+    if r.status_code!=200: raise RuntimeError(f"GW_HTTP_{r.status_code}:{(r.text or '')[:180]}")
     return r.json()
 
 def extract_trade(j):
     if isinstance(j,dict):
         if "Trade" in j:
-            tr=j["Trade"]
+            tr=j["Trade"]; 
             return tr[-1] if isinstance(tr,list) and tr else tr if isinstance(tr,dict) else {}
         keys=("Date","TDate","Limit","CLimit","Cat1","Cat2")
         if any(k in j for k in keys): return j
@@ -269,17 +246,16 @@ def extract_trade(j):
             if t: return t
     return {}
 
-# ===== main =====
 def main():
-    # Sheets init (non-fatal)
-    svc = None; sheet_id = None; guard_sheet_id = None
+    # Sheets init
+    svc=None; sheet_id=None; guard_sheet_id=None
     try:
         sheet_id=os.environ["GSHEET_ID"]
         sa_json=os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
         creds=service_account.Credentials.from_service_account_info(json.loads(sa_json),
             scopes=["https://www.googleapis.com/auth/spreadsheets"])
         svc=gbuild("sheets","v4",credentials=creds)
-        guard_sheet_id = ensure_header_and_get_sheetid(svc, sheet_id, GUARD_TAB, GUARD_HEADERS)
+        guard_sheet_id=ensure_header_and_get_sheetid(svc, sheet_id, GUARD_TAB, GUARD_HEADERS)
     except Exception as e:
         print("ORCH WARN: Sheets init failed — {}".format(str(e)[:200]))
         svc=None
@@ -289,11 +265,10 @@ def main():
         bp,sp,sc,bc = (legs or ("","","",""))
         bpq,spq,scq,bcq = acct_qty
         row=[datetime.utcnow().isoformat()+"Z","ORCH","SPX",sig_date if 'sig_date' in locals() else "",
-             decision, detail, open_units, rem_qty,
-             bp,sp,sc,bc, bpq,spq,scq,bcq]
+             decision, detail, open_units, rem_qty, bp,sp,sc,bc, bpq,spq,scq,bcq]
         guard_log(svc, guard_sheet_id, sheet_id, row)
 
-    # ---- Schwab auth ----
+    # Schwab auth
     try:
         app_key=os.environ["SCHWAB_APP_KEY"]; app_secret=os.environ["SCHWAB_APP_SECRET"]; token_json=os.environ["SCHWAB_TOKEN_JSON"]
         with open("schwab_token.json","w") as f: f.write(token_json)
@@ -301,21 +276,16 @@ def main():
         acct_num, acct_hash = get_primary_acct(c)
     except Exception as e:
         reason="SCHWAB_CLIENT_INIT_FAILED — " + str(e)[:200]
-        print("ORCH ABORT:", reason); log("ABORT", reason)
-        return 1
+        print("ORCH ABORT:", reason); log("ABORT", reason); return 1
 
-    # ---- Leo signal → warm read at ~16:13 ----
+    # Warm read
     try:
         os.environ["GW_TIMEOUT"] = str(GW_WARM_TIMEOUT)
-        api=gw_get_leocross()
-        tr=extract_trade(api)
-        if not tr:
-            print("ORCH SKIP: NO_TRADE_PAYLOAD"); log("SKIP","NO_TRADE_PAYLOAD")
-            return 0
+        api=gw_get_leocross(); tr=extract_trade(api)
+        if not tr: print("ORCH SKIP: NO_TRADE_PAYLOAD"); log("SKIP","NO_TRADE_PAYLOAD"); return 0
     except Exception as e:
         reason="GW_FETCH_FAILED — {}".format(str(e)[:200])
-        print("ORCH ABORT:", reason); log("ABORT", reason)
-        return 1
+        print("ORCH ABORT:", reason); log("ABORT", reason); return 1
 
     sig_date=str(tr.get("Date","")); exp_iso=str(tr.get("TDate","")); exp6=yymmdd(exp_iso)
     inner_put=int(float(tr.get("Limit"))); inner_call=int(float(tr.get("CLimit")))
@@ -325,14 +295,12 @@ def main():
     cat1=fnum(tr.get("Cat1")); cat2=fnum(tr.get("Cat2"))
     is_credit = True if (cat2 is None or cat1 is None or cat2>=cat1) else False
 
-    # ---- opening cash early (needed for Short IC width) ----
+    # Opening cash for width
     oc = opening_cash_for_account(c, acct_num)
     if oc is None:
         reason="OPENING_CASH_UNAVAILABLE — aborting to avoid wrong size/width."
-        print("ORCH ABORT:", reason); log("ABORT", reason)
-        return 1
+        print("ORCH ABORT:", reason); log("ABORT", reason); return 1
 
-    # Build planned legs (width depends on side)
     width = calc_short_ic_width(oc) if is_credit else 5
     p_low,p_high = inner_put - width, inner_put
     c_low,c_high = inner_call, inner_call + width
@@ -351,117 +319,85 @@ def main():
         return [bp,sp,sc,bc]
     legs = orient(bp,sp,sc,bc)
 
-    # --- wait until 16:13:30 ET, then quick refresh of Leo before placing ---
+    # Optional gate (default 0s)
     now = datetime.now(ET)
     gate = now.replace(hour=16, minute=13, second=0, microsecond=0) + timedelta(seconds=FAST_HOLD_SECONDS)
     if now < gate:
         time.sleep((gate - now).total_seconds())
-        # quick refresh (low latency, don’t block long)
+        # quick refresh
         try:
             os.environ["GW_TIMEOUT"] = str(GW_REFRESH_TIMEOUT)
-            api2 = gw_get_leocross()
-            tr2  = extract_trade(api2)
+            api2 = gw_get_leocross(); tr2 = extract_trade(api2)
             if tr2:
-                inner_put2 = int(float(tr2.get("Limit")))
-                inner_call2= int(float(tr2.get("CLimit")))
+                inner_put2 = int(float(tr2.get("Limit"))); inner_call2= int(float(tr2.get("CLimit")))
                 new_exp_iso = str(tr2.get("TDate",""))
                 if (inner_put2 != inner_put) or (inner_call2 != inner_call) or (new_exp_iso!=exp_iso):
-                    # rebuild legs on the fly
-                    exp_iso = new_exp_iso
-                    exp6 = yymmdd(exp_iso)
+                    exp_iso = new_exp_iso; exp6 = yymmdd(exp_iso)
                     inner_put, inner_call = inner_put2, inner_call2
                     p_low,p_high = inner_put - width, inner_put
                     c_low,c_high = inner_call, inner_call + width
                     bp = to_osi(f".SPXW{exp6}P{p_low}"); sp = to_osi(f".SPXW{exp6}P{p_high}")
                     sc = to_osi(f".SPXW{exp6}C{c_low}"); bc = to_osi(f".SPXW{exp6}C{c_high}")
-                    legs = [bp,sp,sc,bc]  # orient below will re-order
-                    legs = orient(*legs)
-        except Exception as _:
-            pass
+                    legs = orient(bp,sp,sc,bc)
+        except Exception: pass
 
-    # ---- positions ----
-    try:
-        pos = positions_map(c, acct_hash)
+    # Positions + checks
+    try: pos = positions_map(c, acct_hash)
     except Exception as e:
         reason="POSITIONS_FAILED — {}".format(str(e)[:200])
-        print("ORCH ABORT:", reason); log("ABORT", reason, legs)
-        return 1
+        print("ORCH ABORT:", reason); log("ABORT", reason, legs); return 1
 
     print("ORCH START RUN_ID={} SHA={}".format(os.environ.get("GITHUB_RUN_ID",""), os.environ.get("GITHUB_SHA","")[:7]))
     print_guard_snapshot(pos, legs, is_credit, width, BYPASS_GUARD)
 
-    # snapshot quantities (for logging)
-    bpq = pos.get(osi_canon(legs[0]), 0.0)
-    spq = pos.get(osi_canon(legs[1]), 0.0)
-    scq = pos.get(osi_canon(legs[2]), 0.0)
-    bcq = pos.get(osi_canon(legs[3]), 0.0)
+    bpq = pos.get(osi_canon(legs[0]), 0.0); spq = pos.get(osi_canon(legs[1]), 0.0)
+    scq = pos.get(osi_canon(legs[2]), 0.0); bcq = pos.get(osi_canon(legs[3]), 0.0)
     acct_snapshot=(bpq,spq,scq,bcq)
 
-    # ---- STRICT checks only if not bypassing ----
     checks=[("BUY",legs[0],-1),("SELL",legs[1],+1),("SELL",legs[2],+1),("BUY",legs[3],-1)]
     if not BYPASS_GUARD:
-        for label, osi, sign in checks:
+        for _, osi, sign in checks:
             cur = pos.get(osi_canon(osi), 0.0)
             if (sign<0 and cur<0) or (sign>0 and cur>0):
-                details="WOULD_CLOSE {} acct_qty={:+g}".format(osi, cur)
-                print("ORCH SKIP:", details); log("SKIP", details, legs, acct_snapshot, "", "")
-                return 0
+                details=f"WOULD_CLOSE {osi} acct_qty={cur:+g}"
+                print("ORCH SKIP:", details); log("SKIP", details, legs, acct_snapshot, "", ""); return 0
         nonzero = sum(1 for _, osi, _ in checks if abs(pos.get(osi_canon(osi),0.0))>1e-9)
         aligned = sum(1 for _, osi, sign in checks
                     if ((sign<0 and pos.get(osi_canon(osi),0.0)>=0) or
                         (sign>0 and pos.get(osi_canon(osi),0.0)<=0)) and
                         abs(pos.get(osi_canon(osi),0.0))>1e-9)
         if 0 < nonzero < 4:
-            present = ["{} {} acct_qty={:+g}".format(l, o, pos.get(osi_canon(o),0.0)) for (l,o,_) in checks if abs(pos.get(osi_canon(o),0.0))>1e-9]
+            present = ["{} {} acct_qty={:+g}".format(l, o, pos.get(osi_canon(o),0.0))
+                       for (l,o,_) in checks if abs(pos.get(osi_canon(o),0.0))>1e-9]
             details="PARTIAL_OVERLAP — " + "; ".join(present)
-            print("ORCH SKIP:", details); log("SKIP", details, legs, acct_snapshot, "", "")
-            return 0
+            print("ORCH SKIP:", details); log("SKIP", details, legs, acct_snapshot, "", ""); return 0
 
-    # ---- target units ----
-    if is_credit:
-        target_units = calc_short_ic_contracts(oc)
-    else:
-        target_units = int(max(0, oc // PER_UNIT))  # legacy debit sizing
-
-    # ---- compute remainder ----
+    target_units = calc_short_ic_contracts(oc) if is_credit else int(max(0, oc // PER_UNIT))
     if BYPASS_GUARD:
-        try:
-            rem_qty = int(BYPASS_QTY) if BYPASS_QTY else int(target_units)
-        except Exception:
-            rem_qty = int(target_units)
-        units_open = 0
-        decision = "ALLOW_BYPASS"
-        detail = f"BYPASS_GUARD=1 width={width} open_cash={oc:.2f} target={target_units} rem_qty={rem_qty}"
+        try: rem_qty = int(BYPASS_QTY) if BYPASS_QTY else int(target_units)
+        except Exception: rem_qty = int(target_units)
+        decision="ALLOW_BYPASS"; detail=f"BYPASS_GUARD=1 width={width} open_cash={oc:.2f} target={target_units} rem_qty={rem_qty}"
+        units_open=0
     else:
-        nonzero = sum(1 for _, osi, _ in checks if abs(pos.get(osi_canon(osi),0.0))>1e-9)
-        aligned = sum(1 for _, osi, sign in checks
-                    if ((sign<0 and pos.get(osi_canon(osi),0.0)>=0) or
-                        (sign>0 and pos.get(osi_canon(osi),0.0)<=0)) and
-                        abs(pos.get(osi_canon(osi),0.0))>1e-9)
-        if nonzero==4 and aligned==4:
-            units_open = condor_units_open(pos, legs)
-        else:
-            units_open = 0
+        def condor_units_open(pos_map, legs):
+            b1 = max(0.0,  pos_map.get(osi_canon(legs[0]), 0.0))
+            b2 = max(0.0,  pos_map.get(osi_canon(legs[3]), 0.0))
+            s1 = max(0.0, -pos_map.get(osi_canon(legs[1]), 0.0))
+            s2 = max(0.0, -pos_map.get(osi_canon(legs[2]), 0.0))
+            return int(min(b1, b2, s1, s2))
+        units_open = condor_units_open(pos, legs)
         rem_qty = max(0, target_units - units_open)
         decision = ("ALLOW" if rem_qty>0 else "SKIP")
-        detail = ("short_ic width={} open_cash={:.2f} target={} units_open={} rem_qty={}"
-                  if is_credit else
-                  "long_ic width=5 open_cash={:.2f} per_unit={} target={} units_open={} rem_qty={}").format(
-                      width, oc, target_units, units_open, rem_qty) if is_credit else \
-                  "long_ic width=5 open_cash={:.2f} per_unit={} target={} units_open={} rem_qty={}".format(
-                      oc, PER_UNIT, target_units, units_open, rem_qty)
+        detail = f"short_ic width={width} open_cash={oc:.2f} target={target_units} units_open={units_open} rem_qty={rem_qty}" \
+                 if is_credit else \
+                 f"long_ic width=5 open_cash={oc:.2f} per_unit={PER_UNIT} target={target_units} units_open={units_open} rem_qty={rem_qty}"
 
-    print("ORCH SIZE", detail)
-    log(decision, detail, legs, acct_snapshot, (0 if BYPASS_GUARD else units_open), rem_qty)
+    print("ORCH SIZE", detail); log(decision, detail, legs, acct_snapshot, (0 if BYPASS_GUARD else units_open), rem_qty)
+    if rem_qty == 0: print("ORCH SKIP: At/above target; no remainder to place."); return 0
 
-    if rem_qty == 0:
-        print("ORCH SKIP: At/above target; no remainder to place.")
-        return 0
-
-    # ---- call placer with override (FORCE MANUAL mode + verbose) ----
     env = dict(os.environ)
     env["QTY_OVERRIDE"] = str(rem_qty)
-    env["PLACER_MODE"]  = "MANUAL"   # << force immediate laddering
+    env["PLACER_MODE"]  = "MANUAL"
     env["VERBOSE"]      = env.get("VERBOSE","1")
     print(f"ORCH CALL → PLACER QTY_OVERRIDE={env['QTY_OVERRIDE']} MODE={env['PLACER_MODE']}")
     rc = os.spawnve(os.P_WAIT, sys.executable, [sys.executable, "scripts/leocross_place_simple.py"], env)
