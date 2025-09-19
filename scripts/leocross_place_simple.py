@@ -56,7 +56,7 @@ CANCEL_SETTLE_SECS = float(os.environ.get("CANCEL_SETTLE_SECS","3.0"))
 REPLACE_MODE            = "CANCEL_REPLACE"   # use PUT replace (we already accept 204)
 DISCRETE_CREDIT_LADDER  = "6,5.70,5.50,5.40,5.30,5.25,5.20,5.15,5.10,5.05,5.00"
 CYCLES_WITH_REFRESH     = 1           # exactly one pass
-STEP_WAIT_CREDIT        = 2.0         # ~22s waiting across 11 rungs; whole pass < 3 minutes incl API
+STEP_WAIT_CREDIT        = 1.5         # ~22s waiting across 11 rungs; whole pass < 3 minutes incl API
 MAX_RUNTIME_SECS        = 170.0       # hard stop under 3 minutes
 CANCEL_SETTLE_SECS      = 1.0         # short settle after DELETE (mostly unused in REPLACE mode)
 VERBOSE                 = True        # keep logs chatty while tuning
@@ -642,7 +642,7 @@ def main():
             if fq > filled_total: filled_total = fq
             if status == "FILLED" or filled_total >= qty:
                 return "FILLED"
-            time.sleep(1)
+            time.sleep(0.25)
         return "WORKING"
 
     def rung(px, secs):
@@ -786,7 +786,8 @@ def main():
 
         cycles += 1
         # For your spec: after each pass, re-fetch Leo and rebuild legs
-        if is_credit and DISCRETE_CREDIT_LADDER and filled_total < qty:
+        if is_credit and DISCRETE_CREDIT_LADDER and filled_total < qty and cycles < _max_cycles:
+             refresh_from_leo()
             refresh_from_leo()
 
     # final cleanup if still working
