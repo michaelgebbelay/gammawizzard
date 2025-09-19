@@ -68,21 +68,22 @@ WINDOW_STATUSES   = {"WORKING","QUEUED","OPEN","PENDING_ACTIVATION","ACCEPTED","
 ACTIVE_STATUSES   = WINDOW_STATUSES | {"PENDING_CANCEL","CANCEL_REQUESTED","PENDING_REPLACE"}
 CANCEL_SETTLE_SECS = float(os.environ.get("CANCEL_SETTLE_SECS","3.0"))
 
-# --- FAST 90s WINDOW, ANCHORED TO NBBO BID ---
-REPLACE_MODE            = "CANCEL_REPLACE"     # robust; 0.5s rung + 1.0s settle ≈ 1.5s per rung
-STEP_WAIT_CREDIT        = 0.5
-MAX_RUNTIME_SECS        = 90.0
-CYCLES_WITH_REFRESH     = 1
-CANCEL_SETTLE_SECS      = 1.0
+# --- 4:13 FAST PLAN — 3 rungs × 10s, two passes with Leo refresh ---
+REPLACE_MODE            = "CANCEL_REPLACE"
+ANCHOR_WAIT_SECS        = float(os.environ.get("ANCHOR_WAIT_SECS","10"))  # per‑rung wait
+STEP_WAIT_CREDIT        = ANCHOR_WAIT_SECS
+STEP_WAIT_DEBIT         = ANCHOR_WAIT_SECS
+MAX_LADDER_CYCLES       = int(os.environ.get("MAX_LADDER_CYCLES","2"))    # exactly two passes
+MAX_RUNTIME_SECS        = float(os.environ.get("MAX_RUNTIME_SECS","110")) # give room for cancel/refresh
+CANCEL_SETTLE_SECS      = float(os.environ.get("CANCEL_SETTLE_SECS","0.8"))
 VERBOSE                 = True
 
-# Use anchored ladder instead of absolute DISCRETE_CREDIT_LADDER
-ANCHOR_MODE             = "BID"                 # or "MID"
-ANCHOR_OFFSETS          = [0.00,0.05,0.10,0.15,0.20,0.25,0.30,0.35,0.40,0.45,0.50]  # credit gets worse as we go
-
-DEBIT_ANCHOR_MODE       = (os.environ.get("DEBIT_ANCHOR_MODE", "ASK") or "ASK").strip().upper()
-DEBIT_RUNG_DELTAS_BID   = _as_float_list("DEBIT_RUNG_DELTAS_BID", [0.00, 0.05, 0.10])
-DEBIT_RUNG_DELTAS_ASK   = _as_float_list("DEBIT_RUNG_DELTAS_ASK", [-0.05, 0.00, 0.05])
+# Anchoring & rung plan
+DEBIT_ANCHOR_MODE       = (os.environ.get("DEBIT_ANCHOR_MODE","BID") or "BID").upper()  # "BID" or "ASK"
+DEBIT_RUNG_DELTAS_BID   = [ 0.00, 0.05, 0.10 ]    # bid → bid+0.05 → bid+0.10
+# Credit (sell):  bid+0.05 → bid → bid-0.05
+CREDIT_RUNG_DELTAS      = [ +0.05, 0.00, -0.05 ]
+DEBIT_RUNG_DELTAS_ASK   = [ -0.05, 0.00, +0.05 ]  # ask-0.05 → ask → ask+0.05
 
 GW_BASE = "https://gandalf.gammawizard.com"
 GW_ENDPOINT = "/rapi/GetLeoCross"
