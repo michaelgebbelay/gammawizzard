@@ -58,6 +58,13 @@ jobs:
           GW_TOKEN:    ${{ secrets.GW_TOKEN }}
           GW_EMAIL:    ${{ secrets.GW_EMAIL }}
           GW_PASSWORD: ${{ secrets.GW_PASSWORD }}
+          REPLACE_MODE: "CANCEL_REPLACE"
+          CREDIT_FLOOR: "4.80"
+          CREDIT_PER5_START: "2.00"
+          CREDIT_STEP: "0.05"
+          RESET_TO_START: "1"
+          STEP_WAIT_CREDIT: "10"
+          MAX_LADDER_CYCLES: "3"
           PYTHONUNBUFFERED: "1"
         run: |
           python scripts/leocross_orchestrator.py
