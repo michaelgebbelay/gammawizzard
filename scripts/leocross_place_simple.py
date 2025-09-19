@@ -801,6 +801,20 @@ def main():
         except Exception:
             pass
 
+    # Final sweep to guarantee no stray working/accepted orders for these legs
+    try:
+        ex, st, ovs = pick_active_and_overlaps(c, acct_hash, canon)
+        for oid in ([ex] if ex else []) + ovs:
+            url = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
+            try:
+                schwab_delete(c, url, tag=f"CANCEL_SWEEP:{oid}")
+                wait_until_closed(oid, max_wait=1.5)
+                vprint(f"CANCEL_SWEEP OID={oid}")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     # ===== Log outcome
     used_price = steps[-1].split("@",1)[0] if steps else ""
     oid_for_log = active_oid or ""
