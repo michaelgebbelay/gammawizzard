@@ -38,7 +38,7 @@ MAX_LADDER_CYCLES = int(os.environ.get("MAX_LADDER_CYCLES", "3") or "3")
 RESET_TO_START    = str(os.environ.get("RESET_TO_START", "1") or "1").strip().lower() in {"1","true","yes","y","on"}
 VERBOSE           = str(os.environ.get("VERBOSE","1")).strip().lower() in {"1","true","yes","y","on"}
 MAX_RUNTIME_SECS  = int(os.environ.get("MAX_RUNTIME_SECS","900") or "900")
-WINDOW_STATUSES   = {"WORKING","QUEUED","OPEN","PENDING_ACTIVATION"}
+WINDOW_STATUSES   = {"WORKING","QUEUED","OPEN","PENDING_ACTIVATION","ACCEPTED","RECEIVED"}
 
 GW_BASE = "https://gandalf.gammawizard.com"
 GW_ENDPOINT = "/rapi/GetLeoCross"
