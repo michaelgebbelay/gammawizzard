@@ -48,6 +48,9 @@ CYCLES_WITH_REFRESH    = int(os.environ.get("CYCLES_WITH_REFRESH","3") or "3")
 VERBOSE           = str(os.environ.get("VERBOSE","1")).strip().lower() in {"1","true","yes","y","on"}
 MAX_RUNTIME_SECS  = _as_float("MAX_RUNTIME_SECS","900")
 WINDOW_STATUSES   = {"WORKING","QUEUED","OPEN","PENDING_ACTIVATION","ACCEPTED","RECEIVED"}
+# Treat these as still-active while we're canceling
+ACTIVE_STATUSES   = WINDOW_STATUSES | {"PENDING_CANCEL","CANCEL_REQUESTED","PENDING_REPLACE"}
+CANCEL_SETTLE_SECS = float(os.environ.get("CANCEL_SETTLE_SECS","3.0"))
 
 GW_BASE = "https://gandalf.gammawizard.com"
 GW_ENDPOINT = "/rapi/GetLeoCross"
@@ -319,7 +322,7 @@ def pick_active_and_overlaps(c, acct_hash: str, canon_set):
     exact_id=None; active_status=""; overlaps=[]
     for o in list_recent_orders(c, acct_hash):
         st=str(o.get("status") or "").upper()
-        if st not in WINDOW_STATUSES: continue
+        if st not in ACTIVE_STATUSES: continue
         got=_legs_canon_from_order(o)
         if not got: continue
         if got==canon_set and exact_id is None:
@@ -479,6 +482,26 @@ def main():
         s=max(CREDIT_FLOOR, units*CREDIT_PER5_START)
         print(f"LADDER CONFIG start≈{clamp_tick(s):.2f} floor={CREDIT_FLOOR:.2f} step={CREDIT_STEP:.2f} wait={STEP_WAIT_CREDIT}s cycles={MAX_LADDER_CYCLES} replace={REPLACE_MODE}")
 
+    def get_status(oid: str) -> dict:
+        url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
+        try:
+            return schwab_get_json(c,url,tag=f"STATUS:{oid}") or {}
+        except Exception:
+            return {}
+
+    def wait_until_closed(oid: str, max_wait: float = CANCEL_SETTLE_SECS) -> bool:
+        t_end = time.time() + max_wait
+        while time.time() < t_end:
+            st = get_status(oid)
+            status = str(st.get("status") or st.get("orderStatus") or "").upper()
+            # closed or not retrievable => safe to proceed
+            if (not status) or status in {"CANCELED","FILLED","REJECTED","EXPIRED"}:
+                return True
+            if status not in ACTIVE_STATUSES:
+                return True
+            time.sleep(0.2)
+        return False
+
     # One active working order (replace). Cancel any overlapping partial matches first.
     active_oid, active_status, overlaps = pick_active_and_overlaps(c, acct_hash, canon)
     for oid in overlaps:
@@ -486,6 +509,7 @@ def main():
             url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
             schwab_delete(c,url,tag=f"CANCEL_OVERLAP:{oid}")
             vprint(f"CANCEL_OVERLAP OID={oid}")
+            wait_until_closed(oid)
         except Exception as e:
             print(f"WARN cancel overlap {oid}: {e}")
 
@@ -503,13 +527,6 @@ def main():
             sys.exit(128+signum)
     signal.signal(signal.SIGTERM, _on_term)
     signal.signal(signal.SIGINT,  _on_term)
-
-    def get_status(oid: str) -> dict:
-        url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
-        try:
-            return schwab_get_json(c,url,tag=f"STATUS:{oid}") or {}
-        except Exception:
-            return {}
 
     def parse_order_id_from_response(r):
         try:
@@ -573,9 +590,20 @@ def main():
                         schwab_delete(c, url, tag=f"CANCEL_STEP:{active_oid}")
                         canceled += 1
                         vprint(f"CANCEL_STEP OID={active_oid}")
+                        wait_until_closed(active_oid)
                     except Exception:
                         pass
                     active_oid = None
+                    # double-check: no residual overlaps before we place
+                    ex, st, ovs = pick_active_and_overlaps(c, acct_hash, canon)
+                    for oid in ([ex] if ex else []) + ovs:
+                        try:
+                            url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
+                            schwab_delete(c, url, tag=f"CANCEL_RESIDUAL:{oid}")
+                            vprint(f"CANCEL_RESIDUAL OID={oid}")
+                            wait_until_closed(oid)
+                        except Exception:
+                            pass
 
                 url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
                 r=schwab_post_json(c, url, order_payload(px,to_place), tag=f"PLACE@{px:.2f}x{to_place}")
@@ -742,6 +770,7 @@ def main():
                 schwab_delete(c, url, tag=f"CANCEL_CYCLE:{active_oid}")
                 canceled += 1
                 vprint(f"CANCEL_CYCLE OID={active_oid}")
+                wait_until_closed(active_oid)
             except Exception:
                 pass
             active_oid = None
@@ -758,6 +787,7 @@ def main():
             schwab_delete(c, url, tag=f"CANCEL_FINAL:{active_oid}")
             canceled += 1
             vprint(f"CANCEL_FINAL OID={active_oid}")
+            wait_until_closed(active_oid)
         except Exception:
             pass
 
