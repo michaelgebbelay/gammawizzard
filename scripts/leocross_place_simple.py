@@ -12,6 +12,7 @@ import requests
 from schwab.auth import client_from_token_file
 from google.oauth2 import service_account
 from googleapiclient.discovery import build as gbuild
+from typing import Iterable, List
 
 # ===== constants & env =====
 TICK = 0.05
@@ -23,6 +24,20 @@ def _as_float(env_name: str, default: str) -> float:
         return float(raw)
     except Exception:
         return float(default)
+
+def _as_float_list(env_name: str, default: Iterable[float]) -> List[float]:
+    raw = (os.environ.get(env_name, "") or "").strip()
+    if not raw:
+        return list(default)
+    out = []
+    for tok in re.split(r'[\s,]+', raw):
+        if not tok:
+            continue
+        try:
+            out.append(float(tok))
+        except Exception:
+            continue
+    return out or list(default)
 
 STEP_WAIT_CREDIT = _as_float("STEP_WAIT_CREDIT", "10")
 STEP_WAIT_DEBIT  = _as_float("STEP_WAIT_DEBIT",  "30")
@@ -38,6 +53,7 @@ QTY_FIXED                   = int(os.environ.get("QTY_FIXED","4") or "4")  # use
 CREDIT_PER5_START = float(os.environ.get("CREDIT_PER5_START", "2.00"))
 CREDIT_STEP       = float(os.environ.get("CREDIT_STEP",       "0.05"))
 CREDIT_FLOOR      = float(os.environ.get("CREDIT_FLOOR",      "4.70"))
+CREDIT_RUNG_DELTAS = _as_float_list("CREDIT_RUNG_DELTAS", [0.05, 0.0, -0.05])
 
 # Control knobs
 REPLACE_MODE      = (os.environ.get("REPLACE_MODE", "REPLACE") or "REPLACE").upper()   # or "CANCEL_REPLACE"
@@ -63,6 +79,10 @@ VERBOSE                 = True
 # Use anchored ladder instead of absolute DISCRETE_CREDIT_LADDER
 ANCHOR_MODE             = "BID"                 # or "MID"
 ANCHOR_OFFSETS          = [0.00,0.05,0.10,0.15,0.20,0.25,0.30,0.35,0.40,0.45,0.50]  # credit gets worse as we go
+
+DEBIT_ANCHOR_MODE       = (os.environ.get("DEBIT_ANCHOR_MODE", "ASK") or "ASK").strip().upper()
+DEBIT_RUNG_DELTAS_BID   = _as_float_list("DEBIT_RUNG_DELTAS_BID", [0.00, 0.05, 0.10])
+DEBIT_RUNG_DELTAS_ASK   = _as_float_list("DEBIT_RUNG_DELTAS_ASK", [-0.05, 0.00, 0.05])
 
 GW_BASE = "https://gandalf.gammawizard.com"
 GW_ENDPOINT = "/rapi/GetLeoCross"
@@ -744,46 +764,27 @@ def main():
         ladder = None
         if is_credit:
             secs = STEP_WAIT_CREDIT
-            # Anchor to live NBBO at start of the cycle
-            nbbo_bid, nbbo_ask, nbbo_mid = condor_nbbo(c, legs)
-            if nbbo_bid is not None:
-                base = nbbo_bid if ANCHOR_MODE.upper() == "BID" else nbbo_mid
-                if base is not None:
-                    ladder = [clamp_tick(max(CREDIT_FLOOR, base - o)) for o in ANCHOR_OFFSETS]
-                    # ensure strictly descending and de-duped
-                    ladder = sorted(set(ladder), reverse=True)
-                    if ladder:
-                        vprint(f"CYCLE {cycles+1}/{_max_cycles} CREDIT ladder (anchored) base={base:.2f} → {ladder[0]:.2f}…{ladder[-1]:.2f}")
-            elif DISCRETE_CREDIT_LADDER:
-                vprint("DISCRETE_CREDIT_LADDER is empty — defaulting to start/step/floor")
-
-            if ladder is None:
-                units = max(1.0, width / 5.0)
-                start = clamp_tick(max(CREDIT_FLOOR, units * CREDIT_PER5_START))
-                stop  = clamp_tick(CREDIT_FLOOR)
-                step  = CREDIT_STEP
-                px0   = start if (RESET_TO_START or cycles == 0) else stop
-
-                ladder = []
-                px = px0
-                while px >= stop - 1e-9:
-                    ladder.append(clamp_tick(px))
-                    px -= step
-                if not ladder:
-                    ladder = [stop]
-                vprint(f"CYCLE {cycles+1}/{_max_cycles} CREDIT ladder {ladder[0]:.2f}→{ladder[-1]:.2f} (width={width})")
+            nbbo_bid, nbbo_ask, _ = condor_nbbo(c, legs)
+            if nbbo_bid is None:
+                vprint("NBBO unavailable — skipping cycle"); break
+            # Credit: bid+0.05 → bid → bid-0.05
+            ladder = [clamp_tick(max(CREDIT_FLOOR, nbbo_bid + d)) for d in CREDIT_RUNG_DELTAS]
+            # de-dupe while preserving order
+            _seen = set()
+            ladder = [x for x in ladder if not (x in _seen or _seen.add(x))]
+            vprint(f"CYCLE {cycles+1}/{_max_cycles} CREDIT ladder(base=bid={nbbo_bid:.2f}): {ladder}")
         else:
-            start = clamp_tick(float(os.environ.get("DEBIT_START","1.90")))
-            stop  = clamp_tick(float(os.environ.get("DEBIT_CEIL","2.10")))
-            step  = float(os.environ.get("DEBIT_STEP","0.05"))
-            secs  = STEP_WAIT_DEBIT
-            px = start
-            ladder = []
-            while px <= stop + 1e-9:
-                ladder.append(clamp_tick(px)); px += step
-            if not ladder:
-                ladder = [start]
-            vprint(f"CYCLE {cycles+1}/{_max_cycles} DEBIT ladder {ladder[0]:.2f}→{ladder[-1]:.2f}")
+            secs = STEP_WAIT_DEBIT
+            nbbo_bid, nbbo_ask, _ = condor_nbbo(c, legs)
+            base = nbbo_bid if DEBIT_ANCHOR_MODE == "BID" else nbbo_ask
+            if base is None:
+                vprint("NBBO unavailable — skipping cycle"); break
+            deltas = DEBIT_RUNG_DELTAS_BID if DEBIT_ANCHOR_MODE == "BID" else DEBIT_RUNG_DELTAS_ASK
+            # Debit rungs keep order (lowest debit first)
+            ladder = [clamp_tick(max(0.05, base + d)) for d in deltas]
+            _seen = set()
+            ladder = [x for x in ladder if not (x in _seen or _seen.add(x))]
+            vprint(f"CYCLE {cycles+1}/{_max_cycles} DEBIT ladder(base={DEBIT_ANCHOR_MODE}={base:.2f}): {ladder}")
 
         for price in ladder:
             status = rung(price, secs)
