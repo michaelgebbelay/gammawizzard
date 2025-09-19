@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-# VERSION: 2025-10-06 v2.7.0 — Placer (robust ladder)
+# VERSION: 2025-10-06 v2.7.2 — Placer (robust ladder)
 # - 429-aware retries on POST/PUT/GET/DELETE
 # - Ladder cycles with cancel & optional restart from top
-# - Per‑rung logs; wall‑clock guard to avoid endless runs
-# - Honors QTY_OVERRIDE from orchestrator
+# - Per‑rung logs; wall‑clock guard; prints config at start
+# - Default mode MANUAL; SCHEDULED gate only if explicitly set
 
 import os, sys, json, time, re, math, random
 from datetime import datetime, date, timezone
@@ -17,10 +17,9 @@ from googleapiclient.discovery import build as gbuild
 TICK = 0.05
 ET = ZoneInfo("America/New_York")
 
-# Waits: Short IC faster per your spec
-STEP_WAIT_CREDIT = int(os.environ.get("STEP_WAIT_CREDIT", "10"))  # seconds between rungs (credit)
-STEP_WAIT_DEBIT  = int(os.environ.get("STEP_WAIT_DEBIT",  "30"))  # unchanged (debit)
-FINAL_CANCEL = True  # if still not filled after last rung, cancel working ticket
+STEP_WAIT_CREDIT = int(os.environ.get("STEP_WAIT_CREDIT", "10"))
+STEP_WAIT_DEBIT  = int(os.environ.get("STEP_WAIT_DEBIT",  "30"))
+FINAL_CANCEL     = True
 
 # Sizing knobs
 CREDIT_DOLLARS_PER_CONTRACT = float(os.environ.get("CREDIT_DOLLARS_PER_CONTRACT", "12000"))
@@ -29,16 +28,16 @@ CREDIT_MIN_WIDTH            = 5
 QTY_FIXED                   = int(os.environ.get("QTY_FIXED","4") or "4")  # used only for Long IC unless QTY_OVERRIDE
 
 # Ladder knobs (credit)
-CREDIT_PER5_START = float(os.environ.get("CREDIT_PER5_START", "2.00"))  # $ per 5pt width
-CREDIT_STEP       = float(os.environ.get("CREDIT_STEP",       "0.05"))  # down 5¢ each rung
-CREDIT_FLOOR      = float(os.environ.get("CREDIT_FLOOR",      "4.80"))  # never go below this
+CREDIT_PER5_START = float(os.environ.get("CREDIT_PER5_START", "2.00"))
+CREDIT_STEP       = float(os.environ.get("CREDIT_STEP",       "0.05"))
+CREDIT_FLOOR      = float(os.environ.get("CREDIT_FLOOR",      "4.80"))
 
 # Control knobs
 REPLACE_MODE      = (os.environ.get("REPLACE_MODE", "REPLACE") or "REPLACE").upper()   # or "CANCEL_REPLACE"
 MAX_LADDER_CYCLES = int(os.environ.get("MAX_LADDER_CYCLES", "3") or "3")
 RESET_TO_START    = str(os.environ.get("RESET_TO_START", "1") or "1").strip().lower() in {"1","true","yes","y","on"}
 VERBOSE           = str(os.environ.get("VERBOSE","1")).strip().lower() in {"1","true","yes","y","on"}
-MAX_RUNTIME_SECS  = int(os.environ.get("MAX_RUNTIME_SECS","900") or "900")  # 15 min hard cap
+MAX_RUNTIME_SECS  = int(os.environ.get("MAX_RUNTIME_SECS","900") or "900")
 WINDOW_STATUSES   = {"WORKING","QUEUED","OPEN","PENDING_ACTIVATION"}
 
 GW_BASE = "https://gandalf.gammawizard.com"
@@ -282,7 +281,6 @@ def _legs_canon_from_order(o):
         try:
             osi = to_osi(sym)
         except Exception:
-            # attempt reconstruct
             exp = ins.get("optionExpirationDate") or ins.get("expirationDate") or ""
             pc  = (ins.get("putCall") or ins.get("type") or "").upper()
             strike = ins.get("strikePrice") or ins.get("strike")
@@ -312,7 +310,7 @@ def pick_active_and_overlaps(c, acct_hash: str, canon_set):
 
 # ===== main =====
 def main():
-    MODE=(os.environ.get("PLACER_MODE","SCHEDULED") or "SCHEDULED").upper()
+    MODE=(os.environ.get("PLACER_MODE","MANUAL") or "MANUAL").upper()  # default MANUAL now
     source=f"SIMPLE_{MODE}"
 
     sheet_id=os.environ["GSHEET_ID"]; sa_json=os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
@@ -346,12 +344,14 @@ def main():
                used_price, legs[0],legs[1],legs[2],legs[3], oid_for_log, status_txt]
         one_log(svc, sheet_id_num, sheet_id, "schwab", row)
 
-    if MODE=="SCHEDULED":
+    # Optional time gate ONLY if SCHEDULED
+    def time_gate_ok():
         now=datetime.now(ZoneInfo("America/New_York"))
-        if now.weekday()>=5 or not (now.hour==16 and 8<=now.minute<=14):
-            row=[datetime.utcnow().isoformat()+"Z", source, "SPX", last_px, "", "SKIP","","","","",
-                 "","","","", "", "SKIPPED_TIME_WINDOW"]
-            one_log(svc, sheet_id_num, sheet_id, "schwab", row); print("skip window"); sys.exit(0)
+        return (now.weekday()<5 and now.hour==16 and 8<=now.minute<=14)
+    if MODE=="SCHEDULED" and not time_gate_ok():
+        row=[datetime.utcnow().isoformat()+"Z", source, "SPX", last_px, "", "SKIP","","","","",
+             "","","","", "", "SKIPPED_TIME_WINDOW"]
+        one_log(svc, sheet_id_num, sheet_id, "schwab", row); print("skip window"); sys.exit(0)
 
     # ---- GW
     def _gw_timeout():
@@ -451,6 +451,12 @@ def main():
              side_name, "", order_type, "",
              legs[0],legs[1],legs[2],legs[3], "", "ABORT_QTY_LT_1"]
         one_log(svc, sheet_id_num, sheet_id, "schwab", row); print("qty<1"); sys.exit(0)
+
+    print(f"PLACER START mode={MODE} is_credit={is_credit} width={width} qty={qty} oc={oc}")
+    if is_credit:
+        units=max(1.0,width/5.0)
+        s=max(CREDIT_FLOOR, units*CREDIT_PER5_START)
+        print(f"LADDER CONFIG start≈{clamp_tick(s):.2f} floor={CREDIT_FLOOR:.2f} step={CREDIT_STEP:.2f} wait={STEP_WAIT_CREDIT}s cycles={MAX_LADDER_CYCLES} replace={REPLACE_MODE}")
 
     # One active working order (replace). Cancel any overlapping partial matches first.
     active_oid, active_status, overlaps = pick_active_and_overlaps(c, acct_hash, canon)
@@ -589,8 +595,10 @@ def main():
             if not ladder: ladder = [stop]
             vprint(f"CYCLE {cycles+1}/{MAX_LADDER_CYCLES} CREDIT ladder {ladder[0]:.2f}→{ladder[-1]:.2f} (width={width})")
         else:
-            start = clamp_tick(DEBIT_START); stop = clamp_tick(DEBIT_CEIL)
-            step  = DEBIT_STEP; secs = STEP_WAIT_DEBIT
+            start = clamp_tick(float(os.environ.get("DEBIT_START","1.90")))
+            stop  = clamp_tick(float(os.environ.get("DEBIT_CEIL","2.10")))
+            step  = float(os.environ.get("DEBIT_STEP","0.05"))
+            secs  = STEP_WAIT_DEBIT
             px = start
             ladder = []
             while px <= stop + 1e-9:
@@ -636,20 +644,15 @@ def main():
     repl_str   = f"REPLACED {replacements}"
     canceled_str = f"CANCELED {canceled}"
     trace = "STEPS " + "→".join(steps) if steps else "STEPS"
-    status_txt = (("FILLED " + trace) if (filled_total >= qty) else (status + " " + trace)) + \
-                 f" | {filled_str} | {repl_str} | {canceled_str} | credit_ladder start={clamp_tick(max(CREDIT_FLOOR, (width/5.0)*CREDIT_PER5_START)):.2f} step={CREDIT_STEP:.2f} floor={CREDIT_FLOOR:.2f} width={width} oc={oc if oc is not None else 'NA'}" \
-                 if is_credit else \
-                 f"{status} {trace} | {filled_str} | {repl_str} | {canceled_str} | debit_ladder {clamp_tick(float(os.environ.get('DEBIT_START','1.90'))):.2f}→{clamp_tick(float(os.environ.get('DEBIT_CEIL','2.10'))):.2f} step={float(os.environ.get('DEBIT_STEP','0.05')):.2f} width={width}"
+    if is_credit:
+        start_used = clamp_tick(max(CREDIT_FLOOR, (width/5.0)*CREDIT_PER5_START))
+        status_txt = (("FILLED " + trace) if (filled_total >= qty) else (status + " " + trace)) + \
+                     f" | {filled_str} | {repl_str} | {canceled_str} | credit_ladder start={start_used:.2f} step={CREDIT_STEP:.2f} floor={CREDIT_FLOOR:.2f} width={width} oc={oc if oc is not None else 'NA'}"
+    else:
+        status_txt = f"{status} {trace} | {filled_str} | {repl_str} | {canceled_str} | debit_ladder width={width}"
 
     print(f"FINAL {status_txt} OID={oid_for_log} PRICE_USED={used_price if used_price else 'NA'}")
     log_row(status_txt, side_name, order_type, legs, qty, used_price, oid_for_log, sig_date)
 
-def time_gate_ok():
-    now=datetime.now(ZoneInfo("America/New_York"))
-    return (now.weekday()<5 and now.hour==16 and 8<=now.minute<=14)
-
 if __name__=="__main__":
-    MODE=(os.environ.get("PLACER_MODE","SCHEDULED") or "SCHEDULED").upper()
-    if MODE=="SCHEDULED" and not time_gate_ok():
-        print("Scheduled window not met; exit."); sys.exit(0)
     main()
