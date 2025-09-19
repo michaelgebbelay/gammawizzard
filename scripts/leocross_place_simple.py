@@ -52,14 +52,17 @@ WINDOW_STATUSES   = {"WORKING","QUEUED","OPEN","PENDING_ACTIVATION","ACCEPTED","
 ACTIVE_STATUSES   = WINDOW_STATUSES | {"PENDING_CANCEL","CANCEL_REQUESTED","PENDING_REPLACE"}
 CANCEL_SETTLE_SECS = float(os.environ.get("CANCEL_SETTLE_SECS","3.0"))
 
-# --- FAST LATE-DAY PROFILE (hard-coded; ignores YAML env) ---
-REPLACE_MODE            = "CANCEL_REPLACE"   # use PUT replace (we already accept 204)
-DISCRETE_CREDIT_LADDER  = "5.70,5.50,5.40,5.30,5.20,5.10,5.00,4.90,4.80,4.70"
-CYCLES_WITH_REFRESH     = 1           # exactly one pass
-STEP_WAIT_CREDIT        = 0.5         # ~22s waiting across 11 rungs; whole pass < 3 minutes incl API
-MAX_RUNTIME_SECS        = 55.0       # hard stop under 3 minutes
-CANCEL_SETTLE_SECS      = 1.0         # short settle after DELETE (mostly unused in REPLACE mode)
-VERBOSE                 = True        # keep logs chatty while tuning
+# --- FAST 90s WINDOW, ANCHORED TO NBBO BID ---
+REPLACE_MODE            = "CANCEL_REPLACE"     # robust; 0.5s rung + 1.0s settle ≈ 1.5s per rung
+STEP_WAIT_CREDIT        = 0.5
+MAX_RUNTIME_SECS        = 90.0
+CYCLES_WITH_REFRESH     = 1
+CANCEL_SETTLE_SECS      = 1.0
+VERBOSE                 = True
+
+# Use anchored ladder instead of absolute DISCRETE_CREDIT_LADDER
+ANCHOR_MODE             = "BID"                 # or "MID"
+ANCHOR_OFFSETS          = [0.00,0.05,0.10,0.15,0.20,0.25,0.30,0.35,0.40,0.45,0.50]  # credit gets worse as we go
 
 GW_BASE = "https://gandalf.gammawizard.com"
 GW_ENDPOINT = "/rapi/GetLeoCross"
@@ -295,6 +298,18 @@ def mid_condor(c, legs):
     if None in (bp_b,bp_a,sp_b,sp_a,sc_b,sc_a,bc_b,bc_a): return None
     net_bid=(sp_b+sc_b)-(bp_a+bc_a); net_ask=(sp_a+sc_a)-(bp_b+bc_b)
     return (net_bid+net_ask)/2.0
+
+def condor_nbbo(c, legs):
+    bp, sp, sc, bc = legs
+    bp_b, bp_a = fetch_bid_ask(c, bp); sp_b, sp_a = fetch_bid_ask(c, sp)
+    sc_b, sc_a = fetch_bid_ask(c, sc); bc_b, bc_a = fetch_bid_ask(c, bc)
+    if None in (bp_b, bp_a, sp_b, sp_a, sc_b, sc_a, bc_b, bc_a):
+        return (None, None, None)
+    # SELL credit = (sell bids) - (buy asks)
+    net_bid = (sp_b + sc_b) - (bp_a + bc_a)
+    net_ask = (sp_a + sc_a) - (bp_b + bc_b)
+    mid     = (net_bid + net_ask) / 2.0
+    return (clamp_tick(net_bid), clamp_tick(net_ask), clamp_tick(mid))
 
 def list_recent_orders(c, acct_hash: str):
     now_et = datetime.now(ZoneInfo("America/New_York"))
@@ -729,10 +744,16 @@ def main():
         ladder = None
         if is_credit:
             secs = STEP_WAIT_CREDIT
-            discrete = _parse_discrete_list(DISCRETE_CREDIT_LADDER) if DISCRETE_CREDIT_LADDER else []
-            if discrete:
-                ladder = discrete
-                vprint(f"CYCLE {cycles+1}/{_max_cycles} CREDIT ladder {ladder[0]:.2f}…{ladder[-1]:.2f} (discrete)")
+            # Anchor to live NBBO at start of the cycle
+            nbbo_bid, nbbo_ask, nbbo_mid = condor_nbbo(c, legs)
+            if nbbo_bid is not None:
+                base = nbbo_bid if ANCHOR_MODE.upper() == "BID" else nbbo_mid
+                if base is not None:
+                    ladder = [clamp_tick(max(CREDIT_FLOOR, base - o)) for o in ANCHOR_OFFSETS]
+                    # ensure strictly descending and de-duped
+                    ladder = sorted(set(ladder), reverse=True)
+                    if ladder:
+                        vprint(f"CYCLE {cycles+1}/{_max_cycles} CREDIT ladder (anchored) base={base:.2f} → {ladder[0]:.2f}…{ladder[-1]:.2f}")
             elif DISCRETE_CREDIT_LADDER:
                 vprint("DISCRETE_CREDIT_LADDER is empty — defaulting to start/step/floor")
 
