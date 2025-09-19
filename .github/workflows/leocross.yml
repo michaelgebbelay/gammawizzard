@@ -68,7 +68,7 @@ jobs:
           DISCRETE_CREDIT_LADDER: "6,5.70,5.50,5.40,5.30,5.25,5.20,5.15,5.10,5.05,5.00"
           CYCLES_WITH_REFRESH: "1"
           CANCEL_SETTLE_SECS: "0.5"
-          MAX_LADDER_CYCLES: "3"
+          MAX_LADDER_CYCLES: "2"
           PYTHONUNBUFFERED: "1"
         run: |
           python scripts/leocross_orchestrator.py
