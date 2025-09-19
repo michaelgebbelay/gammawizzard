@@ -37,7 +37,7 @@ QTY_FIXED                   = int(os.environ.get("QTY_FIXED","4") or "4")  # use
 # Ladder knobs (credit)
 CREDIT_PER5_START = float(os.environ.get("CREDIT_PER5_START", "2.00"))
 CREDIT_STEP       = float(os.environ.get("CREDIT_STEP",       "0.05"))
-CREDIT_FLOOR      = float(os.environ.get("CREDIT_FLOOR",      "4.80"))
+CREDIT_FLOOR      = float(os.environ.get("CREDIT_FLOOR",      "4.70"))
 
 # Control knobs
 REPLACE_MODE      = (os.environ.get("REPLACE_MODE", "REPLACE") or "REPLACE").upper()   # or "CANCEL_REPLACE"
@@ -54,10 +54,10 @@ CANCEL_SETTLE_SECS = float(os.environ.get("CANCEL_SETTLE_SECS","3.0"))
 
 # --- FAST LATE-DAY PROFILE (hard-coded; ignores YAML env) ---
 REPLACE_MODE            = "CANCEL_REPLACE"   # use PUT replace (we already accept 204)
-DISCRETE_CREDIT_LADDER  = "6,5.70,5.50,5.40,5.30,5.25,5.20,5.15,5.10,5.05,5.00"
+DISCRETE_CREDIT_LADDER  = "5.70,5.50,5.40,5.30,5.20,5.10,5.00,4.90,4.80,4.70"
 CYCLES_WITH_REFRESH     = 1           # exactly one pass
-STEP_WAIT_CREDIT        = 1.5         # ~22s waiting across 11 rungs; whole pass < 3 minutes incl API
-MAX_RUNTIME_SECS        = 170.0       # hard stop under 3 minutes
+STEP_WAIT_CREDIT        = 0.5         # ~22s waiting across 11 rungs; whole pass < 3 minutes incl API
+MAX_RUNTIME_SECS        = 55.0       # hard stop under 3 minutes
 CANCEL_SETTLE_SECS      = 1.0         # short settle after DELETE (mostly unused in REPLACE mode)
 VERBOSE                 = True        # keep logs chatty while tuning
 
