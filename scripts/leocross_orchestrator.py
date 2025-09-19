@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-# VERSION: 2025-10-06 v4.3.0 — Orchestrator
-# - BYPASS_GUARD now uses target_units when BYPASS_QTY is not provided
-# - Logs guard decisions to GSheet tab "guard"
+# VERSION: 2025-10-06 v4.3.2 — Orchestrator
+# - BYPASS_GUARD uses target_units when BYPASS_QTY not provided
+# - Forces PLACER_MODE=MANUAL so ladder runs immediately (no time gate)
+# - Logs to GSheet 'guard' tab
 # - Spawns placer with QTY_OVERRIDE=<rem_qty>
 
 import os, sys, json, time, re, math
@@ -24,7 +25,7 @@ def _truthy(s: str) -> bool:
     return str(s or "").strip().lower() in {"1","true","t","yes","y","on"}
 
 BYPASS_GUARD = _truthy(os.environ.get("BYPASS_GUARD",""))
-BYPASS_QTY   = os.environ.get("BYPASS_QTY","").strip()  # optional; if empty, we use target_units
+BYPASS_QTY   = os.environ.get("BYPASS_QTY","").strip()  # if empty, we use target_units
 
 # Google Sheets
 ET = ZoneInfo("America/New_York")
@@ -206,10 +207,10 @@ def calc_short_ic_contracts(opening_cash: float | int) -> int:
 
 # ===== condor helpers =====
 def condor_units_open(pos_map, legs):
-    b1 = max(0.0,  pos_map.get(osi_canon(legs[0]), 0.0))  # long wing put
-    b2 = max(0.0,  pos_map.get(osi_canon(legs[3]), 0.0))  # long wing call
-    s1 = max(0.0, -pos_map.get(osi_canon(legs[1]), 0.0))  # short inner put
-    s2 = max(0.0, -pos_map.get(osi_canon(legs[2]), 0.0))  # short inner call
+    b1 = max(0.0,  pos_map.get(osi_canon(legs[0]), 0.0))
+    b2 = max(0.0,  pos_map.get(osi_canon(legs[3]), 0.0))
+    s1 = max(0.0, -pos_map.get(osi_canon(legs[1]), 0.0))
+    s2 = max(0.0, -pos_map.get(osi_canon(legs[2]), 0.0))
     return int(min(b1, b2, s1, s2))
 
 def print_guard_snapshot(pos, legs, is_credit, width_used, bypass):
@@ -364,7 +365,7 @@ def main():
     bcq = pos.get(osi_canon(legs[3]), 0.0)
     acct_snapshot=(bpq,spq,scq,bcq)
 
-    # ---- STRICT NO‑CLOSE & PARTIAL OVERLAP (only enforced if not bypassing) ----
+    # ---- STRICT checks only if not bypassing ----
     checks=[("BUY",legs[0],-1),("SELL",legs[1],+1),("SELL",legs[2],+1),("BUY",legs[3],-1)]
     if not BYPASS_GUARD:
         for label, osi, sign in checks:
@@ -373,7 +374,6 @@ def main():
                 details="WOULD_CLOSE {} acct_qty={:+g}".format(osi, cur)
                 print("ORCH SKIP:", details); log("SKIP", details, legs, acct_snapshot, "", "")
                 return 0
-
         nonzero = sum(1 for _, osi, _ in checks if abs(pos.get(osi_canon(osi),0.0))>1e-9)
         aligned = sum(1 for _, osi, sign in checks
                     if ((sign<0 and pos.get(osi_canon(osi),0.0)>=0) or
@@ -401,7 +401,6 @@ def main():
         decision = "ALLOW_BYPASS"
         detail = f"BYPASS_GUARD=1 width={width} open_cash={oc:.2f} target={target_units} rem_qty={rem_qty}"
     else:
-        # when not bypassing, top-up logic (only if all 4 aligned)
         nonzero = sum(1 for _, osi, _ in checks if abs(pos.get(osi_canon(osi),0.0))>1e-9)
         aligned = sum(1 for _, osi, sign in checks
                     if ((sign<0 and pos.get(osi_canon(osi),0.0)>=0) or
@@ -427,9 +426,12 @@ def main():
         print("ORCH SKIP: At/above target; no remainder to place.")
         return 0
 
-    # ---- call placer with override ----
+    # ---- call placer with override (FORCE MANUAL mode + verbose) ----
     env = dict(os.environ)
     env["QTY_OVERRIDE"] = str(rem_qty)
+    env["PLACER_MODE"]  = "MANUAL"   # << force immediate laddering
+    env["VERBOSE"]      = env.get("VERBOSE","1")
+    print(f"ORCH CALL → PLACER QTY_OVERRIDE={env['QTY_OVERRIDE']} MODE={env['PLACER_MODE']}")
     rc = os.spawnve(os.P_WAIT, sys.executable, [sys.executable, "scripts/leocross_place_simple.py"], env)
     return rc
 
