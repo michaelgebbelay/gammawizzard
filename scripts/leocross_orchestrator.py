@@ -6,7 +6,7 @@
 # - Spawns placer with QTY_OVERRIDE=<rem_qty>
 
 import os, sys, json, time, re, math
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timezone, timedelta
 from zoneinfo import ZoneInfo
 import requests
 from schwab.auth import client_from_token_file
@@ -31,6 +31,9 @@ BYPASS_QTY   = os.environ.get("BYPASS_QTY","").strip()  # if empty, we use targe
 ET = ZoneInfo("America/New_York")
 GW_BASE = "https://gandalf.gammawizard.com"
 GW_ENDPOINT = "/rapi/GetLeoCross"
+FAST_HOLD_SECONDS = 30          # trigger at 16:13:00 → hold ~30s
+GW_WARM_TIMEOUT   = 6           # seconds for the warm read at 16:13
+GW_REFRESH_TIMEOUT= 3           # seconds for the quick refresh at 16:13:30
 
 GUARD_TAB = "guard"
 GUARD_HEADERS = [
@@ -301,8 +304,9 @@ def main():
         print("ORCH ABORT:", reason); log("ABORT", reason)
         return 1
 
-    # ---- Leo signal → prelim ----
+    # ---- Leo signal → warm read at ~16:13 ----
     try:
+        os.environ["GW_TIMEOUT"] = str(GW_WARM_TIMEOUT)
         api=gw_get_leocross()
         tr=extract_trade(api)
         if not tr:
@@ -346,6 +350,34 @@ def main():
             if bcS>scS: sc,bc = bc,sc
         return [bp,sp,sc,bc]
     legs = orient(bp,sp,sc,bc)
+
+    # --- wait until 16:13:30 ET, then quick refresh of Leo before placing ---
+    now = datetime.now(ET)
+    gate = now.replace(hour=16, minute=13, second=0, microsecond=0) + timedelta(seconds=FAST_HOLD_SECONDS)
+    if now < gate:
+        time.sleep((gate - now).total_seconds())
+        # quick refresh (low latency, don’t block long)
+        try:
+            os.environ["GW_TIMEOUT"] = str(GW_REFRESH_TIMEOUT)
+            api2 = gw_get_leocross()
+            tr2  = extract_trade(api2)
+            if tr2:
+                inner_put2 = int(float(tr2.get("Limit")))
+                inner_call2= int(float(tr2.get("CLimit")))
+                new_exp_iso = str(tr2.get("TDate",""))
+                if (inner_put2 != inner_put) or (inner_call2 != inner_call) or (new_exp_iso!=exp_iso):
+                    # rebuild legs on the fly
+                    exp_iso = new_exp_iso
+                    exp6 = yymmdd(exp_iso)
+                    inner_put, inner_call = inner_put2, inner_call2
+                    p_low,p_high = inner_put - width, inner_put
+                    c_low,c_high = inner_call, inner_call + width
+                    bp = to_osi(f".SPXW{exp6}P{p_low}"); sp = to_osi(f".SPXW{exp6}P{p_high}")
+                    sc = to_osi(f".SPXW{exp6}C{c_low}"); bc = to_osi(f".SPXW{exp6}C{c_high}")
+                    legs = [bp,sp,sc,bc]  # orient below will re-order
+                    legs = orient(*legs)
+        except Exception as _:
+            pass
 
     # ---- positions ----
     try:
