@@ -121,8 +121,16 @@ def parse_hhmm_et(s: str) -> datetime:
     now = datetime.now(ET)
     return now.replace(hour=hh, minute=mm, second=0, microsecond=0)
 
+def _cutoff_reached() -> bool:
+    try:
+        hh, mm = [int(x) for x in HARD_CUTOFF_HHMM.split(":")]
+        now = datetime.now(ET)
+        return (now.hour > hh) or (now.hour == hh and now.minute >= mm)
+    except Exception:
+        return False
+
 def cutoff_reached() -> bool:
-    return datetime.now(ET) >= parse_hhmm_et(HARD_CUTOFF_HHMM)
+    return _cutoff_reached()
 
 # ===== Sheets =====
 def ensure_header_and_get_sheetid(svc, spreadsheet_id: str, tab: str, header: list):
