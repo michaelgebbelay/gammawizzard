@@ -45,7 +45,6 @@ jobs:
           DAYS_BACK: ${{ github.event.inputs.days_back != '' && github.event.inputs.days_back || '5' }}
         run: |
           python scripts/schwab_dump_all_txns.py
-
       # - name: Summarize sw_txn_raw → sw_txn_accum + sw_summary_by_expiry
       #   env:
       #     GSHEET_ID: ${{ secrets.GSHEET_ID }}
