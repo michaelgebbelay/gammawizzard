@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # VERSION: 2025-10-07 v4.4.0 — Orchestrator
-# - Default FAST_HOLD_SECONDS=0 (start immediately when you trigger at 16:13)
+# - Default FAST_HOLD_SECONDS=30 (start shortly after the 16:13 trigger)
 # - Logs guard snapshot and calls placer with QTY_OVERRIDE
 
 import os, sys, json, time, re, math
@@ -11,10 +11,17 @@ from schwab.auth import client_from_token_file
 from google.oauth2 import service_account
 from googleapiclient.discovery import build as gbuild
 
-PER_UNIT = 5000
+# ===== Runtime knobs =====
+PER_UNIT = 5000  # legacy debit sizing
 CREDIT_DOLLARS_PER_CONTRACT = float(os.environ.get("CREDIT_DOLLARS_PER_CONTRACT", "12000"))
 CREDIT_SPREAD_WIDTH         = int(os.environ.get("CREDIT_SPREAD_WIDTH", "15"))
 CREDIT_MIN_WIDTH            = 5
+
+# Read from ENV (with sensible defaults)
+FAST_HOLD_SECONDS  = int(os.environ.get("FAST_HOLD_SECONDS", "30"))
+GW_WARM_TIMEOUT    = int(os.environ.get("GW_WARM_TIMEOUT", "6"))
+GW_REFRESH_TIMEOUT = int(os.environ.get("GW_REFRESH_TIMEOUT", "3"))
+HARD_CUTOFF_HHMM   = os.environ.get("HARD_CUTOFF_HHMM", "16:15").strip()
 
 def _truthy(s: str) -> bool:
     return str(s or "").strip().lower() in {"1","true","t","yes","y","on"}
@@ -25,10 +32,6 @@ BYPASS_QTY   = os.environ.get("BYPASS_QTY","").strip()
 ET = ZoneInfo("America/New_York")
 GW_BASE = "https://gandalf.gammawizard.com"
 GW_ENDPOINT = "/rapi/GetLeoCross"
-FAST_HOLD_SECONDS = int(os.environ.get("FAST_HOLD_SECONDS","0"))  # was 30; now default 0
-GW_WARM_TIMEOUT   = 6
-GW_REFRESH_TIMEOUT= 3
-
 GUARD_TAB = "guard"
 GUARD_HEADERS = [
     "ts","source","symbol","signal_date","decision","detail","open_units","rem_qty",
@@ -319,16 +322,42 @@ def main():
         return [bp,sp,sc,bc]
     legs = orient(bp,sp,sc,bc)
 
-    # Optional gate (default 0s)
+    # Optional gate (hold + cutoff)
     now = datetime.now(ET)
+    cutoff_dt = None
+    if HARD_CUTOFF_HHMM:
+        try:
+            hh, mm = HARD_CUTOFF_HHMM.split(":")
+            cutoff_dt = now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
+        except Exception:
+            print(f"ORCH WARN: invalid HARD_CUTOFF_HHMM='{HARD_CUTOFF_HHMM}' — ignoring cutoff")
+            cutoff_dt = None
+
+    cutoff_reason = f"GATE_AFTER_CUTOFF(HARD_CUTOFF_HHMM={HARD_CUTOFF_HHMM})"
+    if cutoff_dt and now >= cutoff_dt:
+        print("ORCH SKIP:", cutoff_reason)
+        log("SKIP", cutoff_reason, legs)
+        return 0
+
     if FAST_HOLD_SECONDS > 0:
         gate = now.replace(hour=16, minute=13, second=0, microsecond=0) + timedelta(seconds=FAST_HOLD_SECONDS)
+        if cutoff_dt and gate >= cutoff_dt:
+            print("ORCH SKIP:", cutoff_reason)
+            log("SKIP", cutoff_reason, legs)
+            return 0
         if now < gate:
             wait_s = int((gate - now).total_seconds())
             print(f"ORCH GATE sleep {wait_s}s (FAST_HOLD_SECONDS={FAST_HOLD_SECONDS})")
             time.sleep((gate - now).total_seconds())
+            now = datetime.now(ET)
+            if cutoff_dt and now >= cutoff_dt:
+                print("ORCH SKIP:", cutoff_reason)
+                log("SKIP", cutoff_reason, legs)
+                return 0
+        else:
+            print("ORCH GATE immediate (already past hold window)")
     else:
-        print("ORCH GATE disabled (FAST_HOLD_SECONDS=0)")
+        print("ORCH GATE disabled (FAST_HOLD_SECONDS<=0)")
 
     # quick refresh (low latency)
     try:
