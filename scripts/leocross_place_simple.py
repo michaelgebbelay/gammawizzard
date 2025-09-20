@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-# VERSION: 2025-10-07 v2.9.0 — Placer (top‑down ask/mid ladders + 16:15 hard cutoff)
-# - CREDIT: ASK → MID → MID-0.05 → MID-0.10 (descending credit)
-# - DEBIT:  ASK → MID → MID-0.05 → MID-0.10 (default)  | set DEBIT_START=BID to use BID → MID → MID+0.05 → MID+0.10
-# - No intentional waiting between rungs (only minimal settle so Schwab can ack fills)
-# - Auto time-slices waits to finish all rungs inside MAX_RUNTIME_SECS
-# - Hard cutoff at 16:15 ET: cancel everything and sweep residual working orders
+# VERSION: 2025-10-06 v2.9.0 — Placer (NBBO ask/mid + bid/mid ladders, 5s rungs, hard cutoff)
+# - Credit ladder: ASK → MID → MID-0.05 → MID-0.10 (from Schwab NBBO)
+# - Debit  ladder: BID → MID → MID+0.05 → MID+0.10 (from Schwab NBBO)
+# - CANCEL_REPLACE with ~5s dwell per rung (configurable)
+# - Two passes with Leo refresh in between
+# - 16:15 ET hard cutoff: cancel any working orders immediately at/after cutoff
 
 import os, sys, json, time, re, math, random
 from datetime import datetime, date, timezone, timedelta
 from zoneinfo import ZoneInfo
-from typing import Iterable, List
 import requests
+from typing import Iterable, List
 from schwab.auth import client_from_token_file
 from google.oauth2 import service_account
 from googleapiclient.discovery import build as gbuild
@@ -26,69 +26,15 @@ def _as_float(env_name: str, default: str) -> float:
     except Exception:
         return float(default)
 
-def _as_float_list(env_name: str, default: Iterable[float]) -> List[float]:
-    raw = (os.environ.get(env_name, "") or "").strip()
-    if not raw:
-        return list(default)
-    out=[]
-    for tok in re.split(r'[\s,]+', raw):
-        if not tok: continue
-        try: out.append(float(tok))
-        except Exception: continue
-    return out or list(default)
+def _as_int(env_name: str, default: str) -> int:
+    raw = os.environ.get(env_name, default)
+    try:
+        return int(raw)
+    except Exception:
+        return int(default)
 
-STEP_WAIT_CREDIT = _as_float("STEP_WAIT_CREDIT", "0")   # << no intentional delay
-STEP_WAIT_DEBIT  = _as_float("STEP_WAIT_DEBIT",  "0")
-FINAL_CANCEL     = True
-
-# Minimal per‑rung settle so Schwab can acknowledge
-MIN_RUNG_WAIT     = float(os.environ.get("MIN_RUNG_WAIT", "0"))  # secs to keep each rung alive for ACK
-
-# Sizing knobs
-CREDIT_DOLLARS_PER_CONTRACT = float(os.environ.get("CREDIT_DOLLARS_PER_CONTRACT", "12000"))
-CREDIT_SPREAD_WIDTH         = int(os.environ.get("CREDIT_SPREAD_WIDTH", "15"))
-CREDIT_MIN_WIDTH            = 5
-QTY_FIXED                   = int(os.environ.get("QTY_FIXED","4") or "4")  # used only for Long IC unless QTY_OVERRIDE
-
-# Legacy ladder knobs (kept for logging only)
-CREDIT_PER5_START = float(os.environ.get("CREDIT_PER5_START", "2.00"))
-CREDIT_STEP       = float(os.environ.get("CREDIT_STEP",       "0.05"))
-CREDIT_FLOOR      = float(os.environ.get("CREDIT_FLOOR",      "0.05"))
-
-# Control knobs
-REPLACE_MODE      = (os.environ.get("REPLACE_MODE", "CANCEL_REPLACE") or "CANCEL_REPLACE").upper()
-MAX_LADDER_CYCLES = int(os.environ.get("MAX_LADDER_CYCLES", "2") or "2")
-RESET_TO_START    = True
-DISCRETE_CREDIT_LADDER = ""  # disabled; we use ask/mid ladders
-CYCLES_WITH_REFRESH    = MAX_LADDER_CYCLES
-VERBOSE           = str(os.environ.get("VERBOSE","1")).strip().lower() in {"1","true","yes","y","on"}
-MAX_RUNTIME_SECS  = _as_float("MAX_RUNTIME_SECS","115")
-WINDOW_STATUSES   = {"WORKING","QUEUED","OPEN","PENDING_ACTIVATION","ACCEPTED","RECEIVED"}
-ACTIVE_STATUSES   = WINDOW_STATUSES | {"PENDING_CANCEL","CANCEL_REQUESTED","PENDING_REPLACE"}
-CANCEL_SETTLE_SECS = float(os.environ.get("CANCEL_SETTLE_SECS","0.8"))
-
-# Side-specific anchors
-DEBIT_START = (os.environ.get("DEBIT_START","ASK") or "ASK").upper()  # ASK (default) or BID
-
-# Hard cutoff (ET)
-HARD_CUTOFF_HHMM  = os.environ.get("HARD_CUTOFF_HHMM", "16:15").strip()
-
-GW_BASE = "https://gandalf.gammawizard.com"
-GW_ENDPOINT = "/rapi/GetLeoCross"
-
-SHEET_TAB = "schwab"
-HEADERS = [
-    "ts","source","symbol","last_price",
-    "signal_date","order_mode","side","qty_exec","order_type","limit_price",
-    "occ_buy_put","occ_sell_put","occ_sell_call","occ_buy_call",
-    "order_id","status"
-]
-
-def vprint(*args, **kwargs):
-    if VERBOSE: print(*args, **kwargs)
-
-# ===== tiny utils =====
 def clamp_tick(x: float) -> float:
+    # round to nearest 0.05 and keep 2 decimals
     return round(round(x / 0.05) * 0.05 + 1e-12, 2)
 
 def _sanitize_token(t: str) -> str:
@@ -96,7 +42,8 @@ def _sanitize_token(t: str) -> str:
     return t.split(None,1)[1] if t.lower().startswith("bearer ") else t
 
 def yymmdd(iso: str) -> str:
-    d = date.fromisoformat((iso or "")[:10]); return f"{d:%y%m%d}"
+    d = date.fromisoformat((iso or "")[:10])
+    return f"{d:%y%m%d}"
 
 def to_osi(sym: str) -> str:
     raw = (sym or "").strip().upper().lstrip(".").replace("_","")
@@ -116,21 +63,40 @@ def strike_from_osi(osi: str) -> float:
 def iso_z(dt):
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-def parse_hhmm_et(s: str) -> datetime:
-    hh, mm = [int(x) for x in s.split(":")]
-    now = datetime.now(ET)
-    return now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+# ===== config from env =====
+REPLACE_MODE        = (os.environ.get("REPLACE_MODE", "CANCEL_REPLACE") or "CANCEL_REPLACE").upper()
+STEP_WAIT_CREDIT    = _as_float("STEP_WAIT_CREDIT", "5")      # dwell per rung (s)
+STEP_WAIT_DEBIT     = _as_float("STEP_WAIT_DEBIT",  "5")
+MIN_RUNG_WAIT       = _as_float("MIN_RUNG_WAIT",    "5")      # enforce minimum dwell even if step wait is 0
+MAX_LADDER_CYCLES   = _as_int("MAX_LADDER_CYCLES",  "2")      # two passes total
+MAX_RUNTIME_SECS    = _as_float("MAX_RUNTIME_SECS", "115")
+CANCEL_SETTLE_SECS  = _as_float("CANCEL_SETTLE_SECS","0.8")
+HARD_CUTOFF_HHMM    = os.environ.get("HARD_CUTOFF_HHMM","16:15").strip()
 
-def _cutoff_reached() -> bool:
-    try:
-        hh, mm = [int(x) for x in HARD_CUTOFF_HHMM.split(":")]
-        now = datetime.now(ET)
-        return (now.hour > hh) or (now.hour == hh and now.minute >= mm)
-    except Exception:
-        return False
+# sizing
+CREDIT_DOLLARS_PER_CONTRACT = float(os.environ.get("CREDIT_DOLLARS_PER_CONTRACT", "12000"))
+CREDIT_SPREAD_WIDTH         = int(os.environ.get("CREDIT_SPREAD_WIDTH", "15"))
+CREDIT_MIN_WIDTH            = 5
+QTY_FIXED                   = int(os.environ.get("QTY_FIXED","4") or "4")  # for long IC unless QTY_OVERRIDE
+VERBOSE                     = str(os.environ.get("VERBOSE","1")).strip().lower() in {"1","true","yes","y","on"}
 
-def cutoff_reached() -> bool:
-    return _cutoff_reached()
+WINDOW_STATUSES   = {"WORKING","QUEUED","OPEN","PENDING_ACTIVATION","ACCEPTED","RECEIVED"}
+ACTIVE_STATUSES   = WINDOW_STATUSES | {"PENDING_CANCEL","CANCEL_REQUESTED","PENDING_REPLACE"}
+
+GW_BASE = "https://gandalf.gammawizard.com"
+GW_ENDPOINT = "/rapi/GetLeoCross"
+
+SHEET_TAB = "schwab"
+HEADERS = [
+    "ts","source","symbol","last_price",
+    "signal_date","order_mode","side","qty_exec","order_type","limit_price",
+    "occ_buy_put","occ_sell_put","occ_sell_call","occ_buy_call",
+    "order_id","status"
+]
+
+def vprint(*args, **kwargs):
+    if VERBOSE:
+        print(*args, **kwargs)
 
 # ===== Sheets =====
 def ensure_header_and_get_sheetid(svc, spreadsheet_id: str, tab: str, header: list):
@@ -160,12 +126,14 @@ def one_log(svc, sheet_id_num, spreadsheet_id: str, tab: str, row_vals: list):
     svc.spreadsheets().values().update(spreadsheetId=spreadsheet_id, range=f"{tab}!A2",
         valueInputOption="USER_ENTERED", body={"values":[row_vals]}).execute()
 
-# ===== Schwab hardened HTTP (429-aware) =====
+# ===== Schwab hardened HTTP =====
 def _sleep_for_429(r, attempt):
     ra = r.headers.get("Retry-After")
     if ra:
-        try: return max(1.0, float(ra))
-        except Exception: pass
+        try:
+            return max(1.0, float(ra))
+        except Exception:
+            pass
     return min(10.0, 0.5 * (2 ** attempt)) + random.uniform(0.0, 0.25)
 
 def schwab_get_json(c, url, params=None, tries=6, tag=""):
@@ -173,8 +141,10 @@ def schwab_get_json(c, url, params=None, tries=6, tag=""):
     for i in range(tries):
         try:
             r = c.session.get(url, params=(params or {}), timeout=20)
-            if r.status_code == 200: return r.json()
-            if r.status_code == 429: time.sleep(_sleep_for_429(r, i)); continue
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code == 429:
+                time.sleep(_sleep_for_429(r, i)); continue
             last = f"HTTP_{r.status_code}:{(r.text or '')[:160]}"
         except Exception as e:
             last = f"{type(e).__name__}:{str(e)}"
@@ -186,8 +156,10 @@ def schwab_post_json(c, url, payload, tries=6, tag=""):
     for i in range(tries):
         try:
             r = c.session.post(url, json=payload, timeout=20)
-            if r.status_code in (200, 201, 202): return r
-            if r.status_code == 429: time.sleep(_sleep_for_429(r, i)); continue
+            if r.status_code in (200, 201, 202):
+                return r
+            if r.status_code == 429:
+                time.sleep(_sleep_for_429(r, i)); continue
             last = f"HTTP_{r.status_code}:{(r.text or '')[:160]}"
         except Exception as e:
             last = f"{type(e).__name__}:{str(e)}"
@@ -199,8 +171,10 @@ def schwab_put_json(c, url, payload, tries=6, tag=""):
     for i in range(tries):
         try:
             r = c.session.put(url, json=payload, timeout=20)
-            if r.status_code in (200, 201, 202, 204): return r
-            if r.status_code == 429: time.sleep(_sleep_for_429(r, i)); continue
+            if r.status_code in (200, 201, 202, 204):
+                return r
+            if r.status_code == 429:
+                time.sleep(_sleep_for_429(r, i)); continue
             last = f"HTTP_{r.status_code}:{(r.text or '')[:160]}"
         except Exception as e:
             last = f"{type(e).__name__}:{str(e)}"
@@ -212,8 +186,10 @@ def schwab_delete(c, url, tries=6, tag=""):
     for i in range(tries):
         try:
             r = c.session.delete(url, timeout=20)
-            if r.status_code in (200, 201, 202, 204): return r
-            if r.status_code == 429: time.sleep(_sleep_for_429(r, i)); continue
+            if r.status_code in (200, 201, 202, 204):
+                return r
+            if r.status_code == 429:
+                time.sleep(_sleep_for_429(r, i)); continue
             last = f"HTTP_{r.status_code}:{(r.text or '')[:160]}"
         except Exception as e:
             last = f"{type(e).__name__}:{str(e)}"
@@ -274,13 +250,15 @@ def calc_width_for_side(is_credit: bool, opening_cash: float) -> int:
     return _credit_width() if is_credit else 5
 
 def calc_credit_contracts(opening_cash: float | int) -> int:
-    try: oc = float(opening_cash)
-    except Exception: oc = 0.0
+    try:
+        oc = float(opening_cash)
+    except Exception:
+        oc = 0.0
     denom = CREDIT_DOLLARS_PER_CONTRACT if CREDIT_DOLLARS_PER_CONTRACT > 0 else 1.0
     units = math.ceil(max(0.0, oc) / denom)
     return max(1, int(units))
 
-# ===== Orders / quotes =====
+# ===== Quotes & NBBO =====
 def fetch_bid_ask(c, osi: str):
     r=c.get_quote(osi)
     if r.status_code!=200: return (None,None)
@@ -290,33 +268,28 @@ def fetch_bid_ask(c, osi: str):
     a=q.get("askPrice") or q.get("ask") or q.get("askPriceInDouble")
     return (float(b) if b is not None else None, float(a) if a is not None else None)
 
-def mid_condor(c, legs):
-    bp,sp,sc,bc=legs
-    bp_b,bp_a=fetch_bid_ask(c,bp); sp_b,sp_a=fetch_bid_ask(c,sp)
-    sc_b,sc_a=fetch_bid_ask(c,sc); bc_b,bc_a=fetch_bid_ask(c,bc)
-    if None in (bp_b,bp_a,sp_b,sp_a,sc_b,sc_a,bc_b,bc_a): return None
-    net_bid=(sp_b+sc_b)-(bp_a+bc_a); net_ask=(sp_a+sc_a)-(bp_b+bc_b)
-    return (net_bid+net_ask)/2.0
-
 def condor_nbbo(c, legs):
+    """Return (net_bid, net_ask, mid) for the 4-leg IC from Schwab quotes."""
     bp, sp, sc, bc = legs
     bp_b, bp_a = fetch_bid_ask(c, bp); sp_b, sp_a = fetch_bid_ask(c, sp)
     sc_b, sc_a = fetch_bid_ask(c, sc); bc_b, bc_a = fetch_bid_ask(c, bc)
     if None in (bp_b, bp_a, sp_b, sp_a, sc_b, sc_a, bc_b, bc_a):
         return (None, None, None)
-    # For CREDIT (sell):  net_bid <= net_mid <= net_ask   (ask is highest credit)
     net_bid = (sp_b + sc_b) - (bp_a + bc_a)
     net_ask = (sp_a + sc_a) - (bp_b + bc_b)
     mid     = (net_bid + net_ask) / 2.0
     return (clamp_tick(net_bid), clamp_tick(net_ask), clamp_tick(mid))
 
+# ===== Orders / listing =====
 def list_recent_orders(c, acct_hash: str):
     now_et = datetime.now(ET)
     start_et = now_et.replace(hour=0, minute=0, second=0, microsecond=0)
     url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
     params = {"fromEnteredTime": iso_z(start_et), "toEnteredTime": iso_z(now_et), "maxResults": 200}
-    try: return schwab_get_json(c, url, params=params, tag="ORDERS") or []
-    except Exception: return []
+    try:
+        return schwab_get_json(c, url, params=params, tag="ORDERS") or []
+    except Exception:
+        return []
 
 def _legs_canon_from_order(o):
     got=set()
@@ -352,6 +325,47 @@ def pick_active_and_overlaps(c, acct_hash: str, canon_set):
             oid=str(o.get("orderId") or "")
             if oid: overlaps.append(oid)
     return exact_id, active_status, overlaps
+
+# ===== GW helpers =====
+def _gw_timeout():
+    try: return int(os.environ.get("GW_TIMEOUT","30"))
+    except: return 30
+
+def gw_login_token():
+    email=os.environ.get("GW_EMAIL",""); pwd=os.environ.get("GW_PASSWORD","")
+    if not (email and pwd): raise RuntimeError("GW_LOGIN_MISSING_CREDS")
+    r=requests.post(f"{GW_BASE}/goauth/authenticateFireUser", data={"email":email,"password":pwd}, timeout=_gw_timeout())
+    if r.status_code!=200: raise RuntimeError(f"GW_LOGIN_HTTP_{r.status_code}:{(r.text or '')[:180]}")
+    j=r.json(); t=j.get("token"); 
+    if not t: raise RuntimeError("GW_LOGIN_NO_TOKEN")
+    return t
+
+def gw_get_leocross():
+    tok=_sanitize_token(os.environ.get("GW_TOKEN","") or "")
+    def hit(t):
+        h={"Accept":"application/json","Authorization":f"Bearer {_sanitize_token(t)}","User-Agent":"gw-placer/1.4"}
+        return requests.get(f"{GW_BASE.rstrip('/')}/{GW_ENDPOINT.lstrip('/')}", headers=h, timeout=_gw_timeout())
+    r=hit(tok) if tok else None
+    if (r is None) or (r.status_code in (401,403)): r=hit(gw_login_token())
+    if r.status_code!=200: raise RuntimeError(f"GW_HTTP_{r.status_code}:{(r.text or '')[:180]}")
+    return r.json()
+
+def extract(j):
+    if isinstance(j,dict):
+        if "Trade" in j:
+            tr=j["Trade"]; 
+            return tr[-1] if isinstance(tr,list) and tr else tr if isinstance(tr,dict) else {}
+        keys=("Date","TDate","Limit","CLimit","Cat1","Cat2")
+        if any(k in j for k in keys): return j
+        for v in j.values():
+            if isinstance(v,(dict,list)):
+                t=extract(v); 
+                if t: return t
+    if isinstance(j,list):
+        for it in reversed(j):
+            t=extract(it)
+            if t: return t
+    return {}
 
 # ===== main =====
 def main():
@@ -389,7 +403,7 @@ def main():
                used_price, legs[0],legs[1],legs[2],legs[3], oid_for_log, status_txt]
         one_log(svc, sheet_id_num, sheet_id, "schwab", row)
 
-    # Optional time gate ONLY if SCHEDULED
+    # Optional time gate for SCHEDULED only
     def time_gate_ok():
         now=datetime.now(ET)
         return (now.weekday()<5 and now.hour==16 and 8<=now.minute<=14)
@@ -398,47 +412,7 @@ def main():
              "","","","", "", "SKIPPED_TIME_WINDOW"]
         one_log(svc, sheet_id_num, sheet_id, "schwab", row); print("skip window"); sys.exit(0)
 
-    # ---- GW
-    def _gw_timeout():
-        try: return int(os.environ.get("GW_TIMEOUT","30"))
-        except: return 30
-
-    def gw_login_token():
-        email=os.environ.get("GW_EMAIL",""); pwd=os.environ.get("GW_PASSWORD","")
-        if not (email and pwd): raise RuntimeError("GW_LOGIN_MISSING_CREDS")
-        r=requests.post(f"{GW_BASE}/goauth/authenticateFireUser", data={"email":email,"password":pwd}, timeout=_gw_timeout())
-        if r.status_code!=200: raise RuntimeError(f"GW_LOGIN_HTTP_{r.status_code}:{(r.text or '')[:180]}")
-        j=r.json(); t=j.get("token"); 
-        if not t: raise RuntimeError("GW_LOGIN_NO_TOKEN")
-        return t
-
-    def gw_get_leocross():
-        tok=_sanitize_token(os.environ.get("GW_TOKEN","") or "")
-        def hit(t):
-            h={"Accept":"application/json","Authorization":f"Bearer {_sanitize_token(t)}","User-Agent":"gw-placer/1.4"}
-            return requests.get(f"{GW_BASE.rstrip('/')}/{GW_ENDPOINT.lstrip('/')}", headers=h, timeout=_gw_timeout())
-        r=hit(tok) if tok else None
-        if (r is None) or (r.status_code in (401,403)): r=hit(gw_login_token())
-        if r.status_code!=200: raise RuntimeError(f"GW_HTTP_{r.status_code}:{(r.text or '')[:180]}")
-        return r.json()
-
-    def extract(j):
-        if isinstance(j,dict):
-            if "Trade" in j:
-                tr=j["Trade"]; 
-                return tr[-1] if isinstance(tr,list) and tr else tr if isinstance(tr,dict) else {}
-            keys=("Date","TDate","Limit","CLimit","Cat1","Cat2")
-            if any(k in j for k in keys): return j
-            for v in j.values():
-                if isinstance(v,(dict,list)):
-                    t=extract(v); 
-                    if t: return t
-        if isinstance(j,list):
-            for it in reversed(j):
-                t=extract(it)
-                if t: return t
-        return {}
-
+    # ---- Leo
     try:
         api=gw_get_leocross()
     except Exception as e:
@@ -497,35 +471,44 @@ def main():
              legs[0],legs[1],legs[2],legs[3], "", "ABORT_QTY_LT_1"]
         one_log(svc, sheet_id_num, sheet_id, "schwab", row); print("qty<1"); sys.exit(0)
 
-    print(f"PLACER START mode={MODE} is_credit={is_credit} width={width} qty={qty} oc={oc}")
-    print(f"LADDER CONFIG anchored ask/mid, wait={STEP_WAIT_CREDIT if is_credit else STEP_WAIT_DEBIT:.1f}s (min {MIN_RUNG_WAIT:.2f}s), cycles={MAX_LADDER_CYCLES} replace={REPLACE_MODE} cutoff={HARD_CUTOFF_HHMM} ET")
+    # Banner
+    secs = STEP_WAIT_CREDIT if is_credit else STEP_WAIT_DEBIT
+    vprint(f"PLACER START mode={MODE} is_credit={is_credit} width={width} qty={qty} oc={oc}")
+    vprint(f"LADDER CONFIG anchored ask/mid (credit) or bid/mid (debit), wait={secs:.1f}s (min {MIN_RUNG_WAIT:.2f}s), "
+           f"cycles={MAX_LADDER_CYCLES} replace={REPLACE_MODE} cutoff={HARD_CUTOFF_HHMM} ET")
 
+    # ---- status helpers ----
     def get_status(oid: str) -> dict:
         url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
-        try: return schwab_get_json(c,url,tag=f"STATUS:{oid}") or {}
-        except Exception: return {}
+        try:
+            return schwab_get_json(c,url,tag=f"STATUS:{oid}") or {}
+        except Exception:
+            return {}
 
     def wait_until_closed(oid: str, max_wait: float = CANCEL_SETTLE_SECS) -> bool:
         t_end = time.time() + max_wait
         while time.time() < t_end:
             st = get_status(oid)
             status = str(st.get("status") or st.get("orderStatus") or "").upper()
-            if (not status) or status in {"CANCELED","FILLED","REJECTED","EXPIRED"}: return True
-            if status not in ACTIVE_STATUSES: return True
-            time.sleep(0.15)
+            if (not status) or status in {"CANCELED","FILLED","REJECTED","EXPIRED"}:
+                return True
+            if status not in ACTIVE_STATUSES:
+                return True
+            time.sleep(0.2)
         return False
 
-    # One active working order (replace). Cancel any overlapping partial matches first.
+    # One active working order (replace). Cancel overlapping partial matches first.
     active_oid, active_status, overlaps = pick_active_and_overlaps(c, acct_hash, canon)
     for oid in overlaps:
         try:
             url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
             schwab_delete(c,url,tag=f"CANCEL_OVERLAP:{oid}")
-            vprint(f"CANCEL_OVERLAP OID={oid}"); wait_until_closed(oid)
+            vprint(f"CANCEL_OVERLAP OID={oid}")
+            wait_until_closed(oid)
         except Exception as e:
             print(f"WARN cancel overlap {oid}: {e}")
 
-    # Best‑effort SIGTERM/SIGINT cleanup
+    # Best-effort cleanup on termination
     import signal
     def _on_term(signum, frame):
         try:
@@ -537,7 +520,8 @@ def main():
             print(f"WARN SIG cleanup failed: {e}")
         finally:
             sys.exit(128+signum)
-    signal.signal(signal.SIGTERM, _on_term); signal.signal(signal.SIGINT,  _on_term)
+    signal.signal(signal.SIGTERM, _on_term)
+    signal.signal(signal.SIGINT,  _on_term)
 
     def parse_order_id_from_response(r):
         try:
@@ -545,36 +529,35 @@ def main():
             if isinstance(j,dict):
                 oid = j.get("orderId") or j.get("order_id")
                 if oid: return str(oid)
-        except Exception: pass
-        loc=r.headers.get("Location",""); return loc.rstrip("/").split("/")[-1] if loc else ""
+        except Exception:
+            pass
+        loc=r.headers.get("Location","")
+        return loc.rstrip("/").split("/")[-1] if loc else ""
 
-    replacements = 0; canceled = 0; steps=[]; filled_total = 0
+    replacements = 0
+    canceled = 0
+    steps=[]
+    filled_total = 0
     START_TS = time.time()
 
-    def time_budget_secs(base_secs: float, remaining_rungs: int) -> float:
-        # Shrink waits to finish entire plan inside MAX_RUNTIME_SECS
-        elapsed = time.time() - START_TS
-        left = max(0.0, MAX_RUNTIME_SECS - elapsed)
-        buffer = 0.8 * remaining_rungs  # cancel/replace overhead
-        usable = max(0.0, left - buffer)
-        target = base_secs
-        if remaining_rungs > 0 and usable > 0:
-            target = min(base_secs, usable / remaining_rungs)
-        return max(MIN_RUNG_WAIT, target)
-
+    # ---- order payload ----
     def order_payload(price: float, q: int):
         return {
-            "orderType": order_type, "session": "NORMAL",
-            "price": f"{clamp_tick(price):.2f}", "duration": "DAY",
-            "orderStrategyType": "SINGLE", "complexOrderStrategyType": "IRON_CONDOR",
+            "orderType": order_type,
+            "session": "NORMAL",
+            "price": f"{clamp_tick(price):.2f}",
+            "duration": "DAY",
+            "orderStrategyType": "SINGLE",
+            "complexOrderStrategyType": "IRON_CONDOR",
             "orderLegCollection":[
-                {"instruction":"BUY_TO_OPEN","positionEffect":"OPENING","quantity":q,"instrument":{"symbol":legs[0],"assetType":"OPTION"}},
+                {"instruction":"BUY_TO_OPEN", "positionEffect":"OPENING","quantity":q,"instrument":{"symbol":legs[0],"assetType":"OPTION"}},
                 {"instruction":"SELL_TO_OPEN","positionEffect":"OPENING","quantity":q,"instrument":{"symbol":legs[1],"assetType":"OPTION"}},
                 {"instruction":"SELL_TO_OPEN","positionEffect":"OPENING","quantity":q,"instrument":{"symbol":legs[2],"assetType":"OPTION"}},
-                {"instruction":"BUY_TO_OPEN","positionEffect":"OPENING","quantity":q,"instrument":{"symbol":legs[3],"assetType":"OPTION"}},
+                {"instruction":"BUY_TO_OPEN", "positionEffect":"OPENING","quantity":q,"instrument":{"symbol":legs[3],"assetType":"OPTION"}},
             ]
         }
 
+    # ---- (cancel-)replace or place ----
     def ensure_active(price: float, to_place: int):
         nonlocal active_oid, replacements, canceled
         px = clamp_tick(price)
@@ -585,30 +568,39 @@ def main():
                     try:
                         r=schwab_put_json(c, url, order_payload(px,to_place), tag=f"REPLACE@{px:.2f}x{to_place}")
                         new_id = parse_order_id_from_response(r) or active_oid
-                        replacements += 1; active_oid = new_id
-                        vprint(f"REPLACE → OID={active_oid} @ {px:.2f} x{to_place}"); return active_oid
+                        replacements += 1
+                        active_oid = new_id
+                        vprint(f"REPLACE → OID={active_oid} @ {px:.2f} x{to_place}")
+                        return active_oid
                     except Exception as e:
                         vprint(f"REPLACE failed ({e}); falling back to CANCEL_REPLACE")
                         try:
-                            schwab_delete(c, url, tag=f"CANCEL_STEP:{active_oid}"); canceled += 1
-                        except Exception: pass
+                            schwab_delete(c, url, tag=f"CANCEL_STEP:{active_oid}")
+                            canceled += 1
+                        except Exception:
+                            pass
                         active_oid = None
 
                 if active_oid and REPLACE_MODE == "CANCEL_REPLACE":
                     try:
                         url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{active_oid}"
-                        schwab_delete(c, url, tag=f"CANCEL_STEP:{active_oid}"); canceled += 1
-                        vprint(f"CANCEL_STEP OID={active_oid}"); wait_until_closed(active_oid)
-                    except Exception: pass
+                        schwab_delete(c, url, tag=f"CANCEL_STEP:{active_oid}")
+                        canceled += 1
+                        vprint(f"CANCEL_STEP OID={active_oid}")
+                        wait_until_closed(active_oid)
+                    except Exception:
+                        pass
                     active_oid = None
-                    # extra sweep
+                    # double-check: no residual overlaps before we place
                     ex, st, ovs = pick_active_and_overlaps(c, acct_hash, canon)
                     for oid in ([ex] if ex else []) + ovs:
                         try:
                             url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
-                            schwab_delete(c, url, tag=f"CANCEL_RESIDUAL:{oid}"); vprint(f"CANCEL_RESIDUAL OID={oid}")
+                            schwab_delete(c, url, tag=f"CANCEL_RESIDUAL:{oid}")
+                            vprint(f"CANCEL_RESIDUAL OID={oid}")
                             wait_until_closed(oid)
-                        except Exception: pass
+                        except Exception:
+                            pass
 
                 url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
                 r=schwab_post_json(c, url, order_payload(px,to_place), tag=f"PLACE@{px:.2f}x{to_place}")
@@ -620,152 +612,151 @@ def main():
                 vprint(f"ensure_active retry {attempt+1}/6: {e}")
                 time.sleep(min(10.0, 0.5*(2**attempt)))
                 continue
-        vprint("ensure_active exhausted retries; proceeding without active OID"); return active_oid
 
+        vprint("ensure_active exhausted retries; proceeding without active OID")
+        return active_oid
+
+    # ---- cutoff check ----
+    def cutoff_reached() -> bool:
+        now = datetime.now(ET)
+        try:
+            hh, mm = [int(x) for x in HARD_CUTOFF_HHMM.split(":")]
+        except Exception:
+            hh, mm = 16, 15
+        cut = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        return now >= cut
+
+    # ---- wait loop with dwell & cutoff ----
     def wait_loop(secs: float):
         nonlocal filled_total
-        # Always give Schwab at least MIN_RUNG_WAIT seconds; time-sliced above.
-        if _cutoff_reached():
-            return "TIMEOUT"
-        t_end = time.time() + max(MIN_RUNG_WAIT, secs)
-        while time.time() < t_end:
-            if cutoff_reached(): return "CUTOFF"
-            if time.time() - START_TS > MAX_RUNTIME_SECS: return "TIMEOUT"
-            if not active_oid: time.sleep(0.25); continue
+        secs_eff = max(float(secs), MIN_RUNG_WAIT)
+        t_end=time.time()+secs_eff
+        while time.time()<t_end:
+            if cutoff_reached() or (time.time() - START_TS > MAX_RUNTIME_SECS):
+                return "TIMEOUT"
+            if not active_oid:
+                time.sleep(0.25); continue
             st=get_status(active_oid)
             status = str(st.get("status") or st.get("orderStatus") or "").upper()
             fq = int(round(float(st.get("filledQuantity") or st.get("filled_quantity") or 0)))
             if fq > filled_total: filled_total = fq
-            if status == "FILLED" or filled_total >= qty: return "FILLED"
+            if status == "FILLED" or filled_total >= qty:
+                return "FILLED"
             time.sleep(0.25)
         return "WORKING"
 
-    def rung(px, secs, remaining_rungs: int):
+    # ---- rung ----
+    def rung(px, secs):
         nonlocal filled_total
         to_place = max(0, qty - filled_total)
         if to_place==0: return "FILLED"
-        secs_eff = time_budget_secs(secs, remaining_rungs)
-        vprint(f"RUNG → price={clamp_tick(px):.2f} to_place={to_place} wait≈{secs_eff:.2f}s")
+        vprint(f"RUNG → price={clamp_tick(px):.2f} to_place={to_place} wait≈{max(secs, MIN_RUNG_WAIT):.2f}s")
         ensure_active(px, to_place)
-        st = wait_loop(max(secs_eff, MIN_RUNG_WAIT))
+        st = wait_loop(secs)
         steps.append(f"{clamp_tick(px):.2f}@{to_place}")
         vprint(f"RUNG_DONE status={st} filled={filled_total}/{qty} active_oid={active_oid or 'NA'}")
         return st
 
-    def refresh_from_leo():
-        """Rebuild legs from a fresh Leo payload (handles both credit/debit)."""
-        nonlocal legs, canon, width, is_credit, side_name, order_type, exp_iso, inner_put, inner_call
-        try:
-            api = gw_get_leocross(); tr = extract(api)
-            if not tr: vprint("REFRESH_FROM_LEO: NO_TRADE_PAYLOAD — keeping prior legs"); return
-            def fnum(x): 
-                try: return float(x)
-                except Exception: return None
-            cat1,cat2 = fnum(tr.get("Cat1")), fnum(tr.get("Cat2"))
-            new_is_credit = True if (cat2 is None or cat1 is None or cat2 >= cat1) else False
-            exp_iso = str(tr.get("TDate","")); exp6=yymmdd(exp_iso)
-            inner_put = int(float(tr.get("Limit"))); inner_call = int(float(tr.get("CLimit")))
-            new_width = calc_width_for_side(new_is_credit, oc if oc is not None else 0)
-            p_low, p_high = inner_put - new_width, inner_put
-            c_low, c_high = inner_call, inner_call + new_width
-            bp = to_osi(f".SPXW{exp6}P{p_low}"); sp = to_osi(f".SPXW{exp6}P{p_high}")
-            sc = to_osi(f".SPXW{exp6}C{c_low}"); bc = to_osi(f".SPXW{exp6}C{c_high}")
-            def orient(bp_sym, sp_sym, sc_sym, bc_sym):
-                bpS, spS = strike_from_osi(bp_sym), strike_from_osi(sp_sym)
-                scS, bcS = strike_from_osi(sc_sym), strike_from_osi(bc_sym)
-                if new_is_credit:
-                    if bpS>spS: bp_sym,sp_sym=sp_sym,bp_sym
-                    if scS>bcS: sc_sym,bc_sym=bc_sym,sc_sym
-                else:
-                    if bpS<spS: bp_sym,sp_sym=sp_sym,bp_sym
-                    if bcS>scS: sc_sym,bc_sym=bc_sym,sc_sym
-                return [bp_sym, sp_sym, sc_sym, bc_sym]
-            legs = orient(bp, sp, sc, bc)
-            canon = {osi_canon(x) for x in legs}; width = new_width
-            is_credit = new_is_credit
-            side_name  = "SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"
-            order_type = "NET_CREDIT" if is_credit else "NET_DEBIT"
-            vprint(f"REFRESH_FROM_LEO: width={width} legs={legs}")
-        except SystemExit: raise
-        except Exception as e:
-            vprint(f"REFRESH_FROM_LEO failed: {e} — continuing with current legs")
+    # ---- ladder builders (from Schwab NBBO) ----
+    def credit_ladder_from_nbbo(nbbo_bid, nbbo_ask, nbbo_mid):
+        # Highest first: ASK → MID → MID-0.05 → MID-0.10
+        if None in (nbbo_ask, nbbo_mid): return []
+        lad = [nbbo_ask,
+               nbbo_mid,
+               clamp_tick(nbbo_mid - 0.05),
+               clamp_tick(nbbo_mid - 0.10)]
+        # clamp to tick & de-dupe in order
+        seen=set(); out=[]
+        for p in [clamp_tick(x) for x in lad]:
+            if p not in seen:
+                seen.add(p); out.append(p)
+        return out
 
-    # ===== Build ladder (cycled) =====
-    status = "WORKING"; cycles = 0
-    _max_cycles = MAX_LADDER_CYCLES
-    while cycles < _max_cycles and filled_total < qty:
-        if _cutoff_reached():
-            vprint("HARD_CUTOFF reached — breaking and sweeping cancels.")
-            status = "TIMEOUT"
-            break
+    def debit_ladder_from_nbbo(nbbo_bid, nbbo_ask, nbbo_mid):
+        # Lowest first: BID → MID → MID+0.05 → MID+0.10
+        if None in (nbbo_bid, nbbo_mid): return []
+        lad = [nbbo_bid,
+               nbbo_mid,
+               clamp_tick(nbbo_mid + 0.05),
+               clamp_tick(nbbo_mid + 0.10)]
+        seen=set(); out=[]
+        for p in [clamp_tick(x) for x in lad]:
+            if p not in seen:
+                seen.add(p); out.append(p)
+        return out
+
+    # ===== Cycle loop =====
+    status = "WORKING"
+    cycles = 0
+
+    while cycles < MAX_LADDER_CYCLES and filled_total < qty and not cutoff_reached():
+        secs = STEP_WAIT_CREDIT if is_credit else STEP_WAIT_DEBIT
+
         nbbo_bid, nbbo_ask, nbbo_mid = condor_nbbo(c, legs)
         if None in (nbbo_bid, nbbo_ask, nbbo_mid):
             vprint("NBBO unavailable — skipping cycle")
             break
 
-        def _unique(seq):
-            seen=set(); out=[]
-            for x in seq:
-                if x not in seen:
-                    out.append(x); seen.add(x)
-            return out
+        vprint(f"{'CREDIT' if is_credit else 'DEBIT'} NBBO: bid={nbbo_bid} ask={nbbo_ask} mid={nbbo_mid}")
+        ladder = credit_ladder_from_nbbo(nbbo_bid, nbbo_ask, nbbo_mid) if is_credit \
+                 else debit_ladder_from_nbbo(nbbo_bid, nbbo_ask, nbbo_mid)
+        vprint(f"CYCLE {cycles+1}/{MAX_LADDER_CYCLES} ladder: {ladder}")
 
-        if is_credit:
-            # SELL credit: highest first
-            ladder = _unique([
-                clamp_tick(nbbo_ask),
-                clamp_tick(nbbo_mid),
-                clamp_tick(max(0.05, nbbo_mid - 0.05)),
-                clamp_tick(max(0.05, nbbo_mid - 0.10)),
-            ])
-            vprint(f"CYCLE {cycles+1}/{_max_cycles} CREDIT ladder (ASK→MID→MID-5→MID-10): {ladder}")
-        else:
-            # BUY debit: lowest first
-            ladder = _unique([
-                clamp_tick(max(0.05, nbbo_bid)),
-                clamp_tick(nbbo_mid),
-                clamp_tick(nbbo_mid + 0.05),
-                clamp_tick(nbbo_mid + 0.10),
-            ])
-            vprint(f"CYCLE {cycles+1}/{_max_cycles} DEBIT ladder (BID→MID→MID+5→MID+10): {ladder}")
-
-        # no intentional per‑rung wait; we rely on MIN_RUNG_WAIT for ACK settle
-        secs = 0
-
-        # run the ladder
-        for idx, price in enumerate(ladder):
-            remaining = (len(ladder) - idx) + (MAX_LADDER_CYCLES - (cycles+1)) * len(ladder)
-            status = rung(price, secs, remaining_rungs=remaining)
-            if status in ("FILLED","TIMEOUT","CUTOFF"):
+        for price in ladder:
+            status = rung(price, secs)
+            if status in ("FILLED","TIMEOUT"):
                 break
 
-        if filled_total >= qty or status in ("TIMEOUT","CUTOFF"):
+        if filled_total >= qty or status == "TIMEOUT" or cutoff_reached():
             break
 
-        # Not filled — cancel any working order before next cycle
+        # End of cycle — cancel any working order before next cycle
         if active_oid:
             try:
                 url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{active_oid}"
                 schwab_delete(c, url, tag=f"CANCEL_CYCLE:{active_oid}")
-                canceled += 1; vprint(f"CANCEL_CYCLE OID={active_oid}"); wait_until_closed(active_oid)
-            except Exception: pass
+                canceled += 1
+                vprint(f"CANCEL_CYCLE OID={active_oid}")
+                wait_until_closed(active_oid)
+            except Exception:
+                pass
             active_oid = None
 
-        cycles += 1
-        # Re‑fetch Leo between passes
-        if filled_total < qty and cycles < MAX_LADDER_CYCLES:
-            refresh_from_leo()
+        # quick Leo refresh between passes
+        try:
+            api2 = gw_get_leocross()
+            tr2  = extract(api2)
+            if tr2:
+                # (re)build legs if strikes/expiry changed
+                exp6_2 = yymmdd(str(tr2.get("TDate","")))
+                put2   = int(float(tr2.get("Limit"))); call2=int(float(tr2.get("CLimit")))
+                if exp6_2 != exp6 or put2 != inner_put or call2 != inner_call:
+                    exp6 = exp6_2; inner_put = put2; inner_call = call2
+                    p_low,p_high = inner_put-width, inner_put
+                    c_low,c_high = inner_call, inner_call+width
+                    legs = orient(to_osi(f".SPXW{exp6}P{p_low}"),
+                                  to_osi(f".SPXW{exp6}P{p_high}"),
+                                  to_osi(f".SPXW{exp6}C{c_low}"),
+                                  to_osi(f".SPXW{exp6}C{c_high}"))
+                    canon = {osi_canon(x) for x in legs}
+                    vprint(f"REFRESH_FROM_LEO: width={width} legs={legs}")
+        except Exception as e:
+            vprint(f"REFRESH_FROM_LEO failed: {e} — continuing")
 
-    # final cleanup or 16:15 sweep
-    if (status not in ("FILLED",) or cutoff_reached()) and active_oid:
+        cycles += 1
+
+    # final cleanup if still working or cutoff
+    if active_oid:
         try:
             url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{active_oid}"
             schwab_delete(c, url, tag=f"CANCEL_FINAL:{active_oid}")
-            canceled += 1; vprint(f"CANCEL_FINAL OID={active_oid}"); wait_until_closed(active_oid)
-        except Exception: pass
-        active_oid = None
+            canceled += 1
+            vprint(f"CANCEL_FINAL OID={active_oid}")
+            wait_until_closed(active_oid)
+        except Exception:
+            pass
 
-    # unconditional final sweep for these legs (protect against stray)
+    # Final sweep to guarantee no stray working/accepted orders for these legs
     try:
         ex, st, ovs = pick_active_and_overlaps(c, acct_hash, canon)
         for oid in ([ex] if ex else []) + ovs:
@@ -774,22 +765,21 @@ def main():
                 schwab_delete(c, url, tag=f"CANCEL_SWEEP:{oid}")
                 wait_until_closed(oid, max_wait=1.5)
                 vprint(f"CANCEL_SWEEP OID={oid}")
-            except Exception: pass
-    except Exception: pass
+            except Exception:
+                pass
+    except Exception:
+        pass
 
     # ===== Log outcome
     used_price = steps[-1].split("@",1)[0] if steps else ""
-    oid_for_log = active_oid or ""
+    oid_for_log = ""  # none should be left working
     filled_str = f"FILLED {filled_total}/{qty}"
     repl_str   = f"REPLACED {replacements}"
     canceled_str = f"CANCELED {canceled}"
     trace = "STEPS " + "→".join(steps) if steps else "STEPS"
-    status_tag = status if status in ("FILLED","TIMEOUT","CUTOFF") else "DONE"
+    status_txt = (("FILLED " + trace) if (filled_total >= qty) else (status + " " + trace)) + \
+                 f" | {filled_str} | {repl_str} | {canceled_str} | width={width} oc={oc if oc is not None else 'NA'}"
 
-    side_name  = "SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"
-    order_type = "NET_CREDIT" if is_credit else "NET_DEBIT"
-
-    status_txt = f"{status_tag} {trace} | {filled_str} | {repl_str} | {canceled_str} | width={width} oc={oc if oc is not None else 'NA'}"
     print(f"FINAL {status_txt} OID={oid_for_log} PRICE_USED={used_price if used_price else 'NA'}")
     log_row(status_txt, side_name, order_type, legs, qty, used_price, oid_for_log, sig_date)
 
