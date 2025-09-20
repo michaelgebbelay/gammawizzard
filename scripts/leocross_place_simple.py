@@ -41,8 +41,8 @@ STEP_WAIT_CREDIT = _as_float("STEP_WAIT_CREDIT", "0")   # << no intentional dela
 STEP_WAIT_DEBIT  = _as_float("STEP_WAIT_DEBIT",  "0")
 FINAL_CANCEL     = True
 
-# Minimal per‑rung settle so Schwab can acknowledge (don’t set below ~0.6s)
-MIN_RUNG_WAIT    = _as_float("MIN_RUNG_WAIT", "0.75")
+# Minimal per‑rung settle so Schwab can acknowledge
+MIN_RUNG_WAIT     = float(os.environ.get("MIN_RUNG_WAIT", "0"))  # secs to keep each rung alive for ACK
 
 # Sizing knobs
 CREDIT_DOLLARS_PER_CONTRACT = float(os.environ.get("CREDIT_DOLLARS_PER_CONTRACT", "12000"))
@@ -71,7 +71,7 @@ CANCEL_SETTLE_SECS = float(os.environ.get("CANCEL_SETTLE_SECS","0.8"))
 DEBIT_START = (os.environ.get("DEBIT_START","ASK") or "ASK").upper()  # ASK (default) or BID
 
 # Hard cutoff (ET)
-HARD_CUTOFF_HHMM = os.environ.get("HARD_CUTOFF_HHMM","16:15").strip()
+HARD_CUTOFF_HHMM  = os.environ.get("HARD_CUTOFF_HHMM", "16:15").strip()
 
 GW_BASE = "https://gandalf.gammawizard.com"
 GW_ENDPOINT = "/rapi/GetLeoCross"
