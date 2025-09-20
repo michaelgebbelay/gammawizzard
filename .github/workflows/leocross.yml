@@ -15,7 +15,7 @@ on:
         description: 'Qty when forcing (blank=1)'
         required: false
         default: '1'
-  # schedule (optional)
+  # Optional schedules
   # schedule:
   #   - cron: "10 20 * * 1-5"
   #   - cron: "12 20 * * 1-5"
@@ -28,6 +28,7 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 12
+
     steps:
       - uses: actions/checkout@v4
 
@@ -42,39 +43,48 @@ jobs:
 
       - name: LeoCross orchestrator (guard + run)
         env:
+          # Mode
           PLACER_MODE: ${{ github.event.inputs.mode != '' && github.event.inputs.mode || 'SCHEDULED' }}
-          # Guard bypass toggles:
+
+          # Guard bypass toggles
           BYPASS_GUARD: ${{ github.event.inputs.force }}
           BYPASS_QTY:   ${{ github.event.inputs.force_qty }}
 
+          # ===== Credentials =====
           # Schwab
-          SCHWAB_APP_KEY: ${{ secrets.SCHWAB_APP_KEY }}
+          SCHWAB_APP_KEY:    ${{ secrets.SCHWAB_APP_KEY }}
           SCHWAB_APP_SECRET: ${{ secrets.SCHWAB_APP_SECRET }}
           SCHWAB_TOKEN_JSON: ${{ secrets.SCHWAB_TOKEN_JSON }}
-          # Sheets
-          GSHEET_ID: ${{ secrets.GSHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          # Google Sheets
+          GSHEET_ID:                    ${{ secrets.GSHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON:  ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           # GammaWizard
           GW_TOKEN:    ${{ secrets.GW_TOKEN }}
           GW_EMAIL:    ${{ secrets.GW_EMAIL }}
           GW_PASSWORD: ${{ secrets.GW_PASSWORD }}
-          CREDIT_FLOOR: "4.80"
-          CREDIT_PER5_START: "2.00"
-          CREDIT_STEP: "0.05"
-          RESET_TO_START: "1"
-          CREDIT_RUNG_DELTAS: "0.05,0,-0.05,-0.10,-0.15,-0.20"
-          DEBIT_RUNG_DELTAS_ASK: "-0.05,0,0.05,0.10,0.15,0.20"
-          STEP_WAIT_CREDIT: "8"
-          STEP_WAIT_DEBIT: "8"
-          FAST_HOLD_SECONDS: "0"
-          ANCHOR_RESPECT_FLOOR: "0"
-          ANCHOR_CREDIT_MIN: "0.05"
+
+          # ===== Trading knobs (fast two-pass) =====
+          FAST_HOLD_SECONDS: "0"        # start immediately at the trigger
+          MAX_LADDER_CYCLES: "2"        # two passes; Leo refresh between passes
+          MAX_RUNTIME_SECS:  "115"      # entire placer budget
+          STEP_WAIT_CREDIT:  "0"        # no intentional delay per rung
+          STEP_WAIT_DEBIT:   "0"
+          MIN_RUNG_WAIT:     "0.75"     # minimal settle so Schwab can ack (do not set <0.6)
+          HARD_CUTOFF_HHMM:  "16:15"    # cancel-all sweep at/after 16:15 ET
           CANCEL_SETTLE_SECS: "0.8"
-          # New/updated knobs for the fast two-pass plan
-          MAX_LADDER_CYCLES: "2"
-          MAX_RUNTIME_SECS: "115"
-          ANCHOR_WAIT_SECS:  "10"
-          DEBIT_ANCHOR_MODE: "BID"
+
+          # Sizing / width (unchanged)
+          CREDIT_DOLLARS_PER_CONTRACT: "12000"
+          CREDIT_SPREAD_WIDTH:         "15"
+          CREDIT_MIN_WIDTH:            "5"
+
+          # Pricing direction
+          # CREDIT side uses ASK→MID→MID-0.05→MID-0.10 automatically.
+          # DEBIT should start from the lowest number ⇒ BID.
+          DEBIT_START: "BID"
+
+          # Verbose logs
+          VERBOSE: "1"
           PYTHONUNBUFFERED: "1"
         run: |
           python scripts/leocross_orchestrator.py
