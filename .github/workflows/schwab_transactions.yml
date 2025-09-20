@@ -1,4 +1,4 @@
-name: Schwab → Sheets (Dump + Summarize)
+name: download transactions
 
 on:
   workflow_dispatch:
