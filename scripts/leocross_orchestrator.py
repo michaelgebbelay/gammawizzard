@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # VERSION: 2025-10-07 v4.4.0 — Orchestrator
-# - Default FAST_HOLD_SECONDS=0 (start immediately when you trigger at 16:13)
+# - Default FAST_HOLD_SECONDS=30 (override via env to start sooner/later)
 # - Logs guard snapshot and calls placer with QTY_OVERRIDE
 
 import os, sys, json, time, re, math
@@ -11,7 +11,15 @@ from schwab.auth import client_from_token_file
 from google.oauth2 import service_account
 from googleapiclient.discovery import build as gbuild
 
-PER_UNIT = 5000
+# ===== Runtime knobs =====
+PER_UNIT = 5000  # legacy debit sizing
+
+# Read from ENV (with sensible defaults)
+FAST_HOLD_SECONDS  = int(os.environ.get("FAST_HOLD_SECONDS", "30"))
+GW_WARM_TIMEOUT    = int(os.environ.get("GW_WARM_TIMEOUT", "6"))
+GW_REFRESH_TIMEOUT = int(os.environ.get("GW_REFRESH_TIMEOUT", "3"))
+HARD_CUTOFF_HHMM   = os.environ.get("HARD_CUTOFF_HHMM", "16:15").strip()
+
 CREDIT_DOLLARS_PER_CONTRACT = float(os.environ.get("CREDIT_DOLLARS_PER_CONTRACT", "12000"))
 CREDIT_SPREAD_WIDTH         = int(os.environ.get("CREDIT_SPREAD_WIDTH", "15"))
 CREDIT_MIN_WIDTH            = 5
@@ -25,10 +33,6 @@ BYPASS_QTY   = os.environ.get("BYPASS_QTY","").strip()
 ET = ZoneInfo("America/New_York")
 GW_BASE = "https://gandalf.gammawizard.com"
 GW_ENDPOINT = "/rapi/GetLeoCross"
-FAST_HOLD_SECONDS = int(os.environ.get("FAST_HOLD_SECONDS","0"))  # was 30; now default 0
-GW_WARM_TIMEOUT   = 6
-GW_REFRESH_TIMEOUT= 3
-
 GUARD_TAB = "guard"
 GUARD_HEADERS = [
     "ts","source","symbol","signal_date","decision","detail","open_units","rem_qty",
@@ -319,11 +323,27 @@ def main():
         return [bp,sp,sc,bc]
     legs = orient(bp,sp,sc,bc)
 
-    # Optional gate (default 0s)
+    # Optional gate (default 30s) with hard cutoff protection
     now = datetime.now(ET)
-    gate = now.replace(hour=16, minute=13, second=0, microsecond=0) + timedelta(seconds=FAST_HOLD_SECONDS)
+    try:
+        cutoff_hour, cutoff_minute = [int(part) for part in HARD_CUTOFF_HHMM.split(":", 1)]
+    except Exception:
+        cutoff_hour, cutoff_minute = 16, 15
+    hard_cutoff = now.replace(hour=cutoff_hour, minute=cutoff_minute, second=0, microsecond=0)
+    gate_anchor = now.replace(hour=16, minute=13, second=0, microsecond=0)
+    gate = gate_anchor + timedelta(seconds=max(0, FAST_HOLD_SECONDS))
+
+    if now >= hard_cutoff:
+        reason = f"HARD_CUTOFF_REACHED({HARD_CUTOFF_HHMM})"
+        print("ORCH SKIP:", reason); log("SKIP", reason, legs); return 0
+
     if now < gate:
-        time.sleep((gate - now).total_seconds())
+        wait_until = gate if gate <= hard_cutoff else hard_cutoff
+        if now < wait_until:
+            time.sleep((wait_until - now).total_seconds())
+        if wait_until == hard_cutoff:
+            reason = f"HARD_CUTOFF_REACHED({HARD_CUTOFF_HHMM})"
+            print("ORCH SKIP:", reason); log("SKIP", reason, legs); return 0
         # quick refresh
         try:
             os.environ["GW_TIMEOUT"] = str(GW_REFRESH_TIMEOUT)
@@ -339,7 +359,12 @@ def main():
                     bp = to_osi(f".SPXW{exp6}P{p_low}"); sp = to_osi(f".SPXW{exp6}P{p_high}")
                     sc = to_osi(f".SPXW{exp6}C{c_low}"); bc = to_osi(f".SPXW{exp6}C{c_high}")
                     legs = orient(bp,sp,sc,bc)
-        except Exception: pass
+        except Exception:
+            pass
+
+    if datetime.now(ET) >= hard_cutoff:
+        reason = f"HARD_CUTOFF_REACHED({HARD_CUTOFF_HHMM})"
+        print("ORCH SKIP:", reason); log("SKIP", reason, legs); return 0
 
     # Positions + checks
     try: pos = positions_map(c, acct_hash)
