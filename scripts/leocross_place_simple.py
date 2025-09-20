@@ -625,6 +625,8 @@ def main():
     def wait_loop(secs: float):
         nonlocal filled_total
         # Always give Schwab at least MIN_RUNG_WAIT seconds; time-sliced above.
+        if _cutoff_reached():
+            return "TIMEOUT"
         t_end = time.time() + max(MIN_RUNG_WAIT, secs)
         while time.time() < t_end:
             if cutoff_reached(): return "CUTOFF"
@@ -645,7 +647,7 @@ def main():
         secs_eff = time_budget_secs(secs, remaining_rungs)
         vprint(f"RUNG → price={clamp_tick(px):.2f} to_place={to_place} wait≈{secs_eff:.2f}s")
         ensure_active(px, to_place)
-        st = wait_loop(secs_eff)
+        st = wait_loop(max(secs_eff, MIN_RUNG_WAIT))
         steps.append(f"{clamp_tick(px):.2f}@{to_place}")
         vprint(f"RUNG_DONE status={st} filled={filled_total}/{qty} active_oid={active_oid or 'NA'}")
         return st
@@ -691,7 +693,11 @@ def main():
     # ===== Build ladder (cycled) =====
     status = "WORKING"; cycles = 0
     _max_cycles = MAX_LADDER_CYCLES
-    while cycles < MAX_LADDER_CYCLES and filled_total < qty:
+    while cycles < _max_cycles and filled_total < qty:
+        if _cutoff_reached():
+            vprint("HARD_CUTOFF reached — breaking and sweeping cancels.")
+            status = "TIMEOUT"
+            break
         nbbo_bid, nbbo_ask, nbbo_mid = condor_nbbo(c, legs)
         if None in (nbbo_bid, nbbo_ask, nbbo_mid):
             vprint("NBBO unavailable — skipping cycle")
