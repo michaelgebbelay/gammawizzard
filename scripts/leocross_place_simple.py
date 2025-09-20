@@ -682,44 +682,41 @@ def main():
 
     # ===== Build ladder (cycled) =====
     status = "WORKING"; cycles = 0
+    _max_cycles = MAX_LADDER_CYCLES
     while cycles < MAX_LADDER_CYCLES and filled_total < qty:
         nbbo_bid, nbbo_ask, nbbo_mid = condor_nbbo(c, legs)
-        if nbbo_bid is None:
-            vprint("NBBO unavailable — aborting cycle")
+        if None in (nbbo_bid, nbbo_ask, nbbo_mid):
+            vprint("NBBO unavailable — skipping cycle")
             break
 
+        def _unique(seq):
+            seen=set(); out=[]
+            for x in seq:
+                if x not in seen:
+                    out.append(x); seen.add(x)
+            return out
+
         if is_credit:
-            # CREDIT: start at top (ASK), then MID, then MID-0.05, then MID-0.10
-            ladder = [
+            # SELL credit: highest first
+            ladder = _unique([
                 clamp_tick(nbbo_ask),
                 clamp_tick(nbbo_mid),
                 clamp_tick(max(0.05, nbbo_mid - 0.05)),
                 clamp_tick(max(0.05, nbbo_mid - 0.10)),
-            ]
-            vprint(f"CREDIT NBBO: bid={nbbo_bid:.2f} ask={nbbo_ask:.2f} mid={nbbo_mid:.2f}")
-            vprint(f"CYCLE {cycles+1}/{MAX_LADDER_CYCLES} ladder: {ladder}")
-            secs = STEP_WAIT_CREDIT
+            ])
+            vprint(f"CYCLE {cycles+1}/{_max_cycles} CREDIT ladder (ASK→MID→MID-5→MID-10): {ladder}")
         else:
-            # DEBIT default: start at ASK (marketable), then MID, then MID-0.05, then MID-0.10
-            if DEBIT_START == "BID":
-                ladder = [
-                    clamp_tick(max(0.05, nbbo_bid)),
-                    clamp_tick(max(0.05, nbbo_mid)),
-                    clamp_tick(max(0.05, nbbo_mid + 0.05)),
-                    clamp_tick(max(0.05, nbbo_mid + 0.10)),
-                ]
-                start_tag="BID"
-            else:
-                ladder = [
-                    clamp_tick(max(0.05, nbbo_ask)),
-                    clamp_tick(max(0.05, nbbo_mid)),
-                    clamp_tick(max(0.05, nbbo_mid - 0.05)),
-                    clamp_tick(max(0.05, nbbo_mid - 0.10)),
-                ]
-                start_tag="ASK"
-            vprint(f"DEBIT NBBO: bid={nbbo_bid:.2f} ask={nbbo_ask:.2f} mid={nbbo_mid:.2f} start={start_tag}")
-            vprint(f"CYCLE {cycles+1}/{MAX_LADDER_CYCLES} ladder: {ladder}")
-            secs = STEP_WAIT_DEBIT
+            # BUY debit: lowest first
+            ladder = _unique([
+                clamp_tick(max(0.05, nbbo_bid)),
+                clamp_tick(nbbo_mid),
+                clamp_tick(nbbo_mid + 0.05),
+                clamp_tick(nbbo_mid + 0.10),
+            ])
+            vprint(f"CYCLE {cycles+1}/{_max_cycles} DEBIT ladder (BID→MID→MID+5→MID+10): {ladder}")
+
+        # no intentional per‑rung wait; we rely on MIN_RUNG_WAIT for ACK settle
+        secs = 0
 
         # run the ladder
         for idx, price in enumerate(ladder):
