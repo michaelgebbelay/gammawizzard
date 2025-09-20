@@ -64,14 +64,16 @@ jobs:
           GW_PASSWORD: ${{ secrets.GW_PASSWORD }}
 
           # ===== Trading knobs (fast two-pass) =====
-          FAST_HOLD_SECONDS: "0"        # start immediately at the trigger
-          MAX_LADDER_CYCLES: "2"        # two passes; Leo refresh between passes
-          MAX_RUNTIME_SECS:  "115"      # entire placer budget
-          STEP_WAIT_CREDIT:  "0"        # no intentional delay per rung
-          STEP_WAIT_DEBIT:   "0"
-          MIN_RUNG_WAIT:     "0.75"     # minimal settle so Schwab can ack (do not set <0.6)
-          HARD_CUTOFF_HHMM:  "16:15"    # cancel-all sweep at/after 16:15 ET
+          
+          REPLACE_MODE: "CANCEL_REPLACE"  # keep as requested
+          STEP_WAIT_CREDIT: "5"           # ~5s dwell per rung (credit)
+          STEP_WAIT_DEBIT:  "5"           # ~5s dwell per rung (debit)
+          MIN_RUNG_WAIT:    "5"           # enforce minimum dwell ~5s
+          MAX_LADDER_CYCLES: "2"
+          MAX_RUNTIME_SECS:  "115"
+          HARD_CUTOFF_HHMM:  "16:15"
           CANCEL_SETTLE_SECS: "0.8"
+          FAST_HOLD_SECONDS: "0"        # start immediately at the trigger
 
           # Sizing / width (unchanged)
           CREDIT_DOLLARS_PER_CONTRACT: "12000"
