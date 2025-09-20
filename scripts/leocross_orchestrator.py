@@ -321,25 +321,31 @@ def main():
 
     # Optional gate (default 0s)
     now = datetime.now(ET)
-    gate = now.replace(hour=16, minute=13, second=0, microsecond=0) + timedelta(seconds=FAST_HOLD_SECONDS)
-    if now < gate:
-        time.sleep((gate - now).total_seconds())
-        # quick refresh
-        try:
-            os.environ["GW_TIMEOUT"] = str(GW_REFRESH_TIMEOUT)
-            api2 = gw_get_leocross(); tr2 = extract_trade(api2)
-            if tr2:
-                inner_put2 = int(float(tr2.get("Limit"))); inner_call2= int(float(tr2.get("CLimit")))
-                new_exp_iso = str(tr2.get("TDate",""))
-                if (inner_put2 != inner_put) or (inner_call2 != inner_call) or (new_exp_iso!=exp_iso):
-                    exp_iso = new_exp_iso; exp6 = yymmdd(exp_iso)
-                    inner_put, inner_call = inner_put2, inner_call2
-                    p_low,p_high = inner_put - width, inner_put
-                    c_low,c_high = inner_call, inner_call + width
-                    bp = to_osi(f".SPXW{exp6}P{p_low}"); sp = to_osi(f".SPXW{exp6}P{p_high}")
-                    sc = to_osi(f".SPXW{exp6}C{c_low}"); bc = to_osi(f".SPXW{exp6}C{c_high}")
-                    legs = orient(bp,sp,sc,bc)
-        except Exception: pass
+    if FAST_HOLD_SECONDS > 0:
+        gate = now.replace(hour=16, minute=13, second=0, microsecond=0) + timedelta(seconds=FAST_HOLD_SECONDS)
+        if now < gate:
+            wait_s = int((gate - now).total_seconds())
+            print(f"ORCH GATE sleep {wait_s}s (FAST_HOLD_SECONDS={FAST_HOLD_SECONDS})")
+            time.sleep((gate - now).total_seconds())
+    else:
+        print("ORCH GATE disabled (FAST_HOLD_SECONDS=0)")
+
+    # quick refresh (low latency)
+    try:
+        os.environ["GW_TIMEOUT"] = str(GW_REFRESH_TIMEOUT)
+        api2 = gw_get_leocross(); tr2 = extract_trade(api2)
+        if tr2:
+            inner_put2 = int(float(tr2.get("Limit"))); inner_call2= int(float(tr2.get("CLimit")))
+            new_exp_iso = str(tr2.get("TDate",""))
+            if (inner_put2 != inner_put) or (inner_call2 != inner_call) or (new_exp_iso!=exp_iso):
+                exp_iso = new_exp_iso; exp6 = yymmdd(exp_iso)
+                inner_put, inner_call = inner_put2, inner_call2
+                p_low,p_high = inner_put - width, inner_put
+                c_low,c_high = inner_call, inner_call + width
+                bp = to_osi(f".SPXW{exp6}P{p_low}"); sp = to_osi(f".SPXW{exp6}P{p_high}")
+                sc = to_osi(f".SPXW{exp6}C{c_low}"); bc = to_osi(f".SPXW{exp6}C{c_high}")
+                legs = orient(bp,sp,sc,bc)
+    except Exception: pass
 
     # Positions + checks
     try: pos = positions_map(c, acct_hash)
