@@ -36,6 +36,14 @@ RAW_TAB = "sw_txn_raw"
 PERF_TAB = "sw_performance_summary"
 EDGE_RISK_UNIT = 100.0
 
+
+def env_flag(name: str, default: bool = False) -> bool:
+    """Return True when the env var is set to a truthy value."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on", "y"}
+
 RAW_HEADERS = [
     "ts","txn_id","type","sub_type","description",
     "symbol","underlying","exp_primary","strike","put_call",
@@ -671,6 +679,8 @@ def main() -> int:
         print(f"ABORT: Sheets init failed — {e}")
         return 1
 
+    skip_summary = env_flag("SCHWAB_SKIP_SUMMARY", False)
+
     try:
         c, acct_hash = schwab_client()
     except Exception as e:
@@ -706,7 +716,10 @@ def main() -> int:
     existing_rows = read_existing_rows(svc, sid, RAW_TAB, RAW_HEADERS)
     merged_rows = merge_rows(existing_rows, all_rows, RAW_HEADERS)
     overwrite_rows(svc, sid, RAW_TAB, RAW_HEADERS, merged_rows)
-    write_simple_summary_from_raw(svc, sid)
+    if skip_summary:
+        print("NOTE: SCHWAB_SKIP_SUMMARY set — skipping summary generation.")
+    else:
+        write_simple_summary_from_raw(svc, sid)
     print(
         f"OK: merged {len(all_rows)} rows from {len(txns)} ledger activities into {RAW_TAB}."
     )
