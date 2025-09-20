@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # VERSION: 2025-10-07 v2.9.0 — Placer (top‑down ask/mid ladders + 16:15 hard cutoff)
 # - CREDIT: ASK → MID → MID-0.05 → MID-0.10 (descending credit)
-# - DEBIT:  ASK → MID → MID-0.05 → MID-0.10 (default)  | set DEBIT_START=BID to use BID → MID → MID+0.05 → MID+0.10
+# - DEBIT:  BID → MID → MID+0.05 → MID+0.10 (ascending debit)
 # - No intentional waiting between rungs (only minimal settle so Schwab can ack fills)
 # - Auto time-slices waits to finish all rungs inside MAX_RUNTIME_SECS
 # - Hard cutoff at 16:15 ET: cancel everything and sweep residual working orders
@@ -37,12 +37,14 @@ def _as_float_list(env_name: str, default: Iterable[float]) -> List[float]:
         except Exception: continue
     return out or list(default)
 
-STEP_WAIT_CREDIT = _as_float("STEP_WAIT_CREDIT", "0")   # << no intentional delay
-STEP_WAIT_DEBIT  = _as_float("STEP_WAIT_DEBIT",  "0")
 FINAL_CANCEL     = True
 
-# Minimal per‑rung settle so Schwab can acknowledge (don’t set below ~0.6s)
-MIN_RUNG_WAIT    = _as_float("MIN_RUNG_WAIT", "0.75")
+try:
+    MIN_RUNG_WAIT = float(os.environ.get("MIN_RUNG_WAIT", "0"))  # secs to keep each rung alive for ACK
+except (TypeError, ValueError):
+    MIN_RUNG_WAIT = 0.0
+MIN_RUNG_WAIT = max(0.0, MIN_RUNG_WAIT)
+HARD_CUTOFF_HHMM  = os.environ.get("HARD_CUTOFF_HHMM", "16:15").strip()
 
 # Sizing knobs
 CREDIT_DOLLARS_PER_CONTRACT = float(os.environ.get("CREDIT_DOLLARS_PER_CONTRACT", "12000"))
@@ -66,12 +68,6 @@ MAX_RUNTIME_SECS  = _as_float("MAX_RUNTIME_SECS","115")
 WINDOW_STATUSES   = {"WORKING","QUEUED","OPEN","PENDING_ACTIVATION","ACCEPTED","RECEIVED"}
 ACTIVE_STATUSES   = WINDOW_STATUSES | {"PENDING_CANCEL","CANCEL_REQUESTED","PENDING_REPLACE"}
 CANCEL_SETTLE_SECS = float(os.environ.get("CANCEL_SETTLE_SECS","0.8"))
-
-# Side-specific anchors
-DEBIT_START = (os.environ.get("DEBIT_START","ASK") or "ASK").upper()  # ASK (default) or BID
-
-# Hard cutoff (ET)
-HARD_CUTOFF_HHMM = os.environ.get("HARD_CUTOFF_HHMM","16:15").strip()
 
 GW_BASE = "https://gandalf.gammawizard.com"
 GW_ENDPOINT = "/rapi/GetLeoCross"
@@ -490,7 +486,7 @@ def main():
         one_log(svc, sheet_id_num, sheet_id, "schwab", row); print("qty<1"); sys.exit(0)
 
     print(f"PLACER START mode={MODE} is_credit={is_credit} width={width} qty={qty} oc={oc}")
-    print(f"LADDER CONFIG anchored ask/mid, wait={STEP_WAIT_CREDIT if is_credit else STEP_WAIT_DEBIT:.1f}s (min {MIN_RUNG_WAIT:.2f}s), cycles={MAX_LADDER_CYCLES} replace={REPLACE_MODE} cutoff={HARD_CUTOFF_HHMM} ET")
+    print(f"LADDER CONFIG credit=ASK→MID→MID-0.05→MID-0.10 debit=BID→MID→MID+0.05→MID+0.10 settle≥{MIN_RUNG_WAIT:.2f}s cycles={MAX_LADDER_CYCLES} replace={REPLACE_MODE} cutoff={HARD_CUTOFF_HHMM} ET")
 
     def get_status(oid: str) -> dict:
         url=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
@@ -544,14 +540,15 @@ def main():
     START_TS = time.time()
 
     def time_budget_secs(base_secs: float, remaining_rungs: int) -> float:
-        # Shrink waits to finish entire plan inside MAX_RUNTIME_SECS
+        # Shrink waits to finish entire plan inside MAX_RUNTIME_SECS while keeping a minimal settle
         elapsed = time.time() - START_TS
         left = max(0.0, MAX_RUNTIME_SECS - elapsed)
         buffer = 0.8 * remaining_rungs  # cancel/replace overhead
         usable = max(0.0, left - buffer)
-        target = base_secs
+        base = max(base_secs, MIN_RUNG_WAIT)
+        target = base
         if remaining_rungs > 0 and usable > 0:
-            target = min(base_secs, usable / remaining_rungs)
+            target = min(base, usable / remaining_rungs)
         return max(MIN_RUNG_WAIT, target)
 
     def order_payload(price: float, q: int):
@@ -616,7 +613,7 @@ def main():
 
     def wait_loop(secs: float):
         nonlocal filled_total
-        # Always give Schwab at least MIN_RUNG_WAIT seconds; time-sliced above.
+        # Keep each rung alive long enough for Schwab to acknowledge (if MIN_RUNG_WAIT > 0).
         t_end = time.time() + max(MIN_RUNG_WAIT, secs)
         while time.time() < t_end:
             if cutoff_reached(): return "CUTOFF"
@@ -636,6 +633,9 @@ def main():
         if to_place==0: return "FILLED"
         secs_eff = time_budget_secs(secs, remaining_rungs)
         vprint(f"RUNG → price={clamp_tick(px):.2f} to_place={to_place} wait≈{secs_eff:.2f}s")
+        if cutoff_reached():
+            vprint("RUNG abort: cutoff reached before placement")
+            return "CUTOFF"
         ensure_active(px, to_place)
         st = wait_loop(secs_eff)
         steps.append(f"{clamp_tick(px):.2f}@{to_place}")
@@ -683,43 +683,36 @@ def main():
     # ===== Build ladder (cycled) =====
     status = "WORKING"; cycles = 0
     while cycles < MAX_LADDER_CYCLES and filled_total < qty:
+        if cutoff_reached():
+            status = "CUTOFF"
+            break
         nbbo_bid, nbbo_ask, nbbo_mid = condor_nbbo(c, legs)
         if nbbo_bid is None:
             vprint("NBBO unavailable — aborting cycle")
             break
 
         if is_credit:
-            # CREDIT: start at top (ASK), then MID, then MID-0.05, then MID-0.10
+            # CREDIT: ASK → MID → MID-0.05 → MID-0.10
             ladder = [
                 clamp_tick(nbbo_ask),
                 clamp_tick(nbbo_mid),
-                clamp_tick(max(0.05, nbbo_mid - 0.05)),
-                clamp_tick(max(0.05, nbbo_mid - 0.10)),
+                clamp_tick(max(TICK, nbbo_mid - TICK)),
+                clamp_tick(max(TICK, nbbo_mid - 2 * TICK)),
             ]
             vprint(f"CREDIT NBBO: bid={nbbo_bid:.2f} ask={nbbo_ask:.2f} mid={nbbo_mid:.2f}")
             vprint(f"CYCLE {cycles+1}/{MAX_LADDER_CYCLES} ladder: {ladder}")
-            secs = STEP_WAIT_CREDIT
+            secs = 0.0
         else:
-            # DEBIT default: start at ASK (marketable), then MID, then MID-0.05, then MID-0.10
-            if DEBIT_START == "BID":
-                ladder = [
-                    clamp_tick(max(0.05, nbbo_bid)),
-                    clamp_tick(max(0.05, nbbo_mid)),
-                    clamp_tick(max(0.05, nbbo_mid + 0.05)),
-                    clamp_tick(max(0.05, nbbo_mid + 0.10)),
-                ]
-                start_tag="BID"
-            else:
-                ladder = [
-                    clamp_tick(max(0.05, nbbo_ask)),
-                    clamp_tick(max(0.05, nbbo_mid)),
-                    clamp_tick(max(0.05, nbbo_mid - 0.05)),
-                    clamp_tick(max(0.05, nbbo_mid - 0.10)),
-                ]
-                start_tag="ASK"
-            vprint(f"DEBIT NBBO: bid={nbbo_bid:.2f} ask={nbbo_ask:.2f} mid={nbbo_mid:.2f} start={start_tag}")
+            # DEBIT: BID → MID → MID+0.05 → MID+0.10
+            ladder = [
+                clamp_tick(max(TICK, nbbo_bid)),
+                clamp_tick(max(TICK, nbbo_mid)),
+                clamp_tick(max(TICK, nbbo_mid + TICK)),
+                clamp_tick(max(TICK, nbbo_mid + 2 * TICK)),
+            ]
+            vprint(f"DEBIT NBBO: bid={nbbo_bid:.2f} ask={nbbo_ask:.2f} mid={nbbo_mid:.2f} start=BID")
             vprint(f"CYCLE {cycles+1}/{MAX_LADDER_CYCLES} ladder: {ladder}")
-            secs = STEP_WAIT_DEBIT
+            secs = 0.0
 
         # run the ladder
         for idx, price in enumerate(ladder):
