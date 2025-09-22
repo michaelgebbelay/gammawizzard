@@ -6,7 +6,7 @@ on:
       days_back:
         description: "Days of history to pull (default 5)"
         required: false
-        default: "5"
+        default: "130"
       acc_reset:
         description: "Reset accumulator this run? (1=yes, 0=no)"
         required: false
