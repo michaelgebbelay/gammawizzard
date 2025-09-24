@@ -636,6 +636,7 @@ def rows_from_ledger_txn(txn: Dict[str, Any]) -> List[List[Any]]:
 
     rows: List[List[Any]] = []
     seen_leg = set()  # prevent duplicates within the same ledger activity
+    did_attach_totals = False  # ensure net/fees only emitted once per ledger txn
 
     for it in (txn.get("transferItems") or []):
         inst = it.get("instrument") or {}
@@ -669,11 +670,22 @@ def rows_from_ledger_txn(txn: Dict[str, Any]) -> List[List[Any]]:
             continue
         seen_leg.add(leg_key)
 
+        # attach ledger-level totals/net ONCE (first option leg)
+        if not did_attach_totals:
+            net_for_row = txn.get("netAmount") if txn.get("netAmount") is not None else ""
+            comm_for_row = comm_total or ""
+            fees_for_row = fees_total or ""
+            did_attach_totals = True
+        else:
+            net_for_row = ""
+            comm_for_row = ""
+            fees_for_row = ""
+
         rows.append([
             ts, txn_id_for_sheet, ttype, subtype, desc,
             symbol, underlying, (exp_primary or ""), (strike if strike is not None else ""), pc,
             (qty if qty is not None else ""), (price if price is not None else ""), (amt if amt is not None else ""),
-            (txn.get("netAmount") if txn.get("netAmount") is not None else ""), comm_total or "", fees_total or "",
+            net_for_row, comm_for_row, fees_for_row,
             "schwab_ledger", ledger_id
         ])
 
