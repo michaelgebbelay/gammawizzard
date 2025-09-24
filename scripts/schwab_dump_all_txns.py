@@ -20,10 +20,10 @@ Env:
 Output tab: sw_txn_raw with RAW_HEADERS below
 """
 
-import calendar
+import math
 import os, sys, json, base64, re, time
 from datetime import datetime, timedelta, timezone, date
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 from schwab.auth import client_from_token_file
@@ -276,69 +276,156 @@ def max_drawdown(pnls: List[float]) -> float:
 
 
 def compute_stats(pnls: List[float]) -> Dict[str, Any]:
+    pnls = [float(x) for x in pnls if x is not None]
     count = len(pnls)
     total = round(sum(pnls), 2)
     wins = sum(1 for v in pnls if v > 0)
     win_rate = (wins / count * 100.0) if count else 0.0
-    edge = (total / (count * EDGE_RISK_UNIT)) if count else 0.0
+    expectancy = (total / count) if count else 0.0
+    edge = (expectancy / EDGE_RISK_UNIT) if count else 0.0
     dd = max_drawdown(pnls) if count else 0.0
     factor = (total / dd) if dd else 0.0
+    sum_wins = sum(v for v in pnls if v > 0)
+    sum_losses = sum(v for v in pnls if v < 0)
+    if sum_losses < 0:
+        profit_factor = (sum_wins / abs(sum_losses)) if sum_wins else 0.0
+    else:
+        profit_factor = None
+    recovery_factor = (total / dd) if dd else None
+    sharpe = None
+    if count >= 2:
+        mean = total / count
+        variance = sum((v - mean) ** 2 for v in pnls) / (count - 1)
+        std_dev = math.sqrt(variance) if variance > 0 else 0.0
+        if std_dev > 0:
+            sharpe = mean / std_dev
     return {
         "count": count,
         "total": total,
         "wins": wins,
         "win_rate": win_rate,
         "edge": edge,
+        "expectancy": expectancy,
         "max_drawdown": round(dd, 2),
         "factor": round(factor, 2) if factor else 0.0,
+        "profit_factor": profit_factor,
+        "expectancy_per_unit_risk": edge,
+        "recovery_factor": recovery_factor,
+        "sharpe": sharpe,
     }
 
 
-def fmt_number(val: Optional[float]) -> str:
+def fmt_currency(val: Optional[float]) -> str:
     if val is None:
-        return "NA"
+        return "#DIV/0!"
     try:
         fval = float(val)
     except Exception:
         return str(val)
-    if abs(fval) < 1e-9:
-        fval = 0.0
-    if abs(fval - round(fval)) < 1e-9:
-        return str(int(round(fval)))
-    return f"{fval:.2f}"
+    if not math.isfinite(fval):
+        return "#DIV/0!"
+    sign = "-" if fval < 0 else ""
+    return f"{sign}$ {abs(fval):,.2f}"
 
 
-def fmt_edge(val: float) -> str:
-    text = f"{val:.7f}"
+def fmt_decimal(val: Optional[float], digits: int = 2) -> str:
+    if val is None:
+        return "#DIV/0!"
+    try:
+        fval = float(val)
+    except Exception:
+        return str(val)
+    if not math.isfinite(fval):
+        return "#DIV/0!"
+    text = f"{fval:.{digits}f}"
     text = text.rstrip("0").rstrip(".")
     return text or "0"
 
 
-def fmt_percent(val: float) -> str:
-    text = f"{val:.2f}"
+def fmt_percent(val: Optional[float]) -> str:
+    if val is None:
+        return "#DIV/0!"
+    try:
+        fval = float(val)
+    except Exception:
+        return str(val)
+    if not math.isfinite(fval):
+        return "#DIV/0!"
+    text = f"{fval:.2f}"
     text = text.rstrip("0").rstrip(".")
     return f"{text}%"
 
 
+def fmt_edge_expectancy(stats: Dict[str, Any]) -> str:
+    if not stats.get("count"):
+        return "#DIV/0!"
+    expectancy = stats.get("expectancy")
+    edge = stats.get("edge")
+    if expectancy is None or edge is None or not math.isfinite(edge):
+        return "#DIV/0!"
+    edge_text = fmt_decimal(edge, digits=4)
+    expect_text = fmt_currency(expectancy)
+    if edge_text == "#DIV/0!" or expect_text == "#DIV/0!":
+        return "#DIV/0!"
+    return f"{edge_text} / {expect_text}"
+
+
 def build_performance_summary_rows(values: List[List[Any]]) -> List[List[Any]]:
+    header_row = ["Last 10 trades", "Last 20 trades", "", "Category", "Last 10", "Last 20"]
+
+    def summary_section(stats10: Dict[str, Any], stats20: Dict[str, Any]) -> List[List[Any]]:
+        def currency_value(stats: Dict[str, Any], key: str) -> str:
+            if not stats.get("count"):
+                return "#DIV/0!"
+            return fmt_currency(stats.get(key))
+
+        def percent_value(stats: Dict[str, Any], key: str) -> str:
+            if not stats.get("count"):
+                return "#DIV/0!"
+            return fmt_percent(stats.get(key))
+
+        def decimal_value(stats: Dict[str, Any], key: str, digits: int = 2) -> str:
+            if not stats.get("count"):
+                return "#DIV/0!"
+            return fmt_decimal(stats.get(key), digits=digits)
+
+        rows = [["", "", "", "Category", "Last 10", "Last 20"]]
+        rows.append(["", "", "", "Total profit", currency_value(stats10, "total"), currency_value(stats20, "total")])
+        rows.append(["", "", "", "Win rate", percent_value(stats10, "win_rate"), percent_value(stats20, "win_rate")])
+        rows.append(["", "", "", "Profit factor", decimal_value(stats10, "profit_factor"), decimal_value(stats20, "profit_factor")])
+        rows.append(["", "", "", "Edge / Expectancy per trade", fmt_edge_expectancy(stats10), fmt_edge_expectancy(stats20)])
+        rows.append(["", "", "", "Max drawdown", currency_value(stats10, "max_drawdown"), currency_value(stats20, "max_drawdown")])
+        rows.append(["", "", "", "Expectancy per unit risk", decimal_value(stats10, "expectancy_per_unit_risk", digits=4), decimal_value(stats20, "expectancy_per_unit_risk", digits=4)])
+        rows.append(["", "", "", "Recovery factor", decimal_value(stats10, "recovery_factor"), decimal_value(stats20, "recovery_factor")])
+        rows.append(["", "", "", "Sharpe per trade", decimal_value(stats10, "sharpe", digits=2), decimal_value(stats20, "sharpe", digits=2)])
+        return rows
+
     if len(values) <= 1:
-        return [["Monthly performance"], ["No trade data available"]]
+        empty_stats = compute_stats([])
+        rows: List[List[Any]] = [header_row, ["No trade data available", "", "", "", "", ""]]
+        rows.extend(summary_section(empty_stats, empty_stats))
+        return rows
 
     header = values[0]
     try:
         i_ts = header.index("ts")
         i_net = header.index("net_amount")
     except ValueError:
-        return [["Monthly performance"], ["Missing expected columns"]]
+        empty_stats = compute_stats([])
+        rows = [header_row, ["Missing expected columns", "", "", "", "", ""]]
+        rows.extend(summary_section(empty_stats, empty_stats))
+        return rows
 
     i_ledger = header.index("ledger_id") if "ledger_id" in header else -1
     i_txn = header.index("txn_id") if "txn_id" in header else -1
     i_exp = header.index("exp_primary") if "exp_primary" in header else -1
+    max_index = max(0, i_ts, i_net, i_ledger, i_txn, i_exp)
 
     trades: Dict[str, Dict[str, Any]] = {}
-    for row in values[1:]:
-        if max(i_ts, i_net, i_ledger, i_txn) >= len(row):
-            row = list(row) + [""] * (max(i_ts, i_net, i_ledger, i_txn) + 1 - len(row))
+    for raw_row in values[1:]:
+        row = list(raw_row)
+        if len(row) <= max_index:
+            row.extend([""] * (max_index + 1 - len(row)))
         ledger = ""
         if 0 <= i_ledger < len(row):
             ledger = str(row[i_ledger]).strip()
@@ -360,40 +447,47 @@ def build_performance_summary_rows(values: List[List[Any]]) -> List[List[Any]]:
         entry = trades.setdefault(ledger, {"net": None, "ts": None, "exp": None})
         entry["net"] = net
         if dt is not None:
-            if entry["ts"] is None or dt < entry["ts"]:
+            current_ts = entry.get("ts")
+            if current_ts is None or (isinstance(current_ts, datetime) and dt < current_ts):
                 entry["ts"] = dt
-        if exp_date is not None and entry.get("exp") is None:
+        if exp_date is not None:
             entry["exp"] = exp_date
 
-    trade_list = []
-    for k, v in trades.items():
-        if v.get("net") is None:
+    trade_list: List[Dict[str, Any]] = []
+    for ledger, info in trades.items():
+        net = info.get("net")
+        if net is None:
             continue
-        ts = v.get("ts")
+        ts = info.get("ts")
         if isinstance(ts, datetime):
-            ts_et = ts.astimezone(ET) if ts.tzinfo else ts
-            ts_date = ts_et.date()
+            ts_et = ts.astimezone(ET) if ts.tzinfo else ts.replace(tzinfo=ET)
         else:
-            ts_date = None
-        exp_date = v.get("exp") if isinstance(v.get("exp"), date) else None
-        trade_date = exp_date or ts_date
+            ts_et = None
+        exp_date = info.get("exp") if isinstance(info.get("exp"), date) else None
+        trade_date = exp_date
+        if not trade_date and isinstance(ts_et, datetime):
+            trade_date = ts_et.date()
         trade_list.append(
             {
-                "ledger": k,
-                "net": float(v["net"]),
-                "ts": ts,
+                "ledger": ledger,
+                "net": float(net),
+                "ts": ts_et,
                 "exp": exp_date,
                 "date": trade_date,
             }
         )
+
     if not trade_list:
-        return [["Monthly performance"], ["No trade data available"]]
+        empty_stats = compute_stats([])
+        rows = [header_row, ["No trade data available", "", "", "", "", ""]]
+        rows.extend(summary_section(empty_stats, empty_stats))
+        return rows
 
     trade_list.sort(key=lambda item: (item.get("date") or date.min, item["ledger"]))
 
     cutoff_date = et_yesterday_date()
 
-    filtered_trades = []
+    filtered_trades: List[Dict[str, Any]] = []
     for t in trade_list:
         exp_date = t.get("exp")
         trade_date = t.get("date")
@@ -405,83 +499,45 @@ def build_performance_summary_rows(values: List[List[Any]]) -> List[List[Any]]:
         filtered_trades.append(t)
 
     if not filtered_trades:
-        return [["Monthly performance"], ["No trade data available"]]
+        empty_stats = compute_stats([])
+        rows = [header_row, ["No trade data available", "", "", "", "", ""]]
+        rows.extend(summary_section(empty_stats, empty_stats))
+        return rows
 
     pnls = [float(t["net"]) for t in filtered_trades]
-
-    monthly: Dict[Tuple[int, int], float] = {}
-    years: List[int] = []
-    for t in filtered_trades:
-        trade_date = t.get("date")
-        if not isinstance(trade_date, date):
-            continue
-        year = trade_date.year
-        month = trade_date.month
-        monthly[(year, month)] = round(monthly.get((year, month), 0.0) + float(t["net"]), 2)
-        if year not in years:
-            years.append(year)
-
-    years.sort()
-    if not years:
-        years = []
-    years_to_show = years[-2:] if len(years) > 2 else years
-
-    rows: List[List[Any]] = [["Monthly performance"]]
-    if years_to_show:
-        header_row = ["Month"] + [str(y) for y in years_to_show]
-        rows.append(header_row)
-        for m in range(1, 13):
-            row = [calendar.month_abbr[m]]
-            for y in years_to_show:
-                val = monthly.get((y, m))
-                row.append(val if val is not None else "NA")
-            rows.append(row)
-    else:
-        rows.append(["Month"])
-        rows.append(["(no dated trades)"])
-
-    rows.append([])
-
-    stats_all = compute_stats(pnls)
     stats_last10 = compute_stats(pnls[-10:])
     stats_last20 = compute_stats(pnls[-20:])
 
-    now_et = datetime.now(ET)
-    pnls_ytd = [
-        float(t["net"])
-        for t in filtered_trades
-        if isinstance(t.get("date"), date) and t["date"].year == now_et.year
-    ]
-    stats_ytd = compute_stats(pnls_ytd)
+    recent_trades = list(reversed(filtered_trades))
+    last10 = recent_trades[:10]
+    last20 = recent_trades[:20]
 
-    def stats_block(label: str, stats: Dict[str, Any]) -> List[List[str]]:
-        if not stats.get("count"):
-            return [[f"Total profit {label} = N/A (no trades)"]]
-        total = fmt_number(stats["total"])
-        edge = fmt_edge(float(stats["edge"]))
-        dd = fmt_number(stats["max_drawdown"])
-        factor = fmt_number(stats["factor"])
-        win = fmt_percent(float(stats["win_rate"]))
-        return [
-            [f"Total profit {label} = {total} Edge= {edge} Max Drawdown = {dd}"],
-            [f"Factor = {factor} Win rate = {win}"],
-        ]
+    def trade_entry_string(trade: Dict[str, Any]) -> str:
+        trade_date = trade.get("date")
+        if isinstance(trade_date, date):
+            date_text = trade_date.isoformat()
+        else:
+            ts_val = trade.get("ts")
+            if isinstance(ts_val, datetime):
+                ts_et = ts_val.astimezone(ET) if ts_val.tzinfo else ts_val
+                date_text = ts_et.date().isoformat()
+            else:
+                date_text = ""
+        pnl_text = fmt_currency(trade.get("net"))
+        return f"{date_text} — {pnl_text}".strip()
 
-    rows.extend(stats_block("last 10 trades", stats_last10))
-    rows.extend(stats_block("last 20 trades", stats_last20))
-    rows.extend(stats_block("Year To Date", stats_ytd))
+    rows = [header_row]
+    max_rows = max(len(last20), len(last10))
+    for idx in range(max_rows):
+        row = []
+        row.append(trade_entry_string(last10[idx]) if idx < len(last10) else "")
+        row.append(trade_entry_string(last20[idx]) if idx < len(last20) else "")
+        row.append("")
+        row.extend(["", "", ""])
+        rows.append(row)
 
-    if stats_all.get("count"):
-        rows.append([])
-        hist_win = fmt_percent(float(stats_all["win_rate"]))
-        hist_win_display = hist_win[:-1] if hist_win.endswith("%") else hist_win
-        rows.append([f"Historical Win rate: {hist_win_display}"])
-        total_all = fmt_number(stats_all["total"])
-        total_dd = fmt_number(stats_all["max_drawdown"])
-        rows.append([f"Total Profit: {total_all} Total Max DD = {total_dd}"])
-    else:
-        rows.append(["No historical trade data available."])
-
+    rows.append(["", "", "", "", "", ""])
+    rows.extend(summary_section(stats_last10, stats_last20))
     return rows
 
 
