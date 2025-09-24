@@ -681,48 +681,87 @@ def rows_from_ledger_txn(txn: Dict[str, Any]) -> List[List[Any]]:
 
 
 def write_simple_summary_from_raw(svc, sid, src_tab=RAW_TAB, out_tab="sw_txn_summary"):
-    # Pull raw values
+    # Pull raw values (through ledger_id col R)
+    last_col = chr(ord("A") + len(RAW_HEADERS) - 1)  # "R"
     resp = svc.spreadsheets().values().get(
-        spreadsheetId=sid, range=f"{src_tab}!A1:Q"
+        spreadsheetId=sid, range=f"{src_tab}!A1:{last_col}"
     ).execute()
     values = resp.get("values", [])
-    # Ensure tab + header even if empty
+
     headers = ["exp_primary", "net_amount_sum"]
     ensure_tab_with_header(svc, sid, out_tab, headers)
+
+    # Always refresh performance summary alongside
     write_performance_summary_from_raw(svc, sid, values)
+
     if len(values) <= 1:
         overwrite_rows(svc, sid, out_tab, headers, [])
         return
 
     header = values[0]
-    # robust lookup by name
+    # indices
     try:
+        i_ledger = header.index("ledger_id")
         i_exp = header.index("exp_primary")
         i_net = header.index("net_amount")
+        i_ts = header.index("ts")
     except ValueError:
-        # If headers are off, just leave summary empty rather than crashing
         overwrite_rows(svc, sid, out_tab, headers, [])
         return
 
-    # Group sum(net_amount) by exp_primary
-    cutoff_date = et_yesterday_date()
+    cutoff = et_yesterday_date()
+
+    # First, collapse to 1 row per ledger with: net, exp (or trade date)
+    by_ledger: Dict[str, Dict[str, Any]] = {}
+    for raw in values[1:]:
+        row = list(raw)
+        # pad
+        need = max(i_ledger, i_exp, i_net, i_ts) + 1
+        if len(row) < need:
+            row += [""] * (need - len(row))
+
+        ledger = str(row[i_ledger]).strip()
+        if not ledger:
+            continue
+
+        entry = by_ledger.get(ledger) or {"net": None, "exp": None, "date": None}
+
+        # capture net when present (we now put it on the first leg only)
+        if entry["net"] is None:
+            net = safe_float(row[i_net])
+            if net is not None:
+                entry["net"] = float(net)
+
+        # capture expiry/trade date if not set
+        if entry["exp"] is None:
+            e = parse_sheet_date(row[i_exp])
+            if e is not None:
+                entry["exp"] = e
+        if entry["date"] is None:
+            dt = parse_sheet_datetime(row[i_ts])
+            if isinstance(dt, datetime):
+                if dt.tzinfo is not None:
+                    dt = dt.astimezone(ET)
+                entry["date"] = dt.date()
+
+        by_ledger[ledger] = entry
+
+    # Group by chosen date (expiry if present, else trade date)
     sums: Dict[date, float] = {}
-    for r in values[1:]:
-        # pad row so indexing is safe
-        if len(r) < max(i_exp, i_net) + 1:
+    for entry in by_ledger.values():
+        net = entry.get("net")
+        if net is None:
             continue
-        exp_raw = r[i_exp] if i_exp < len(r) else ""
-        exp_date = parse_sheet_date(exp_raw)
-        if exp_date is None:
+        d = entry.get("exp") or entry.get("date")
+        if not isinstance(d, date):
             continue
-        if exp_date > cutoff_date:
+        if d > cutoff:
             continue
-        net = safe_float(r[i_net]) or 0.0
-        sums[exp_date] = round(sums.get(exp_date, 0.0) + net, 2)
+        sums[d] = round(sums.get(d, 0.0) + float(net), 2)
 
-    summary_entries = sorted(sums.items(), key=lambda item: item[0], reverse=True)
-    summary_rows = [[dt.isoformat(), total] for dt, total in summary_entries]
-
+    # Write
+    summary_entries = sorted(sums.items(), key=lambda kv: kv[0], reverse=True)
+    summary_rows = [[d.isoformat(), total] for d, total in summary_entries]
     overwrite_rows(svc, sid, out_tab, headers, summary_rows)
 
 
