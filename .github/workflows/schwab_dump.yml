@@ -42,11 +42,11 @@ jobs:
           BACKFILL_YTD: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.backfill_ytd == 'true' && '1' || '0') || '0' }}
           DAYS_BACK: ${{ github.event.inputs.days_back != '' && github.event.inputs.days_back || '4' }}
         run: |
-          python scripts/sw_dump_raw.py
+          python scripts/data/sw_dump_raw.py
       - name: 3-way expiry summary (Leo vs Standard vs Adjusted)
         env:
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           UNIT_RISK: "4500"
         run: |
-          python scripts/sw_3way_summary.py
+          python scripts/data/sw_3way_summary.py
