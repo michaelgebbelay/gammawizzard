@@ -89,4 +89,4 @@ jobs:
           VERBOSE: "1"
           PYTHONUNBUFFERED: "1"
         run: |
-          python scripts/leocross_orchestrator.py
+          python scripts/trade/leocross_orchestrator.py

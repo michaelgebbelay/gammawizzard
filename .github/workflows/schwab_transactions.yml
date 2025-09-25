@@ -45,4 +45,4 @@ jobs:
           DAYS_BACK: ${{ github.event.inputs.days_back != '' && github.event.inputs.days_back || '5' }}
           SCHWAB_SKIP_SUMMARY: "0"
         run: |
-          python scripts/schwab_dump_all_txns.py
+          python scripts/data/schwab_dump_all_txns.py
