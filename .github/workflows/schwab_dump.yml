@@ -56,10 +56,14 @@ jobs:
           # or GW_TOKEN instead of GW_EMAIL/GW_PASSWORD
         run: |
           python scripts/data/gw_leo_to_sheet.py
-      - name: 3-way expiry summary (Leo vs Standard vs Adjusted)
+      - name: 3-way expiry summary (Std+Adj from raw; Leo/Std P&L waits for settle)
         env:
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           UNIT_RISK: "4500"
+          ORIG_ET_START: "16:00"
+          ORIG_ET_END: "16:20"
+          ORIG_DAYS_BEFORE: "1"
+          ALLOCATE_MULTI_EXP: "1"
         run: |
           python scripts/data/sw_3way_summary.py
