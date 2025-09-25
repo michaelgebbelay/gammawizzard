@@ -435,7 +435,7 @@ def main():
     env["PLACER_MODE"]  = "MANUAL"
     env["VERBOSE"]      = env.get("VERBOSE","1")
     print(f"ORCH CALL → PLACER QTY_OVERRIDE={env['QTY_OVERRIDE']} MODE={env['PLACER_MODE']}")
-    rc = os.spawnve(os.P_WAIT, sys.executable, [sys.executable, "scripts/leocross_place_simple.py"], env)
+    rc = os.spawnve(os.P_WAIT, sys.executable, [sys.executable, "scripts/trade/leocross_place_simple.py"], env)
     return rc
 
 if __name__ == "__main__":
