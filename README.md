@@ -32,7 +32,7 @@ A. Orchestrator (guard + runner) — scripts/leocross_orchestrator.py
 	•	Backoff/retry on Schwab HTTP calls.
 	•	Per‑run lock (based on GITHUB_RUN_ID) + duplicate‑main sentinel so it can’t run twice inside a single job even if the file is ever pasted twice by mistake.
 
-B. Placer (ladder) — scripts/leocross_place_simple.py
+B. Placer (ladder) — scripts/trade/leocross_place_simple.py
 	•	Takes the four legs from LeoCross.
 	•	Quantity: uses QTY_OVERRIDE if present; otherwise a hard‑coded constant at the top of the file (set to 4 as you asked). No OBP sizing. No balance checks.
 	•	Cancel/replace ladder (one cycle):
@@ -91,7 +91,7 @@ Secrets (GitHub → Settings → Secrets and variables → Actions):
 	•	GOOGLE_SERVICE_ACCOUNT_JSON (service account JSON with edit rights on that sheet)
 	•	GammaWizard: GW_TOKEN (optional), GW_EMAIL, GW_PASSWORD (fallback auth)
 
-Placer constants (top of leocross_place_simple.py):
+Placer constants (top of scripts/trade/leocross_place_simple.py):
 	•	QTY_FIXED = 4 (your hard‑coded quantity when QTY_OVERRIDE not set)
 	•	Ladder tuning:
 	•	STEP_WAIT = 30 (seconds between checks)
