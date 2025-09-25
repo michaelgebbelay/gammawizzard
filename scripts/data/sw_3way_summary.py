@@ -194,7 +194,8 @@ def _is_ic_open(legs: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     }
 
 def derive_standard_from_raw(raw: List[List[Any]], alerts: List[List[Any]]) -> Dict[date, Dict[str, Any]]:
-    """Return per-expiry STANDARD built from sw_txn_raw using 16:00–16:20 ET on expiry-1."""
+    """Return per-expiry STANDARD from sw_txn_raw using 16:00–16:20 ET on expiry-1.
+       Returns {exp: {side, width, price, contracts, risk_total, tickets:[{side,sp,lp,sc,lc,price,contracts}]}}"""
     if not raw or raw[0] != RAW_HEADERS:
         return {}
     head = raw[0]
@@ -245,11 +246,11 @@ def derive_standard_from_raw(raw: List[List[Any]], alerts: List[List[Any]]) -> D
     start_min = _to_minutes(ORIG_ET_START); end_min = _to_minutes(ORIG_ET_END)
     std: Dict[date, Dict[str, Any]] = {}  # exp -> aggregate
 
-    def add_component(exp: date, side: str, width: float, contracts: int, net: float):
+    def add_component(exp: date, side: str, width: float, contracts: int, net: float, strikes=None):
         # net<0 => credit (short). price is positive number per condor
         price = abs(net) / (contracts * 100.0) if contracts>0 else 0.0
         risk = (width*100.0 - price*100.0) if side=="short" else (price*100.0)
-        agg = std.setdefault(exp, {"side": side, "contracts": 0, "widths": {}, "price_sum": 0.0, "price_w": 0, "risk_total": 0.0})
+        agg = std.setdefault(exp, {"side": side, "contracts": 0, "widths": {}, "price_sum": 0.0, "price_w": 0, "risk_total": 0.0, "tickets":[]})
         if side != agg["side"]:
             alerts.append(["std","mixed_side_for_expiry", exp.isoformat(), f"{agg['side']} vs {side}"])
         agg["contracts"] += contracts
@@ -257,6 +258,9 @@ def derive_standard_from_raw(raw: List[List[Any]], alerts: List[List[Any]]) -> D
         agg["price_sum"] += price * contracts
         agg["price_w"]   += contracts
         agg["risk_total"] += risk * contracts
+        if strikes:
+            sp,lp,sc,lc = strikes
+            agg["tickets"].append({"side":side,"sp":sp,"lp":lp,"sc":sc,"lc":lc,"price":price,"contracts":contracts})
 
     for lg, b in led.items():
         if len(b["exp_set"]) != 1:
@@ -274,7 +278,8 @@ def derive_standard_from_raw(raw: List[List[Any]], alerts: List[List[Any]]) -> D
         if not cls:
             continue
         side = ("short" if (b["net"] or 0.0) < 0 else "long")
-        add_component(exp, side, cls["width"], cls["contracts"], (b["net"] or 0.0))
+        strikes = (cls["short_put"], cls["long_put"], cls["short_call"], cls["long_call"])
+        add_component(exp, side, cls["width"], cls["contracts"], (b["net"] or 0.0), strikes)
 
     # Fallback: if no window match for an expiry that clearly had an IC open, take earliest IC-open on exp-1 any time
     have_by_exp = set(std.keys())
@@ -296,7 +301,8 @@ def derive_standard_from_raw(raw: List[List[Any]], alerts: List[List[Any]]) -> D
     for exp, arr in fallback_candidates.items():
         arr.sort(key=lambda x: x[0])  # earliest first
         for _, side, width, contracts, net in arr:
-            add_component(exp, side, width, contracts, net)
+            # No per-ledger strikes in fallback path; leave strikes=None. P&L will still be approx via width/price if needed.
+            add_component(exp, side, width, contracts, net, strikes=None)
         alerts.append(["std","used_fallback_no_time_window", exp.isoformat(), f"{len(arr)} ticket(s)"])
 
     # finalize: compute representative width (mode) & VWAP price
@@ -503,6 +509,34 @@ def build_three_way(svc, sid):
             continue
         settle_px = st_map.get(d)
 
+        # Standard (from raw) — compute P&L when settle exists
+        std_pnl_norm=None; std_w=None; std_price=None; std_contracts=None; std_risk_total=None
+        if d in std_map:
+            S = std_map[d]
+            std_w = S.get("width"); std_price = S.get("price"); std_contracts = S.get("contracts")
+            std_risk_total = S.get("risk_total")
+            if settle_px is not None and std_risk_total and std_risk_total>0:
+                pnl_sum = 0.0
+                tickets = S.get("tickets") or []
+                if tickets:
+                    # precise per-ticket payoff
+                    for t in tickets:
+                        sp,lp,sc,lc = t["sp"],t["lp"],t["sc"],t["lc"]
+                        per = pnl_iron_condor(t["side"], sp, lp, sc, lc, t["price"], settle_px)
+                        pnl_sum += per * (t["contracts"] or 1)
+                else:
+                    # approximate using width/price if strikes are missing
+                    w = std_w; px = std_price; side = S.get("side","short")
+                    if w is not None and px is not None:
+                        # Build proxy symmetric wings around settle (ok for PM 0DTE stats)
+                        sp = settle_px - w/2.0; lp = sp - w
+                        sc = settle_px + w/2.0; lc = sc + w
+                        per = pnl_iron_condor(side, sp, lp, sc, lc, px, settle_px)
+                        pnl_sum += per * (std_contracts or 1)
+                        alerts.append(["std","approx_pnl_used_no_strikes", d.isoformat(), f"w={w} px={px}"])
+                std_pnl_norm = pnl_sum * (UNIT_RISK / std_risk_total)
+                series_std.append((d, round(std_pnl_norm,2)))
+
         # Leo normalized P&L
         leo_pnl_norm=None; leo_w=None; leo_price=None
         if d in leo_map and settle_px is not None:
@@ -517,15 +551,6 @@ def build_three_way(svc, sid):
                 if ml>0:
                     leo_pnl_norm = per * (UNIT_RISK/ml)
                     series_leo.append((d, round(leo_pnl_norm,2)))
-
-        # Standard normalized P&L
-        std_pnl_norm=None; std_w=None; std_price=None; std_contracts=None; std_risk_total=None
-        if d in std_map:
-            S = std_map[d]
-            std_w = S.get("width"); std_price = S.get("price"); std_contracts = S.get("contracts")
-            std_risk_total = S.get("risk_total")
-            # We will compute std_pnl_norm later when settle appears AND we have exact leg set per ticket
-            # (For now leave std_pnl_norm blank until settle step.)
 
         # Adjusted: realized dollars (from Schwab) and normalized (using std risk)
         adj_nom = adj_by_exp.get(d)
