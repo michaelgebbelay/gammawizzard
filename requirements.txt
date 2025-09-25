@@ -1,0 +1,8 @@
+# Core
+schwab-py
+requests
+
+# Google Sheets client
+google-api-python-client
+google-auth
+google-auth-httplib2
