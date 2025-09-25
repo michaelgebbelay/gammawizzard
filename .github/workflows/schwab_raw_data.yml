@@ -31,11 +31,12 @@ jobs:
         with:
           python-version: "3.11"
           cache: "pip"
+          cache-dependency-path: requirements.txt
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install --quiet schwab-py requests google-api-python-client google-auth google-auth-httplib2
+          pip install -r requirements.txt
 
       - name: Compute dump params
         id: dump_params
@@ -72,7 +73,6 @@ jobs:
           GW_EMAIL: ${{ secrets.GW_EMAIL }}
           GW_PASSWORD: ${{ secrets.GW_PASSWORD }}
           GW_BASE: ${{ secrets.GW_BASE }}
-          # (or use GW_TOKEN instead of GW_EMAIL/GW_PASSWORD)
         run: |
           python scripts/data/gw_leo_to_sheet.py
 
