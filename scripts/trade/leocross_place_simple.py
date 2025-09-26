@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-# VERSION: 2025-10-06 v2.9.2 — Placer
-# - Debit NBBO fixed (buys − sells).
-# - Debit ladder: BID → MID → MID-0.05 → MID-0.10 (per user).
-# - Credit ladder unchanged.
+# VERSION: 2025-10-06 v2.9.3 — Placer
+# - Debit ladder: BID → MID → MID+0.05 → MID+0.10 (capped to ASK)
+# - Credit ladder: ASK → MID → MID-0.05 → MID-0.10 (capped to BID)
 # - CANCEL_REPLACE with ~5s dwell per rung (configurable)
 # - Two passes with Leo refresh in between
 # - 16:15 ET hard cutoff: cancel any working orders immediately at/after cutoff
@@ -270,7 +269,7 @@ def fetch_bid_ask(c, osi: str):
     return (float(b) if b is not None else None, float(a) if a is not None else None)
 
 def condor_nbbo_credit(c, legs):
-    """NBBO for SELL (credit): (sells − buys). Returns (bid, ask, mid)."""
+    """NBBO for SELL (credit): (sells − buys) → (bid, ask, mid)."""
     bp, sp, sc, bc = legs
     bp_b, bp_a = fetch_bid_ask(c, bp); sp_b, sp_a = fetch_bid_ask(c, sp)
     sc_b, sc_a = fetch_bid_ask(c, sc); bc_b, bc_a = fetch_bid_ask(c, bc)
@@ -282,15 +281,14 @@ def condor_nbbo_credit(c, legs):
     return (clamp_tick(credit_bid), clamp_tick(credit_ask), clamp_tick(credit_mid))
 
 def condor_nbbo_debit(c, legs):
-    """NBBO for BUY (debit): (buys − sells). Returns (bid, ask, mid)."""
+    """NBBO for BUY (debit): (buys − sells) → (bid, ask, mid)."""
     bp, sp, sc, bc = legs
     bp_b, bp_a = fetch_bid_ask(c, bp); sp_b, sp_a = fetch_bid_ask(c, sp)
     sc_b, sc_a = fetch_bid_ask(c, sc); bc_b, bc_a = fetch_bid_ask(c, bc)
     if None in (bp_b, bp_a, sp_b, sp_a, sc_b, sc_a, bc_b, bc_a):
         return (None, None, None)
-    # Lowest you might pay vs highest you might pay:
-    debit_bid = (bp_b + bc_b) - (sp_a + sc_a)
-    debit_ask = (bp_a + bc_a) - (sp_b + sc_b)
+    debit_bid = (bp_b + bc_b) - (sp_a + sc_a)   # lowest you might pay
+    debit_ask = (bp_a + bc_a) - (sp_b + sc_b)   # highest you might pay
     debit_mid = (debit_bid + debit_ask) / 2.0
     return (clamp_tick(debit_bid), clamp_tick(debit_ask), clamp_tick(debit_mid))
 
@@ -672,33 +670,43 @@ def main():
         return st
 
     # ---- ladder builders (from Schwab NBBO) ----
-    def credit_ladder_from_nbbo(nbbo_bid, nbbo_ask, nbbo_mid):
-        # Highest first: ASK → MID → MID-0.05 → MID-0.10
-        if None in (nbbo_ask, nbbo_mid): return []
-        lad = [nbbo_ask,
-               nbbo_mid,
-               clamp_tick(nbbo_mid - 0.05),
-               clamp_tick(nbbo_mid - 0.10)]
-        # clamp to tick & de-dupe in order
+    def credit_ladder_from_nbbo(credit_bid, credit_ask, credit_mid):
+        """ASK → MID → MID-0.05 → MID-0.10, never below credit_bid."""
+        if credit_ask is None and credit_mid is None:
+            return []
+        rungs = []
+        if credit_ask is not None:
+            rungs.append(credit_ask)
+        if credit_mid is not None:
+            rungs += [credit_mid,
+                      clamp_tick(credit_mid - 0.05),
+                      clamp_tick(credit_mid - 0.10)]
+            if credit_bid is not None:
+                rungs[-2] = max(rungs[-2], credit_bid)
+                rungs[-1] = max(rungs[-1], credit_bid)
         seen=set(); out=[]
-        for p in [clamp_tick(x) for x in lad]:
+        for p in rungs:
+            p = clamp_tick(p)
             if p not in seen:
                 seen.add(p); out.append(p)
         return out
 
-    def debit_ladder_from_bid_mid(nbbo_bid, nbbo_mid):
-        """Debit ladder: BID → MID → MID-0.05 → MID-0.10."""
-        if nbbo_bid is None and nbbo_mid is None:
+    def debit_ladder_from_nbbo(debit_bid, debit_ask, debit_mid):
+        """BID → MID → MID+0.05 → MID+0.10, never above debit_ask; floor at 0.05."""
+        if debit_bid is None and debit_mid is None:
             return []
-        if nbbo_bid is None:
-            base = [nbbo_mid, clamp_tick(nbbo_mid - 0.05), clamp_tick(nbbo_mid - 0.10)]
-        elif nbbo_mid is None:
-            base = [nbbo_bid]
-        else:
-            base = [nbbo_bid, nbbo_mid, clamp_tick(nbbo_mid - 0.05), clamp_tick(nbbo_mid - 0.10)]
-        # clamp to tick, floor at 0.05 to avoid invalid 0.00 debits, and de-dupe
+        rungs = []
+        if debit_bid is not None:
+            rungs.append(debit_bid)
+        if debit_mid is not None:
+            p3 = clamp_tick(debit_mid + 0.05)
+            p4 = clamp_tick(debit_mid + 0.10)
+            if debit_ask is not None:
+                p3 = min(p3, debit_ask)
+                p4 = min(p4, debit_ask)
+            rungs += [debit_mid, p3, p4]
         seen=set(); out=[]
-        for p in base:
+        for p in rungs:
             p = clamp_tick(max(0.05, p))
             if p not in seen:
                 seen.add(p); out.append(p)
@@ -722,7 +730,7 @@ def main():
         vprint(f"{'CREDIT' if is_credit else 'DEBIT'} NBBO: bid={nbbo_bid} ask={nbbo_ask} mid={nbbo_mid}")
         ladder = (credit_ladder_from_nbbo(nbbo_bid, nbbo_ask, nbbo_mid)
                   if is_credit else
-                  debit_ladder_from_bid_mid(nbbo_bid, nbbo_mid))
+                  debit_ladder_from_nbbo(nbbo_bid, nbbo_ask, nbbo_mid))
         vprint(f"CYCLE {cycles+1}/{MAX_LADDER_CYCLES} ladder: {ladder}")
 
         for price in ladder:
