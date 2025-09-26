@@ -1,3 +1,220 @@
+# ===== ORIG-ONLY HOT PATH (exp_primary | side | contracts) =====
+import os, json, base64, re
+from typing import Any, List, Dict, Tuple, Optional
+from datetime import datetime, date, time, timedelta, timezone
+from zoneinfo import ZoneInfo
+from google.oauth2 import service_account
+from googleapiclient.discovery import build as gbuild
+
+if os.environ.get("ORIG_ONLY", "1").strip().lower() in {"1","true","yes","on"}:
+    ET = ZoneInfo("America/New_York")
+    RAW_TAB = "sw_txn_raw"
+    OUT_TAB = "sw_orig_orders"
+    OUT_HEADERS = ["exp_primary","side","contracts"]
+
+    def _svc_sid():
+        sid = os.environ["GSHEET_ID"]
+        sa_json = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+        try:
+            dec = base64.b64decode(sa_json).decode("utf-8")
+            if dec.strip().startswith("{"): sa_json = dec
+        except Exception:
+            pass
+        creds = service_account.Credentials.from_service_account_info(
+            json.loads(sa_json),
+            scopes=["https://www.googleapis.com/auth/spreadsheets"]
+        )
+        return gbuild("sheets","v4",credentials=creds), sid
+
+    def ensure_tab_with_header(svc, sid: str, tab: str, headers: List[str]) -> None:
+        meta = svc.spreadsheets().get(spreadsheetId=sid).execute()
+        titles = {s["properties"]["title"] for s in meta.get("sheets",[])}
+        if tab not in titles:
+            svc.spreadsheets().batchUpdate(
+                spreadsheetId=sid,
+                body={"requests":[{"addSheet":{"properties":{"title":tab}}}]}
+            ).execute()
+        got = svc.spreadsheets().values().get(spreadsheetId=sid, range=f"{tab}!1:1").execute().get("values",[])
+        if not got or got[0] != headers:
+            svc.spreadsheets().values().update(
+                spreadsheetId=sid,
+                range=f"{tab}!A1",
+                valueInputOption="RAW",
+                body={"values":[headers]}
+            ).execute()
+
+    def overwrite_rows(svc, sid: str, tab: str, headers: List[str], rows: List[List[Any]]) -> None:
+        svc.spreadsheets().values().clear(spreadsheetId=sid, range=tab).execute()
+        svc.spreadsheets().values().update(
+            spreadsheetId=sid,
+            range=f"{tab}!A1",
+            valueInputOption="RAW",
+            body={"values":[headers] + rows}
+        ).execute()
+
+    def _idx(hdr: List[str], col: str) -> int:
+        try: return hdr.index(col)
+        except ValueError: return -1
+
+    def _fix_iso(s: str) -> str:
+        x = (s or "").strip()
+        if x.endswith("Z"): x = x[:-1] + "+00:00"
+        if re.search(r"[+-]\d{4}$", x):
+            x = x[:-5] + x[-5:-2] + ":" + x[-2:]
+        return x
+
+    def _dt_et(s: str) -> Optional[datetime]:
+        if not s: return None
+        try:
+            dt = datetime.fromisoformat(_fix_iso(s))
+            return dt.astimezone(ET)
+        except Exception:
+            return None
+
+    def _prev_bday(d: date, n: int) -> date:
+        cur, step = d, 0
+        while step < n:
+            cur = cur - timedelta(days=1)
+            if cur.weekday() < 5: step += 1
+        return cur
+
+    def _safe_f(x): 
+        try: return float(x)
+        except Exception: return None
+
+    def _build_orig_min(svc, sid):
+        # Pull raw
+        resp = svc.spreadsheets().values().get(spreadsheetId=sid, range=f"{RAW_TAB}!A1:R").execute()
+        vals = resp.get("values", [])
+        if not vals: 
+            ensure_tab_with_header(svc, sid, OUT_TAB, OUT_HEADERS)
+            overwrite_rows(svc, sid, OUT_TAB, OUT_HEADERS, [])
+            print("ORIG_ONLY: no raw.")
+            return
+
+        hdr = vals[0]
+        i_ts   = _idx(hdr,"ts")
+        i_ledger = _idx(hdr,"ledger_id")
+        i_exp  = _idx(hdr,"exp_primary")
+        i_pc   = _idx(hdr,"put_call")
+        i_strk = _idx(hdr,"strike")
+        i_qty  = _idx(hdr,"quantity")
+        i_amt  = _idx(hdr,"amount")
+        i_net  = _idx(hdr,"net_amount")
+        i_comm = _idx(hdr,"commissions")
+        i_fee  = _idx(hdr,"fees_other")
+        rows = [r + [""]*(len(hdr)-len(r)) for r in vals[1:]]
+
+        # Window config
+        T0 = os.environ.get("ORIG_ET_START","16:00")
+        T1 = os.environ.get("ORIG_ET_END","16:20")
+        def _hhmm(s):
+            try:
+                h,m = [int(x) for x in s.split(":")]
+                return time(hour=h, minute=m, tzinfo=ET)
+            except Exception:
+                return time(16,0,tzinfo=ET)
+        W0, W1 = _hhmm(T0), _hhmm(T1)
+        D_BEFORE = int(os.environ.get("ORIG_DAYS_BEFORE","1") or "1")
+
+        # Collect candidate ledgers per expiry within window
+        exps = sorted({ (r[i_exp] or "").strip() for r in rows if i_exp>=0 and r[i_exp] }, key=lambda s:s)
+        out = []
+        for e in exps:
+            try:
+                exp_d = date.fromisoformat(e[:10])
+            except Exception:
+                continue
+            orig_d = _prev_bday(exp_d, D_BEFORE)
+            win_start = datetime.combine(orig_d, W0).astimezone(ET)
+            win_end   = datetime.combine(orig_d, W1).astimezone(ET)
+
+            per_ledger: Dict[str, List[List[Any]]] = {}
+            for r in rows:
+                if (r[i_exp] or "").strip() != e: continue
+                lid = (r[i_ledger] or "").strip()
+                if not lid: continue
+                dt = _dt_et(r[i_ts]) if i_ts>=0 else None
+                if not dt or not (win_start <= dt <= win_end): continue
+                per_ledger.setdefault(lid, []).append(r)
+
+            if not per_ledger: 
+                continue
+
+            # Score ledgers, compute units and side
+            choices: List[Tuple[int,int,datetime,str,Dict[str,Any]]] = []
+            for lid, legs in per_ledger.items():
+                # classify legs
+                put_strikes = {}
+                call_strikes = {}
+                latest = None
+                amt_sum = 0.0
+                have_amt = True
+                net = None; comm=0.0; fee=0.0
+                for r in legs:
+                    pc = (r[i_pc] or "").strip().upper() if i_pc>=0 else ""
+                    s  = _safe_f(r[i_strk]) if i_strk>=0 else None
+                    q  = _safe_f(r[i_qty]) if i_qty>=0 else None
+                    a  = _safe_f(r[i_amt]) if i_amt>=0 else None
+                    if latest is None or (_dt_et(r[i_ts]) and _dt_et(r[i_ts]) > latest):
+                        latest = _dt_et(r[i_ts])
+                    if a is None: have_amt = False
+                    else: amt_sum += a
+                    if i_net>=0 and net is None and r[i_net] not in ("",None):
+                        net = _safe_f(r[i_net])
+                    if i_comm>=0 and r[i_comm] not in ("",None):
+                        comm = max(comm, _safe_f(r[i_comm]) or 0.0)
+                    if i_fee>=0 and r[i_fee] not in ("",None):
+                        fee = max(fee, _safe_f(r[i_fee]) or 0.0)
+                    if pc and s is not None and q is not None:
+                        d = put_strikes if pc=="PUT" else call_strikes if pc=="CALL" else None
+                        if d is not None:
+                            d[s] = d.get(s, 0.0) + q
+
+                if len(put_strikes) < 2 or len(call_strikes) < 2:
+                    continue
+
+                # units = min abs qty across top 2 strikes per side
+                def top2_units(dmap):
+                    pairs = sorted(((abs(q), s) for s,q in dmap.items()), reverse=True)
+                    if not pairs: return []
+                    top = pairs[:2] if len(pairs)>=2 else pairs*2
+                    return [abs(dmap[top[0][1]]), abs(dmap[top[1][1]])]
+                q_puts  = top2_units(put_strikes)
+                q_calls = top2_units(call_strikes)
+                if not q_puts or not q_calls:
+                    continue
+                units = int(round(min(q_puts + q_calls)))
+                if units <= 0: 
+                    continue
+
+                # side: prefer sign of (sum amounts); fallback to net_amount; else assume short
+                if have_amt:
+                    side = "short" if (amt_sum < 0) else "long"
+                elif net is not None:
+                    side = "short" if (net > 0) else "long"  # net>0 means cash received → credit (short)
+                else:
+                    side = "short"
+
+                score = 1  # valid condor
+                choices.append((score, units, latest or datetime.min.replace(tzinfo=ET), lid, {"e":e,"side":side,"units":units}))
+
+            if not choices:
+                continue
+            choices.sort(key=lambda x: (x[0], x[1], x[2]))
+            best = choices[-1][4]
+            out.append([best["e"], best["side"], str(int(best["units"]))])
+
+        out.sort(key=lambda r: r[0])
+        ensure_tab_with_header(svc, sid, OUT_TAB, OUT_HEADERS)
+        overwrite_rows(svc, sid, OUT_TAB, OUT_HEADERS, out)
+        print(f"ORIG_ONLY: wrote {len(out)} rows to {OUT_TAB} (exp_primary|side|contracts).")
+
+    # run and exit BEFORE legacy code below
+    _svc, _sid = _svc_sid()
+    _build_orig_min(_svc, _sid)
+    raise SystemExit(0)
+# ===== END ORIG-ONLY HOT PATH =====
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
