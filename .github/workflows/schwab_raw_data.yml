@@ -97,6 +97,7 @@ jobs:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           ORIG_ET_START: "16:00"
           ORIG_ET_END:   "16:20"
-          ORIG_DAYS_BEFORE: "1"   # business days
+          ORIG_DAYS_BEFORE: "1"
+          ORIG_ONLY: "1"   # ensures the hot path runs
         run: |
           python scripts/data/sw_3way_summary.py
