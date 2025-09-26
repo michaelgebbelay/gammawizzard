@@ -80,7 +80,6 @@ jobs:
         env:
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          GW_BASE: ${{ secrets.GW_BASE }}
           GW_TOKEN: ${{ secrets.GW_TOKEN }}
           GW_EMAIL: ${{ secrets.GW_EMAIL }}
           GW_PASSWORD: ${{ secrets.GW_PASSWORD }}
