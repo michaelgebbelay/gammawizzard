@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-# VERSION: 2025-10-06 v2.9.0 — Placer (NBBO ask/mid + bid/mid ladders, 5s rungs, hard cutoff)
-# - Credit ladder: ASK → MID → MID-0.05 → MID-0.10 (from Schwab NBBO)
-# - Debit  ladder: BID → MID → MID+0.05 → MID+0.10 (from Schwab NBBO)
+# VERSION: 2025-10-06 v2.9.2 — Placer
+# - Debit NBBO fixed (buys − sells).
+# - Debit ladder: BID → MID → MID-0.05 → MID-0.10 (per user).
+# - Credit ladder unchanged.
 # - CANCEL_REPLACE with ~5s dwell per rung (configurable)
 # - Two passes with Leo refresh in between
 # - 16:15 ET hard cutoff: cancel any working orders immediately at/after cutoff
@@ -268,17 +269,30 @@ def fetch_bid_ask(c, osi: str):
     a=q.get("askPrice") or q.get("ask") or q.get("askPriceInDouble")
     return (float(b) if b is not None else None, float(a) if a is not None else None)
 
-def condor_nbbo(c, legs):
-    """Return (net_bid, net_ask, mid) for the 4-leg IC from Schwab quotes."""
+def condor_nbbo_credit(c, legs):
+    """NBBO for SELL (credit): (sells − buys). Returns (bid, ask, mid)."""
     bp, sp, sc, bc = legs
     bp_b, bp_a = fetch_bid_ask(c, bp); sp_b, sp_a = fetch_bid_ask(c, sp)
     sc_b, sc_a = fetch_bid_ask(c, sc); bc_b, bc_a = fetch_bid_ask(c, bc)
     if None in (bp_b, bp_a, sp_b, sp_a, sc_b, sc_a, bc_b, bc_a):
         return (None, None, None)
-    net_bid = (sp_b + sc_b) - (bp_a + bc_a)
-    net_ask = (sp_a + sc_a) - (bp_b + bc_b)
-    mid     = (net_bid + net_ask) / 2.0
-    return (clamp_tick(net_bid), clamp_tick(net_ask), clamp_tick(mid))
+    credit_bid = (sp_b + sc_b) - (bp_a + bc_a)
+    credit_ask = (sp_a + sc_a) - (bp_b + bc_b)
+    credit_mid = (credit_bid + credit_ask) / 2.0
+    return (clamp_tick(credit_bid), clamp_tick(credit_ask), clamp_tick(credit_mid))
+
+def condor_nbbo_debit(c, legs):
+    """NBBO for BUY (debit): (buys − sells). Returns (bid, ask, mid)."""
+    bp, sp, sc, bc = legs
+    bp_b, bp_a = fetch_bid_ask(c, bp); sp_b, sp_a = fetch_bid_ask(c, sp)
+    sc_b, sc_a = fetch_bid_ask(c, sc); bc_b, bc_a = fetch_bid_ask(c, bc)
+    if None in (bp_b, bp_a, sp_b, sp_a, sc_b, sc_a, bc_b, bc_a):
+        return (None, None, None)
+    # Lowest you might pay vs highest you might pay:
+    debit_bid = (bp_b + bc_b) - (sp_a + sc_a)
+    debit_ask = (bp_a + bc_a) - (sp_b + sc_b)
+    debit_mid = (debit_bid + debit_ask) / 2.0
+    return (clamp_tick(debit_bid), clamp_tick(debit_ask), clamp_tick(debit_mid))
 
 # ===== Orders / listing =====
 def list_recent_orders(c, acct_hash: str):
@@ -672,15 +686,20 @@ def main():
                 seen.add(p); out.append(p)
         return out
 
-    def debit_ladder_from_nbbo(nbbo_bid, nbbo_ask, nbbo_mid):
-        # Lowest first: BID → MID → MID+0.05 → MID+0.10
-        if None in (nbbo_bid, nbbo_mid): return []
-        lad = [nbbo_bid,
-               nbbo_mid,
-               clamp_tick(nbbo_mid + 0.05),
-               clamp_tick(nbbo_mid + 0.10)]
+    def debit_ladder_from_bid_mid(nbbo_bid, nbbo_mid):
+        """Debit ladder: BID → MID → MID-0.05 → MID-0.10."""
+        if nbbo_bid is None and nbbo_mid is None:
+            return []
+        if nbbo_bid is None:
+            base = [nbbo_mid, clamp_tick(nbbo_mid - 0.05), clamp_tick(nbbo_mid - 0.10)]
+        elif nbbo_mid is None:
+            base = [nbbo_bid]
+        else:
+            base = [nbbo_bid, nbbo_mid, clamp_tick(nbbo_mid - 0.05), clamp_tick(nbbo_mid - 0.10)]
+        # clamp to tick, floor at 0.05 to avoid invalid 0.00 debits, and de-dupe
         seen=set(); out=[]
-        for p in [clamp_tick(x) for x in lad]:
+        for p in base:
+            p = clamp_tick(max(0.05, p))
             if p not in seen:
                 seen.add(p); out.append(p)
         return out
@@ -692,14 +711,18 @@ def main():
     while cycles < MAX_LADDER_CYCLES and filled_total < qty and not cutoff_reached():
         secs = STEP_WAIT_CREDIT if is_credit else STEP_WAIT_DEBIT
 
-        nbbo_bid, nbbo_ask, nbbo_mid = condor_nbbo(c, legs)
-        if None in (nbbo_bid, nbbo_ask, nbbo_mid):
+        if is_credit:
+            nbbo_bid, nbbo_ask, nbbo_mid = condor_nbbo_credit(c, legs)
+        else:
+            nbbo_bid, nbbo_ask, nbbo_mid = condor_nbbo_debit(c, legs)
+        if nbbo_bid is None and nbbo_mid is None:
             vprint("NBBO unavailable — skipping cycle")
             break
 
         vprint(f"{'CREDIT' if is_credit else 'DEBIT'} NBBO: bid={nbbo_bid} ask={nbbo_ask} mid={nbbo_mid}")
-        ladder = credit_ladder_from_nbbo(nbbo_bid, nbbo_ask, nbbo_mid) if is_credit \
-                 else debit_ladder_from_nbbo(nbbo_bid, nbbo_ask, nbbo_mid)
+        ladder = (credit_ladder_from_nbbo(nbbo_bid, nbbo_ask, nbbo_mid)
+                  if is_credit else
+                  debit_ladder_from_bid_mid(nbbo_bid, nbbo_mid))
         vprint(f"CYCLE {cycles+1}/{MAX_LADDER_CYCLES} ladder: {ladder}")
 
         for price in ladder:
