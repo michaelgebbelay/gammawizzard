@@ -91,7 +91,6 @@ jobs:
       #     SETTLE_BACKFILL_DAYS: "180"
       #   run: |
       #     python scripts/data/gw_settlements_to_sheet.py
-
       - name: Build Standard orig orders from sw_txn_raw (only)
           env:
             GSHEET_ID: ${{ secrets.GSHEET_ID }}
