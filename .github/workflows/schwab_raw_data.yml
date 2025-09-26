@@ -59,6 +59,7 @@ jobs:
           SCHWAB_TOKEN_JSON: ${{ secrets.SCHWAB_TOKEN_JSON }}
           BACKFILL_YTD: ${{ steps.dump_params.outputs.BACKFILL_YTD }}
           DAYS_BACK:    ${{ steps.dump_params.outputs.DAYS_BACK }}
+          SCHWAB_SKIP_SUMMARY: "1"
         run: |
           python scripts/data/sw_dump_raw.py
 
