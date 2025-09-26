@@ -10,7 +10,7 @@ on:
       force:
         description: 'Bypass guard and place anyway? (true/false)'
         required: false
-        default: 'false'
+        default: 'true'
       force_qty:
         description: 'Qty when forcing (blank=1)'
         required: false
