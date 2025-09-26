@@ -72,7 +72,6 @@ jobs:
           SCHWAB_TOKEN_JSON: ${{ secrets.SCHWAB_TOKEN_JSON }}
           GW_EMAIL: ${{ secrets.GW_EMAIL }}
           GW_PASSWORD: ${{ secrets.GW_PASSWORD }}
-          GW_BASE: ${{ secrets.GW_BASE }}
         run: |
           python scripts/data/gw_leo_to_sheet.py
 
