@@ -92,11 +92,11 @@ jobs:
       #   run: |
       #     python scripts/data/gw_settlements_to_sheet.py
       - name: Build Standard orig orders from sw_txn_raw (only)
-          env:
-            GSHEET_ID: ${{ secrets.GSHEET_ID }}
-            GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-            ORIG_ET_START: "16:00"
-            ORIG_ET_END:   "16:20"
-            ORIG_DAYS_BEFORE: "1"   # business days
-          run: |
-            python scripts/data/sw_3way_summary.py
+        env:
+          GSHEET_ID: ${{ secrets.GSHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          ORIG_ET_START: "16:00"
+          ORIG_ET_END:   "16:20"
+          ORIG_DAYS_BEFORE: "1"   # business days
+        run: |
+          python scripts/data/sw_3way_summary.py
