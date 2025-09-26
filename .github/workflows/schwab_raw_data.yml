@@ -63,44 +63,41 @@ jobs:
         run: |
           python scripts/data/sw_dump_raw.py
 
-      - name: Ingest Leo → sw_leo_orders (NBBO mid, 5-wide)
-        if: always()
-        env:
-          GSHEET_ID: ${{ secrets.GSHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          SCHWAB_APP_KEY: ${{ secrets.SCHWAB_APP_KEY }}
-          SCHWAB_APP_SECRET: ${{ secrets.SCHWAB_APP_SECRET }}
-          SCHWAB_TOKEN_JSON: ${{ secrets.SCHWAB_TOKEN_JSON }}
-          GW_EMAIL: ${{ secrets.GW_EMAIL }}
-          GW_PASSWORD: ${{ secrets.GW_PASSWORD }}
-        run: |
-          python scripts/data/gw_leo_to_sheet.py
+      # - name: Ingest Leo → sw_leo_orders (NBBO mid, 5-wide)
+      #   if: always()
+      #   env:
+      #     GSHEET_ID: ${{ secrets.GSHEET_ID }}
+      #     GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+      #     SCHWAB_APP_KEY: ${{ secrets.SCHWAB_APP_KEY }}
+      #     SCHWAB_APP_SECRET: ${{ secrets.SCHWAB_APP_SECRET }}
+      #     SCHWAB_TOKEN_JSON: ${{ secrets.SCHWAB_TOKEN_JSON }}
+      #     GW_EMAIL: ${{ secrets.GW_EMAIL }}
+      #     GW_PASSWORD: ${{ secrets.GW_PASSWORD }}
+      #   run: |
+      #     python scripts/data/gw_leo_to_sheet.py
 
-      - name: SPX settlements from GammaWizard (fallback Schwab)
-        if: always()
-        env:
-          GSHEET_ID: ${{ secrets.GSHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          GW_TOKEN: ${{ secrets.GW_TOKEN }}
-          GW_EMAIL: ${{ secrets.GW_EMAIL }}
-          GW_PASSWORD: ${{ secrets.GW_PASSWORD }}
-          GW_SETTLE_ENDPOINT: ${{ secrets.GW_SETTLE_ENDPOINT }}
-          SCHWAB_APP_KEY: ${{ secrets.SCHWAB_APP_KEY }}
-          SCHWAB_APP_SECRET: ${{ secrets.SCHWAB_APP_SECRET }}
-          SCHWAB_TOKEN_JSON: ${{ secrets.SCHWAB_TOKEN_JSON }}
-          SETTLE_BACKFILL_DAYS: "180"
-        run: |
-          python scripts/data/gw_settlements_to_sheet.py
+      # - name: SPX settlements from GammaWizard (fallback Schwab)
+      #   if: always()
+      #   env:
+      #     GSHEET_ID: ${{ secrets.GSHEET_ID }}
+      #     GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+      #     GW_TOKEN: ${{ secrets.GW_TOKEN }}
+      #     GW_EMAIL: ${{ secrets.GW_EMAIL }}
+      #     GW_PASSWORD: ${{ secrets.GW_PASSWORD }}
+      #     GW_SETTLE_ENDPOINT: ${{ secrets.GW_SETTLE_ENDPOINT }}
+      #     SCHWAB_APP_KEY: ${{ secrets.SCHWAB_APP_KEY }}
+      #     SCHWAB_APP_SECRET: ${{ secrets.SCHWAB_APP_SECRET }}
+      #     SCHWAB_TOKEN_JSON: ${{ secrets.SCHWAB_TOKEN_JSON }}
+      #     SETTLE_BACKFILL_DAYS: "180"
+      #   run: |
+      #     python scripts/data/gw_settlements_to_sheet.py
 
-      - name: 3-way expiry summary (Std+Adj from raw; full P&L with settle)
-        if: always()
-        env:
-          GSHEET_ID: ${{ secrets.GSHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          UNIT_RISK: "4500"
-          ORIG_ET_START: "16:00"
-          ORIG_ET_END: "16:20"
-          ORIG_DAYS_BEFORE: "1"
-          ALLOCATE_MULTI_EXP: "1"
-        run: |
-          python scripts/data/sw_3way_summary.py
+      - name: Build Standard orig orders from sw_txn_raw (only)
+          env:
+            GSHEET_ID: ${{ secrets.GSHEET_ID }}
+            GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+            ORIG_ET_START: "16:00"
+            ORIG_ET_END:   "16:20"
+            ORIG_DAYS_BEFORE: "1"   # business days
+          run: |
+            python scripts/data/sw_3way_summary.py
