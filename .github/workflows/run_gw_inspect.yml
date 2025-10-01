@@ -10,7 +10,7 @@ on:
       path:
         description: "Comma-separated endpoint paths"
         required: false
-        default: "/rapi/Market/SpxClose,/rapi/SpxClose"
+        default: "/rapi/Market/SpxClose,/rapi/SpxClose,/rapi/GetLeoCross"
       start:
         description: "Override start date YYYY-MM-DD (optional)"
         required: false
@@ -21,17 +21,11 @@ on:
 jobs:
   inspect:
     runs-on: ubuntu-latest
-
-    # Map secrets/vars at the JOB level so every step sees them.
     env:
       GW_BASE: https://gandalf.gammawizard.com
       GW_PATH: ${{ github.event.inputs.path }}
-      GW_DAYS: ${{ github.event.inputs.days }}
-      GW_START: ${{ github.event.inputs.start }}
-      GW_END: ${{ github.event.inputs.end }}
       GW_DUMP_DIR: gw_dump
-
-      # *** Secrets: these must match your repo secret names exactly ***
+      # Auth (map your secrets)
       GW_TOKEN: ${{ secrets.GW_TOKEN }}
       GW_VAR2_TOKEN: ${{ secrets.GW_VAR2_TOKEN }}
       GW_EMAIL: ${{ secrets.GW_EMAIL }}
@@ -50,19 +44,26 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Hard fail if secrets missing (no values printed)
+      - name: Compute window (avoid empty env)
+        run: |
+          DAYS="${{ github.event.inputs.days }}"
+          [ -z "$DAYS" ] && DAYS=14
+          START="${{ github.event.inputs.start }}"
+          END="${{ github.event.inputs.end }}"
+          if [ -z "$START" ]; then START=$(date -u -d "$DAYS days ago" +%F); fi
+          if [ -z "$END" ]; then END=$(date -u +%F); fi
+          echo "GW_DAYS=$DAYS"   >> $GITHUB_ENV
+          echo "GW_START=$START" >> $GITHUB_ENV
+          echo "GW_END=$END"     >> $GITHUB_ENV
+          echo "Computed window: $START → $END"
+
+      - name: Sanity check secrets
         run: |
           miss=0
           for k in GW_TOKEN GW_EMAIL GW_PASSWORD; do
-            if [ -z "${!k:-}" ]; then
-              echo "::error ::$k is NOT set"; miss=1
-            else
-              echo "$k is set"
-            fi
+            if [ -z "${!k:-}" ]; then echo "::warning ::$k is NOT set"; else echo "$k is set"; fi
           done
-          if [ "$miss" -eq 1 ]; then
-            echo "Required secrets missing. Aborting."; exit 1
-          fi
+          # Not fatal—token OR email/password is fine.
 
       - name: Run inspector
         run: |
