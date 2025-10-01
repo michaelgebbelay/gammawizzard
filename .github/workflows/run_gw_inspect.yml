@@ -1,25 +1,63 @@
-name: Run GammaWizard Inspect
+name: GW Inspect
 
 on:
   workflow_dispatch:
+    inputs:
+      days:
+        description: "Days back to fetch"
+        required: false
+        default: "14"
+      path:
+        description: "Comma-separated endpoint paths"
+        required: false
+        default: "/rapi/Market/SpxClose,/rapi/SpxClose"
+      start:
+        description: "Override start date YYYY-MM-DD (optional)"
+        required: false
+      end:
+        description: "Override end date YYYY-MM-DD (optional)"
+        required: false
 
 jobs:
-  run-inspect:
+  run:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-      - name: Install dependencies
+          python-version: "3.11"
+
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-      - name: Run inspect script
-        run: python scripts/data/gw_inspect.py
+          pip install requests
+
+      - name: Debug env presence (no secrets printed)
+        run: |
+          for k in GW_TOKEN GW_EMAIL GW_PASSWORD; do
+            if [ -n "${!k:-}" ]; then echo "$k is set"; else echo "::warning ::$k is NOT set"; fi
+          done
+
+      - name: Run inspector
         env:
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          GSHEET_ID: ${{ secrets.GSHEET_ID }}
+          # Base + window
+          GW_BASE: https://gandalf.gammawizard.com
+          GW_PATH: ${{ github.event.inputs.path }}
+          GW_DAYS: ${{ github.event.inputs.days }}
+          GW_START: ${{ github.event.inputs.start }}
+          GW_END: ${{ github.event.inputs.end }}
+          GW_DUMP_DIR: gw_dump
+
+          # Auth (use whichever you have; token preferred)
+          GW_TOKEN: ${{ secrets.GW_TOKEN }}
+          GW_VAR2_TOKEN: ${{ secrets.GW_VAR2_TOKEN }}   # optional fallback you already have
+          GW_EMAIL: ${{ secrets.GW_EMAIL }}
+          GW_PASSWORD: ${{ secrets.GW_PASSWORD }}
+        run: |
+          python3 scripts/data/gw_inspect.py
+
       - name: Upload GW dumps
         if: always()
         uses: actions/upload-artifact@v4
