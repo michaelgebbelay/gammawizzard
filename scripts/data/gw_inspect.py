@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
-# Inspect GammaWizard responses and dump raw payloads.
 import os, re, json, sys
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 import requests
 
-def _now_utc():
-    return datetime.now(timezone.utc)
+def _now_utc(): return datetime.now(timezone.utc)
+def _ts(): return _now_utc().strftime("%Y%m%d_%H%M%S")
 
-def _ts():
-    return _now_utc().strftime("%Y%m%d_%H%M%S")
+def _nonempty(*names):
+    for n in names:
+        v = os.environ.get(n)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    return None
 
 def _sanitize_token(t: str | None) -> str | None:
     if not t: return None
     t = t.strip().strip('"').strip("'")
-    if t.lower().startswith("bearer "):
-        t = t.split(None, 1)[1]
-    return t
+    return t.split(None, 1)[1] if t.lower().startswith("bearer ") else t
 
 def _timeout() -> int:
     try: return int(os.environ.get("GW_TIMEOUT", "30"))
@@ -25,22 +26,19 @@ def _timeout() -> int:
 def _slug(s: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_.-]+", "_", s).strip("_")[:120] or "gw"
 
-def _bearer_header(tok: str | None) -> dict:
-    h = {"Accept": "application/json", "User-Agent": "gw-inspect/1.0"}
-    if tok:
-        h["Authorization"] = f"Bearer {tok}"
+def _hdr(tok: str | None) -> dict:
+    h = {"Accept": "application/json", "User-Agent": "gw-inspect/1.1"}
+    if tok: h["Authorization"] = f"Bearer {tok}"
     return h
 
 def _login_token(base: str) -> str:
-    email = os.environ.get("GW_EMAIL", "")
-    pwd   = os.environ.get("GW_PASSWORD", "")
+    email = _nonempty("GW_EMAIL")
+    pwd   = _nonempty("GW_PASSWORD")
     if not (email and pwd):
         raise RuntimeError("GW_LOGIN_MISSING_CREDS")
-    r = requests.post(
-        f"{base}/goauth/authenticateFireUser",
-        data={"email": email, "password": pwd},
-        timeout=_timeout(),
-    )
+    r = requests.post(f"{base}/goauth/authenticateFireUser",
+                      data={"email": email, "password": pwd},
+                      timeout=_timeout())
     r.raise_for_status()
     j = r.json()
     tok = j.get("token") or j.get("access_token")
@@ -48,19 +46,21 @@ def _login_token(base: str) -> str:
         raise RuntimeError(f"GW_LOGIN_NO_TOKEN in response: {list(j.keys())}")
     return _sanitize_token(tok)
 
-def _call(base: str, path: str, start: str, end: str, tok: str | None):
-    url = f"{base.rstrip('/')}/{path.lstrip('/')}"
-    return requests.get(
-        url,
-        params={"start": start, "end": end},
-        headers=_bearer_header(tok),
-        timeout=_timeout(),
-    )
+def _params_for(path: str, start: str | None, end: str | None) -> dict:
+    # Some endpoints (e.g., GetLeoCross) don’t take start/end; only send if both present.
+    if start and end:
+        return {"start": start, "end": end}
+    return {}
 
-def _dump_response(text: str, dump_dir: Path, path: str) -> Path:
+def _get(base: str, path: str, start: str | None, end: str | None, tok: str | None):
+    url = f"{base.rstrip('/')}/{path.lstrip('/')}"
+    qs = _params_for(path, start, end)
+    print(f"→ GET {path} params={qs if qs else '{}'}")
+    return requests.get(url, params=qs, headers=_hdr(tok), timeout=_timeout())
+
+def _dump(text: str, dump_dir: Path, path: str) -> Path:
     dump_dir.mkdir(parents=True, exist_ok=True)
-    name = f"{_ts()}_{_slug(path)}.json"
-    fp = dump_dir / name
+    fp = dump_dir / f"{_ts()}_{_slug(path)}.json"
     fp.write_text(text, encoding="utf-8")
     print(f"→ Dumped {len(text.encode('utf-8'))} bytes to {fp}")
     return fp
@@ -90,45 +90,38 @@ def _preview_json(obj):
     pv(obj)
 
 def main():
-    base  = os.environ.get("GW_BASE", "https://gandalf.gammawizard.com").rstrip("/")
-    paths = [p.strip() for p in os.environ.get("GW_PATH", "").split(",") if p.strip()]
-    if not paths:
-        paths = ["/rapi/Market/SpxClose", "/rapi/SpxClose"]
+    base  = _nonempty("GW_BASE") or "https://gandalf.gammawizard.com"
+    raw_paths = _nonempty("GW_PATH")
+    paths = [p.strip() for p in raw_paths.split(",")] if raw_paths else ["/rapi/Market/SpxClose", "/rapi/SpxClose", "/rapi/GetLeoCross"]
 
+    # Compute window with sane fallbacks
     try:
-        days_env = os.environ.get("GW_DAYS") or os.environ.get("SETTLE_BACKFILL_DAYS") or "14"
-        days = int(days_env)
+        days = int(_nonempty("GW_DAYS", "SETTLE_BACKFILL_DAYS") or "14")
     except Exception:
         days = 14
-    t1 = datetime.now(timezone.utc).date()
-    t0 = t1 - timedelta(days=days)
-    start_iso = os.environ.get("GW_START", t0.isoformat())
-    end_iso   = os.environ.get("GW_END",   t1.isoformat())
+    t1_default = datetime.now(timezone.utc).date()
+    t0_default = t1_default - timedelta(days=days)
+    start = _nonempty("GW_START") or t0_default.isoformat()
+    end   = _nonempty("GW_END")   or t1_default.isoformat()
 
-    dump_dir = Path(os.environ.get("GW_DUMP_DIR", "gw_dump"))
+    dump_dir = Path(_nonempty("GW_DUMP_DIR") or "gw_dump")
 
-    token = _sanitize_token(os.environ.get("GW_TOKEN") or os.environ.get("GW_VAR2_TOKEN"))
-    email = os.environ.get("GW_EMAIL")
-    pwd   = os.environ.get("GW_PASSWORD")
+    tok = _sanitize_token(_nonempty("GW_TOKEN", "GW_VAR2_TOKEN"))
 
-    print(f"Base={base}  window={start_iso}→{end_iso}  paths={paths}")
+    print(f"Base={base}  window={start}→{end}  paths={paths}")
 
     for path in paths:
-        print(f"\n=== Hitting {path} start={start_iso} end={end_iso} ===")
-        r = _call(base, path, start_iso, end_iso, token)
+        r = _get(base, path, start, end, tok)
         if r.status_code in (401, 403):
-            if email and pwd:
-                print("Auth failed → trying email/password login…")
-            else:
-                print("Auth failed or no token → logging in…")
+            print("Auth failed → trying email/password login…")
             try:
-                token = _login_token(base)
-                r = _call(base, path, start_iso, end_iso, token)
+                tok = _login_token(base)
+                r = _get(base, path, start, end, tok)
             except Exception as e:
                 print(f"!! Unable to obtain login token: {e}. Skipping {path}.")
 
         print(f"HTTP {r.status_code}  content-type={r.headers.get('content-type','?')}  bytes={len(r.content)}")
-        _dump_response(r.text, dump_dir, path)
+        _dump(r.text, dump_dir, path)
 
         try:
             j = r.json()
