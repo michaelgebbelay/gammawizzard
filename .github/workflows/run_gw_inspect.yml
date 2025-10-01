@@ -19,8 +19,24 @@ on:
         required: false
 
 jobs:
-  run:
+  inspect:
     runs-on: ubuntu-latest
+
+    # Map secrets/vars at the JOB level so every step sees them.
+    env:
+      GW_BASE: https://gandalf.gammawizard.com
+      GW_PATH: ${{ github.event.inputs.path }}
+      GW_DAYS: ${{ github.event.inputs.days }}
+      GW_START: ${{ github.event.inputs.start }}
+      GW_END: ${{ github.event.inputs.end }}
+      GW_DUMP_DIR: gw_dump
+
+      # *** Secrets: these must match your repo secret names exactly ***
+      GW_TOKEN: ${{ secrets.GW_TOKEN }}
+      GW_VAR2_TOKEN: ${{ secrets.GW_VAR2_TOKEN }}
+      GW_EMAIL: ${{ secrets.GW_EMAIL }}
+      GW_PASSWORD: ${{ secrets.GW_PASSWORD }}
+
     steps:
       - uses: actions/checkout@v4
 
@@ -34,27 +50,21 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Debug env presence (no secrets printed)
+      - name: Hard fail if secrets missing (no values printed)
         run: |
+          miss=0
           for k in GW_TOKEN GW_EMAIL GW_PASSWORD; do
-            if [ -n "${!k:-}" ]; then echo "$k is set"; else echo "::warning ::$k is NOT set"; fi
+            if [ -z "${!k:-}" ]; then
+              echo "::error ::$k is NOT set"; miss=1
+            else
+              echo "$k is set"
+            fi
           done
+          if [ "$miss" -eq 1 ]; then
+            echo "Required secrets missing. Aborting."; exit 1
+          fi
 
       - name: Run inspector
-        env:
-          # Base + window
-          GW_BASE: https://gandalf.gammawizard.com
-          GW_PATH: ${{ github.event.inputs.path }}
-          GW_DAYS: ${{ github.event.inputs.days }}
-          GW_START: ${{ github.event.inputs.start }}
-          GW_END: ${{ github.event.inputs.end }}
-          GW_DUMP_DIR: gw_dump
-
-          # Auth (use whichever you have; token preferred)
-          GW_TOKEN: ${{ secrets.GW_TOKEN }}
-          GW_VAR2_TOKEN: ${{ secrets.GW_VAR2_TOKEN }}   # optional fallback you already have
-          GW_EMAIL: ${{ secrets.GW_EMAIL }}
-          GW_PASSWORD: ${{ secrets.GW_PASSWORD }}
         run: |
           python3 scripts/data/gw_inspect.py
 
