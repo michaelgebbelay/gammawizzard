@@ -35,6 +35,17 @@ ET = ZoneInfo("America/New_York")
 RAW_TAB = "sw_txn_raw"
 PERF_TAB = "sw_performance_summary"
 EDGE_RISK_UNIT = 100.0
+NUMERIC_DECIMALS = {
+    # header -> decimals to round to when coercing
+    "strike": 4,
+    "quantity": 4,
+    "price": 4,
+    "amount": 2,
+    "net_amount": 2,
+    "commissions": 2,
+    "fees_other": 2,
+}
+NUMERIC_COLUMNS = set(NUMERIC_DECIMALS.keys())
 
 
 def env_flag(name: str, default: bool = False) -> bool:
@@ -85,6 +96,64 @@ def ensure_tab_with_header(svc, sid: str, tab: str, headers: List[str]) -> None:
         ).execute()
 
 
+def sheet_id_by_title(svc, sid: str, tab: str) -> Optional[int]:
+    meta = svc.spreadsheets().get(spreadsheetId=sid).execute()
+    for s in meta.get("sheets", []):
+        if s["properties"]["title"] == tab:
+            return s["properties"].get("sheetId")
+    return None
+
+
+def apply_raw_number_formats(svc, sid: str, tab: str, headers: List[str]) -> None:
+    """Apply number/currency formats to numeric columns (data rows only)."""
+
+    shid = sheet_id_by_title(svc, sid, tab)
+    if shid is None:
+        return
+
+    def idx(col: str) -> Optional[int]:
+        try:
+            return headers.index(col)
+        except ValueError:
+            return None
+
+    def fmt_req(col_idx: int, fmt_type: str, pattern: str) -> dict:
+        return {
+            "repeatCell": {
+                "range": {
+                    "sheetId": shid,
+                    "startRowIndex": 1,  # skip header
+                    "startColumnIndex": col_idx,
+                    "endColumnIndex": col_idx + 1,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "numberFormat": {"type": fmt_type, "pattern": pattern}
+                    }
+                },
+                "fields": "userEnteredFormat.numberFormat",
+            }
+        }
+
+    requests: List[dict] = []
+
+    for h in ("strike", "quantity", "price"):
+        i = idx(h)
+        if i is not None:
+            requests.append(fmt_req(i, "NUMBER", "0.####"))
+
+    for h in ("amount", "net_amount", "commissions", "fees_other"):
+        i = idx(h)
+        if i is not None:
+            requests.append(fmt_req(i, "CURRENCY", "$#,##0.00"))
+
+    if requests:
+        svc.spreadsheets().batchUpdate(
+            spreadsheetId=sid,
+            body={"requests": requests},
+        ).execute()
+
+
 def ensure_tab_exists(svc, sid: str, tab: str) -> None:
     meta = svc.spreadsheets().get(spreadsheetId=sid).execute()
     titles = {s["properties"]["title"] for s in meta.get("sheets", [])}
@@ -114,6 +183,7 @@ def read_existing_rows(
     resp = svc.spreadsheets().values().get(
         spreadsheetId=sid,
         range=f"{tab}!A2:{chr(ord('A') + len(headers) - 1)}",
+        valueRenderOption="UNFORMATTED_VALUE",
     ).execute()
     rows = resp.get("values", [])
     norm: List[List[Any]] = []
@@ -125,6 +195,22 @@ def read_existing_rows(
             cur = cur[: len(headers)]
         norm.append(cur)
     return norm
+
+
+def _coerce_numeric_columns(rows: List[List[Any]], headers: List[str]) -> List[List[Any]]:
+    """Ensure numeric columns are stored as floats with sane rounding."""
+
+    col_idx = {h: headers.index(h) for h in NUMERIC_COLUMNS if h in headers}
+    for r in rows:
+        for h, i in col_idx.items():
+            if i >= len(r):
+                continue
+            f = safe_float(r[i])
+            if f is None:
+                r[i] = ""
+            else:
+                r[i] = round(f, NUMERIC_DECIMALS[h])
+    return rows
 
 
 def merge_rows(existing: List[List[Any]], new: List[List[Any]], headers: List[str]) -> List[List[Any]]:
@@ -146,9 +232,9 @@ def merge_rows(existing: List[List[Any]], new: List[List[Any]], headers: List[st
     def key_for(row: List[Any]) -> tuple:
         ledger = (row[i_ledger].strip() if i_ledger >= 0 and i_ledger < len(row) else "")
         symbol = row[i_symbol] if i_symbol >= 0 and i_symbol < len(row) else ""
-        qty = row[i_qty] if i_qty >= 0 and i_qty < len(row) else ""
-        price = row[i_price] if i_price >= 0 and i_price < len(row) else ""
-        amt = row[i_amt] if i_amt >= 0 and i_amt < len(row) else ""
+        qty = safe_float(row[i_qty]) if i_qty >= 0 and i_qty < len(row) else None
+        price = safe_float(row[i_price]) if i_price >= 0 and i_price < len(row) else None
+        amt = safe_float(row[i_amt]) if i_amt >= 0 and i_amt < len(row) else None
         if ledger:
             return ("ledger", ledger, symbol, qty, price, amt)
         return tuple(row)
@@ -689,7 +775,9 @@ def write_simple_summary_from_raw(svc, sid, src_tab=RAW_TAB, out_tab="sw_txn_sum
     # Pull raw values (through ledger_id col R)
     last_col = chr(ord("A") + len(RAW_HEADERS) - 1)  # "R"
     resp = svc.spreadsheets().values().get(
-        spreadsheetId=sid, range=f"{src_tab}!A1:{last_col}"
+        spreadsheetId=sid,
+        range=f"{src_tab}!A1:{last_col}",
+        valueRenderOption="UNFORMATTED_VALUE",
     ).execute()
     values = resp.get("values", [])
 
@@ -815,7 +903,9 @@ def main() -> int:
 
     existing_rows = read_existing_rows(svc, sid, RAW_TAB, RAW_HEADERS)
     merged_rows = merge_rows(existing_rows, all_rows, RAW_HEADERS)
+    merged_rows = _coerce_numeric_columns(merged_rows, RAW_HEADERS)
     overwrite_rows(svc, sid, RAW_TAB, RAW_HEADERS, merged_rows)
+    apply_raw_number_formats(svc, sid, RAW_TAB, RAW_HEADERS)
     if skip_summary:
         print("NOTE: SCHWAB_SKIP_SUMMARY set — skipping summary generation.")
     else:
