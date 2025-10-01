@@ -41,11 +41,25 @@ def gw_inspect(paths, start_iso: str, end_iso: str):
 
     for path in paths:
         print(f"\n=== Hitting {path} start={start_iso} end={end_iso} ===")
-        r=_hit(token, path) if token else None
+        try:
+            r=_hit(token, path)
+        except requests.exceptions.RequestException as exc:
+            print(f"!! Request to {path} failed: {exc}")
+            continue
         if (r is None) or (r.status_code in (401,403)):
             print("Auth failed or no token → logging in…")
-            token=gw_login_token()
-            r=_hit(token, path)
+            try:
+                token=gw_login_token()
+            except RuntimeError as e:
+                print(f"!! Unable to obtain login token: {e}. Skipping {path}.")
+                if r is None:
+                    continue
+            else:
+                try:
+                    r=_hit(token, path)
+                except requests.exceptions.RequestException as exc:
+                    print(f"!! Request to {path} failed after login: {exc}")
+                    continue
 
         print(f"HTTP {r.status_code}  content-type={r.headers.get('content-type','?')}  bytes={len(r.content)}")
         body_text=r.text
