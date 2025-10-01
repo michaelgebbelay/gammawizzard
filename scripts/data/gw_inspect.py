@@ -90,13 +90,11 @@ def _preview_json(obj):
     pv(obj)
 
 def main():
-    # ---- Config from env
     base  = os.environ.get("GW_BASE", "https://gandalf.gammawizard.com").rstrip("/")
     paths = [p.strip() for p in os.environ.get("GW_PATH", "").split(",") if p.strip()]
     if not paths:
         paths = ["/rapi/Market/SpxClose", "/rapi/SpxClose"]
 
-    # date window
     try:
         days_env = os.environ.get("GW_DAYS") or os.environ.get("SETTLE_BACKFILL_DAYS") or "14"
         days = int(days_env)
@@ -109,7 +107,6 @@ def main():
 
     dump_dir = Path(os.environ.get("GW_DUMP_DIR", "gw_dump"))
 
-    # creds
     token = _sanitize_token(os.environ.get("GW_TOKEN") or os.environ.get("GW_VAR2_TOKEN"))
     email = os.environ.get("GW_EMAIL")
     pwd   = os.environ.get("GW_PASSWORD")
@@ -122,23 +119,17 @@ def main():
         if r.status_code in (401, 403):
             if email and pwd:
                 print("Auth failed → trying email/password login…")
-                try:
-                    token = _login_token(base)
-                    r = _call(base, path, start_iso, end_iso, token)
-                except Exception as e:
-                    print(f"!! Unable to obtain login token: {e}. Skipping {path}.")
             else:
                 print("Auth failed or no token → logging in…")
-                try:
-                    token = _login_token(base)
-                    r = _call(base, path, start_iso, end_iso, token)
-                except Exception as e:
-                    print(f"!! Unable to obtain login token: {e}. Skipping {path}.")
+            try:
+                token = _login_token(base)
+                r = _call(base, path, start_iso, end_iso, token)
+            except Exception as e:
+                print(f"!! Unable to obtain login token: {e}. Skipping {path}.")
 
         print(f"HTTP {r.status_code}  content-type={r.headers.get('content-type','?')}  bytes={len(r.content)}")
         _dump_response(r.text, dump_dir, path)
 
-        # Try to preview JSON shape
         try:
             j = r.json()
         except Exception as e:
