@@ -160,15 +160,39 @@ def parse_leocross(obj: Any) -> List[List[Any]]:
                 if isinstance(tr, dict):
                     rows.append(as_row(tr, "Pred"))
 
-    # Dedup by (as_of_date, source) keeping the last occurrence
-    dedup: Dict[tuple, List[Any]] = {}
+    # Dedup by as_of_date keeping the most relevant row for each date.
+    dedup: Dict[str, List[Any]] = {}
     idx_as_of = HEADERS.index("as_of_date")
     idx_source = HEADERS.index("source")
+
+    def prefer_new(prev: Optional[List[Any]], new: List[Any]) -> bool:
+        """Return True if ``new`` should replace ``prev`` for a date key."""
+        if prev is None:
+            return True
+        src_prev = (prev[idx_source] or "").lower()
+        src_new = (new[idx_source] or "").lower()
+        if src_prev == src_new:
+            # Later occurrence wins to reflect freshest pull.
+            return True
+        if src_new == "trade" and src_prev != "trade":
+            # Prefer the Trade snapshot over historical predictions.
+            return True
+        if src_prev == "trade" and src_new != "trade":
+            return False
+        # Otherwise allow the latest row to override.
+        return True
+
     for r in rows:
-        key = (r[idx_as_of], r[idx_source])
-        dedup[key] = r
-    # Sort by as_of_date ascending, Trade rows last for the same date (Pred first)
-    return sorted(dedup.values(), key=lambda r: (r[idx_as_of] or "", r[idx_source]))
+        key = r[idx_as_of] or ""
+        if prefer_new(dedup.get(key), r):
+            dedup[key] = r
+
+    # Sort by as_of_date descending so the newest data is first.
+    return sorted(
+        dedup.values(),
+        key=lambda r: (r[idx_as_of] or ""),
+        reverse=True
+    )
 
 # --------- Google Sheets ---------
 
