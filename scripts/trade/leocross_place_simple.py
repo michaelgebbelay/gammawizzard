@@ -7,6 +7,7 @@
 # - 16:15 ET hard cutoff: cancel any working orders immediately at/after cutoff
 
 import os, sys, json, time, re, math, random
+from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime, date, timezone, timedelta
 from zoneinfo import ZoneInfo
 import requests
@@ -246,16 +247,21 @@ def _credit_width() -> int:
     width = max(CREDIT_MIN_WIDTH, int(CREDIT_SPREAD_WIDTH))
     return int(math.ceil(width / 5.0) * 5)
 
+def _round_half_up(x: float) -> int:
+    return int(Decimal(x).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
+
 def calc_width_for_side(is_credit: bool, opening_cash: float) -> int:
     return _credit_width() if is_credit else 5
 
 def calc_credit_contracts(opening_cash: float | int) -> int:
+    """Short-IC sizing: $4,000 per 5-wide, scaled by width, half-up rounding, min 1."""
     try:
         oc = float(opening_cash)
     except Exception:
         oc = 0.0
-    denom = CREDIT_DOLLARS_PER_CONTRACT if CREDIT_DOLLARS_PER_CONTRACT > 0 else 1.0
-    units = math.ceil(max(0.0, oc) / denom)
+    width = _credit_width()               # uses CREDIT_SPREAD_WIDTH (20) and rounds to 5-pt grid
+    denom = 4000.0 * (width / 5.0)        # 20-wide → $16,000 per contract
+    units = _round_half_up(oc / denom)
     return max(1, int(units))
 
 # ===== Quotes & NBBO =====
