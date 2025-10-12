@@ -14,7 +14,8 @@ from googleapiclient.discovery import build as gbuild
 # ===== Runtime knobs =====
 PER_UNIT = 5000  # legacy debit sizing
 CREDIT_DOLLARS_PER_CONTRACT = float(os.environ.get("CREDIT_DOLLARS_PER_CONTRACT", "12000"))
-CREDIT_SPREAD_WIDTH         = int(os.environ.get("CREDIT_SPREAD_WIDTH", "15"))
+# Default to 20-wide; still overridable by env.
+CREDIT_SPREAD_WIDTH         = int(os.environ.get("CREDIT_SPREAD_WIDTH", "20"))
 CREDIT_MIN_WIDTH            = 5
 
 # Read from ENV (with sensible defaults)
@@ -304,9 +305,22 @@ def main():
         reason="OPENING_CASH_UNAVAILABLE — aborting to avoid wrong size/width."
         print("ORCH ABORT:", reason); log("ABORT", reason); return 1
 
+    # SHORT: use configured width (default now 20). LONG: keep your original 5-wide.
     width = calc_short_ic_width(oc) if is_credit else 5
-    p_low,p_high = inner_put - width, inner_put
-    c_low,c_high = inner_call, inner_call + width
+
+    # legs (unoriented base strikes)
+    if is_credit:
+        # PUSHED-OUT SHORTS by 5; wings at ± width from those shorts
+        sell_put  = inner_put  - 5
+        buy_put   = sell_put   - width
+        sell_call = inner_call + 5
+        buy_call  = sell_call  + width
+        p_low, p_high = buy_put, sell_put
+        c_low, c_high = sell_call, buy_call
+    else:
+        # LONG path unchanged (your original behavior)
+        p_low, p_high = inner_put - width, inner_put
+        c_low, c_high = inner_call, inner_call + width
     bp = to_osi(f".SPXW{exp6}P{p_low}"); sp = to_osi(f".SPXW{exp6}P{p_high}")
     sc = to_osi(f".SPXW{exp6}C{c_low}"); bc = to_osi(f".SPXW{exp6}C{c_high}")
 
