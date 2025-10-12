@@ -13,16 +13,13 @@ import requests
 from schwab.auth import client_from_token_file
 
 # ----- Config knobs (credit spreads) -----
-CREDIT_DOLLARS_PER_CONTRACT = float(os.environ.get("CREDIT_DOLLARS_PER_CONTRACT", "12000"))
-# Default to 20-wide; still overridable via env.
+# width stays on SPX 5-pt grid
 CREDIT_SPREAD_WIDTH         = int(os.environ.get("CREDIT_SPREAD_WIDTH", "20"))
 CREDIT_MIN_WIDTH            = 5  # SPX strikes trade in 5-point increments
 
 ET = ZoneInfo("America/New_York")
 GW_BASE = "https://gandalf.gammawizard.com"
 GW_ENDPOINT = "/rapi/GetLeoCross"
-
-QTY_TARGET = int(os.environ.get("QTY_TARGET","4") or "4")
 
 # ------------- small utils -------------
 def goutput(name: str, val: str):
@@ -71,7 +68,7 @@ def calc_short_ic_width(opening_cash: float | int) -> int:
     return _credit_width()
 
 def calc_short_ic_contracts(opening_cash: float | int) -> int:
-    """Short-IC sizing: $4,000 per 5-wide, scaled by width, half-up rounding, min 1."""
+    """Short-IC sizing: $4k per 5-wide, scaled by configured width, half-up rounding, min 1."""
     try:
         oc = float(opening_cash)
     except Exception:
@@ -80,6 +77,14 @@ def calc_short_ic_contracts(opening_cash: float | int) -> int:
     denom = 4000.0 * (width / 5.0)
     units = _round_half_up(oc / denom)
     return max(1, int(units))
+
+def calc_long_ic_contracts(opening_cash: float | int) -> int:
+    """Long-IC sizing: $4k per condor (always 5-wide), floor, min 1."""
+    try:
+        oc = float(opening_cash)
+    except Exception:
+        oc = 0.0
+    return max(1, int(math.floor(oc / 4000.0)))
 
 # ------------- Schwab helpers -------------
 def schwab_client():
@@ -390,7 +395,7 @@ def main():
         s2 = max(0.0, -pos_map.get(osi_canon(legs[2]), 0.0))
         return int(min(b1, b2, s1, s2))
 
-    target_qty = calc_short_ic_contracts(oc) if is_credit else max(0, QTY_TARGET)
+    target_qty = calc_short_ic_contracts(oc) if is_credit else calc_long_ic_contracts(oc)
 
     if any_opposite:
         action="SKIP"; reason="WOULD_CLOSE"
