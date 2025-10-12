@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-# VERSION: 2025-10-07 v4.4.0 — Orchestrator
+# VERSION: 2025-10-07 v4.4.1 — Orchestrator
 # - Default FAST_HOLD_SECONDS=30 (start shortly after the 16:13 trigger)
 # - Logs guard snapshot and calls placer with QTY_OVERRIDE
+# - Aligns sizing math with guard/placer (Short IC = $4k/5-wide, Long IC = $4k)
 
 import os, sys, json, time, re, math
 from datetime import datetime, date, timezone, timedelta
@@ -10,10 +11,11 @@ import requests
 from schwab.auth import client_from_token_file
 from google.oauth2 import service_account
 from googleapiclient.discovery import build as gbuild
+from decimal import Decimal, ROUND_HALF_UP
 
 # ===== Runtime knobs =====
-PER_UNIT = 5000  # legacy debit sizing
-CREDIT_DOLLARS_PER_CONTRACT = float(os.environ.get("CREDIT_DOLLARS_PER_CONTRACT", "12000"))
+CREDIT_DOLLARS_PER_CONTRACT = float(os.environ.get("CREDIT_DOLLARS_PER_CONTRACT", "4000"))
+DEBIT_DOLLARS_PER_CONTRACT  = float(os.environ.get("DEBIT_DOLLARS_PER_CONTRACT",  "4000"))
 # Default to 20-wide; still overridable by env.
 CREDIT_SPREAD_WIDTH         = int(os.environ.get("CREDIT_SPREAD_WIDTH", "20"))
 CREDIT_MIN_WIDTH            = 5
@@ -179,15 +181,33 @@ def opening_cash_for_account(c, acct_number: str):
     if oc is None: oc = pick(curr,"cashBalance","cashAvailableForTrading","liquidationValue")
     return oc
 
+def _round_half_up(x: float) -> int:
+    return int(Decimal(x).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
+
 def calc_short_ic_width(opening_cash: float | int) -> int:
     width = max(CREDIT_MIN_WIDTH, int(CREDIT_SPREAD_WIDTH))
     return int(math.ceil(width / 5.0) * 5)
 
 def calc_short_ic_contracts(opening_cash: float | int) -> int:
-    try: oc = float(opening_cash)
-    except Exception: oc = 0.0
-    denom = CREDIT_DOLLARS_PER_CONTRACT if CREDIT_DOLLARS_PER_CONTRACT > 0 else 1.0
-    units = math.ceil(max(0.0, oc) / denom)
+    try:
+        oc = float(opening_cash)
+    except Exception:
+        oc = 0.0
+    width = calc_short_ic_width(opening_cash)
+    base = CREDIT_DOLLARS_PER_CONTRACT if CREDIT_DOLLARS_PER_CONTRACT > 0 else 4000.0
+    denom = base * (width / 5.0)
+    if denom <= 0:
+        denom = 4000.0 * (width / 5.0)
+    units = _round_half_up(max(0.0, oc) / denom)
+    return max(1, int(units))
+
+def calc_long_ic_contracts(opening_cash: float | int) -> int:
+    try:
+        oc = float(opening_cash)
+    except Exception:
+        oc = 0.0
+    base = DEBIT_DOLLARS_PER_CONTRACT if DEBIT_DOLLARS_PER_CONTRACT > 0 else 4000.0
+    units = math.floor(max(0.0, oc) / base)
     return max(1, int(units))
 
 def condor_units_open(pos_map, legs):
@@ -421,7 +441,7 @@ def main():
             details="PARTIAL_OVERLAP — " + "; ".join(present)
             print("ORCH SKIP:", details); log("SKIP", details, legs, acct_snapshot, "", ""); return 0
 
-    target_units = calc_short_ic_contracts(oc) if is_credit else int(max(0, oc // PER_UNIT))
+    target_units = calc_short_ic_contracts(oc) if is_credit else calc_long_ic_contracts(oc)
     if BYPASS_GUARD:
         try: rem_qty = int(BYPASS_QTY) if BYPASS_QTY else int(target_units)
         except Exception: rem_qty = int(target_units)
@@ -437,9 +457,12 @@ def main():
         units_open = condor_units_open(pos, legs)
         rem_qty = max(0, target_units - units_open)
         decision = ("ALLOW" if rem_qty>0 else "SKIP")
-        detail = f"short_ic width={width} open_cash={oc:.2f} target={target_units} units_open={units_open} rem_qty={rem_qty}" \
-                 if is_credit else \
-                 f"long_ic width=5 open_cash={oc:.2f} per_unit={PER_UNIT} target={target_units} units_open={units_open} rem_qty={rem_qty}"
+        detail = (
+            f"short_ic width={width} open_cash={oc:.2f} target={target_units} units_open={units_open} rem_qty={rem_qty}"
+            if is_credit
+            else
+            f"long_ic width=5 open_cash={oc:.2f} dollars_per={DEBIT_DOLLARS_PER_CONTRACT} target={target_units} units_open={units_open} rem_qty={rem_qty}"
+        )
 
     print("ORCH SIZE", detail); log(decision, detail, legs, acct_snapshot, (0 if BYPASS_GUARD else units_open), rem_qty)
     if rem_qty == 0: print("ORCH SKIP: At/above target; no remainder to place."); return 0
