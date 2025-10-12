@@ -403,7 +403,16 @@ def main():
     c=client_from_token_file(api_key=app_key, app_secret=app_secret, token_path="schwab_token.json")
 
     acct_num, acct_hash = get_primary_acct(c)
-    oc = opening_cash_for_account(c, acct_num)
+    # Manual $ override for tests
+    oc_override_raw = os.environ.get("SIZING_DOLLARS_OVERRIDE", "").strip()
+    oc_override = None
+    if oc_override_raw:
+        try:
+            oc_override = float(oc_override_raw)
+        except Exception:
+            oc_override = None
+    oc_real = opening_cash_for_account(c, acct_num)
+    oc = oc_override if (oc_override is not None and oc_override > 0) else oc_real
 
     def spx_last():
         for sym in ["$SPX.X","SPX","SPX.X","$SPX"]:
