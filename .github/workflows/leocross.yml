@@ -12,11 +12,11 @@ on:
         required: false
         default: 'false'
       force_qty:
-        description: 'Qty when forcing (blank=1)'
+        description: 'Qty override (blank = compute from $)'
         required: false
-        default: '1'
+        default: ''
       sizing_override:
-        description: 'Override target sizing in dollars (blank=default)'
+        description: 'Override account value used for sizing (USD). Blank = use Schwab.'
         required: false
         default: ''
       ignore_cutoff:
