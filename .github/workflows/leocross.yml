@@ -15,6 +15,10 @@ on:
         description: 'Qty when forcing (blank=1)'
         required: false
         default: '1'
+      sizing_override:
+        description: 'Override target sizing in dollars (blank=default)'
+        required: false
+        default: ''
       ignore_cutoff:
         description: 'Ignore the 16:15 ET cutoff?'
         required: false
@@ -53,6 +57,7 @@ jobs:
           # Guard bypass toggles (position/overlap checks only)
           BYPASS_GUARD: ${{ github.event.inputs.force }}
           BYPASS_QTY:   ${{ github.event.inputs.force_qty }}
+          SIZING_DOLLARS_OVERRIDE: ${{ github.event.inputs.sizing_override }}
 
           # ===== Credentials =====
           # Schwab
