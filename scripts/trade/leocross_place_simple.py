@@ -75,7 +75,7 @@ HARD_CUTOFF_HHMM    = os.environ.get("HARD_CUTOFF_HHMM","16:15").strip()
 
 # sizing
 CREDIT_DOLLARS_PER_CONTRACT = float(os.environ.get("CREDIT_DOLLARS_PER_CONTRACT", "12000"))
-CREDIT_SPREAD_WIDTH         = int(os.environ.get("CREDIT_SPREAD_WIDTH", "15"))
+CREDIT_SPREAD_WIDTH         = int(os.environ.get("CREDIT_SPREAD_WIDTH", "20"))
 CREDIT_MIN_WIDTH            = 5
 QTY_FIXED                   = int(os.environ.get("QTY_FIXED","4") or "4")  # for long IC unless QTY_OVERRIDE
 VERBOSE                     = str(os.environ.get("VERBOSE","1")).strip().lower() in {"1","true","yes","y","on"}
@@ -448,8 +448,18 @@ def main():
 
     # ---- build legs with proper width ----
     width = calc_width_for_side(is_credit, oc if oc is not None else 0)
-    p_low,p_high = inner_put-width, inner_put
-    c_low,c_high = inner_call, inner_call+width
+    if is_credit:
+        # PUSHED-OUT shorts by 5; wings ±width from shorts
+        sell_put  = inner_put  - 5
+        buy_put   = sell_put   - width
+        sell_call = inner_call + 5
+        buy_call  = sell_call  + width
+        p_low, p_high = buy_put, sell_put
+        c_low, c_high = sell_call, buy_call
+    else:
+        # LONG unchanged
+        p_low, p_high = inner_put - width, inner_put
+        c_low, c_high = inner_call, inner_call + width
     bp = to_osi(f".SPXW{exp6}P{p_low}"); sp = to_osi(f".SPXW{exp6}P{p_high}")
     sc = to_osi(f".SPXW{exp6}C{c_low}"); bc = to_osi(f".SPXW{exp6}C{c_high}")
 
@@ -763,8 +773,16 @@ def main():
                 put2   = int(float(tr2.get("Limit"))); call2=int(float(tr2.get("CLimit")))
                 if exp6_2 != exp6 or put2 != inner_put or call2 != inner_call:
                     exp6 = exp6_2; inner_put = put2; inner_call = call2
-                    p_low,p_high = inner_put-width, inner_put
-                    c_low,c_high = inner_call, inner_call+width
+                    if is_credit:
+                        sell_put  = inner_put  - 5
+                        buy_put   = sell_put   - width
+                        sell_call = inner_call + 5
+                        buy_call  = sell_call  + width
+                        p_low, p_high = buy_put, sell_put
+                        c_low, c_high = sell_call, buy_call
+                    else:
+                        p_low, p_high = inner_put - width, inner_put
+                        c_low, c_high = inner_call, inner_call + width
                     legs = orient(to_osi(f".SPXW{exp6}P{p_low}"),
                                   to_osi(f".SPXW{exp6}P{p_high}"),
                                   to_osi(f".SPXW{exp6}C{c_low}"),
