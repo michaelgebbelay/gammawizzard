@@ -6,6 +6,7 @@ __version__ = "3.3.0"
 # and emit a single decision for the orchestrator.
 
 import os, sys, json, re, time, math, random
+from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime, date, timezone
 from zoneinfo import ZoneInfo
 import requests
@@ -62,17 +63,22 @@ def _credit_width() -> int:
     # round to nearest 5 upward to stay on SPX grid
     return int(math.ceil(width / 5.0) * 5)
 
+def _round_half_up(x: float) -> int:
+    return int(Decimal(x).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
+
 def calc_short_ic_width(opening_cash: float | int) -> int:
     """Retained for compatibility: ignores cash and returns configured credit width."""
     return _credit_width()
 
 def calc_short_ic_contracts(opening_cash: float | int) -> int:
+    """Short-IC sizing: $4,000 per 5-wide, scaled by width, half-up rounding, min 1."""
     try:
         oc = float(opening_cash)
     except Exception:
         oc = 0.0
-    denom = CREDIT_DOLLARS_PER_CONTRACT if CREDIT_DOLLARS_PER_CONTRACT > 0 else 1.0
-    units = math.ceil(max(0.0, oc) / denom)
+    width = _credit_width()
+    denom = 4000.0 * (width / 5.0)
+    units = _round_half_up(oc / denom)
     return max(1, int(units))
 
 # ------------- Schwab helpers -------------
