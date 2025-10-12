@@ -319,8 +319,16 @@ def main():
     cat1=fnum(tr.get("Cat1")); cat2=fnum(tr.get("Cat2"))
     is_credit = True if (cat2 is None or cat1 is None or cat2>=cat1) else False
 
-    # Opening cash for width
-    oc = opening_cash_for_account(c, acct_num)
+    # Opening cash for width (allow manual override for testing)
+    oc_override_raw = os.environ.get("SIZING_DOLLARS_OVERRIDE", "").strip()
+    oc_override = None
+    if oc_override_raw:
+        try:
+            oc_override = float(oc_override_raw)
+        except Exception:
+            oc_override = None
+    oc_real = opening_cash_for_account(c, acct_num)
+    oc = oc_override if (oc_override is not None and oc_override > 0) else oc_real
     if oc is None:
         reason="OPENING_CASH_UNAVAILABLE — aborting to avoid wrong size/width."
         print("ORCH ABORT:", reason); log("ABORT", reason); return 1
@@ -403,8 +411,16 @@ def main():
             if (inner_put2 != inner_put) or (inner_call2 != inner_call) or (new_exp_iso!=exp_iso):
                 exp_iso = new_exp_iso; exp6 = yymmdd(exp_iso)
                 inner_put, inner_call = inner_put2, inner_call2
-                p_low,p_high = inner_put - width, inner_put
-                c_low,c_high = inner_call, inner_call + width
+                if is_credit:
+                    sell_put  = inner_put  - 5
+                    buy_put   = sell_put   - width
+                    sell_call = inner_call + 5
+                    buy_call  = sell_call  + width
+                    p_low, p_high = buy_put, sell_put
+                    c_low, c_high = sell_call, buy_call
+                else:
+                    p_low, p_high = inner_put - width, inner_put
+                    c_low, c_high = inner_call, inner_call + width
                 bp = to_osi(f".SPXW{exp6}P{p_low}"); sp = to_osi(f".SPXW{exp6}P{p_high}")
                 sc = to_osi(f".SPXW{exp6}C{c_low}"); bc = to_osi(f".SPXW{exp6}C{c_high}")
                 legs = orient(bp,sp,sc,bc)
