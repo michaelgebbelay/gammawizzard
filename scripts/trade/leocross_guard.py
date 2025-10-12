@@ -314,7 +314,17 @@ def main():
     is_credit = True if (cat2 is None or cat1 is None or cat2>=cat1) else False
 
     # determine width
-    oc = opening_cash_for_account(c, acct_num)
+    # Allow manual override of account value for sizing (testing)
+    oc_override_raw = os.environ.get("SIZING_DOLLARS_OVERRIDE", "").strip()
+    oc_override = None
+    if oc_override_raw:
+        try:
+            oc_override = float(oc_override_raw)
+        except Exception:
+            oc_override = None
+
+    oc_real = opening_cash_for_account(c, acct_num)
+    oc = oc_override if (oc_override is not None and oc_override > 0) else oc_real
     if is_credit and oc is None:
         reason="OPENING_CASH_UNAVAILABLE — cannot compute Short IC width."
         print("GUARD SKIP:", reason)
