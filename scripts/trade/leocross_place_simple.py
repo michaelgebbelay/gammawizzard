@@ -75,10 +75,8 @@ CANCEL_SETTLE_SECS  = _as_float("CANCEL_SETTLE_SECS","0.8")
 HARD_CUTOFF_HHMM    = os.environ.get("HARD_CUTOFF_HHMM","16:15").strip()
 
 # sizing
-CREDIT_DOLLARS_PER_CONTRACT = float(os.environ.get("CREDIT_DOLLARS_PER_CONTRACT", "12000"))
 CREDIT_SPREAD_WIDTH         = int(os.environ.get("CREDIT_SPREAD_WIDTH", "20"))
 CREDIT_MIN_WIDTH            = 5
-QTY_FIXED                   = int(os.environ.get("QTY_FIXED","4") or "4")  # for long IC unless QTY_OVERRIDE
 VERBOSE                     = str(os.environ.get("VERBOSE","1")).strip().lower() in {"1","true","yes","y","on"}
 
 WINDOW_STATUSES   = {"WORKING","QUEUED","OPEN","PENDING_ACTIVATION","ACCEPTED","RECEIVED"}
@@ -254,15 +252,23 @@ def calc_width_for_side(is_credit: bool, opening_cash: float) -> int:
     return _credit_width() if is_credit else 5
 
 def calc_credit_contracts(opening_cash: float | int) -> int:
-    """Short-IC sizing: $4,000 per 5-wide, scaled by width, half-up rounding, min 1."""
+    """SHORT IC sizing: $4k per 5-wide, scaled by width W, half-up, min 1."""
     try:
         oc = float(opening_cash)
     except Exception:
         oc = 0.0
-    width = _credit_width()               # uses CREDIT_SPREAD_WIDTH (20) and rounds to 5-pt grid
-    denom = 4000.0 * (width / 5.0)        # 20-wide → $16,000 per contract
+    width = _credit_width()
+    denom = 4000.0 * (width / 5.0)
     units = _round_half_up(oc / denom)
     return max(1, int(units))
+
+def calc_debit_contracts(opening_cash: float | int) -> int:
+    """LONG IC sizing: 5-wide, floor(account/4000), min 1."""
+    try:
+        oc = float(opening_cash)
+    except Exception:
+        oc = 0.0
+    return max(1, int(math.floor(oc / 4000.0)))
 
 # ===== Quotes & NBBO =====
 def fetch_bid_ask(c, osi: str):
@@ -491,7 +497,7 @@ def main():
         try: qty = max(0, int(qty_override))
         except: qty = 0
     else:
-        qty = calc_credit_contracts(oc) if is_credit else QTY_FIXED
+        qty = calc_credit_contracts(oc) if is_credit else calc_debit_contracts(oc)
 
     if qty < 1:
         row=[datetime.utcnow().isoformat()+"Z", source, "SPX", last_px, sig_date, "ABORT",
