@@ -81,7 +81,6 @@ jobs:
           HARD_CUTOFF_HHMM: ${{ github.event.inputs.ignore_cutoff == 'true' && '23:59' || '16:15' }}
 
           # Sizing / width
-          CREDIT_DOLLARS_PER_CONTRACT: "12000"
           CREDIT_SPREAD_WIDTH:         "20"
           CREDIT_MIN_WIDTH:            "5"
 
