@@ -13,7 +13,8 @@ from schwab.auth import client_from_token_file
 
 # ----- Config knobs (credit spreads) -----
 CREDIT_DOLLARS_PER_CONTRACT = float(os.environ.get("CREDIT_DOLLARS_PER_CONTRACT", "12000"))
-CREDIT_SPREAD_WIDTH         = int(os.environ.get("CREDIT_SPREAD_WIDTH", "15"))
+# Default to 20-wide; still overridable via env.
+CREDIT_SPREAD_WIDTH         = int(os.environ.get("CREDIT_SPREAD_WIDTH", "20"))
 CREDIT_MIN_WIDTH            = 5  # SPX strikes trade in 5-point increments
 
 ET = ZoneInfo("America/New_York")
@@ -314,8 +315,18 @@ def main():
     width = calc_short_ic_width(oc) if is_credit else 5
 
     # legs (unoriented base strikes)
-    p_low,p_high = inner_put - width, inner_put
-    c_low,c_high = inner_call, inner_call + width
+    if is_credit:
+        # PUSHED-OUT shorts by 5; wings ±width from those shorts
+        sell_put  = inner_put  - 5
+        buy_put   = sell_put   - width
+        sell_call = inner_call + 5
+        buy_call  = sell_call  + width
+        p_low, p_high = buy_put, sell_put
+        c_low, c_high = sell_call, buy_call
+    else:
+        # LONG path unchanged (same-shorts)
+        p_low, p_high = inner_put - width, inner_put
+        c_low, c_high = inner_call, inner_call + width
     bp = to_osi(f".SPXW{exp6}P{p_low}")
     sp = to_osi(f".SPXW{exp6}P{p_high}")
     sc = to_osi(f".SPXW{exp6}C{c_low}")
