@@ -82,7 +82,7 @@ jobs:
 
           # Sizing / width
           CREDIT_DOLLARS_PER_CONTRACT: "12000"
-          CREDIT_SPREAD_WIDTH:         "15"
+          CREDIT_SPREAD_WIDTH:         "20"
           CREDIT_MIN_WIDTH:            "5"
 
           # Verbose logs
