@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 # WIDTH PICKER — chooses the best credit width for today from live quotes
-# Emits GitHub Actions outputs: picked_width, picked_ref, picked_score, picked_edge, five_mid, pushed_out
-# Credit side only; long days are ignored (outputs default width).
+# Emits GitHub Actions outputs:
+#   picked_width, picked_ref, picked_score, picked_edge, five_mid, pushed_out, picker_diag
+# Notes:
+#   - Credit-only selector; set PICKER_FORCE_CREDIT=true to test on long days.
+#   - 5‑wide is never “pushed”, even when PUSH_OUT_SHORTS=true.
 
-import os, sys, re, json, math, time
+import os, sys, re, json
 from datetime import date
 from zoneinfo import ZoneInfo
-from schwab.auth import client_from_token_file
 import requests
+from schwab.auth import client_from_token_file
 
-ET = ZoneInfo("America/New_York")
+ET   = ZoneInfo("America/New_York")
 TICK = 0.05
 
 def clamp_tick(x: float) -> float:
@@ -85,7 +88,7 @@ def gw_get_leocross(base: str, endpoint: str):
 def extract_trade(j):
     if isinstance(j,dict):
         if "Trade" in j:
-            tr=j["Trade"]; 
+            tr=j["Trade"]
             return tr[-1] if isinstance(tr,list) and tr else tr if isinstance(tr,dict) else {}
         keys=("Date","TDate","Limit","CLimit","Cat1","Cat2")
         if any(k in j for k in keys): return j
@@ -99,18 +102,15 @@ def extract_trade(j):
             if t: return t
     return {}
 
-def build_legs(width:int, is_credit:bool, exp6:str, inner_put:int, inner_call:int, pushed:bool):
-    if is_credit:
-        if pushed and width != 5:
-            sell_put  = inner_put  - 5
-            buy_put   = sell_put   - width
-            sell_call = inner_call + 5
-            buy_call  = sell_call  + width
-            p_low, p_high = buy_put, sell_put
-            c_low, c_high = sell_call, buy_call
-        else:
-            p_low, p_high = inner_put - width, inner_put
-            c_low, c_high = inner_call, inner_call + width
+def build_legs(width:int, exp6:str, inner_put:int, inner_call:int, pushed:bool):
+    # 5‑wide is never pushed
+    if pushed and width != 5:
+        sell_put  = inner_put  - 5
+        buy_put   = sell_put   - width
+        sell_call = inner_call + 5
+        buy_call  = sell_call  + width
+        p_low, p_high = buy_put, sell_put
+        c_low, c_high = sell_call, buy_call
     else:
         p_low, p_high = inner_put - width, inner_put
         c_low, c_high = inner_call, inner_call + width
@@ -123,6 +123,21 @@ def build_legs(width:int, is_credit:bool, exp6:str, inner_put:int, inner_call:in
 def _truthy(s:str)->bool:
     return str(s or "").strip().lower() in {"1","true","t","yes","y","on"}
 
+def emit(width:int, ref:float, score:float, edge:float, five_mid:float, pushed:bool, diag=None):
+    out_path = os.environ.get("GITHUB_OUTPUT","")
+    def w(k,v):
+        if not out_path: return
+        with open(out_path,"a") as fh: fh.write(f"{k}={v}\n")
+    w("picked_width", str(width))
+    w("picked_ref",   f"{ref:.2f}")
+    w("picked_score", f"{score:.6f}")
+    w("picked_edge",  f"{edge:+.2f}")
+    w("five_mid",     f"{five_mid:.2f}")
+    w("pushed_out",   "true" if pushed else "false")
+    if diag: w("picker_diag", " / ".join(diag)[:900])
+    print(f"::notice title=WidthPicker::picked_width={width} ref={ref:.2f} score={score:.6f} edge={edge:+.2f} five_mid={five_mid:.2f} pushed_out={pushed}")
+    return 0
+
 def main():
     # ---- env knobs
     GW_BASE = os.environ.get("GW_BASE","https://gandalf.gammawizard.com")
@@ -132,8 +147,8 @@ def main():
     CANDS = [int(x) for x in (os.environ.get("CANDIDATE_CREDIT_WIDTHS","15,20,25,30,40,50").split(","))]
     SELECTOR_USE      = (os.environ.get("SELECTOR_USE","MID") or "MID").upper()  # MID or ASK
     SELECTOR_TICK_TOL = float(os.environ.get("SELECTOR_TICK_TOL","0.10"))
-    RATIO_STD = json.loads(os.environ.get("RATIO_STD_JSON",'{"5":1.0, "15":2.55, "20":3.175, "25":3.6625, "30":4.15, "40":4.85, "50":5.375}'))
-    RATIO_PUSH= json.loads(os.environ.get("RATIO_PUSH_JSON",'{"5":1.0, "15":2.205128, "20":2.743590, "25":3.179487, "30":3.615385, "40":4.256410, "50":4.717949}'))
+    RATIO_STD = json.loads(os.environ.get("RATIO_STD_JSON",'{"5":1.0,"15":2.55,"20":3.175,"25":3.6625,"30":4.15,"40":4.85,"50":5.375}'))
+    RATIO_PUSH= json.loads(os.environ.get("RATIO_PUSH_JSON",'{"5":1.0,"15":2.205128,"20":2.743590,"25":3.179487,"30":3.615385,"40":4.256410,"50":4.717949}'))
 
     # ---- Schwab auth
     app_key=os.environ["SCHWAB_APP_KEY"]; app_secret=os.environ["SCHWAB_APP_SECRET"]; token_json=os.environ["SCHWAB_TOKEN_JSON"]
@@ -153,18 +168,18 @@ def main():
         try: return float(x)
         except: return None
     cat1=fnum(tr.get("Cat1")); cat2=fnum(tr.get("Cat2"))
-    is_credit = True if (cat2 is None or cat1 is None or cat2>=cat1) else False
+    is_credit_signal = True if (cat2 is None or cat1 is None or cat2>=cat1) else False
 
     PICKER_FORCE_CREDIT = _truthy(os.environ.get("PICKER_FORCE_CREDIT","false"))
-    if not is_credit and not PICKER_FORCE_CREDIT:
+    if not is_credit_signal and not PICKER_FORCE_CREDIT:
         print("WIDTH_PICKER: Non‑credit day — set PICKER_FORCE_CREDIT=true to test the picker.")
         return emit(DEFAULT_WIDTH, 0.0, 0.0, 0.0, 0.0, PUSH_OUT_SHORTS)
 
-    if not is_credit and PICKER_FORCE_CREDIT:
+    if not is_credit_signal and PICKER_FORCE_CREDIT:
         print("WIDTH_PICKER: Forced‑credit test on a long‑signal day.")
 
-    # ---- 5‑wide at current shorts (or pushed for 5? keep 5 unchanged)
-    legs5 = build_legs(5, True, exp6, inner_put, inner_call, False)  # 5-wide never pushed
+    # ---- 5‑wide at same shorts (baseline; never pushed)
+    legs5 = build_legs(5, exp6, inner_put, inner_call, False)
     bid5, ask5, mid5 = condor_nbbo_credit(c, legs5)
     five_ref = (mid5 if SELECTOR_USE=="MID" else ask5)
 
@@ -173,31 +188,26 @@ def main():
     best = None  # (W, ref, score, edge, baseline)
 
     for W in CANDS:
-        legsW = build_legs(W, True, exp6, inner_put, inner_call, PUSH_OUT_SHORTS)
+        legsW = build_legs(W, exp6, inner_put, inner_call, PUSH_OUT_SHORTS)
         b,a,m = condor_nbbo_credit(c, legsW)
         ref = (m if SELECTOR_USE=="MID" else a)
         if ref is None or ref <= 0:
-            diag.append(f"W{W}: NOQUOTE")
-            continue
-        # baseline from ratio * five_mid (if we have a five_ref); else 0
-        mult = ratios.get(str(W)) if isinstance(ratios, dict) else None
-        if mult is None:
-            try: mult = ratios.get(W)  # int key fallback
-            except: mult = None
+            diag.append(f"W{W}: NOQUOTE"); continue
+
+        mult = (ratios.get(str(W)) if isinstance(ratios,dict) else None)
         baseline = (mult * five_ref) if (mult is not None and five_ref and five_ref>0) else 0.0
+
         edge = ref - baseline
-        score = ref / float(W)
+        score = ref / float(W)  # credit per point of width
+
         diag.append(f"W{W}: ref={ref:.2f} score={score:.5f} edge={edge:+.2f} base={baseline:.2f}")
         cand = (W, ref, score, edge, baseline)
         if best is None:
             best = cand
         else:
-            # primary: higher score
             if cand[2] > best[2] + 1e-12:
                 best = cand
             else:
-                # tie band: within SELECTOR_TICK_TOL on total‑credit equivalence
-                # Convert score diff into credit diff at a "typical" width (use max(W,bestW))
                 credit_diff = abs(cand[2] - best[2]) * float(max(W, best[0]))
                 if credit_diff <= SELECTOR_TICK_TOL and cand[3] > best[3] + 1e-12:
                     best = cand
@@ -211,24 +221,6 @@ def main():
         f"{five_ref:.2f}" if five_ref else "NA", SELECTOR_USE, PUSH_OUT_SHORTS, Wsel, f"{refsel:.2f}", scoresel, edgesel))
     print("CANDIDATES → " + " | ".join(diag))
     return emit(Wsel, refsel, scoresel, edgesel, (five_ref or 0.0), PUSH_OUT_SHORTS, diag)
-
-def emit(width:int, ref:float, score:float, edge:float, five_mid:float, pushed:bool, diag=None):
-    out_path = os.environ.get("GITHUB_OUTPUT","")
-    def w(k,v):
-        if not out_path: return
-        with open(out_path,"a") as fh:
-            fh.write(f"{k}={v}\n")
-    w("picked_width", str(width))
-    w("picked_ref",   f"{ref:.2f}")
-    w("picked_score", f"{score:.6f}")
-    w("picked_edge",  f"{edge:+.2f}")
-    w("five_mid",     f"{five_mid:.2f}")
-    w("pushed_out",   "true" if pushed else "false")
-    if diag:
-        # truncate to keep logs tidy
-        w("picker_diag", " / ".join(diag)[:900])
-    print(f"::notice title=WidthPicker::picked_width={width} ref={ref:.2f} score={score:.6f} edge={edge:+.2f} five_mid={five_mid:.2f} pushed_out={pushed}")
-    return 0
 
 if __name__=="__main__":
     sys.exit(main())
