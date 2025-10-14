@@ -221,7 +221,7 @@ def _credit_width() -> int:
 def _round_half_up(x: float) -> int:
     return int(Decimal(x).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
 
-def calc_width_for_side(is_credit: bool) -> int:
+def calc_width_for_side(is_credit: bool, opening_cash: float | int | None = None) -> int:
     return _credit_width() if is_credit else 5
 
 def calc_credit_contracts(opening_cash: float | int) -> int:
@@ -381,6 +381,11 @@ def main():
     oc_real = opening_cash_for_account(c, acct_num)
     oc = oc_override if (oc_override is not None and oc_override > 0) else oc_real
 
+    LOCK_SIDE        = (os.environ.get("LOCK_SIDE") or os.environ.get("SIDE_OVERRIDE") or "AUTO").strip().upper()
+    LOCK_WIDTH_RAW   = (os.environ.get("LOCK_WIDTH") or "").strip()
+    LOCK_LEGS_JSON   = (os.environ.get("LOCK_LEGS_JSON") or "").strip()
+    ALLOW_QTY_OVER_MAX = str(os.environ.get("ALLOW_QTY_OVER_MAX","false")).lower() in {"1","true","t","yes","y","on"}
+
     # SPX last (for logging)
     def spx_last():
         for sym in ["$SPX.X","SPX","SPX.X","$SPX"]:
@@ -421,49 +426,89 @@ def main():
         log_row("SKIPPED_TIME_WINDOW","", "", ["","","",""], 0, "", "", "")
         print("skip window"); sys.exit(0)
 
-    # ---- Leo
-    try:
-        api=gw_get_leocross()
-    except Exception as e:
-        log_row(f"ABORT_GW:{str(e)[:150]}", "", "", ["","","",""], 0, "", "", "")
-        print(e); sys.exit(0)
+    # ---- Leo / Locks
+    tr = {}
+    sig_date = ""
+    exp_iso = ""
 
-    tr=extract(api)
-    if not tr:
-        log_row("NO_TRADE_PAYLOAD", "", "", ["","","",""], 0, "", "", ""); sys.exit(0)
+    # Determine side (credit/debit) and legs/width
+    is_credit = None
+    legs = None
+    width = None
 
-    sig_date=str(tr.get("Date","")); exp_iso=str(tr.get("TDate","")); exp6=yymmdd(exp_iso)
-    inner_put=int(float(tr.get("Limit"))); inner_call=int(float(tr.get("CLimit")))
-    def fnum(x): 
-        try: return float(x)
-        except: return None
-    cat1=fnum(tr.get("Cat1")); cat2=fnum(tr.get("Cat2"))
-    is_credit_signal = True if (cat2 is None or cat1 is None or cat2>=cat1) else False
+    # 1) If we were given exact legs, use them and deduce width if not provided.
+    if LOCK_LEGS_JSON:
+        try:
+            legs = json.loads(LOCK_LEGS_JSON)
+            if not (isinstance(legs, list) and len(legs) == 4):
+                legs = None
+        except Exception:
+            legs = None
 
-    SIDE_OVERRIDE = (os.environ.get("SIDE_OVERRIDE","AUTO") or "AUTO").strip().upper()
-    is_credit = (True if SIDE_OVERRIDE=="CREDIT" else False if SIDE_OVERRIDE=="DEBIT" else is_credit_signal)
+    if LOCK_SIDE in {"CREDIT","DEBIT"}:
+        is_credit = (LOCK_SIDE == "CREDIT")
 
-    # Width + legs (push-out only on credit; 5-wide never pushed)
-    width = calc_width_for_side(is_credit)
-    if is_credit:
-        if PUSH_OUT_SHORTS and width != 5:
-            sell_put  = inner_put  - 5
-            buy_put   = sell_put   - width
-            sell_call = inner_call + 5
-            buy_call  = sell_call  + width
-            p_low, p_high = buy_put, sell_put
-            c_low, c_high = sell_call, buy_call
-        else:
-            p_low, p_high = inner_put - width, inner_put
-            c_low, c_high = inner_call, inner_call + width
+    if LOCK_WIDTH_RAW:
+        try:
+            width = int(LOCK_WIDTH_RAW)
+        except Exception:
+            width = None
+
+    # 2) If legs are locked, we don't need Leo to rebuild anything.
+    if legs and (is_credit is not None) and (width is not None):
+        pass  # fully locked path
     else:
-        p_low, p_high = inner_put - width, inner_put
-        c_low, c_high = inner_call, inner_call + width
+        # FALLBACK: fetch Leo once (only if locks were not complete)
+        try:
+            api = gw_get_leocross()
+            tr = extract(api)
+        except Exception as e:
+            log_row(f"ABORT_GW:{str(e)[:150]}", "", "", ["","","",""], 0, "", "", "")
+            print(e); sys.exit(0)
 
-    bp = to_osi(f".SPXW{exp6}P{p_low}"); sp = to_osi(f".SPXW{exp6}P{p_high}")
-    sc = to_osi(f".SPXW{exp6}C{c_low}"); bc = to_osi(f".SPXW{exp6}C{c_high}")
+        if not tr:
+            log_row("NO_TRADE_PAYLOAD", "", "", ["","","",""], 0, "", "", ""); sys.exit(0)
+
+        sig_date = str(tr.get("Date",""))
+        exp_iso = str(tr.get("TDate",""))
+
+        if is_credit is None:
+            def fnum(x):
+                try: return float(x)
+                except: return None
+            cat1=fnum(tr.get("Cat1")); cat2=fnum(tr.get("Cat2"))
+            is_credit = True if (cat2 is None or cat1 is None or cat2>=cat1) else False
+
+        if legs is None or width is None:
+            exp6 = yymmdd(exp_iso)
+            inner_put = int(float(tr.get("Limit")))
+            inner_call = int(float(tr.get("CLimit")))
+            if width is None:
+                width = calc_width_for_side(is_credit, oc if oc is not None else 0)
+            if is_credit:
+                if PUSH_OUT_SHORTS and width != 5:
+                    sell_put  = inner_put  - 5
+                    buy_put   = sell_put   - width
+                    sell_call = inner_call + 5
+                    buy_call  = sell_call  + width
+                    p_low, p_high = buy_put, sell_put
+                    c_low, c_high = sell_call, buy_call
+                else:
+                    p_low, p_high = inner_put - width, inner_put
+                    c_low, c_high = inner_call, inner_call + width
+            else:
+                p_low, p_high = inner_put - width, inner_put
+                c_low, c_high = inner_call, inner_call + width
+            bp = to_osi(f".SPXW{exp6}P{p_low}"); sp = to_osi(f".SPXW{exp6}P{p_high}")
+            sc = to_osi(f".SPXW{exp6}C{c_low}"); bc = to_osi(f".SPXW{exp6}C{c_high}")
+            legs = [bp, sp, sc, bc]
+
+    # Safety: if width is still None, compute from legs
+    if width is None and legs:
+        width = int(round(abs(strike_from_osi(legs[1]) - strike_from_osi(legs[0]))))
 
     # Orient legs
+    bp, sp, sc, bc = legs
     bpS=strike_from_osi(bp); spS=strike_from_osi(sp)
     scS=strike_from_osi(sc); bcS=strike_from_osi(bc)
     if is_credit:
@@ -479,20 +524,28 @@ def main():
     side_name  = "SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"
     order_type = "NET_CREDIT"        if is_credit else "NET_DEBIT"
 
-    # Quantity
-    qty_override = os.environ.get("QTY_OVERRIDE","").strip()
-    if qty_override:
-        try: qty = max(0, int(qty_override))
-        except: qty = 0
+    # ---- Quantity (with clamp) ----
+    qty_override_raw = os.environ.get("QTY_OVERRIDE","" ).strip()
+    qty_req = 0
+    if qty_override_raw:
+        try: qty_req = int(qty_override_raw)
+        except: qty_req = 0
+
+    auto_max = calc_credit_contracts(oc) if is_credit else calc_debit_contracts(oc)
+    qty = (qty_req if qty_req>0 else auto_max)
+    if not ALLOW_QTY_OVER_MAX:
+        qty = max(1, min(qty, auto_max))
     else:
-        qty = calc_credit_contracts(oc) if is_credit else calc_debit_contracts(oc)
+        qty = max(1, qty)
 
     if qty < 1:
         log_row("ABORT_QTY_LT_1", side_name, order_type, legs, 0, "", "", sig_date); print("qty<1"); sys.exit(0)
 
     # Banner
     secs = STEP_WAIT_CREDIT if is_credit else STEP_WAIT_DEBIT
-    vprint(f"PLACER START side={'CREDIT' if is_credit else 'DEBIT'} width={width} push_out={PUSH_OUT_SHORTS} qty={qty} oc={oc}")
+    vprint(f"PLACER START side={'CREDIT' if is_credit else 'DEBIT'} "
+           f"{'(LOCKED)' if LOCK_SIDE in {'CREDIT','DEBIT'} else '(AUTO)'} "
+           f"width={width} qty={qty} (req={qty_req}, auto_max={auto_max}) oc={oc}")
     vprint(f"LADDER wait={secs:.1f}s (min {MIN_RUNG_WAIT:.2f}s), cycles={MAX_LADDER_CYCLES} replace={REPLACE_MODE} cutoff={HARD_CUTOFF_HHMM} ET")
 
     # ---- status helpers ----
