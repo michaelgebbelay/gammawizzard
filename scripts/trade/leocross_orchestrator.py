@@ -14,11 +14,31 @@ from googleapiclient.discovery import build as gbuild
 from decimal import Decimal, ROUND_HALF_UP
 
 # ===== Runtime knobs =====
-CREDIT_DOLLARS_PER_CONTRACT = float(os.environ.get("CREDIT_DOLLARS_PER_CONTRACT", "4000"))
-DEBIT_DOLLARS_PER_CONTRACT  = float(os.environ.get("DEBIT_DOLLARS_PER_CONTRACT",  "4000"))
+def _env_float(name: str, default: float) -> float:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(float(raw))
+    except ValueError:
+        return default
+
+
+CREDIT_DOLLARS_PER_CONTRACT = _env_float("CREDIT_DOLLARS_PER_CONTRACT", 4000.0)
+DEBIT_DOLLARS_PER_CONTRACT  = _env_float("DEBIT_DOLLARS_PER_CONTRACT", 4000.0)
 # Default to 20-wide; still overridable by env.
-CREDIT_SPREAD_WIDTH         = int(os.environ.get("CREDIT_SPREAD_WIDTH", "20"))
-CREDIT_MIN_WIDTH            = 5
+CREDIT_SPREAD_WIDTH         = _env_int("CREDIT_SPREAD_WIDTH", 20)
+CREDIT_MIN_WIDTH            = max(5, _env_int("CREDIT_MIN_WIDTH", 5))
 
 # Read from ENV (with sensible defaults)
 FAST_HOLD_SECONDS  = int(os.environ.get("FAST_HOLD_SECONDS", "30"))
