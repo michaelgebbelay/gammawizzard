@@ -319,6 +319,12 @@ def main():
     cat1=fnum(tr.get("Cat1")); cat2=fnum(tr.get("Cat2"))
     is_credit = True if (cat2 is None or cat1 is None or cat2>=cat1) else False
 
+    SIDE_OVERRIDE = (os.environ.get("SIDE_OVERRIDE","AUTO") or "AUTO").strip().upper()
+    if SIDE_OVERRIDE == "CREDIT":
+        is_credit = True
+    elif SIDE_OVERRIDE == "DEBIT":
+        is_credit = False
+
     # Opening cash for width (allow manual override for testing)
     oc_override_raw = os.environ.get("SIZING_DOLLARS_OVERRIDE", "").strip()
     oc_override = None
