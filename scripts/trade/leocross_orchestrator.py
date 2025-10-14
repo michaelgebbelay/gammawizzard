@@ -460,15 +460,27 @@ def main():
         print("ORCH SKIP: At/above target; no remainder to place."); 
         return 0
 
-    # Pass to placer
+    # --- call placer with hard locks and safety clamp ---
     env = dict(os.environ)
-    env["QTY_OVERRIDE"] = str(rem_qty)
-    env["PLACER_MODE"]  = "MANUAL"
-    env["VERBOSE"]      = env.get("VERBOSE","1")
-    env["SIDE_OVERRIDE"]= os.environ.get("SIDE_OVERRIDE","AUTO")
-    env["PUSH_OUT_SHORTS"] = "true" if PUSH_OUT_SHORTS else "false"
-    print(f"ORCH → PLACER QTY_OVERRIDE={env['QTY_OVERRIDE']} SIDE={env['SIDE_OVERRIDE']} WIDTH={_credit_width() if is_credit else 5}")
-    rc = os.spawnve(os.P_WAIT, sys.executable, [sys.executable, "scripts/trade/leocross_place_simple.py"], env)
+    env["QTY_OVERRIDE"]   = str(rem_qty)          # requested units
+    env["PLACER_MODE"]    = "MANUAL"
+    env["VERBOSE"]        = env.get("VERBOSE","1")
+
+    # NEW: hard-lock what the placer must do
+    env["LOCK_SIDE"]      = ("CREDIT" if is_credit else "DEBIT")   # do not let placer re-decide
+    env["LOCK_WIDTH"]     = str(width)                              # 5 for debit; credit uses configured width
+    env["LOCK_LEGS_JSON"] = json.dumps(legs)                        # exact four OSI legs, already oriented
+
+    # NEW: safety — clamp qty to side/width max unless you explicitly turn this off
+    env["ALLOW_QTY_OVER_MAX"] = "false"
+
+    print(f"ORCH CALL → PLACER side={env['LOCK_SIDE']} width={env['LOCK_WIDTH']} QTY_OVERRIDE={env['QTY_OVERRIDE']}")
+    rc = os.spawnve(
+        os.P_WAIT,
+        sys.executable,
+        [sys.executable, "scripts/trade/leocross_place_simple.py"],
+        env
+    )
     return rc
 
 if __name__ == "__main__":
