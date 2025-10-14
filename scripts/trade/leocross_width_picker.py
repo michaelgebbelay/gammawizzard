@@ -128,6 +128,7 @@ def main():
     GW_BASE = os.environ.get("GW_BASE","https://gandalf.gammawizard.com")
     GW_ENDPOINT = os.environ.get("GW_ENDPOINT","/rapi/GetLeoCross")
     PUSH_OUT_SHORTS   = _truthy(os.environ.get("PUSH_OUT_SHORTS","false"))
+    FORCE_CREDIT      = _truthy(os.environ.get("PICKER_FORCE_CREDIT","false"))
     DEFAULT_WIDTH     = int(os.environ.get("DEFAULT_CREDIT_WIDTH","20"))
     CANDS = [int(x) for x in (os.environ.get("CANDIDATE_CREDIT_WIDTHS","15,20,25,30,40,50").split(","))]
     SELECTOR_USE      = (os.environ.get("SELECTOR_USE","MID") or "MID").upper()  # MID or ASK
@@ -154,7 +155,9 @@ def main():
         except: return None
     cat1=fnum(tr.get("Cat1")); cat2=fnum(tr.get("Cat2"))
     is_credit = True if (cat2 is None or cat1 is None or cat2>=cat1) else False
-    if not is_credit:
+    if not is_credit and FORCE_CREDIT:
+        print("WIDTH_PICKER: Non‑credit day — force override engaged, continuing")
+    elif not is_credit:
         print("WIDTH_PICKER: Non‑credit day — returning default width for completeness")
         return emit(DEFAULT_WIDTH, 0.0, 0.0, 0.0, 0.0, PUSH_OUT_SHORTS)
 
