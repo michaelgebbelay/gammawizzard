@@ -73,18 +73,19 @@ jobs:
           GW_TOKEN:          ${{ secrets.GW_TOKEN }}
           GW_EMAIL:          ${{ secrets.GW_EMAIL }}
           GW_PASSWORD:       ${{ secrets.GW_PASSWORD }}
-          # Picker knobs
-          PICKER_FORCE_CREDIT: ${{ github.event.inputs.picker_force }}
-          PUSH_OUT_SHORTS:     ${{ github.event.inputs.push_out_shorts }}
+
+          # ---- Picker knobs ----
+          PICKER_MODE: "EV"                 # use EV mode
+          PICKER_FORCE_CREDIT:  ${{ github.event.inputs.picker_force }}   # allow testing on long-signal days
+          PUSH_OUT_SHORTS:      ${{ github.event.inputs.push_out_shorts }}
           CANDIDATE_CREDIT_WIDTHS: "15,20,25,30,40,50"
-          SELECTOR_USE: "MID"             # or ASK
-          SELECTOR_TICK_TOL: "0.10"       # tie-band in $ credit terms
+          SELECTOR_USE: "MID"               # or "ASK" if we prefer to work the offer
+          SELECTOR_TICK_TOL: "0.10"         # tie band ($/trade approx)
           DEFAULT_CREDIT_WIDTH: "20"
-          # Ratios (baseline = five_mid * ratio[W])
-          # Standard (same Leo shorts):
-          RATIO_STD_JSON:  '{"5":1.0,"15":2.55,"20":3.175,"25":3.6625,"30":4.15,"40":4.85,"50":5.375}'
-          # Pushed-out (shorts ±5 farther):
-          RATIO_PUSH_JSON: '{"5":1.0,"15":2.205128,"20":2.743590,"25":3.179487,"30":3.615385,"40":4.256410,"50":4.717949}'
+
+          # Win-rate tables (CX settle; decimals)
+          WIN_TABLE_STD_JSON:  '{"5":0.7141,"15":0.7906,"20":0.8156,"30":0.8625,"40":0.8891,"50":0.9156}'
+          WIN_TABLE_PUSH_JSON: '{"5":0.8125,"15":0.8625,"20":0.8844,"30":0.9078,"40":0.9250,"50":0.9313}'
         run: |
           python scripts/trade/leocross_width_picker.py
 
