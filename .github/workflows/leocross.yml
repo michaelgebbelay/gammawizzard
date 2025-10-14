@@ -21,8 +21,8 @@ on:
         default: ''
       width_picker:
         description: 'Use live width picker for credit days? (true/false)'
-        required: false
-        default: 'false'
+        required: true
+        default: 'true'
       picker_force:
         description: 'Force picker on long-signal days (test credit shopping)? (true/false)'
         required: false
