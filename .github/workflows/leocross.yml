@@ -23,6 +23,14 @@ on:
         description: 'Use live width picker for credit days? (true/false)'
         required: false
         default: 'false'
+      picker_force:
+        description: 'Force picker on long-signal days? (true/false)'
+        required: false
+        default: 'false'
+      side_override:
+        description: 'AUTO | CREDIT | DEBIT (optional forcing for the orchestrator)'
+        required: false
+        default: 'AUTO'
       ignore_cutoff:
         description: 'Ignore the 16:15 ET cutoff?'
         required: false
@@ -66,10 +74,11 @@ jobs:
           GW_EMAIL:          ${{ secrets.GW_EMAIL }}
           GW_PASSWORD:       ${{ secrets.GW_PASSWORD }}
           # Picker knobs
-          PUSH_OUT_SHORTS:   "false"   # flip to "true" to shop pushed ±5 instead
+          PICKER_FORCE_CREDIT: ${{ github.event.inputs.picker_force }}
+          PUSH_OUT_SHORTS:     "false"   # flip to "true" to shop pushed ±5 instead
           CANDIDATE_CREDIT_WIDTHS: "15,20,25,30,40,50"
-          SELECTOR_USE: "MID"          # MID or ASK
-          SELECTOR_TICK_TOL: "0.10"    # tie band in credit points
+          SELECTOR_USE: "MID"
+          SELECTOR_TICK_TOL: "0.10"
           DEFAULT_CREDIT_WIDTH: "20"
           RATIO_STD_JSON:  '{"5":1.0,"15":2.55,"20":3.175,"25":3.6625,"30":4.15,"40":4.85,"50":5.375}'
           RATIO_PUSH_JSON: '{"5":1.0,"15":2.205128,"20":2.743590,"25":3.179487,"30":3.615385,"40":4.256410,"50":4.717949}'
@@ -85,6 +94,7 @@ jobs:
           BYPASS_GUARD: ${{ github.event.inputs.force }}
           BYPASS_QTY:   ${{ github.event.inputs.force_qty }}
           SIZING_DOLLARS_OVERRIDE: ${{ github.event.inputs.sizing_override }}
+          SIDE_OVERRIDE: ${{ github.event.inputs.side_override }}
 
           # ===== Credentials =====
           # Schwab
