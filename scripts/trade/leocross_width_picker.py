@@ -199,7 +199,8 @@ def main():
     # ---- Schwab auth
     app_key=os.environ["SCHWAB_APP_KEY"]; app_secret=os.environ["SCHWAB_APP_SECRET"]; token_json=os.environ["SCHWAB_TOKEN_JSON"]
     with open("schwab_token.json","w") as f: f.write(token_json)
-    c=client_from_token_file(api_key=app_key, api_secret=app_secret, token_path="schwab_token.json")
+    # FIX: correct keyword is app_secret
+    c=client_from_token_file(api_key=app_key, app_secret=app_secret, token_path="schwab_token.json")
 
     # ---- Leo signal
     api = gw_get_leocross(GW_BASE, GW_ENDPOINT); tr = extract_trade(api)
@@ -245,8 +246,8 @@ def main():
             if pW is None:
                 diag.append(f"W{W}: NOVALID_P"); continue
             loss_prob = 1.0 - float(pW)
-            edge_dollars = ref - loss_prob * W     # EV per contract in $ (binary settle)
-            score = edge_dollars / float(W)        # EV per contract per width (∝ EV per trade @ constant risk)
+            edge_dollars = ref - loss_prob * W     # EV per contract in $
+            score = edge_dollars / float(W)        # EV per contract per width (∝ EV per trade @ const risk)
         else:
             # Legacy ratio baseline (kept for backwards compatibility)
             mult = (RAT_PUSH if PUSHED else RAT_STD).get(W) or (RAT_PUSH if PUSHED else RAT_STD).get(int(W))
@@ -272,7 +273,6 @@ def main():
                 best = cand
             else:
                 # Tie band: if scores nearly equal, prefer larger dollar edge (more cushion)
-                # Convert score diff into approximate $/trade diff using the larger width.
                 per_trade_diff = abs(cand[4] - best[4]) * float(max(cand[0], best[0]))
                 if per_trade_diff <= TIE_TOL and cand[3] > best[3] + 1e-12:
                     best = cand
@@ -282,8 +282,13 @@ def main():
         return emit(DEFAULT_W, 0.0, 0.0, 0.0, (five_ref or 0.0), PUSHED, diag)
 
     Wsel, refsel, psel, edgesel, scoresel, losssel = best
-    print("WIDTH_PICKER[{}]: five_ref={} ({}), pushed_out={}, pick=W{}, ref={}, p={:.4f}, edge={:+.2f}, score={:.5f}".format(
-        MODE, (f\"{five_ref:.2f}\" if five_ref else "NA"), SELECTOR, PUSHED, Wsel, f\"{refsel:.2f}\", psel, edgesel, scoresel))
+    five_ref_str = f"{five_ref:.2f}" if five_ref else "NA"
+    # FIX: use a normal f-string (no stray backslashes)
+    print(
+        f"WIDTH_PICKER[{MODE}]: five_ref={five_ref_str} ({SELECTOR}), "
+        f"pushed_out={PUSHED}, pick=W{Wsel}, ref={refsel:.2f}, "
+        f"p={psel:.4f}, edge={edgesel:+.2f}, score={scoresel:.5f}"
+    )
     print("CANDIDATES → " + " | ".join(diag))
     return emit(Wsel, refsel, psel, edgesel, (five_ref or 0.0), PUSHED, diag, score=scoresel)
 
@@ -302,7 +307,8 @@ def emit(width:int, ref:float, p:float, edge:float, five_mid:float, pushed:bool,
     w("pushed_out",   "true" if pushed else "false")
     if diag:
         w("picker_diag", " / ".join(diag)[:900])
-    print(f"::notice title=WidthPicker::{('EV' if os.environ.get('PICKER_MODE','EV').upper()=='EV' else 'RATIO')}  pick=W{width} ref={ref:.2f} p={p:.4f} edge={edge:+.2f} score={score:.5f} pushed_out={pushed}")
+    mode = (os.environ.get("PICKER_MODE","EV") or "EV").upper()
+    print(f"::notice title=WidthPicker::{mode} pick=W{width} ref={ref:.2f} p={p:.4f} edge={edge:+.2f} score={score:.5f} pushed_out={pushed}")
     return 0
 
 if __name__=="__main__":
