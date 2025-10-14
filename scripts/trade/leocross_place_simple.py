@@ -507,18 +507,19 @@ def main():
     if width is None and legs:
         width = int(round(abs(strike_from_osi(legs[1]) - strike_from_osi(legs[0]))))
 
-    # Orient legs
-    bp, sp, sc, bc = legs
-    bpS=strike_from_osi(bp); spS=strike_from_osi(sp)
-    scS=strike_from_osi(sc); bcS=strike_from_osi(bc)
-    if is_credit:
-        if bpS>spS: bp,sp = sp,bp
-        if scS>bcS: sc,bc = bc,sc
-    else:
-        if bpS<spS: bp,sp = sp,bp
-        if bcS>scS: sc,bc = bc,sc
+    def orient(bp, sp, sc, bc):
+        bpS=strike_from_osi(bp); spS=strike_from_osi(sp)
+        scS=strike_from_osi(sc); bcS=strike_from_osi(bc)
+        if is_credit:
+            if bpS>spS: bp,sp = sp,bp
+            if scS>bcS: sc,bc = bc,sc
+        else:
+            if bpS<spS: bp,sp = sp,bp
+            if bcS>scS: sc,bc = bc,sc
+        return [bp, sp, sc, bc]
 
-    legs=[bp,sp,sc,bc]
+    legs = orient(*legs)
+    bp, sp, sc, bc = legs
     canon = {osi_canon(x) for x in legs}
 
     side_name  = "SHORT_IRON_CONDOR" if is_credit else "LONG_IRON_CONDOR"
@@ -812,38 +813,44 @@ def main():
             api2 = gw_get_leocross()
             tr2  = extract(api2)
             if tr2:
-                exp6_2 = yymmdd(str(tr2.get("TDate","")))
-                put2   = int(float(tr2.get("Limit"))); call2=int(float(tr2.get("CLimit")))
-                if exp6_2 != exp6 or put2 != inner_put or call2 != inner_call:
-                    exp6 = exp6_2; inner_put = put2; inner_call = call2
+                # (re)build legs if strikes/expiry changed
+                exp6_new = yymmdd(str(tr2.get("TDate","")))
+                put_new  = int(float(tr2.get("Limit")))
+                call_new = int(float(tr2.get("CLimit")))
+
+                # Read the current value safely without tripping Python's local
+                # scoping rules when we assign later in this block.
+                exp6_cur = locals().get("exp6")
+
+                changed = (exp6_cur is None) or \
+                          (exp6_new != exp6_cur) or \
+                          (put_new  != inner_put) or \
+                          (call_new != inner_call)
+                if changed:
+                    # Update working strikes/expiry
+                    exp6      = exp6_new
+                    inner_put = put_new
+                    inner_call= call_new
+
                     if is_credit:
-                        if PUSH_OUT_SHORTS and width != 5:
-                            sell_put  = inner_put  - 5
-                            buy_put   = sell_put   - width
-                            sell_call = inner_call + 5
-                            buy_call  = sell_call  + width
-                            p_low, p_high = buy_put, sell_put
-                            c_low, c_high = sell_call, buy_call
-                        else:
-                            p_low, p_high = inner_put - width, inner_put
-                            c_low, c_high = inner_call, inner_call + width
+                        sell_put  = inner_put  - 5
+                        buy_put   = sell_put   - width
+                        sell_call = inner_call + 5
+                        buy_call  = sell_call  + width
+                        p_low, p_high = buy_put, sell_put
+                        c_low, c_high = sell_call, buy_call
                     else:
                         p_low, p_high = inner_put - width, inner_put
                         c_low, c_high = inner_call, inner_call + width
-                    bp = to_osi(f".SPXW{exp6}P{p_low}"); sp = to_osi(f".SPXW{exp6}P{p_high}")
-                    sc = to_osi(f".SPXW{exp6}C{c_low}"); bc = to_osi(f".SPXW{exp6}C{c_high}")
-                    # orient
-                    bpS=strike_from_osi(bp); spS=strike_from_osi(sp)
-                    scS=strike_from_osi(sc); bcS=strike_from_osi(bc)
-                    if is_credit:
-                        if bpS>spS: bp,sp = sp,bp
-                        if scS>bcS: sc,bc = bc,sc
-                    else:
-                        if bpS<spS: bp,sp = sp,bp
-                        if bcS>scS: sc,bc = bc,sc
-                    legs=[bp,sp,sc,bc]
+
+                    legs = orient(
+                        to_osi(f".SPXW{exp6}P{p_low}"),
+                        to_osi(f".SPXW{exp6}P{p_high}"),
+                        to_osi(f".SPXW{exp6}C{c_low}"),
+                        to_osi(f".SPXW{exp6}C{c_high}")
+                    )
                     canon = {osi_canon(x) for x in legs}
-                    vprint(f"REFRESH_FROM_LEO: width={width} push_out={PUSH_OUT_SHORTS} legs={legs}")
+                    vprint(f"REFRESH_FROM_LEO: width={width} legs={legs}")
         except Exception as e:
             vprint(f"REFRESH_FROM_LEO failed: {e} — continuing")
 
