@@ -8,7 +8,7 @@ on:
         required: true
         default: 'NOW'
       force:
-        description: 'Bypass guard and place anyway? (true/false)'
+        description: 'Bypass guard checks (WOULD_CLOSE / partial-overlap) and place anyway? (true/false)'
         required: false
         default: 'false'
       force_qty:
@@ -24,21 +24,21 @@ on:
         required: false
         default: 'false'
       picker_force:
-        description: 'Force picker on long-signal days? (true/false)'
+        description: 'Force picker on long-signal days (test credit shopping)? (true/false)'
+        required: false
+        default: 'false'
+      push_out_shorts:
+        description: 'When credit, push shorts 5 points farther (true/false). NOTE: 5-wide never pushed.'
         required: false
         default: 'false'
       side_override:
-        description: 'AUTO | CREDIT | DEBIT (optional forcing for the orchestrator)'
+        description: 'AUTO | CREDIT | DEBIT'
         required: false
         default: 'AUTO'
       ignore_cutoff:
-        description: 'Ignore the 16:15 ET cutoff?'
+        description: 'Ignore the 16:15 ET cutoff? (true/false)'
         required: false
         default: 'false'
-  # Optional schedules
-  # schedule:
-  #   - cron: "10 20 * * 1-5"
-  #   - cron: "12 20 * * 1-5"
 
 concurrency:
   group: leocross-min
@@ -75,12 +75,15 @@ jobs:
           GW_PASSWORD:       ${{ secrets.GW_PASSWORD }}
           # Picker knobs
           PICKER_FORCE_CREDIT: ${{ github.event.inputs.picker_force }}
-          PUSH_OUT_SHORTS:     "false"   # flip to "true" to shop pushed ±5 instead
+          PUSH_OUT_SHORTS:     ${{ github.event.inputs.push_out_shorts }}
           CANDIDATE_CREDIT_WIDTHS: "15,20,25,30,40,50"
-          SELECTOR_USE: "MID"
-          SELECTOR_TICK_TOL: "0.10"
+          SELECTOR_USE: "MID"             # or ASK
+          SELECTOR_TICK_TOL: "0.10"       # tie-band in $ credit terms
           DEFAULT_CREDIT_WIDTH: "20"
+          # Ratios (baseline = five_mid * ratio[W])
+          # Standard (same Leo shorts):
           RATIO_STD_JSON:  '{"5":1.0,"15":2.55,"20":3.175,"25":3.6625,"30":4.15,"40":4.85,"50":5.375}'
+          # Pushed-out (shorts ±5 farther):
           RATIO_PUSH_JSON: '{"5":1.0,"15":2.205128,"20":2.743590,"25":3.179487,"30":3.615385,"40":4.256410,"50":4.717949}'
         run: |
           python scripts/trade/leocross_width_picker.py
@@ -88,7 +91,7 @@ jobs:
       - name: LeoCross orchestrator (guard + run)
         env:
           # Mode
-          PLACER_MODE: ${{ github.event.inputs.mode != '' && github.event.inputs.mode || 'SCHEDULED' }}
+          PLACER_MODE: ${{ github.event.inputs.mode != '' && github.event.inputs.mode || 'NOW' }}
 
           # Guard bypass toggles (position/overlap checks only)
           BYPASS_GUARD: ${{ github.event.inputs.force }}
@@ -122,10 +125,10 @@ jobs:
           # Cutoff: flip to 23:59 when ignore_cutoff=true
           HARD_CUTOFF_HHMM: ${{ github.event.inputs.ignore_cutoff == 'true' && '23:59' || '16:15' }}
 
-          # Sizing / width
+          # Width / push toggle (picker output if present)
           CREDIT_SPREAD_WIDTH: "${{ steps.widthpicker.outputs.picked_width != '' && steps.widthpicker.outputs.picked_width || '20' }}"
-          CREDIT_MIN_WIDTH:            "5"
-          PUSH_OUT_SHORTS:             "false"  # must match the picker’s setting if you flip it
+          CREDIT_MIN_WIDTH: "5"
+          PUSH_OUT_SHORTS:  ${{ github.event.inputs.push_out_shorts }}
 
           # Verbose logs
           VERBOSE: "1"
