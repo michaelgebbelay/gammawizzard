@@ -1,3 +1,4 @@
+# scripts/trade/leocross_guard.py
 #!/usr/bin/env python3
 # VERSION: 2025-10-05 ShortIC fixed-width + contracts-per-equity sizing
 __version__ = "3.3.0"
@@ -52,10 +53,8 @@ def osi_canon(osi: str):
 def strike_from_osi(osi: str) -> float:
     return int(osi[-8:]) / 1000.0
 
-
 def build_legs_same_shorts(exp6: str, inner_put: int, inner_call: int, width: int, *, is_credit: bool = True):
     """Construct same-shorts iron condor legs for credit (default) or debit."""
-
     p_low, p_high = inner_put - width, inner_put
     c_low, c_high = inner_call, inner_call + width
 
@@ -136,7 +135,6 @@ def _sleep_for_429(r, attempt):
             pass
     # exponential backoff + small jitter
     return min(10.0, 0.5 * (2 ** attempt)) + random.uniform(0.0, 0.25)
-
 
 def schwab_get_json(c, url, params=None, tries=6, tag=""):
     last = ""
