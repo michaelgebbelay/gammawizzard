@@ -5,6 +5,7 @@
 import os, re, json, math, sys
 from datetime import date
 import requests
+from schwab.auth import client_from_token_file
 
 TICK = 0.05
 
@@ -23,7 +24,8 @@ def to_osi(sym: str) -> str:
     mills = int(strike)*1000 + (int((frac or "0").ljust(3,'0')) if frac else 0) if len(strike)<8 else int(strike)
     return f"{root:<6}{ymd}{cp}{mills:08d}"
 
-def strike_from_osi(osi: str) -> float: return int(osi[-8:]) / 1000.0
+def strike_from_osi(osi: str) -> float:
+    return int(osi[-8:]) / 1000.0
 
 def orient_credit(bp,sp,sc,bc):
     bpS=strike_from_osi(bp); spS=strike_from_osi(sp)
@@ -40,9 +42,6 @@ def build_legs(exp6: str, inner_put: int, inner_call: int, width: int):
     sc = to_osi(f".SPXW{exp6}C{c_low}")
     bc = to_osi(f".SPXW{exp6}C{c_high}")
     return orient_credit(bp,sp,sc,bc)
-
-def _truthy(s: str) -> bool:
-    return str(s or "").strip().lower() in {"1","true","t","yes","y","on"}
 
 def _sanitize_token(t: str) -> str:
     t=(t or "").strip().strip('"').strip("'")
@@ -84,8 +83,7 @@ def extract_trade(j):
             if t: return t
     return {}
 
-# --- Schwab quote helpers (using schwab-py client session) ---
-from schwab.auth import client_from_token_file
+# --- Schwab quote helpers ---
 def schwab_client():
     app_key=os.environ["SCHWAB_APP_KEY"]; app_secret=os.environ["SCHWAB_APP_SECRET"]; token_json=os.environ["SCHWAB_TOKEN_JSON"]
     with open("schwab_token.json","w") as f: f.write(token_json)
@@ -132,7 +130,7 @@ def main():
     EV_MIN_ADV = float(os.environ.get("EV_MIN_ADVANTAGE","0.10"))
     CANDS = [int(x) for x in (os.environ.get("CANDIDATE_CREDIT_WIDTHS","15,20,25,30,40,50").split(","))]
 
-    # Historical win% table (same‑shorts). You can override via env.
+    # Historical win% table (same‑shorts). Overridable via env.
     WINP = json.loads(os.environ.get("WINP_STD_JSON",
         '{"5":0.714,"15":0.791,"20":0.816,"25":0.840,"30":0.863,"40":0.889,"50":0.916}'))
 
@@ -149,7 +147,7 @@ def main():
     # Schwab
     c = schwab_client()
 
-    # 5‑wide ref (for operator visibility; not used in EV math)
+    # 5‑wide ref (for visibility; not used in EV math)
     legs5 = build_legs(exp6, inner_put, inner_call, 5)
     _,_,five_mid = condor_nbbo_credit(c, legs5)
 
@@ -168,11 +166,10 @@ def main():
         if W == DEFAULT_WIDTH:
             base_ev = ev
             if best is None: best = (W, m, p, ev)
-        # pick by EV
         if best is None or ev > best[3] + 1e-12:
             best = (W, m, p, ev)
 
-    # Print table
+    # Table
     print("|Width|Mid|Win%|EV|Credit/Width|")
     print("|---:|---:|---:|---:|---:|")
     for W, m, p, ev in rows:
@@ -187,12 +184,15 @@ def main():
 
     if base_ev is None:
         base_ev = next((ev for (W,m,p,ev) in rows if W==DEFAULT_WIDTH and ev is not None), 0.0)
-    delta = best[3] - (base_ev or 0.0)
     pickedW, pickedMid, pickedP, pickedEV = best
+    delta = pickedEV - (base_ev or 0.0)
 
     # EV gate
     width_out = pickedW if (delta > EV_MIN_ADV) else DEFAULT_WIDTH
-    print(f"**Picked:** {width_out}-wide @ {pickedMid:.2f if pickedMid else 0.0} (metric=EV), base_ev={(base_ev or 0.0):.2f}, delta_ev={delta:+.2f} {'→ Switch' if delta>EV_MIN_ADV else '→ Stay'}")
+
+    picked_mid_txt = f"{pickedMid:.2f}" if (pickedMid is not None and pickedMid>0) else "NA"
+    switch_txt = "→ Switch" if delta > EV_MIN_ADV else "→ Stay"
+    print(f"**Picked:** {width_out}-wide @ {picked_mid_txt} (metric=EV), base_ev={(base_ev or 0.0):.2f}, delta_ev={delta:+.2f} {switch_txt}")
 
     emit_output(width_out, (pickedMid or 0.0), "EV", (pickedEV or 0.0), (base_ev or 0.0), (delta or 0.0), (five_mid or 0.0))
     return 0
