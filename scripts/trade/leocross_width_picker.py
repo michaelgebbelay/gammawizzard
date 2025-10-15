@@ -103,12 +103,31 @@ def gw_login():
     return t
 
 def gw_fetch():
-    tok=(os.environ.get("GW_TOKEN","") or "").strip()
-    if tok.lower().startswith("bearer "): tok=tok.split(None,1)[1]
-    if not tok: tok=gw_login()
-    h={"Authorization":f"Bearer {tok}","Accept":"application/json"}
-    r=requests.get("https://gandalf.gammawizard.com/rapi/GetLeoCross", headers=h, timeout=30)
-    r.raise_for_status()
+    """Fetch LeoCross, trying GW_TOKEN first; on 401/403, log in and retry."""
+    base = "https://gandalf.gammawizard.com"
+    endpoint = "/rapi/GetLeoCross"
+
+    def _sanitize_token(t: str) -> str:
+        t = (t or "").strip().strip('"').strip("'")
+        return t.split(None, 1)[1] if t.lower().startswith("bearer ") else t
+
+    def hit(token: str | None):
+        h = {"Accept": "application/json", "User-Agent": "width-picker/1.1"}
+        if token:
+            h["Authorization"] = f"Bearer {token}"
+        return requests.get(f"{base.rstrip('/')}/{endpoint.lstrip('/')}", headers=h, timeout=30)
+
+    # Try the provided token first (if any)
+    tok = _sanitize_token(os.environ.get("GW_TOKEN", "") or "")
+    r = hit(tok) if tok else None
+
+    # If token missing/expired/forbidden, do a fresh login and retry once
+    if (r is None) or (r.status_code in (401, 403)):
+        fresh = gw_login()  # uses GW_EMAIL / GW_PASSWORD
+        r = hit(_sanitize_token(fresh))
+
+    if r.status_code != 200:
+        raise RuntimeError(f"GW_HTTP_{r.status_code}:{(r.text or '')[:200]}")
     return r.json()
 
 def main():
