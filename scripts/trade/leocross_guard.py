@@ -438,6 +438,8 @@ def main():
         "open_order_ids": ",".join(open_ids),
         "signal_date": sig_date,
     }
+    outs["width"] = str(width)
+    outs["legs_kind"] = "SAME_SHORTS"
     for k,v in outs.items(): goutput(k, v)
 
     print(f"GUARD DECISION: action={action} rem_qty={rem_qty or 'NA'} width={width} open_order_ids={outs['open_order_ids']}")
