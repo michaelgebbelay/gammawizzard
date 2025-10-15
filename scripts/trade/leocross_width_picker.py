@@ -32,6 +32,23 @@ from schwab.auth import client_from_token_file
 ET   = ZoneInfo("America/New_York")
 TICK = 0.05
 
+def emit_default(baseW: int, pushed: bool, note: str):
+    out_path = os.environ.get("GITHUB_OUTPUT", "")
+    def w(k, v):
+        if out_path:
+            with open(out_path, "a") as fh:
+                fh.write(f"{k}={v}\n")
+    w("picked_width", str(baseW))
+    w("picked_ref",   "0.00")
+    w("picked_metric","EV")
+    w("picked_ev",    "0.0000")
+    w("base_ev",      "0.0000")
+    w("delta_ev",     "0.0000")
+    w("five_mid",     "0.00")
+    w("pushed_out",   "true" if pushed else "false")
+    w("picker_diag",  note[:900])
+    print(f"WIDTH_PICKER: {note} — defaulting to {baseW}-wide.")
+
 def clamp(x): return round(round(float(x)/TICK)*TICK + 1e-12, 2)
 def yymmdd(iso): return f"{date.fromisoformat((iso or '')[:10]):%y%m%d}"
 
@@ -169,7 +186,11 @@ def main():
     c=client_from_token_file(api_key=app_key, app_secret=app_secret, token_path="schwab_token.json")
 
     # ===== Leo =====
-    j=gw_fetch()
+    try:
+        j=gw_fetch()
+    except Exception as e:
+        emit_default(baseW, pushed, f"GW fetch failed: {e}")
+        return
     tr = j["Trade"][-1] if isinstance(j.get("Trade"), list) else j
     exp6 = yymmdd(str(tr.get("TDate","")))
     inner_put  = int(float(tr.get("Limit")))
