@@ -435,6 +435,7 @@ def main():
     is_credit = None
     legs = None
     width = None
+    side_src = ""
 
     # 1) If we were given exact legs, use them and deduce width if not provided.
     if LOCK_LEGS_JSON:
@@ -447,6 +448,7 @@ def main():
 
     if LOCK_SIDE in {"CREDIT","DEBIT"}:
         is_credit = (LOCK_SIDE == "CREDIT")
+        side_src = "LOCK"
 
     if LOCK_WIDTH_RAW:
         try:
@@ -472,19 +474,41 @@ def main():
         sig_date = str(tr.get("Date",""))
         exp_iso = str(tr.get("TDate",""))
 
-        if is_credit is None:
-            def fnum(x):
-                try: return float(x)
-                except: return None
-            cat1=fnum(tr.get("Cat1")); cat2=fnum(tr.get("Cat2"))
-            is_credit = True if (cat2 is None or cat1 is None or cat2>=cat1) else False
-
         if legs is None or width is None:
             exp6 = yymmdd(exp_iso)
             inner_put = int(float(tr.get("Limit")))
             inner_call = int(float(tr.get("CLimit")))
+
+            # ---- read side; do NOT flip later ----
+            SIDE_OVERRIDE = (os.environ.get("SIDE_OVERRIDE", "AUTO") or "AUTO").upper()
+            ORCH_SIDE     = (os.environ.get("ORCH_SIDE", "") or "").upper()
+
+            # derive from Leo (fallback only)
+            def _leo_side_from_trade(tr):
+                def fnum(x):
+                    try: return float(x)
+                    except: return None
+                cat1 = fnum(tr.get("Cat1")); cat2 = fnum(tr.get("Cat2"))
+                return ("CREDIT" if (cat2 is None or cat1 is None or cat2 >= cat1) else "DEBIT")
+
+            leo_side = _leo_side_from_trade(tr)
+
+            if SIDE_OVERRIDE in {"CREDIT","DEBIT"}:
+                side_src = "OVERRIDE"
+                side     = SIDE_OVERRIDE
+            elif ORCH_SIDE in {"CREDIT","DEBIT"}:
+                side_src = "ORCHESTRATOR"
+                side     = ORCH_SIDE
+            else:
+                side_src = "LEO"
+                side     = leo_side
+
+            is_credit = (side == "CREDIT")
+
             if width is None:
                 width = calc_width_for_side(is_credit, oc if oc is not None else 0)
+
+            # ---- honor PUSH_OUT_SHORTS on credit days; never push 5-wide ----
             if is_credit:
                 if PUSH_OUT_SHORTS and width != 5:
                     sell_put  = inner_put  - 5
@@ -544,8 +568,8 @@ def main():
 
     # Banner
     secs = STEP_WAIT_CREDIT if is_credit else STEP_WAIT_DEBIT
-    vprint(f"PLACER START side={'CREDIT' if is_credit else 'DEBIT'} "
-           f"{'(LOCKED)' if LOCK_SIDE in {'CREDIT','DEBIT'} else '(AUTO)'} "
+    src_label = side_src or ('LOCK' if LOCK_SIDE in {'CREDIT','DEBIT'} else 'AUTO')
+    vprint(f"PLACER START side={'CREDIT' if is_credit else 'DEBIT'} source={src_label} "
            f"width={width} qty={qty} (req={qty_req}, auto_max={auto_max}) oc={oc}")
     vprint(f"LADDER wait={secs:.1f}s (min {MIN_RUNG_WAIT:.2f}s), cycles={MAX_LADDER_CYCLES} replace={REPLACE_MODE} cutoff={HARD_CUTOFF_HHMM} ET")
 
