@@ -1,6 +1,7 @@
 # scripts/trade/leocross_place_simple.py
 #!/usr/bin/env python3
-# PLACER — CREDIT only, same‑shorts. Minimal ladder + 429 backoff + cancel settle waits.
+# PLACER — supports CREDIT (short IC) and DEBIT (long IC), same‑shorts.
+# Minimal ladder + 429 backoff + cancel settle waits.
 
 import os, sys, time, json, random
 from schwab.auth import client_from_token_file
@@ -30,9 +31,21 @@ def condor_nbbo_credit(c, legs):
     credit_mid = (credit_bid + credit_ask) / 2.0
     return (clamp_tick(credit_bid), clamp_tick(credit_ask), clamp_tick(credit_mid))
 
-def order_payload_credit(legs, price, qty):
+def condor_nbbo_debit(c, legs):
+    bp, sp, sc, bc = legs
+    bp_b, bp_a = fetch_bid_ask(c, bp); sp_b, sp_a = fetch_bid_ask(c, sp)
+    sc_b, sc_a = fetch_bid_ask(c, sc); bc_b, bc_a = fetch_bid_ask(c, bc)
+    if None in (bp_b, bp_a, sp_b, sp_a, sc_b, sc_a, bc_b, bc_a):
+        return (None, None, None)
+    # Lowest debit you could pay (best for buyer) vs highest debit (worst)
+    debit_bid = (bp_b + bc_b) - (sp_a + sc_a)
+    debit_ask = (bp_a + bc_a) - (sp_b + sc_b)
+    debit_mid = (debit_bid + debit_ask) / 2.0
+    return (clamp_tick(debit_bid), clamp_tick(debit_ask), clamp_tick(debit_mid))
+
+def order_payload(legs, price, qty, *, side_credit: bool):
     return {
-        "orderType": "NET_CREDIT",
+        "orderType": "NET_CREDIT" if side_credit else "NET_DEBIT",
         "session": "NORMAL",
         "price": f"{clamp_tick(price):.2f}",
         "duration": "DAY",
@@ -101,16 +114,17 @@ def wait_settle(c, acct_hash: str, oid: str, max_wait=2.0):
         time.sleep(0.15)
     return False
 
-def place_one_credit(c, acct_hash: str, legs, price, qty):
+def place_one(c, acct_hash: str, legs, price, qty, *, side_credit: bool):
     url_post = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
-    payload = order_payload_credit(legs, price, qty)
+    payload = order_payload(legs, price, qty, side_credit=side_credit)
     r = post_with_retry(c, url_post, payload, tag=f"PLACE@{price:.2f}x{qty}")
     return parse_order_id(r)
 
 if __name__=="__main__":
-    side = (os.environ.get("SIDE","CREDIT") or "CREDIT").upper()
-    if side != "CREDIT":
-        print("PLACER ABORT: side must be CREDIT in this minimal placer.")
+    side_txt = (os.environ.get("SIDE","CREDIT") or "CREDIT").upper()
+    side_credit = (side_txt == "CREDIT")
+    if side_txt not in {"CREDIT","DEBIT"}:
+        print("PLACER ABORT: side must be CREDIT or DEBIT.")
         sys.exit(1)
 
     legs = [
@@ -130,30 +144,41 @@ if __name__=="__main__":
     acct_hash = str(r.json()[0]["hashValue"])
 
     # Ladder params
-    STEP_WAIT = float(os.environ.get("STEP_WAIT_CREDIT","5"))
+    STEP_WAIT = float(os.environ.get("STEP_WAIT_CREDIT" if side_credit else "STEP_WAIT_DEBIT","5"))
     MIN_RUNG_WAIT = max(1.0, float(os.environ.get("MIN_RUNG_WAIT","5")))
     CANCEL_SETTLE_SECS = float(os.environ.get("CANCEL_SETTLE_SECS","1.0"))
     MAX_CYCLES = int(os.environ.get("MAX_LADDER_CYCLES","2"))
 
-    print(f"PLACER START side=CREDIT width={width} qty={qty}")
+    print(f"PLACER START side={side_txt} width={width} qty={qty}")
 
     # NBBO & ladder
-    bid, ask, mid = condor_nbbo_credit(c, legs)
-    print(f"CREDIT NBBO: bid={bid} ask={ask} mid={mid}")
-    if mid is None and ask is None:
-        print("WARN: no NBBO — abort")
-        sys.exit(0)
+    if side_credit:
+        bid, ask, mid = condor_nbbo_credit(c, legs)
+        print(f"CREDIT NBBO: bid={bid} ask={ask} mid={mid}")
+        if mid is None and ask is None:
+            print("WARN: no NBBO — abort"); sys.exit(0)
+        base = []
+        if ask is not None: base.append(ask)
+        if mid is not None:
+            m1 = clamp_tick(mid-0.05); m2 = clamp_tick(mid-0.10)
+            if bid is not None:
+                m1 = max(m1, bid); m2 = max(m2, bid)
+            base += [mid, m1, m2]
+    else:
+        bid, ask, mid = condor_nbbo_debit(c, legs)
+        print(f"DEBIT NBBO: bid={bid} ask={ask} mid={mid}")
+        if mid is None and bid is None:
+            print("WARN: no NBBO — abort"); sys.exit(0)
+        base = []
+        if bid is not None: base.append(bid)
+        if mid is not None:
+            base += [mid, clamp_tick(mid+0.05), clamp_tick(mid+0.10)]
+        if ask is not None:
+            base.append(ask)
 
-    base_ladder = []
-    if ask is not None: base_ladder.append(ask)
-    if mid is not None:
-        base_ladder += [mid, clamp_tick(mid-0.05), clamp_tick(mid-0.10)]
-        if bid is not None:
-            base_ladder[-2] = max(base_ladder[-2], bid)
-            base_ladder[-1] = max(base_ladder[-1], bid)
-    # dedupe
+    # dedupe ladder
     ladder=[]; seen=set()
-    for p in base_ladder:
+    for p in base:
         p = clamp_tick(p)
         if p not in seen:
             seen.add(p); ladder.append(p)
@@ -178,7 +203,7 @@ if __name__=="__main__":
 
             print(f"RUNG → price={price:.2f} to_place={to_place}")
             try:
-                active_oid = place_one_credit(c, acct_hash, legs, price, to_place)
+                active_oid = place_one(c, acct_hash, legs, price, to_place, side_credit=side_credit)
             except Exception as e:
                 print(str(e))
                 continue
@@ -207,7 +232,10 @@ if __name__=="__main__":
             break
 
         # refresh NBBO between cycles
-        bid, ask, mid = condor_nbbo_credit(c, legs)
+        if side_credit:
+            bid, ask, mid = condor_nbbo_credit(c, legs)
+        else:
+            bid, ask, mid = condor_nbbo_debit(c, legs)
 
     # Final cleanup
     if active_oid:
