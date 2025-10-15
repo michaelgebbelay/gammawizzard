@@ -84,6 +84,14 @@ jobs:
           echo "EV picked/base/delta: ${{ steps.widthpicker.outputs.picked_ev }} / ${{ steps.widthpicker.outputs.base_ev }} / ${{ steps.widthpicker.outputs.delta_ev }}"
           echo "5-wide mid: ${{ steps.widthpicker.outputs.five_mid }}"
 
+      - name: Show picker outputs
+        if: ${{ github.event.inputs.width_picker == 'true' }}
+        run: |
+          echo "Picked width: ${{ steps.widthpicker.outputs.picked_width }}"
+          echo "Picker metric: ${{ steps.widthpicker.outputs.picked_metric }}"
+          echo "EV picked/base/delta: ${{ steps.widthpicker.outputs.picked_ev }} / ${{ steps.widthpicker.outputs.base_ev }} / ${{ steps.widthpicker.outputs.delta_ev }}"
+          echo "5-wide mid: ${{ steps.widthpicker.outputs.five_mid }}"
+
       - name: LeoCross orchestrator (guard + run)
         env:
           # Mode
