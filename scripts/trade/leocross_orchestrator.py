@@ -1,8 +1,9 @@
+# scripts/trade/leocross_orchestrator.py
 #!/usr/bin/env python3
 # ORCHESTRATOR — same‑shorts CREDIT only (width from picker). Minimal, no push‑out.
 # Calls placer with legs + qty. Mode NOW (no gates) unless you add them.
 
-import os, sys, json, re, math, time
+import os, sys, json, re, math
 from datetime import date
 import requests
 from decimal import Decimal, ROUND_HALF_UP
@@ -58,8 +59,7 @@ def opening_cash_for_account(c):
         for k in ks:
             v=(d or {}).get(k)
             if isinstance(v,(int,float)): return float(v)
-    # pick first acct
-    a=arr[0]
+    a=arr[0]  # pick first acct
     init=a.get("initialBalances",{}) if isinstance(a,dict) else {}
     curr=a.get("currentBalances",{}) if isinstance(a,dict) else {}
     oc = pick(init,"cashBalance","cashAvailableForTrading","liquidationValue")
@@ -119,11 +119,21 @@ def main():
     # Schwab + sizing
     c = schwab_client()
     oc = opening_cash_for_account(c)
+
+    # Optional override of account value
+    oc_override_raw = os.environ.get("SIZING_DOLLARS_OVERRIDE","").strip()
+    if oc_override_raw:
+        try:
+            oc = float(oc_override_raw)
+        except Exception:
+            pass
+
     # $4k per 5‑wide; scale with width; round half‑up; min 1
     denom = 4000.0 * (width/5.0)
     qty = max(1, _round_half_up((float(oc) if oc is not None else 0.0) / denom))
-    # Allow override
-    qov = os.environ.get("QTY_OVERRIDE","").strip()
+
+    # Qty override (accept both names)
+    qov = (os.environ.get("QTY_OVERRIDE","") or os.environ.get("BYPASS_QTY","")).strip()
     if qov:
         try: qty = max(1, int(qov))
         except: pass
@@ -139,6 +149,7 @@ def main():
         print(f"  {name:10s} {osi}  acct_qty=+0 sign={sign:+d}")  # minimal snapshot
 
     print(f"ORCH SIZE: qty={qty} open_cash={oc:.2f}")
+    print("ORCH → PLACER")
 
     # Pass to placer via env
     env = dict(os.environ)
@@ -157,8 +168,6 @@ def main():
     env["SCHWAB_APP_SECRET"]=app_secret
     env["SCHWAB_TOKEN_JSON"]=token_json
 
-    # Run placer
-    print("ORCH → PLACER")
     rc = os.spawnve(os.P_WAIT, sys.executable, [sys.executable, "scripts/trade/leocross_place_simple.py"], env)
     return rc
 
