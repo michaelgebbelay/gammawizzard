@@ -1,19 +1,14 @@
+# scripts/trade/leocross_place_simple.py
 #!/usr/bin/env python3
 # PLACER — CREDIT only, same‑shorts. Minimal ladder + 429 backoff + cancel settle waits.
 
-import os, sys, time, math, json, random
-from datetime import timezone, datetime
+import os, sys, time, json, random
 from schwab.auth import client_from_token_file
 
 TICK = 0.05
 
 def clamp_tick(x: float) -> float:
     return round(round(float(x) / TICK) * TICK + 1e-12, 2)
-
-def schwab_client():
-    app_key=os.environ["SCHWAB_APP_KEY"]; app_secret=os.environ["SCHWAB_APP_SECRET"]; token_json=os.environ["SCHWAB_TOKEN_JSON"]
-    with open("schwab_token.json","w") as f: f.write(token_json)
-    return client_from_token_file(api_key=app_key, app_secret=app_secret, token_path="schwab_token.json")
 
 def fetch_bid_ask(c, osi: str):
     r=c.get_quote(osi)
@@ -69,12 +64,10 @@ def post_with_retry(c, url, payload, tag="", tries=6):
         if r.status_code in (200,201,202):
             return r
         if r.status_code == 429:
-            # exponential + small jitter
             wait = min(12.0, 0.6 * (2**i)) + random.uniform(0.0, 0.3)
             print(f"WARN: place failed — HTTP_429 — backoff {wait:.2f}s")
             time.sleep(wait); continue
         last = f"HTTP_{r.status_code}:{(r.text or '')[:200]}"
-        # brief wait before retry
         time.sleep(min(6.0, 0.4 * (2**i)))
     raise RuntimeError(f"POST_FAIL({tag}) {last or 'unknown'}")
 
@@ -108,13 +101,12 @@ def wait_settle(c, acct_hash: str, oid: str, max_wait=2.0):
         time.sleep(0.15)
     return False
 
-def place_one_credit(c, legs, price, qty):
+def place_one_credit(c, acct_hash: str, legs, price, qty):
     url_post = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
     payload = order_payload_credit(legs, price, qty)
     r = post_with_retry(c, url_post, payload, tag=f"PLACE@{price:.2f}x{qty}")
     return parse_order_id(r)
 
-# ===== Main =====
 if __name__=="__main__":
     side = (os.environ.get("SIDE","CREDIT") or "CREDIT").upper()
     if side != "CREDIT":
@@ -186,7 +178,7 @@ if __name__=="__main__":
 
             print(f"RUNG → price={price:.2f} to_place={to_place}")
             try:
-                active_oid = place_one_credit(c, legs, price, to_place)
+                active_oid = place_one_credit(c, acct_hash, legs, price, to_place)
             except Exception as e:
                 print(str(e))
                 continue
@@ -196,7 +188,13 @@ if __name__=="__main__":
             while time.time() < t_end:
                 st = get_status(c, acct_hash, active_oid)
                 s  = str(st.get("status") or st.get("orderStatus") or "").upper()
-                fq = int(round(float(st.get("filledQuantity") or st.get("filled_quantity") or 0)))
+                fq = 0
+                for k in ("filledQuantity","filled_quantity","quantityFilled","filled"):
+                    try:
+                        fq = int(round(float(st.get(k, 0))))
+                        if fq: break
+                    except Exception:
+                        pass
                 if fq > filled: filled=fq
                 if s == "FILLED" or filled >= qty:
                     break
