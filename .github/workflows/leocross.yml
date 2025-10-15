@@ -23,14 +23,6 @@ on:
         description: 'Use live width picker for credit days? (true/false)'
         required: true
         default: 'true'
-      picker_force:
-        description: 'Force picker on long-signal days (test credit shopping)? (true/false)'
-        required: false
-        default: 'false'
-      push_out_shorts:
-        description: 'When credit, push shorts 5 points farther (true/false). NOTE: 5-wide never pushed.'
-        required: false
-        default: 'false'
       side_override:
         description: 'AUTO | CREDIT | DEBIT'
         required: false
@@ -75,19 +67,22 @@ jobs:
           GW_PASSWORD:       ${{ secrets.GW_PASSWORD }}
 
           # Picker knobs
-          DEFAULT_CREDIT_WIDTH: "20"               # ← base width for the EV gate
-          EV_MIN_ADVANTAGE: "0.10"                 # ← only switch if EV improves > $0.10
+          DEFAULT_CREDIT_WIDTH: "20"               # base width for EV gate comparison
+          EV_MIN_ADVANTAGE: "0.10"                 # only switch if EV improves by > $0.10
           CANDIDATE_CREDIT_WIDTHS: "15,20,25,30,40,50"
+          SELECTOR: "EV"                            # explicit: EV | CREDIT_PER_WIDTH | CREDIT_PER_MAX_LOSS
 
-          # Win% tables (override if you want different ones)
+          # Historical win% used by EV math
           WINP_STD_JSON:  '{"5":0.714,"15":0.791,"20":0.816,"25":0.840,"30":0.863,"40":0.889,"50":0.916}'
-          WINP_PUSH_JSON: '{"5":0.812,"15":0.868,"20":0.885,"25":0.900,"30":0.914,"40":0.929,"50":0.943}'
 
-          # Ratios used only for the "edge" column (cosmetic)
+          # Ratios only inform the “edge vs 5‑wide” column (cosmetic)
           RATIO_STD_JSON:  '{"5":1.0,"15":2.55,"20":3.175,"25":3.6625,"30":4.15,"40":4.85,"50":5.375}'
-          RATIO_PUSH_JSON: '{"5":1.0,"15":2.205128,"20":2.743590,"25":3.179487,"30":3.615385,"40":4.256410,"50":4.717949}'
         run: |
           python scripts/trade/leocross_width_picker.py
+          echo "Picked width: ${{ steps.widthpicker.outputs.picked_width }}"
+          echo "Picker metric: ${{ steps.widthpicker.outputs.picked_metric }}"
+          echo "EV picked/base/delta: ${{ steps.widthpicker.outputs.picked_ev }} / ${{ steps.widthpicker.outputs.base_ev }} / ${{ steps.widthpicker.outputs.delta_ev }}"
+          echo "5-wide mid: ${{ steps.widthpicker.outputs.five_mid }}"
 
       - name: LeoCross orchestrator (guard + run)
         env:
@@ -101,14 +96,11 @@ jobs:
           SIDE_OVERRIDE: ${{ github.event.inputs.side_override }}
 
           # ===== Credentials =====
-          # Schwab
           SCHWAB_APP_KEY:    ${{ secrets.SCHWAB_APP_KEY }}
           SCHWAB_APP_SECRET: ${{ secrets.SCHWAB_APP_SECRET }}
           SCHWAB_TOKEN_JSON: ${{ secrets.SCHWAB_TOKEN_JSON }}
-          # Google Sheets
           GSHEET_ID:                   ${{ secrets.GSHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          # GammaWizard
           GW_TOKEN:    ${{ secrets.GW_TOKEN }}
           GW_EMAIL:    ${{ secrets.GW_EMAIL }}
           GW_PASSWORD: ${{ secrets.GW_PASSWORD }}
@@ -126,7 +118,7 @@ jobs:
           # Cutoff: flip to 23:59 when ignore_cutoff=true
           HARD_CUTOFF_HHMM: ${{ github.event.inputs.ignore_cutoff == 'true' && '23:59' || '16:15' }}
 
-          # Width / push toggle (picker output if present)
+          # Width chosen by picker (or default)
           CREDIT_SPREAD_WIDTH: "${{ steps.widthpicker.outputs.picked_width != '' && steps.widthpicker.outputs.picked_width || '20' }}"
           CREDIT_MIN_WIDTH: "5"
 
