@@ -1,7 +1,8 @@
 # scripts/trade/leocross_orchestrator.py
 #!/usr/bin/env python3
-# ORCHESTRATOR — same‑shorts CREDIT only (width from picker). Minimal, no push‑out.
-# Calls placer with legs + qty. Mode NOW (no gates) unless you add them.
+# ORCHESTRATOR — same‑shorts; AUTO side (from Leo). No push‑out.
+# For CREDIT: width from env (picker). For DEBIT (long IC): fixed 5‑wide.
+# Calls placer with legs + qty.
 
 import os, sys, json, re, math
 from datetime import date
@@ -25,21 +26,26 @@ def to_osi(sym: str) -> str:
 def strike_from_osi(osi: str) -> float:
     return int(osi[-8:]) / 1000.0
 
-def orient_credit(bp,sp,sc,bc):
+def orient_credit(bp,sp,sc,bc, *, is_credit: bool):
     bpS=strike_from_osi(bp); spS=strike_from_osi(sp)
     scS=strike_from_osi(sc); bcS=strike_from_osi(bc)
-    if bpS>spS: bp,sp=sp,bp
-    if scS>bcS: sc,bc=bc,sc
+    if is_credit:
+        if bpS>spS: bp,sp=sp,bp
+        if scS>bcS: sc,bc=bc,sc
+    else:
+        if bpS<spS: bp,sp=sp,bp
+        if bcS>scS: sc,bc=bc,sc
     return [bp,sp,sc,bc]
 
-def build_legs_same_shorts(exp6: str, inner_put: int, inner_call: int, width: int):
+def build_legs_same_shorts(exp6: str, inner_put: int, inner_call: int, width: int, *, is_credit: bool):
     p_low, p_high = inner_put - width, inner_put
     c_low, c_high = inner_call, inner_call + width
     return orient_credit(
         to_osi(f".SPXW{exp6}P{p_low}"),
         to_osi(f".SPXW{exp6}P{p_high}"),
         to_osi(f".SPXW{exp6}C{c_low}"),
-        to_osi(f".SPXW{exp6}C{c_high}")
+        to_osi(f".SPXW{exp6}C{c_high}"),
+        is_credit=is_credit
     )
 
 def _round_half_up(x: float) -> int:
@@ -59,7 +65,7 @@ def opening_cash_for_account(c):
         for k in ks:
             v=(d or {}).get(k)
             if isinstance(v,(int,float)): return float(v)
-    a=arr[0]  # pick first acct
+    a=arr[0]  # first acct
     init=a.get("initialBalances",{}) if isinstance(a,dict) else {}
     curr=a.get("currentBalances",{}) if isinstance(a,dict) else {}
     oc = pick(init,"cashBalance","cashAvailableForTrading","liquidationValue")
@@ -105,16 +111,32 @@ def extract_trade(j):
 # ====== Main ======
 def main():
     MODE = (os.environ.get("PLACER_MODE","NOW") or "NOW").upper()
-    width_env = os.environ.get("CREDIT_SPREAD_WIDTH","20").strip()
-    try: width = int(width_env)
-    except: width = 20
-    width = max(5, int(math.ceil(width/5.0)*5))
 
-    # GW
+    # GW for strikes + side
     tr = extract_trade(gw_fetch())
     exp6 = yymmdd(str(tr.get("TDate","")))
     inner_put  = int(float(tr.get("Limit")))
     inner_call = int(float(tr.get("CLimit")))
+    # Side from Leo: if Cat2 < Cat1 → DEBIT (long IC), else CREDIT (short IC)
+    def fnum(x):
+        try: return float(x)
+        except: return None
+    cat1=fnum(tr.get("Cat1")); cat2=fnum(tr.get("Cat2"))
+    is_credit = True if (cat2 is None or cat1 is None or cat2>=cat1) else False
+
+    # Override?
+    side_override = (os.environ.get("SIDE_OVERRIDE","AUTO") or "AUTO").upper()
+    if side_override == "CREDIT": is_credit = True
+    elif side_override == "DEBIT": is_credit = False
+
+    # Width
+    if is_credit:
+        width_env = os.environ.get("CREDIT_SPREAD_WIDTH","20").strip()
+        try: width = int(width_env)
+        except: width = 20
+        width = max(5, int(math.ceil(width/5.0)*5))
+    else:
+        width = 5  # long IC = fixed 5‑wide
 
     # Schwab + sizing
     c = schwab_client()
@@ -128,9 +150,12 @@ def main():
         except Exception:
             pass
 
-    # $4k per 5‑wide; scale with width; round half‑up; min 1
-    denom = 4000.0 * (width/5.0)
-    qty = max(1, _round_half_up((float(oc) if oc is not None else 0.0) / denom))
+    if is_credit:
+        denom = 4000.0 * (width/5.0)                    # $4k per 5‑wide scaled
+        qty = max(1, _round_half_up((float(oc) if oc is not None else 0.0) / denom))
+    else:
+        denom = 4000.0                                  # $4k per long IC (5‑wide)
+        qty = max(1, int((float(oc) if oc is not None else 0.0) // denom))  # floor
 
     # Qty override (accept both names)
     qov = (os.environ.get("QTY_OVERRIDE","") or os.environ.get("BYPASS_QTY","")).strip()
@@ -138,22 +163,23 @@ def main():
         try: qty = max(1, int(qov))
         except: pass
 
-    # Legs (same‑shorts; CREDIT)
-    legs = build_legs_same_shorts(exp6, inner_put, inner_call, width)
+    # Legs (same‑shorts; orient by side)
+    legs = build_legs_same_shorts(exp6, inner_put, inner_call, width, is_credit=is_credit)
+    side_txt = "CREDIT" if is_credit else "DEBIT"
 
     print(f"ORCH GATE disabled (MODE={MODE})")
-    print(f"ORCH CONFIG: side=CREDIT, width={width}, mode={MODE}")
+    print(f"ORCH CONFIG: side={side_txt}, width={width}, mode={MODE}")
     print("ORCH SNAPSHOT:")
     labels=[("BUY_PUT",legs[0],-1),("SELL_PUT",legs[1],+1),("SELL_CALL",legs[2],+1),("BUY_CALL",legs[3],-1)]
     for name, osi, sign in labels:
-        print(f"  {name:10s} {osi}  acct_qty=+0 sign={sign:+d}")  # minimal snapshot
+        print(f"  {name:10s} {osi}  acct_qty=+0 sign={sign:+d}")
 
     print(f"ORCH SIZE: qty={qty} open_cash={oc:.2f}")
     print("ORCH → PLACER")
 
     # Pass to placer via env
     env = dict(os.environ)
-    env["SIDE"] = "CREDIT"
+    env["SIDE"] = side_txt
     env["WIDTH"] = str(width)
     env["QTY"]   = str(qty)
     env["OCC_BUY_PUT"]  = legs[0]
