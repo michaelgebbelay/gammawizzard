@@ -1,15 +1,35 @@
 #!/usr/bin/env python3
-# WIDTH PICKER (credit only)
-# - Lock to a specific width with PICKER_LOCK_TO
-# - Choose by EV if WINP_JSON provided; else by credit/width
-# - Print full candidate table; emit GH outputs
+# WIDTH PICKER — CREDIT SIDE ONLY
+#
+# Picks the best credit width from live quotes with an EV gate:
+#   Only deviate from the base width if EV(best) - EV(base) > EV_MIN_ADVANTAGE (default $0.10)
+#
+# ENV knobs:
+#   SCHWAB_APP_KEY / SCHWAB_APP_SECRET / SCHWAB_TOKEN_JSON  (auth)
+#   GW_TOKEN or (GW_EMAIL + GW_PASSWORD)                    (LeoCross)
+#
+#   DEFAULT_CREDIT_WIDTH   e.g. "20"   ← base width the gate compares against
+#   CANDIDATE_CREDIT_WIDTHS e.g. "15,20,25,30,40,50"
+#   PUSH_OUT_SHORTS        "true"|"false" (never pushes 5‑wide)
+#
+#   EV_MIN_ADVANTAGE       numeric string, default "0.10"
+#
+#   WINP_STD_JSON          JSON of standard (same‑shorts) win% by width (0..1)
+#   WINP_PUSH_JSON         JSON of pushed‑shorts win% by width (0..1)
+#   RATIO_STD_JSON         JSON of baseline ratios for "edge" column
+#   RATIO_PUSH_JSON        (optional) ratios when PUSH_OUT_SHORTS=true
+#
+# Outputs (GitHub Actions):
+#   picked_width, picked_ref, picked_metric="EV", picked_ev, base_ev, delta_ev,
+#   five_mid, pushed_out, picker_diag  (and a full markdown table in logs)
 
 import os, re, json
 from datetime import date
 from zoneinfo import ZoneInfo
+import requests
 from schwab.auth import client_from_token_file
 
-ET = ZoneInfo("America/New_York")
+ET   = ZoneInfo("America/New_York")
 TICK = 0.05
 
 def clamp(x): return round(round(float(x)/TICK)*TICK + 1e-12, 2)
@@ -24,8 +44,8 @@ def to_osi(sym):
     mills=int(strike)*1000 + (int((frac or '0').ljust(3,'0')) if frac else 0) if len(strike)<8 else int(strike)
     return f"{root:<6}{ymd}{cp}{mills:08d}"
 
-def osi_canon(osi): return (osi[6:12], osi[12], osi[-8:])
 def strike_from_osi(osi): return int(osi[-8:])/1000.0
+
 def orient(bp,sp,sc,bc, credit=True):
     bpS,spS=strike_from_osi(bp),strike_from_osi(sp)
     scS,bcS=strike_from_osi(sc),strike_from_osi(bc)
@@ -57,7 +77,7 @@ def nbbo_credit(c, legs):
 def _truthy(s): return str(s or "").strip().lower() in {"1","true","t","yes","y","on"}
 
 def build_legs(exp6, inner_put, inner_call, width, pushed=False):
-    # 5-wide is never pushed
+    # 5‑wide is never pushed
     if pushed and width!=5:
         sell_put  = inner_put  - 5
         buy_put   = sell_put   - width
@@ -74,93 +94,114 @@ def build_legs(exp6, inner_put, inner_call, width, pushed=False):
                   to_osi(f".SPXW{exp6}C{c_high}"),
                   True)
 
+def gw_login():
+    r=requests.post("https://gandalf.gammawizard.com/goauth/authenticateFireUser",
+                    data={"email":os.environ["GW_EMAIL"],"password":os.environ["GW_PASSWORD"]}, timeout=30)
+    r.raise_for_status()
+    j=r.json(); t=j.get("token")
+    if not t: raise RuntimeError("GW login failed")
+    return t
+
+def gw_fetch():
+    tok=(os.environ.get("GW_TOKEN","") or "").strip()
+    if tok.lower().startswith("bearer "): tok=tok.split(None,1)[1]
+    if not tok: tok=gw_login()
+    h={"Authorization":f"Bearer {tok}","Accept":"application/json"}
+    r=requests.get("https://gandalf.gammawizard.com/rapi/GetLeoCross", headers=h, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
 def main():
-    # ---- env knobs ----
-    pushed   = _truthy(os.environ.get("PUSH_OUT_SHORTS","false"))
-    lock_to  = os.environ.get("PICKER_LOCK_TO","" ).strip()
-    lock_to  = int(lock_to) if (lock_to and lock_to.isdigit()) else None
-    cands    = [int(x) for x in (os.environ.get("CANDIDATE_CREDIT_WIDTHS","15,20,25,30,40,50").split(","))]
-    selector = (os.environ.get("SELECTOR_METRIC","EV") or "EV").upper()  # EV | SCORE | EDGE
-    ratios   = json.loads(os.environ.get(
+    # ===== env =====
+    baseW   = int(os.environ.get("DEFAULT_CREDIT_WIDTH","20") or 20)
+    pushed  = _truthy(os.environ.get("PUSH_OUT_SHORTS","false"))
+    ev_gate = float(os.environ.get("EV_MIN_ADVANTAGE","0.10") or "0.10")
+
+    # candidates (ensure base is included)
+    CANDS = [int(x) for x in (os.environ.get("CANDIDATE_CREDIT_WIDTHS","15,20,25,30,40,50").split(","))]
+    if baseW not in CANDS: CANDS.append(baseW)
+    CANDS = sorted(set(CANDS))
+
+    # win% tables
+    WINP_STD = json.loads(os.environ.get(
+        "WINP_STD_JSON",
+        '{"5":0.714,"15":0.791,"20":0.816,"25":0.840,"30":0.863,"40":0.889,"50":0.916}'
+    ))
+    WINP_PUSH = json.loads(os.environ.get(
+        "WINP_PUSH_JSON",
+        '{"5":0.812,"15":0.868,"20":0.885,"25":0.900,"30":0.914,"40":0.929,"50":0.943}'
+    ))
+    WINP = WINP_PUSH if pushed else WINP_STD
+
+    # ratios just for the "edge vs baseline" column (not used by gate)
+    RATIO_STD = json.loads(os.environ.get(
         "RATIO_STD_JSON",
         '{"5":1.0,"15":2.55,"20":3.175,"25":3.6625,"30":4.15,"40":4.85,"50":5.375}'
     ))
-    # Optional win% (standard)
-    WINP = json.loads(os.environ.get(
-        "WINP_JSON",
-        '{"5":0.714,"15":0.791,"20":0.816,"25":0.840,"30":0.863,"40":0.889,"50":0.916}'
+    RATIO_PUSH = json.loads(os.environ.get(
+        "RATIO_PUSH_JSON",
+        '{"5":1.0,"15":2.205128,"20":2.743590,"25":3.179487,"30":3.615385,"40":4.256410,"50":4.717949}'
     ))
+    RATIOS = RATIO_PUSH if pushed else RATIO_STD
 
-    # ---- Schwab auth ----
+    # ===== Schwab auth =====
     app_key=os.environ["SCHWAB_APP_KEY"]; app_secret=os.environ["SCHWAB_APP_SECRET"]; token_json=os.environ["SCHWAB_TOKEN_JSON"]
     with open("schwab_token.json","w") as f: f.write(token_json)
     c=client_from_token_file(api_key=app_key, app_secret=app_secret, token_path="schwab_token.json")
 
-    # ---- Leo ----
-    import requests
-    def _sanitize(t): 
-        t=(t or "").strip().strip('"').strip("'")
-        return t.split(None,1)[1] if t.lower().startswith("bearer ") else t
-    def gw_login():
-        r=requests.post("https://gandalf.gammawizard.com/goauth/authenticateFireUser",
-                        data={"email":os.environ["GW_EMAIL"],"password":os.environ["GW_PASSWORD"]}, timeout=30)
-        r.raise_for_status(); j=r.json(); 
-        if not j.get("token"): raise RuntimeError("GW login failed")
-        return j["token"]
-    tok=_sanitize(os.environ.get("GW_TOKEN","") or "") or gw_login()
-    h={"Authorization":f"Bearer {_sanitize(tok)}","Accept":"application/json"}
-    r=requests.get("https://gandalf.gammawizard.com/rapi/GetLeoCross", headers=h, timeout=30); r.raise_for_status()
-    j=r.json()
+    # ===== Leo =====
+    j=gw_fetch()
     tr = j["Trade"][-1] if isinstance(j.get("Trade"), list) else j
     exp6 = yymmdd(str(tr.get("TDate","")))
-    inner_put  = int(float(tr.get("Limit"))); 
+    inner_put  = int(float(tr.get("Limit")))
     inner_call = int(float(tr.get("CLimit")))
-    # 5-wide baseline (never pushed) for ratio baseline
-    bid5,ask5,mid5 = nbbo_credit(c, build_legs(exp6, inner_put, inner_call, 5, pushed=False))
-    five_ref = mid5
 
-    rows=[]
-    best=None
-    for W in cands:
+    # 5‑wide reference (never pushed) for the baseline/edge column
+    _,_,five_mid = nbbo_credit(c, build_legs(exp6, inner_put, inner_call, 5, pushed=False))
+
+    # collect candidates
+    rows=[]  # (W, mid, baseline, edge, winp, ev, score)
+    for W in CANDS:
         legs = build_legs(exp6, inner_put, inner_call, W, pushed=pushed)
-        b,a,m = nbbo_credit(c, legs)
-        ref = m
-        if not ref:
+        _,_,mid = nbbo_credit(c, legs)
+        if not mid:
             rows.append((W, None, None, None, None, None, None)); continue
-        base_mult = ratios.get(str(W), None)
-        baseline  = (base_mult * five_ref) if (base_mult and five_ref) else None
-        edge      = (ref - baseline) if baseline else None
-        winp      = WINP.get(str(W)) or WINP.get(W)  # optional
-        breach    = (1.0 - winp) if winp else None
-        ev        = (ref - breach*W) if (breach is not None) else None
-        score     = ref/float(W)
+        mult = RATIOS.get(str(W))
+        baseline = (mult * five_mid) if (mult and five_mid) else None
+        edge     = (mid - baseline) if baseline else None
+        winp     = WINP.get(str(W)) or WINP.get(W)
+        breach   = (1.0 - winp) if winp is not None else None
+        ev       = (mid - breach*W) if breach is not None else None
+        score    = mid/float(W)
+        rows.append((W, mid, baseline, edge, winp, ev, score))
 
-        # choose metric
-        metric = (ev if (selector=="EV" and ev is not None) 
-                    else (score if selector=="SCORE" else (edge if edge is not None else score)))
+    # find base row & best EV row
+    base_row = next((r for r in rows if r[0]==baseW and r[5] is not None), None)
+    best_row = None
+    for r in rows:
+        if r[5] is None:   # EV missing
+            continue
+        if (best_row is None) or (r[5] > best_row[5] + 1e-12):
+            best_row = r
 
-        rows.append((W, ref, baseline, edge, winp, ev, score))
-        cand = (W, ref, metric)
-        if best is None or (cand[2] > best[2] + 1e-12):
-            best = cand
+    # decision with EV gate
+    if base_row is None:
+        # Cannot compute EV(base) — be conservative and stick to base if quoted; otherwise pick best mid
+        picked = next((r for r in rows if r[0]==baseW and r[1] is not None), None) or \
+                 (best_row if best_row is not None else max(rows, key=lambda x: (x[1] or 0.0)))
+        gate_note = "EV(base) unavailable → fallback"
+    else:
+        base_ev = base_row[5]
+        if (best_row is None) or (best_row[0]==baseW):
+            picked = base_row; gate_note = "Best==Base"
+        else:
+            delta_ev = best_row[5] - base_ev
+            if delta_ev > ev_gate + 1e-12:
+                picked = best_row; gate_note = f"Switch (ΔEV={delta_ev:.2f} > {ev_gate:.2f})"
+            else:
+                picked = base_row; gate_note = f"Stick (ΔEV={delta_ev:.2f} ≤ {ev_gate:.2f})"
 
-    # Lock, if requested and quoted
-    if lock_to and any(r[0]==lock_to and r[1] for r in rows):
-        for r in rows:
-            if r[0]==lock_to and r[1]:
-                best = (r[0], r[1], (r[5] if selector=="EV" else (r[6] if selector=="SCORE" else r[3])))
-                break
-
-    if best is None:
-        print("WIDTH_PICKER: no quotes; defaulting to 20")
-        emit(20, 0.0, "NONE", rows, five_ref, pushed); 
-        return
-
-    Wsel, refsel, metric_sel = best
-    emit(Wsel, refsel, selector, rows, five_ref, pushed)
-
-def emit(width, ref, selector, rows, five_ref, pushed):
-    # Markdown table
+    # print nice table
     hdr = "|Width|Mid|Baseline|Edge|Win%|EV|Credit/Width|\n|---:|---:|---:|---:|---:|---:|---:|"
     lines=[hdr]
     for W,mid,base,edge,winp,ev,score in rows:
@@ -171,20 +212,32 @@ def emit(width, ref, selector, rows, five_ref, pushed):
                      f"{'' if ev   is None else f'{ev:.2f}'}|"
                      f"{'' if score is None else f'{score:.5f}'}|")
     table_md = "\n".join(lines)
-    five_ref_str = "NA" if five_ref is None else f"{five_ref:.2f}"
-    pick_line = f"**Picked:** {width}-wide @ {ref:.2f} ({selector}), five_ref={five_ref_str}, pushed_out={pushed}"
-    print("WIDTH_PICKER\n" + table_md + "\n" + pick_line)
+    Wsel, mid_sel = picked[0], picked[1] or 0.0
+    base_ev_out  = (base_row[5] if base_row else 0.0)
+    delta_ev_out = ((picked[5] - base_ev_out) if (base_row and picked[5] is not None) else 0.0)
 
+    print("WIDTH_PICKER (pushed_out={}, EV_gate={:.2f}, baseW={})"
+          .format(pushed, ev_gate, baseW))
+    print(table_md)
+    print(f"**Picked:** {Wsel}-wide @ {mid_sel:.2f} (metric=EV), "
+          f"base_ev={base_ev_out:.2f}, delta_ev={delta_ev_out:+.2f} → {gate_note}")
+    if five_mid:
+        print(f"5‑wide mid reference = {five_mid:.2f}")
+
+    # emit GH outputs
     out_path=os.environ.get("GITHUB_OUTPUT","")
     def w(k,v):
         if not out_path: return
         with open(out_path,"a") as fh: fh.write(f"{k}={v}\n")
-    w("picked_width", str(width))
-    w("picked_ref",   f"{ref:.2f}")
-    w("picked_metric", selector)
-    # also expose a compact diag
-    diag = "; ".join([f"W{r[0]}:{'NA' if r[1] is None else f'{r[1]:.2f}'}"
-                      for r in rows])
+    w("picked_width", str(Wsel))
+    w("picked_ref",   f"{mid_sel:.2f}")
+    w("picked_metric","EV")
+    w("picked_ev",    f"{(picked[5] if picked[5] is not None else 0.0):.4f}")
+    w("base_ev",      f"{base_ev_out:.4f}")
+    w("delta_ev",     f"{delta_ev_out:.4f}")
+    w("five_mid",     f"{(five_mid or 0.0):.2f}")
+    w("pushed_out",   "true" if pushed else "false")
+    diag = "; ".join([f"W{r[0]}:{'NA' if r[5] is None else f'EV={r[5]:.2f}'}" for r in rows])
     w("picker_diag", diag)
 
 if __name__ == "__main__":
