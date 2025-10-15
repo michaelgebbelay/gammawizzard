@@ -75,7 +75,6 @@ jobs:
           GW_PASSWORD:       ${{ secrets.GW_PASSWORD }}
 
           # Picker knobs
-          PUSH_OUT_SHORTS: "false"                 # 5-wide is never pushed
           DEFAULT_CREDIT_WIDTH: "20"               # ← base width for the EV gate
           EV_MIN_ADVANTAGE: "0.10"                 # ← only switch if EV improves > $0.10
           CANDIDATE_CREDIT_WIDTHS: "15,20,25,30,40,50"
@@ -130,7 +129,6 @@ jobs:
           # Width / push toggle (picker output if present)
           CREDIT_SPREAD_WIDTH: "${{ steps.widthpicker.outputs.picked_width != '' && steps.widthpicker.outputs.picked_width || '20' }}"
           CREDIT_MIN_WIDTH: "5"
-          PUSH_OUT_SHORTS:  ${{ github.event.inputs.push_out_shorts }}
 
           # Verbose logs
           VERBOSE: "1"
