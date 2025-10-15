@@ -26,7 +26,6 @@ FAST_HOLD_SECONDS     = int(os.environ.get("FAST_HOLD_SECONDS","30"))
 GW_WARM_TIMEOUT       = int(os.environ.get("GW_WARM_TIMEOUT","6"))
 GW_REFRESH_TIMEOUT    = int(os.environ.get("GW_REFRESH_TIMEOUT","3"))
 HARD_CUTOFF_HHMM      = os.environ.get("HARD_CUTOFF_HHMM","16:15").strip()
-PUSH_OUT_SHORTS       = str(os.environ.get("PUSH_OUT_SHORTS","false")).strip().lower() in {"1","true","t","yes","y","on"}
 
 def _truthy(s: str) -> bool:
     return str(s or "").strip().lower() in {"1","true","t","yes","y","on"}
@@ -242,38 +241,45 @@ def extract_trade(j):
             if t: return t
     return {}
 
-def build_legs_credit(width:int, exp6:str, inner_put:int, inner_call:int, pushed:bool):
-    # Never push 5‑wide
-    if pushed and width != 5:
-        sell_put  = inner_put  - 5
-        buy_put   = sell_put   - width
-        sell_call = inner_call + 5
-        buy_call  = sell_call  + width
-        p_low, p_high = buy_put, sell_put
-        c_low, c_high = sell_call, buy_call
+def _build_legs(is_credit: bool, width: int, exp6: str, inner_put: int, inner_call: int, push_out: bool):
+    # ----- build legs (CREDIT: same-shorts unless PUSH_OUT_SHORTS true; 5-wide is never pushed) -----
+    if is_credit:
+        if push_out and width != 5:
+            # pushed shorts by 5
+            sell_put  = inner_put  - 5
+            buy_put   = sell_put   - width
+            sell_call = inner_call + 5
+            buy_call  = sell_call  + width
+            p_low, p_high = buy_put, sell_put
+            c_low, c_high = sell_call, buy_call
+        else:
+            # same shorts (standard)
+            p_low, p_high = inner_put - width, inner_put
+            c_low, c_high = inner_call, inner_call + width
     else:
+        # long IC path unchanged (5-wide)
         p_low, p_high = inner_put - width, inner_put
         c_low, c_high = inner_call, inner_call + width
-    bp = to_osi(f".SPXW{exp6}P{p_low}"); sp = to_osi(f".SPXW{exp6}P{p_high}")
-    sc = to_osi(f".SPXW{exp6}C{c_low}"); bc = to_osi(f".SPXW{exp6}C{c_high}")
-    # orient for credit: buys are wings, sells are shorts
-    bpS=strike_from_osi(bp); spS=strike_from_osi(sp)
-    scS=strike_from_osi(sc); bcS=strike_from_osi(bc)
-    if bpS>spS: bp,sp = sp,bp
-    if scS>bcS: sc,bc = bc,sc
-    return [bp,sp,sc,bc]
 
-def build_legs_long(width:int, exp6:str, inner_put:int, inner_call:int):
-    p_low, p_high = inner_put - width, inner_put
-    c_low, c_high = inner_call, inner_call + width
-    bp = to_osi(f".SPXW{exp6}P{p_low}"); sp = to_osi(f".SPXW{exp6}P{p_high}")
-    sc = to_osi(f".SPXW{exp6}C{c_low}"); bc = to_osi(f".SPXW{exp6}C{c_high}")
-    # orient for debit: buys are shorts side (reverse vs credit)
-    bpS=strike_from_osi(bp); spS=strike_from_osi(sp)
-    scS=strike_from_osi(sc); bcS=strike_from_osi(bc)
-    if bpS<spS: bp,sp = sp,bp
-    if bcS>scS: sc,bc = bc,sc
-    return [bp,sp,sc,bc]
+    bp = to_osi(f".SPXW{exp6}P{p_low}")
+    sp = to_osi(f".SPXW{exp6}P{p_high}")
+    sc = to_osi(f".SPXW{exp6}C{c_low}")
+    bc = to_osi(f".SPXW{exp6}C{c_high}")
+
+    if is_credit:
+        # orient for credit: buys are wings, sells are shorts
+        if strike_from_osi(bp) > strike_from_osi(sp):
+            bp, sp = sp, bp
+        if strike_from_osi(sc) > strike_from_osi(bc):
+            sc, bc = bc, sc
+    else:
+        # orient for debit: buys are shorts side (reverse vs credit)
+        if strike_from_osi(bp) < strike_from_osi(sp):
+            bp, sp = sp, bp
+        if strike_from_osi(sc) < strike_from_osi(bc):
+            sc, bc = bc, sc
+
+    return [bp, sp, sc, bc]
 
 def print_snapshot(pos, legs, is_credit, width, bypass):
     labels=[("BUY_PUT",legs[0],-1),("SELL_PUT",legs[1],+1),("SELL_CALL",legs[2],+1),("BUY_CALL",legs[3],-1)]
@@ -358,10 +364,13 @@ def main():
     # Width decision
     width = (_credit_width() if is_credit else 5)
 
-    # Build legs (push toggle only matters on credit; 5‑wide never pushed)
-    legs = (build_legs_credit(width, exp6, inner_put, inner_call, PUSH_OUT_SHORTS) 
-            if is_credit else
-            build_legs_long(5, exp6, inner_put, inner_call))
+    PUSH_OUT_SHORTS = _truthy(os.environ.get("PUSH_OUT_SHORTS", "false"))
+
+    legs = _build_legs(is_credit, width if is_credit else 5, exp6, inner_put, inner_call, PUSH_OUT_SHORTS)
+    bp, sp, sc, bc = legs
+
+    # --- add this small debug so we can see exactly what happened today ---
+    print(f"ORCH CONFIG: side={'CREDIT' if is_credit else 'DEBIT'}, width={width}, push_out={PUSH_OUT_SHORTS}")
 
     # Optional gate (hold + cutoff)
     now = datetime.now(ET)
@@ -406,9 +415,8 @@ def main():
             if (ip2 != inner_put) or (ic2 != inner_call) or (new_exp_iso!=exp_iso):
                 exp_iso=new_exp_iso; exp6=yymmdd(exp_iso)
                 inner_put, inner_call = ip2, ic2
-                legs = (build_legs_credit(width, exp6, inner_put, inner_call, PUSH_OUT_SHORTS) 
-                        if is_credit else
-                        build_legs_long(5, exp6, inner_put, inner_call))
+                legs = _build_legs(is_credit, width if is_credit else 5, exp6, inner_put, inner_call, PUSH_OUT_SHORTS)
+                bp, sp, sc, bc = legs
     except Exception: pass
 
     # Positions + checks
@@ -464,6 +472,7 @@ def main():
     env = dict(os.environ)
     env["QTY_OVERRIDE"]   = str(rem_qty)          # requested units
     env["PLACER_MODE"]    = "MANUAL"
+    env["ORCH_SIDE"]      = ("CREDIT" if is_credit else "DEBIT")    # <— NEW: freeze side for placer
     env["VERBOSE"]        = env.get("VERBOSE","1")
 
     # NEW: hard-lock what the placer must do
