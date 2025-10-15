@@ -342,6 +342,11 @@ def main():
         except: return None
     cat1=fnum(tr.get("Cat1")); cat2=fnum(tr.get("Cat2"))
     is_credit = True if (cat2 is None or cat1 is None or cat2>=cat1) else False
+    SIDE_OVERRIDE = (os.environ.get("SIDE_OVERRIDE","AUTO") or "AUTO").upper()
+    if SIDE_OVERRIDE == "CREDIT":
+        is_credit = True
+    elif SIDE_OVERRIDE == "DEBIT":
+        is_credit = False
 
     # determine width
     # Allow manual override of account value for sizing (testing)
