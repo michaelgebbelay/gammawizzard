@@ -187,10 +187,10 @@ def main():
 
     # ===== Leo =====
     try:
-        j=gw_fetch()
+        j = gw_fetch()
     except Exception as e:
         emit_default(baseW, pushed, f"GW fetch failed: {e}")
-        return
+        return  # graceful exit, step succeeds
     tr = j["Trade"][-1] if isinstance(j.get("Trade"), list) else j
     exp6 = yymmdd(str(tr.get("TDate","")))
     inner_put  = int(float(tr.get("Limit")))
