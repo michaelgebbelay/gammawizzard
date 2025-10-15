@@ -241,25 +241,10 @@ def extract_trade(j):
             if t: return t
     return {}
 
-def _build_legs(is_credit: bool, width: int, exp6: str, inner_put: int, inner_call: int, push_out: bool):
-    # ----- build legs (CREDIT: same-shorts unless PUSH_OUT_SHORTS true; 5-wide is never pushed) -----
-    if is_credit:
-        if push_out and width != 5:
-            # pushed shorts by 5
-            sell_put  = inner_put  - 5
-            buy_put   = sell_put   - width
-            sell_call = inner_call + 5
-            buy_call  = sell_call  + width
-            p_low, p_high = buy_put, sell_put
-            c_low, c_high = sell_call, buy_call
-        else:
-            # same shorts (standard)
-            p_low, p_high = inner_put - width, inner_put
-            c_low, c_high = inner_call, inner_call + width
-    else:
-        # long IC path unchanged (5-wide)
-        p_low, p_high = inner_put - width, inner_put
-        c_low, c_high = inner_call, inner_call + width
+def _build_legs_same_shorts(is_credit: bool, width: int, exp6: str, inner_put: int, inner_call: int):
+    """Build a same-shorts iron condor layout for both credit and debit paths."""
+    p_low, p_high = inner_put - width, inner_put
+    c_low, c_high = inner_call, inner_call + width
 
     bp = to_osi(f".SPXW{exp6}P{p_low}")
     sp = to_osi(f".SPXW{exp6}P{p_high}")
@@ -362,15 +347,14 @@ def main():
         print("ORCH ABORT:", reason); log("ABORT", reason); return 1
 
     # Width decision
+    # SHORT: use configured width (default now 20). LONG: keep 5-wide.
     width = (_credit_width() if is_credit else 5)
 
-    PUSH_OUT_SHORTS = _truthy(os.environ.get("PUSH_OUT_SHORTS", "false"))
-
-    legs = _build_legs(is_credit, width if is_credit else 5, exp6, inner_put, inner_call, PUSH_OUT_SHORTS)
+    legs = _build_legs_same_shorts(is_credit, width if is_credit else 5, exp6, inner_put, inner_call)
     bp, sp, sc, bc = legs
 
     # --- add this small debug so we can see exactly what happened today ---
-    print(f"ORCH CONFIG: side={'CREDIT' if is_credit else 'DEBIT'}, width={width}, push_out={PUSH_OUT_SHORTS}")
+    print(f"ORCH CONFIG: side={'CREDIT' if is_credit else 'DEBIT'}, width={width}")
 
     # Optional gate (hold + cutoff)
     now = datetime.now(ET)
@@ -410,14 +394,18 @@ def main():
         os.environ["GW_TIMEOUT"] = str(GW_REFRESH_TIMEOUT)
         api2 = gw_get_leocross(); tr2 = extract_trade(api2)
         if tr2:
-            ip2 = int(float(tr2.get("Limit"))); ic2= int(float(tr2.get("CLimit")))
+            ip2 = int(float(tr2.get("Limit")))
+            ic2 = int(float(tr2.get("CLimit")))
             new_exp_iso = str(tr2.get("TDate",""))
-            if (ip2 != inner_put) or (ic2 != inner_call) or (new_exp_iso!=exp_iso):
-                exp_iso=new_exp_iso; exp6=yymmdd(exp_iso)
+            exp6_2 = yymmdd(new_exp_iso) if new_exp_iso else exp6
+            if (ip2 != inner_put) or (ic2 != inner_call) or (exp6_2 != exp6):
+                exp_iso = new_exp_iso
+                exp6 = exp6_2
                 inner_put, inner_call = ip2, ic2
-                legs = _build_legs(is_credit, width if is_credit else 5, exp6, inner_put, inner_call, PUSH_OUT_SHORTS)
+                legs = _build_legs_same_shorts(is_credit, width if is_credit else 5, exp6, inner_put, inner_call)
                 bp, sp, sc, bc = legs
-    except Exception: pass
+    except Exception:
+        pass
 
     # Positions + checks
     try: pos = positions_map(c, acct_hash)
@@ -453,7 +441,7 @@ def main():
     units_open = condor_units_open(pos, legs)
     rem_qty = max(0, target_units - units_open)
 
-    detail = (f"short_ic width={width} push_out={PUSH_OUT_SHORTS} open_cash={oc:.2f} "
+    detail = (f"short_ic width={width} open_cash={oc:.2f} "
               f"target={target_units} units_open={units_open} rem_qty={rem_qty}"
               if is_credit else
               f"long_ic width=5 open_cash={oc:.2f} target={target_units} units_open={units_open} rem_qty={rem_qty}")
