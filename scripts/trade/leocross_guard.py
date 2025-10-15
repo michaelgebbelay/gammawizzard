@@ -52,6 +52,36 @@ def osi_canon(osi: str):
 def strike_from_osi(osi: str) -> float:
     return int(osi[-8:]) / 1000.0
 
+
+def build_legs_same_shorts(exp6: str, inner_put: int, inner_call: int, width: int, *, is_credit: bool = True):
+    """Construct same-shorts iron condor legs for credit (default) or debit."""
+
+    p_low, p_high = inner_put - width, inner_put
+    c_low, c_high = inner_call, inner_call + width
+
+    bp = to_osi(f".SPXW{exp6}P{p_low}")
+    sp = to_osi(f".SPXW{exp6}P{p_high}")
+    sc = to_osi(f".SPXW{exp6}C{c_low}")
+    bc = to_osi(f".SPXW{exp6}C{c_high}")
+
+    bpS = strike_from_osi(bp)
+    spS = strike_from_osi(sp)
+    scS = strike_from_osi(sc)
+    bcS = strike_from_osi(bc)
+
+    if is_credit:
+        if bpS > spS:
+            bp, sp = sp, bp
+        if scS > bcS:
+            sc, bc = bc, sc
+    else:
+        if bpS < spS:
+            bp, sp = sp, bp
+        if bcS > scS:
+            sc, bc = bc, sc
+
+    return [bp, sp, sc, bc]
+
 def iso_z(dt):
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -335,36 +365,10 @@ def main():
 
     width = calc_short_ic_width(oc) if is_credit else 5
 
-    # legs (unoriented base strikes)
     if is_credit:
-        # PUSHED-OUT shorts by 5; wings ±width from those shorts
-        sell_put  = inner_put  - 5
-        buy_put   = sell_put   - width
-        sell_call = inner_call + 5
-        buy_call  = sell_call  + width
-        p_low, p_high = buy_put, sell_put
-        c_low, c_high = sell_call, buy_call
+        legs = build_legs_same_shorts(exp6, inner_put, inner_call, width, is_credit=True)
     else:
-        # LONG path unchanged (same-shorts)
-        p_low, p_high = inner_put - width, inner_put
-        c_low, c_high = inner_call, inner_call + width
-    bp = to_osi(f".SPXW{exp6}P{p_low}")
-    sp = to_osi(f".SPXW{exp6}P{p_high}")
-    sc = to_osi(f".SPXW{exp6}C{c_low}")
-    bc = to_osi(f".SPXW{exp6}C{c_high}")
-
-    # orient so BUY legs are protective wings for credit; reverse for debit
-    def orient(bp,sp,sc,bc):
-        bpS=strike_from_osi(bp); spS=strike_from_osi(sp)
-        scS=strike_from_osi(sc); bcS=strike_from_osi(bc)
-        if is_credit:
-            if bpS>spS: bp,sp = sp,bp
-            if scS>bcS: sc,bc = bc,sc
-        else:
-            if bpS<spS: bp,sp = sp,bp
-            if bcS>scS: sc,bc = bc,sc
-        return [bp,sp,sc,bc]
-    legs = orient(bp,sp,sc,bc)
+        legs = build_legs_same_shorts(exp6, inner_put, inner_call, width, is_credit=False)
     canon = {osi_canon(x) for x in legs}
 
     # positions
