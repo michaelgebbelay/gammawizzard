@@ -37,4 +37,4 @@ jobs:
           GW_ENDPOINTS: ${{ github.event.inputs.endpoints }}
           GW_SAVE_DIR:  ${{ github.event.inputs.save_dir }}
         run: |
-          python scripts/trade/gw_fetch.py
+          python scripts/data/gw_fetch.py
