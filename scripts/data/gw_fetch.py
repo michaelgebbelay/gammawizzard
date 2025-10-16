@@ -1,38 +1,96 @@
 #!/usr/bin/env python3
-# Batch fetcher for multiple GammaWizard endpoints.
-# Reads list from CLI args or env GW_ENDPOINTS (comma-separated).
-import os, sys, json, re, datetime as dt
-from gw_api import gw_get
+# Fetch one or more GammaWizard endpoints and save JSON locally.
+# Env:
+#   GW_BASE        default https://gandalf.gammawizard.com
+#   GW_TOKEN       optional bearer (preferred)
+#   GW_EMAIL       optional (fallback)
+#   GW_PASSWORD    optional (fallback)
+#   GW_ENDPOINTS   comma-separated: e.g. "rapi/GetUltraConstantStable,rapi/GetLeoCross,rapi/GetUltraSVJ"
+#   GW_SAVE_DIR    optional dir to write files (created if missing)
 
-def sanitize_name(s: str) -> str:
-    s = (s or "").strip().strip("/")
-    s = s.replace("rapi/", "")
-    return re.sub(r'[^A-Za-z0-9_.-]+', '_', s)
+import os, sys, json, time, pathlib, requests
+
+BASE = os.environ.get("GW_BASE","https://gandalf.gammawizard.com").rstrip("/")
+ENDPOINTS_RAW = os.environ.get("GW_ENDPOINTS","rapi/GetUltraConstantStable,rapi/GetLeoCross,rapi/GetUltraSVJ")
+SAVE_DIR = os.environ.get("GW_SAVE_DIR","").strip()
+TOKEN = os.environ.get("GW_TOKEN","").strip()
+EMAIL = os.environ.get("GW_EMAIL","").strip()
+PASSWORD = os.environ.get("GW_PASSWORD","").strip()
+
+def sanitize_token(t: str) -> str:
+    t = (t or "").strip().strip('"').strip("'")
+    return t.split(None,1)[1] if t.lower().startswith("bearer ") else t
+
+def login_token() -> str:
+    if not (EMAIL and PASSWORD):
+        raise RuntimeError("GW_AUTH_REQUIRED (no token and no creds)")
+    r = requests.post(f"{BASE}/goauth/authenticateFireUser", data={"email":EMAIL,"password":PASSWORD}, timeout=30)
+    r.raise_for_status()
+    j = r.json() or {}
+    tok = j.get("token")
+    if not tok:
+        raise RuntimeError("GW_LOGIN_NO_TOKEN")
+    return tok
+
+def build_url(ep: str) -> str:
+    e = (ep or "").strip()
+    if e.startswith("http://") or e.startswith("https://"):
+        return e
+    if e.startswith("rapi/") or e.startswith("/rapi/"):
+        return f"{BASE}/{e.lstrip('/')}"
+    # allow bare names like "GetLeoCross"
+    return f"{BASE}/rapi/{e.lstrip('/')}"
+
+def fetch_endpoint(ep: str, tok: str | None):
+    url = build_url(ep)
+    def hit(t):
+        h={"Accept":"application/json"}
+        if t:
+            h["Authorization"]=f"Bearer {sanitize_token(t)}"
+        return requests.get(url, headers=h, timeout=45)
+    r = hit(tok) if tok else None
+    if (r is None) or (r.status_code in (401,403)):
+        t2 = login_token()
+        r = hit(t2)
+    r.raise_for_status()
+    try:
+        return r.json()
+    except Exception:
+        return {"raw": r.text}
+
+def save_json(obj, ep: str, root: pathlib.Path) -> pathlib.Path:
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    safe = ep.strip().strip("/").replace("/", "_")
+    if not safe:
+        safe = "endpoint"
+    fn = f"{safe}_{ts}.json"
+    path = root / fn
+    path.write_text(json.dumps(obj, ensure_ascii=False, separators=(",",":")), encoding="utf-8")
+    return path
 
 def main():
-    eps = sys.argv[1:]
+    eps = [e.strip() for e in (ENDPOINTS_RAW or "").split(",") if e.strip()]
     if not eps:
-        env_list = os.environ.get("GW_ENDPOINTS", "")
-        if env_list:
-            eps = [e.strip() for e in env_list.split(",") if e.strip()]
-    if not eps:
-        eps = ["rapi/GetUltraSupreme", "rapi/GetLeoCross"]
+        print("ERROR: GW_ENDPOINTS is empty", file=sys.stderr)
+        return 2
 
-    save_dir = os.environ.get("GW_SAVE_DIR", "").strip()
-    stamp = dt.datetime.utcnow().strftime("%Y%m%d")
+    outdir = pathlib.Path(SAVE_DIR) if SAVE_DIR else pathlib.Path.cwd()
+    outdir.mkdir(parents=True, exist_ok=True)
 
+    tok = TOKEN or ""
+    ok = 0
     for ep in eps:
-        data = gw_get(ep)
-        print(f"===== {ep} =====")
-        print(json.dumps(data, indent=2, sort_keys=False))
-        print()
-        if save_dir:
-            os.makedirs(save_dir, exist_ok=True)
-            name = sanitize_name(ep)
-            path = os.path.join(save_dir, f"{name}_{stamp}.json")
-            with open(path, "w") as f:
-                json.dump(data, f, indent=2)
-            print(f"[saved] {path}")
+        try:
+            data = fetch_endpoint(ep, tok)
+            p = save_json(data, ep, outdir)
+            print(f"SAVED {ep} -> {p}")
+            ok += 1
+        except Exception as e:
+            print(f"ERROR {ep}: {type(e).__name__}: {e}", file=sys.stderr)
+            # continue to next endpoint
+            continue
+
+    return 0 if ok > 0 else 1
 
 if __name__ == "__main__":
     sys.exit(main())
