@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       endpoints:
-        description: 'Comma-separated endpoints (e.g. rapi/GetUltraSupreme,rapi/GetLeoCross)'
+        description: 'Comma-separated endpoints (e.g. rapi/GetUltraConstantStable,rapi/GetLeoCross,rapi/GetUltraSVJ)'
         required: false
-        default: 'rapi/GetUltraSupreme,rapi/GetLeoCross'
+        default: 'rapi/GetUltraConstantStable,rapi/GetLeoCross,rapi/GetUltraSVJ'
       save_dir:
         description: 'Optional save dir in repo workspace (e.g. out)'
         required: false
@@ -18,22 +18,23 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install --quiet requests
+
       - name: Fetch GW endpoints
         env:
           GW_BASE: "https://gandalf.gammawizard.com"
-          # Prefer weekly token if you have it; otherwise email+password are used.
           GW_TOKEN:    ${{ secrets.GW_TOKEN }}
           GW_EMAIL:    ${{ secrets.GW_EMAIL }}
           GW_PASSWORD: ${{ secrets.GW_PASSWORD }}
           GW_ENDPOINTS: ${{ github.event.inputs.endpoints }}
           GW_SAVE_DIR:  ${{ github.event.inputs.save_dir }}
         run: |
-          python scripts/trade/gw_api.py rapi/Ping >/dev/null 2>&1 || true
           python scripts/trade/gw_fetch.py
