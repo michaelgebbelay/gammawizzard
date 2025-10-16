@@ -38,3 +38,16 @@ jobs:
           GW_SAVE_DIR:  ${{ github.event.inputs.save_dir }}
         run: |
           python scripts/data/gw_fetch.py
+
+      - name: List saved files
+        run: |
+          echo "Workspace: $PWD"
+          ls -la "${{ github.event.inputs.save_dir || 'out' }}" || true
+
+      - name: Upload results (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: gw-json-${{ github.run_id }}
+          path: ${{ github.event.inputs.save_dir || 'out' }}/**
+          if-no-files-found: error
+          retention-days: 14
