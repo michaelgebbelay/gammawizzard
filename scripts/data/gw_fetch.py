@@ -1,21 +1,12 @@
 #!/usr/bin/env python3
-# Fetch one or more GammaWizard endpoints and save JSON locally.
-# Env:
-#   GW_BASE        default https://gandalf.gammawizard.com
-#   GW_TOKEN       optional bearer (preferred)
-#   GW_EMAIL       optional (fallback)
-#   GW_PASSWORD    optional (fallback)
-#   GW_ENDPOINTS   comma-separated: e.g. "rapi/GetUltraConstantStable,rapi/GetLeoCross,rapi/GetUltraSVJ"
-#   GW_SAVE_DIR    optional dir to write files (created if missing)
-
 import os, sys, json, time, pathlib, requests
 
 BASE = os.environ.get("GW_BASE","https://gandalf.gammawizard.com").rstrip("/")
 ENDPOINTS_RAW = os.environ.get("GW_ENDPOINTS","rapi/GetUltraConstantStable,rapi/GetLeoCross,rapi/GetUltraSVJ")
-SAVE_DIR = os.environ.get("GW_SAVE_DIR","").strip()
-TOKEN = os.environ.get("GW_TOKEN","").strip()
-EMAIL = os.environ.get("GW_EMAIL","").strip()
-PASSWORD = os.environ.get("GW_PASSWORD","").strip()
+SAVE_DIR = os.environ.get("GW_SAVE_DIR","out")
+TOKEN = (os.environ.get("GW_TOKEN") or "").strip()
+EMAIL = (os.environ.get("GW_EMAIL") or "").strip()
+PASSWORD = (os.environ.get("GW_PASSWORD") or "").strip()
 
 def sanitize_token(t: str) -> str:
     t = (t or "").strip().strip('"').strip("'")
@@ -24,7 +15,8 @@ def sanitize_token(t: str) -> str:
 def login_token() -> str:
     if not (EMAIL and PASSWORD):
         raise RuntimeError("GW_AUTH_REQUIRED (no token and no creds)")
-    r = requests.post(f"{BASE}/goauth/authenticateFireUser", data={"email":EMAIL,"password":PASSWORD}, timeout=30)
+    r = requests.post(f"{BASE}/goauth/authenticateFireUser",
+                      data={"email":EMAIL,"password":PASSWORD}, timeout=30)
     r.raise_for_status()
     j = r.json() or {}
     tok = j.get("token")
@@ -38,7 +30,6 @@ def build_url(ep: str) -> str:
         return e
     if e.startswith("rapi/") or e.startswith("/rapi/"):
         return f"{BASE}/{e.lstrip('/')}"
-    # allow bare names like "GetLeoCross"
     return f"{BASE}/rapi/{e.lstrip('/')}"
 
 def fetch_endpoint(ep: str, tok: str | None):
@@ -60,13 +51,10 @@ def fetch_endpoint(ep: str, tok: str | None):
 
 def save_json(obj, ep: str, root: pathlib.Path) -> pathlib.Path:
     ts = time.strftime("%Y%m%d_%H%M%S")
-    safe = ep.strip().strip("/").replace("/", "_")
-    if not safe:
-        safe = "endpoint"
-    fn = f"{safe}_{ts}.json"
-    path = root / fn
-    path.write_text(json.dumps(obj, ensure_ascii=False, separators=(",",":")), encoding="utf-8")
-    return path
+    safe = ep.strip().strip("/").replace("/", "_") or "endpoint"
+    p = root / f"{safe}_{ts}.json"
+    p.write_text(json.dumps(obj, ensure_ascii=False, separators=(",",":")), encoding="utf-8")
+    return p
 
 def main():
     eps = [e.strip() for e in (ENDPOINTS_RAW or "").split(",") if e.strip()]
@@ -74,7 +62,7 @@ def main():
         print("ERROR: GW_ENDPOINTS is empty", file=sys.stderr)
         return 2
 
-    outdir = pathlib.Path(SAVE_DIR) if SAVE_DIR else pathlib.Path.cwd()
+    outdir = pathlib.Path(SAVE_DIR or "out")
     outdir.mkdir(parents=True, exist_ok=True)
 
     tok = TOKEN or ""
@@ -87,7 +75,6 @@ def main():
             ok += 1
         except Exception as e:
             print(f"ERROR {ep}: {type(e).__name__}: {e}", file=sys.stderr)
-            # continue to next endpoint
             continue
 
     return 0 if ok > 0 else 1
