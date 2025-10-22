@@ -113,15 +113,16 @@ jobs:
           GW_EMAIL:    ${{ secrets.GW_EMAIL }}
           GW_PASSWORD: ${{ secrets.GW_PASSWORD }}
 
+          # ===== Picker outputs (CREDIT ONLY; blank on DEBIT) =====
+          PUT_WIDTH:  ${{ steps.widthpicker.outputs.picked_put_width != '' && steps.widthpicker.outputs.picked_put_width || steps.widthpicker.outputs.picked_width || '20' }}
+          CALL_WIDTH: ${{ steps.widthpicker.outputs.picked_call_width != '' && steps.widthpicker.outputs.picked_call_width || steps.widthpicker.outputs.picked_width || '20' }}
+          CALL_MULT:  ${{ steps.widthpicker.outputs.call_mult != '' && steps.widthpicker.outputs.call_mult || '1' }}
+
           # ===== Trading knobs (fast two-pass) =====
-          REPLACE_MODE: "CANCEL_REPLACE"
-          STEP_WAIT_CREDIT: "5"
-          STEP_WAIT_DEBIT:  "5"
-          MIN_RUNG_WAIT:    "5"
+          STEP_WAIT: "5"
+          MIN_RUNG_WAIT: "5"
           MAX_LADDER_CYCLES: "2"
-          MAX_RUNTIME_SECS:  "115"
           CANCEL_SETTLE_SECS: "0.8"
-          FAST_HOLD_SECONDS: "30"
 
           # Cutoff: flip to 23:59 when ignore_cutoff=true
           HARD_CUTOFF_HHMM: ${{ github.event.inputs.ignore_cutoff == 'true' && '23:59' || '16:15' }}
