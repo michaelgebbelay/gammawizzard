@@ -103,6 +103,10 @@ jobs:
           SIZING_DOLLARS_OVERRIDE: ${{ github.event.inputs.sizing_override }}
           #SIDE_OVERRIDE: ${{ github.event.inputs.side_override }}
 
+          # Sizing risk budget (defaults are 6000 if omitted)
+          SIZING_PER_5WIDE: "6000"  # credit: dollars per 5-wide risk
+          SIZING_PER_LONG:  "6000"  # debit:  dollars per 5-wide long IC
+
           # ===== Credentials =====
           SCHWAB_APP_KEY:    ${{ secrets.SCHWAB_APP_KEY }}
           SCHWAB_APP_SECRET: ${{ secrets.SCHWAB_APP_SECRET }}
