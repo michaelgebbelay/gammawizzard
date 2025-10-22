@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# PLACER — supports CREDIT (short IC) and DEBIT (long IC). Same‑shorts only.
-# Minimal ladder + 429 backoff + cancel/settle waits.
+# PLACER — CREDIT/DEBIT, asymmetric wings, supports CALL_MULT (ratio condor).
+# Uses CUSTOM multi‑leg to allow non‑equal quantities.
 
 import os, sys, time, random
 from schwab.auth import client_from_token_file
@@ -13,8 +13,7 @@ def clamp_tick(x: float) -> float:
 def schwab_client():
     app_key=os.environ["SCHWAB_APP_KEY"]; app_secret=os.environ["SCHWAB_APP_SECRET"]; token_json=os.environ["SCHWAB_TOKEN_JSON"]
     with open("schwab_token.json","w") as f: f.write(token_json)
-    c=client_from_token_file(api_key=app_key, app_secret=app_secret, token_path="schwab_token.json")
-    return c
+    return client_from_token_file(api_key=app_key, app_secret=app_secret, token_path="schwab_token.json")
 
 def fetch_bid_ask(c, osi: str):
     r=c.get_quote(osi)
@@ -25,58 +24,38 @@ def fetch_bid_ask(c, osi: str):
     a=q.get("askPrice") or q.get("ask") or q.get("askPriceInDouble")
     return (float(b) if b is not None else None, float(a) if a is not None else None)
 
-def condor_nbbo_credit(c, legs):
-    # short IC credit = (shorts bid) - (longs ask)
+def condor_nbbo(c, legs, m:int):
     bp, sp, sc, bc = legs
     bp_b, bp_a = fetch_bid_ask(c, bp); sp_b, sp_a = fetch_bid_ask(c, sp)
     sc_b, sc_a = fetch_bid_ask(c, sc); bc_b, bc_a = fetch_bid_ask(c, bc)
-    if None in (bp_b, bp_a, sp_b, sp_a, sc_b, sc_a, bc_b, bc_a): return (None,None,None)
-    bid = (sp_b + sc_b) - (bp_a + bc_a)
-    ask = (sp_a + sc_a) - (bp_b + bc_b)
-    mid = (bid + ask) / 2.0
+    if None in (bp_b, bp_a, sp_b, sp_a, sc_b, sc_a, bc_b, bc_a):
+        return (None, None, None)
+    if SIDE == "CREDIT":
+        bid = (sp_b - bp_a) + m*(sc_b - bc_a)
+        ask = (sp_a - bp_b) + m*(sc_a - bc_b)
+        mid = (bid + ask)/2.0
+    else:
+        # debit: pay for wings (opposite signs)
+        bid = (bp_b - sp_a) + m*(bc_b - sc_a)   # value if selling package now
+        ask = (bp_a - sp_b) + m*(bc_a - sc_b)   # what we pay to buy now
+        mid = (bid + ask)/2.0
     return (clamp_tick(bid), clamp_tick(ask), clamp_tick(mid))
 
-def condor_nbbo_debit(c, legs):
-    # long IC debit = (longs ask) - (shorts bid)
+def order_payload(legs, price, q_put, q_call, *, side: str):
     bp, sp, sc, bc = legs
-    bp_b, bp_a = fetch_bid_ask(c, bp); sp_b, sp_a = fetch_bid_ask(c, sp)
-    sc_b, sc_a = fetch_bid_ask(c, sc); bc_b, bc_a = fetch_bid_ask(c, bc)
-    if None in (bp_b, bp_a, sp_b, sp_a, sc_b, sc_a, bc_b, bc_a): return (None,None,None)
-    bid = (bp_b + bc_b) - (sp_a + sc_a)   # what you could sell the long IC for
-    ask = (bp_a + bc_a) - (sp_b + sc_b)   # what you pay to buy it
-    mid = (bid + ask) / 2.0
-    return (clamp_tick(bid), clamp_tick(ask), clamp_tick(mid))
-
-def order_payload_credit(legs, price, qty):
+    ot = "NET_CREDIT" if side=="CREDIT" else "NET_DEBIT"
     return {
-        "orderType": "NET_CREDIT",
+        "orderType": ot,
         "session": "NORMAL",
         "price": f"{clamp_tick(price):.2f}",
         "duration": "DAY",
         "orderStrategyType": "SINGLE",
-        "complexOrderStrategyType": "IRON_CONDOR",
+        "complexOrderStrategyType": "CUSTOM",  # allow ratio/non‑standard
         "orderLegCollection":[
-            {"instruction":"BUY_TO_OPEN", "positionEffect":"OPENING","quantity":qty,"instrument":{"symbol":legs[0],"assetType":"OPTION"}},
-            {"instruction":"SELL_TO_OPEN","positionEffect":"OPENING","quantity":qty,"instrument":{"symbol":legs[1],"assetType":"OPTION"}},
-            {"instruction":"SELL_TO_OPEN","positionEffect":"OPENING","quantity":qty,"instrument":{"symbol":legs[2],"assetType":"OPTION"}},
-            {"instruction":"BUY_TO_OPEN", "positionEffect":"OPENING","quantity":qty,"instrument":{"symbol":legs[3],"assetType":"OPTION"}},
-        ]
-    }
-
-def order_payload_debit(legs, price, qty):
-    # Legs are already oriented BUY_PUT, SELL_PUT, SELL_CALL, BUY_CALL for long IC
-    return {
-        "orderType": "NET_DEBIT",
-        "session": "NORMAL",
-        "price": f"{clamp_tick(price):.2f}",
-        "duration": "DAY",
-        "orderStrategyType": "SINGLE",
-        "complexOrderStrategyType": "IRON_CONDOR",
-        "orderLegCollection":[
-            {"instruction":"BUY_TO_OPEN", "positionEffect":"OPENING","quantity":qty,"instrument":{"symbol":legs[0],"assetType":"OPTION"}},
-            {"instruction":"SELL_TO_OPEN","positionEffect":"OPENING","quantity":qty,"instrument":{"symbol":legs[1],"assetType":"OPTION"}},
-            {"instruction":"SELL_TO_OPEN","positionEffect":"OPENING","quantity":qty,"instrument":{"symbol":legs[2],"assetType":"OPTION"}},
-            {"instruction":"BUY_TO_OPEN", "positionEffect":"OPENING","quantity":qty,"instrument":{"symbol":legs[3],"assetType":"OPTION"}},
+            {"instruction":"BUY_TO_OPEN" if side=="CREDIT" else "SELL_TO_OPEN", "positionEffect":"OPENING","quantity":q_put,  "instrument":{"symbol":bp,"assetType":"OPTION"}},
+            {"instruction":"SELL_TO_OPEN" if side=="CREDIT" else "BUY_TO_OPEN", "positionEffect":"OPENING","quantity":q_put,  "instrument":{"symbol":sp,"assetType":"OPTION"}},
+            {"instruction":"SELL_TO_OPEN" if side=="CREDIT" else "BUY_TO_OPEN", "positionEffect":"OPENING","quantity":q_call, "instrument":{"symbol":sc,"assetType":"OPTION"}},
+            {"instruction":"BUY_TO_OPEN" if side=="CREDIT" else "SELL_TO_OPEN", "positionEffect":"OPENING","quantity":q_call, "instrument":{"symbol":bc,"assetType":"OPTION"}},
         ]
     }
 
@@ -95,8 +74,7 @@ def post_with_retry(c, url, payload, tag="", tries=6):
     last=""
     for i in range(tries):
         r = c.session.post(url, json=payload, timeout=20)
-        if r.status_code in (200,201,202):
-            return r
+        if r.status_code in (200,201,202): return r
         if r.status_code == 429:
             wait = min(12.0, 0.6 * (2**i)) + random.uniform(0.0, 0.3)
             print(f"WARN: place failed — HTTP_429 — backoff {wait:.2f}s")
@@ -108,8 +86,7 @@ def post_with_retry(c, url, payload, tag="", tries=6):
 def delete_with_retry(c, url, tag="", tries=6):
     for i in range(tries):
         r = c.session.delete(url, timeout=20)
-        if r.status_code in (200,201,202,204):
-            return True
+        if r.status_code in (200,201,202,204): return True
         if r.status_code == 429:
             wait = min(8.0, 0.5 * (2**i)) + random.uniform(0.0, 0.25)
             time.sleep(wait); continue
@@ -135,33 +112,42 @@ def wait_settle(c, acct_hash: str, oid: str, max_wait=2.0):
         time.sleep(0.15)
     return False
 
-def main():
-    side = (os.environ.get("SIDE","CREDIT") or "CREDIT").upper()
+if __name__=="__main__":
+    SIDE = (os.environ.get("SIDE","CREDIT") or "CREDIT").upper()
     legs = [
-        os.environ["OCC_BUY_PUT"],
-        os.environ["OCC_SELL_PUT"],
-        os.environ["OCC_SELL_CALL"],
-        os.environ["OCC_BUY_CALL"],
+        os.environ["OCC_BUY_PUT"],   # bp
+        os.environ["OCC_SELL_PUT"],  # sp
+        os.environ["OCC_SELL_CALL"], # sc
+        os.environ["OCC_BUY_CALL"],  # bc
     ]
-    qty   = max(1, int(os.environ.get("QTY","1")))
-    width = int(os.environ.get("WIDTH","20"))
+    qty_base = max(1, int(os.environ.get("QTY","1")))
+    CALL_MULT = max(1, int(os.environ.get("CALL_MULT","1")))
 
-    c=schwab_client()
+    # Schwab client + acct hash
+    app_key=os.environ["SCHWAB_APP_KEY"]; app_secret=os.environ["SCHWAB_APP_SECRET"]; token_json=os.environ["SCHWAB_TOKEN_JSON"]
+    with open("schwab_token.json","w") as f: f.write(token_json)
+    c=client_from_token_file(api_key=app_key, app_secret=app_secret, token_path="schwab_token.json")
     r=c.get_account_numbers(); r.raise_for_status()
     acct_hash = str(r.json()[0]["hashValue"])
 
-    STEP_WAIT         = float(os.environ.get("STEP_WAIT_CREDIT","5" if side=="CREDIT" else "5"))
-    MIN_RUNG_WAIT     = max(1.0, float(os.environ.get("MIN_RUNG_WAIT","5")))
-    CANCEL_SETTLE_SECS= float(os.environ.get("CANCEL_SETTLE_SECS","1.0"))
-    MAX_CYCLES        = int(os.environ.get("MAX_LADDER_CYCLES","2"))
+    # Ladder params
+    STEP_WAIT = float(os.environ.get("STEP_WAIT_CREDIT","5" if SIDE=="CREDIT" else os.environ.get("STEP_WAIT_DEBIT","5")))
+    MIN_RUNG_WAIT = max(1.0, float(os.environ.get("MIN_RUNG_WAIT","5")))
+    CANCEL_SETTLE_SECS = float(os.environ.get("CANCEL_SETTLE_SECS","1.0"))
+    MAX_CYCLES = int(os.environ.get("MAX_LADDER_CYCLES","2"))
 
-    print(f"PLACER START side={side} width={width} qty={qty}")
+    print(f"PLACER START side={SIDE} structure=CONDOR qty={qty_base}")
 
-    if side == "CREDIT":
-        bid, ask, mid = condor_nbbo_credit(c, legs)
-        print(f"CREDIT NBBO: bid={bid} ask={ask} mid={mid}")
-        if (bid,ask,mid) == (None,None,None):
-            print("WARN: no NBBO — abort"); return 0
+    bid, ask, mid = condor_nbbo(c, legs, CALL_MULT)
+    label = "CREDIT NBBO (synth)" if SIDE=="CREDIT" else "DEBIT NBBO (synth)"
+    print(f"{label}: bid={bid} ask={ask} mid={mid}")
+    if mid is None and ask is None:
+        print("WARN: no NBBO — abort")
+        sys.exit(0)
+
+    # Ladder: ask → mid → mid±ticks (credit: start high; debit: start low)
+    ladder=[]
+    if SIDE=="CREDIT":
         base = []
         if ask is not None: base.append(ask)
         if mid is not None:
@@ -169,38 +155,40 @@ def main():
             if bid is not None:
                 base[-2] = max(base[-2], bid)
                 base[-1] = max(base[-1], bid)
-        ladder=[]; seen=set()
+        seen=set()
         for p in base:
-            p=clamp_tick(p)
-            if p not in seen: seen.add(p); ladder.append(p)
-        make_payload = order_payload_credit
+            p = clamp_tick(p)
+            if p not in seen:
+                seen.add(p); ladder.append(p)
     else:
-        bid, ask, mid = condor_nbbo_debit(c, legs)
-        print(f"DEBIT NBBO: bid={bid} ask={ask} mid={mid}")
-        if (bid,ask,mid) == (None,None,None):
-            print("WARN: no NBBO — abort"); return 0
+        # debit: start at bid (cheapest), walk up
         base = []
-        if bid is not None: base.append(bid)                 # try best case first
-        if mid is not None: base += [mid, clamp_tick(mid+0.05), clamp_tick(mid+0.10)]
-        if ask is not None: base.append(ask)
-        ladder=[]; seen=set()
+        if bid is not None: base.append(bid)
+        if mid is not None:
+            base += [mid, clamp_tick(mid+0.05), clamp_tick(mid+0.10)]
+            if ask is not None:
+                base[-2] = min(base[-2], ask)
+                base[-1] = min(base[-1], ask)
+        seen=set()
         for p in base:
-            p=clamp_tick(p)
-            if p not in seen: seen.add(p); ladder.append(p)
-        make_payload = order_payload_debit
+            p = clamp_tick(p)
+            if p not in seen:
+                seen.add(p); ladder.append(p)
 
     filled=0
     active_oid=None
+    q_put = qty_base
+    q_call = qty_base * CALL_MULT
     url_post = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
 
-    # ladder cycles
-    for _ in range(MAX_CYCLES):
+    def post_order(price):
+        payload = order_payload(legs, price, q_put, q_call, side=SIDE)
+        r = post_with_retry(c, url_post, payload, tag=f"PLACE@{price:.2f}x{q_put}:{q_call}")
+        return parse_order_id(r)
+
+    for cycle in range(1, MAX_CYCLES+1):
         print(f"CYCLE ladder: {ladder}")
         for price in ladder:
-            to_place = max(0, qty - filled)
-            if to_place==0: break
-
-            # cancel previous rung if any
             if active_oid:
                 url_del=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{active_oid}"
                 ok = delete_with_retry(c, url_del, tag=f"CANCEL {active_oid}")
@@ -209,37 +197,25 @@ def main():
                 active_oid=None
                 time.sleep(0.20)
 
-            print(f"RUNG → price={price:.2f} to_place={to_place}")
-            payload = make_payload(legs, price, to_place)
+            print(f"RUNG → price={price:.2f} to_place=1")
             try:
-                r = post_with_retry(c, url_post, payload, tag=f"PLACE@{price:.2f}x{to_place}")
-                active_oid = parse_order_id(r)
+                active_oid = post_order(price)
             except Exception as e:
                 print(str(e)); continue
 
-            # dwell + poll
             t_end = time.time() + max(STEP_WAIT, MIN_RUNG_WAIT)
             while time.time() < t_end:
                 st = get_status(c, acct_hash, active_oid)
                 s  = str(st.get("status") or st.get("orderStatus") or "").upper()
-                fq = int(round(float(st.get("filledQuantity") or st.get("filled_quantity") or 0)))
-                if fq > filled: filled=fq
-                if s == "FILLED" or filled >= qty:
-                    break
+                if s == "FILLED":
+                    filled=1; break
                 time.sleep(0.25)
+            if filled>=1: break
 
-            if filled >= qty:
-                break
+        if filled>=1: break
+        # refresh nbbo
+        bid, ask, mid = condor_nbbo(c, legs, CALL_MULT)
 
-        if filled >= qty:
-            break
-        # refresh NBBO between cycles
-        if side == "CREDIT":
-            bid, ask, mid = condor_nbbo_credit(c, legs)
-        else:
-            bid, ask, mid = condor_nbbo_debit(c, legs)
-
-    # final cleanup
     if active_oid:
         url_del=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{active_oid}"
         ok = delete_with_retry(c, url_del, tag=f"CANCEL {active_oid}")
@@ -247,7 +223,4 @@ def main():
         wait_settle(c, acct_hash, active_oid, max_wait=CANCEL_SETTLE_SECS)
 
     print("PLACER DONE")
-    return 0
-
-if __name__=="__main__":
-    sys.exit(main())
+    sys.exit(0)
