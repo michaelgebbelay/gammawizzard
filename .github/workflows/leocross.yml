@@ -101,7 +101,7 @@ jobs:
           BYPASS_GUARD: ${{ github.event.inputs.force }}
           BYPASS_QTY:   ${{ github.event.inputs.force_qty }}
           SIZING_DOLLARS_OVERRIDE: ${{ github.event.inputs.sizing_override }}
-          SIDE_OVERRIDE: ${{ github.event.inputs.side_override }}
+          #SIDE_OVERRIDE: ${{ github.event.inputs.side_override }}
 
           # ===== Credentials =====
           SCHWAB_APP_KEY:    ${{ secrets.SCHWAB_APP_KEY }}
@@ -114,10 +114,11 @@ jobs:
           GW_PASSWORD: ${{ secrets.GW_PASSWORD }}
 
           # ===== Picker outputs (CREDIT ONLY; blank on DEBIT) =====
-          PUT_WIDTH:  ${{ steps.widthpicker.outputs.picked_put_width != '' && steps.widthpicker.outputs.picked_put_width || steps.widthpicker.outputs.picked_width || '20' }}
-          CALL_WIDTH: ${{ steps.widthpicker.outputs.picked_call_width != '' && steps.widthpicker.outputs.picked_call_width || steps.widthpicker.outputs.picked_width || '20' }}
-          CALL_MULT:  ${{ steps.widthpicker.outputs.call_mult != '' && steps.widthpicker.outputs.call_mult || '1' }}
-
+          CREDIT_PUT_WIDTH:  ${{ steps.widthpicker.outputs.picked_put_width  }}
+          CREDIT_CALL_WIDTH: ${{ steps.widthpicker.outputs.picked_call_width }}
+          CALL_MULT:         ${{ steps.widthpicker.outputs.call_mult || '2' }}
+          SIDE_OVERRIDE:     ${{ github.event.inputs.side_override || 'AUTO' }}
+          
           # ===== Trading knobs (fast two-pass) =====
           STEP_WAIT: "5"
           MIN_RUNG_WAIT: "5"
