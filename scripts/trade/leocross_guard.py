@@ -103,7 +103,7 @@ def calc_short_ic_contracts(opening_cash: float | int) -> int:
     except Exception:
         oc = 0.0
     width = _credit_width()
-    denom = 4000.0 * (width / 5.0)
+    denom = 6000.0 * (width / 5.0)
     units = _round_half_up(oc / denom)
     return max(1, int(units))
 
@@ -113,7 +113,7 @@ def calc_long_ic_contracts(opening_cash: float | int) -> int:
         oc = float(opening_cash)
     except Exception:
         oc = 0.0
-    return max(1, int(math.floor(oc / 4000.0)))
+    return max(1, int(math.floor(oc / 6000.0)))
 
 # ------------- Schwab helpers -------------
 def schwab_client():
