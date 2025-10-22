@@ -96,24 +96,35 @@ def calc_short_ic_width(opening_cash: float | int) -> int:
     """Retained for compatibility: ignores cash and returns configured credit width."""
     return _credit_width()
 
+# ----- Sizing ($ per risk unit) -----
+# Allow env overrides; defaults bumped to 6000
+def _to_float_env(key, default):
+    try:
+        return float(os.environ.get(key, str(default)))
+    except Exception:
+        return float(default)
+
+SIZING_PER_5WIDE = _to_float_env("SIZING_PER_5WIDE", 6000.0)  # credit: per 5-wide risk
+SIZING_PER_LONG  = _to_float_env("SIZING_PER_LONG",  6000.0)  # debit: per long IC (5-wide)
+
 def calc_short_ic_contracts(opening_cash: float | int) -> int:
-    """Short-IC sizing: $4k per 5-wide, scaled by configured width, half-up rounding, min 1."""
+    """Short IC sizing: $SIZING_PER_5WIDE per 5-wide risk, scaled by configured width, half-up, min 1."""
     try:
         oc = float(opening_cash)
     except Exception:
         oc = 0.0
     width = _credit_width()
-    denom = 6000.0 * (width / 5.0)
-    units = _round_half_up(oc / denom)
+    denom = SIZING_PER_5WIDE * (width / 5.0)
+    units = _round_half_up(oc / max(1e-9, denom))
     return max(1, int(units))
 
 def calc_long_ic_contracts(opening_cash: float | int) -> int:
-    """Long-IC sizing: $4k per condor (always 5-wide), floor, min 1."""
+    """Long IC sizing: $SIZING_PER_LONG per condor (always 5-wide), floor, min 1."""
     try:
         oc = float(opening_cash)
     except Exception:
         oc = 0.0
-    return max(1, int(math.floor(oc / 6000.0)))
+    return max(1, int(math.floor(oc / max(1e-9, SIZING_PER_LONG))))
 
 # ------------- Schwab helpers -------------
 def schwab_client():
