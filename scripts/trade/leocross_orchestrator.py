@@ -152,7 +152,7 @@ def main():
     oc = opening_cash_for_account(c)
     # Risk driver is the put width (Wp) on CREDIT; 5 on DEBIT
     risk_w = Wp if is_credit else 5
-    denom = 4000.0 * (risk_w/5.0)
+    denom = 6000.0 * (risk_w/5.0)
     qty = max(1, _round_half_up((float(oc) if oc is not None else 0.0) / denom))
     # Manual override if provided
     qov = os.environ.get("BYPASS_QTY","").strip()
