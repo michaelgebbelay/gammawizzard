@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-# ORCHESTRATOR — CREDIT/DEBIT. CREDIT uses picker (put/call widths). DEBIT ignores picker.
-
+# ORCHESTRATOR — CREDIT: ratio IC (call width = half, call qty = 2x). DEBIT: symmetric 5-wide.
 import os, sys, json, re, math
-from datetime import date
 import requests
+from datetime import date
 from decimal import Decimal, ROUND_HALF_UP
 from schwab.auth import client_from_token_file
 
-# ====== Utils ======
+# ---------- small utils ----------
 def yymmdd(iso: str) -> str:
     d = date.fromisoformat((iso or "")[:10]); return f"{d:%y%m%d}"
 
@@ -30,48 +29,40 @@ def orient_credit(bp,sp,sc,bc):
     if scS>bcS: sc,bc=bc,sc
     return [bp,sp,sc,bc]
 
-def build_condor_split(exp6: str, inner_put: int, inner_call: int, Wp: int, Wc: int, credit=True):
+def build_legs_ratio(exp6: str, inner_put: int, inner_call: int, Wp: int, Wc: int):
     p_low, p_high = inner_put - Wp, inner_put
     c_low, c_high = inner_call, inner_call + Wc
-    bp = to_osi(f".SPXW{exp6}P{p_low}")
-    sp = to_osi(f".SPXW{exp6}P{p_high}")
-    sc = to_osi(f".SPXW{exp6}C{c_low}")
-    bc = to_osi(f".SPXW{exp6}C{c_high}")
-    legs = [bp, sp, sc, bc]
-    if credit:
-        return orient_credit(*legs)
-    else:
-        # long IC (debit): reverse wings
-        bpS, spS, scS, bcS = map(strike_from_osi, legs)
-        if bpS < spS: bp, sp = sp, bp
-        if bcS > scS: sc, bc = bc, sc
-        return [bp, sp, sc, bc]
+    return orient_credit(
+        to_osi(f".SPXW{exp6}P{p_low}"),
+        to_osi(f".SPXW{exp6}P{p_high}"),
+        to_osi(f".SPXW{exp6}C{c_low}"),
+        to_osi(f".SPXW{exp6}C{c_high}")
+    )
 
 def _round_half_up(x: float) -> int:
     return int(Decimal(x).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
 
-# ====== Schwab ======
+# ---------- Schwab ----------
 def schwab_client():
     app_key=os.environ["SCHWAB_APP_KEY"]; app_secret=os.environ["SCHWAB_APP_SECRET"]; token_json=os.environ["SCHWAB_TOKEN_JSON"]
     with open("schwab_token.json","w") as f: f.write(token_json)
     return client_from_token_file(api_key=app_key, app_secret=app_secret, token_path="schwab_token.json")
 
-def opening_cash_for_account(c):
+def opening_cash(c):
     r=c.get_accounts(); r.raise_for_status()
-    j=r.json()
-    arr = j if isinstance(j,list) else [j]
+    j=r.json(); arr = j if isinstance(j,list) else [j]
     def pick(d,*ks):
         for k in ks:
             v=(d or {}).get(k)
             if isinstance(v,(int,float)): return float(v)
-    a=arr[0]
+    a=arr[0] if arr else {}
     init=a.get("initialBalances",{}) if isinstance(a,dict) else {}
     curr=a.get("currentBalances",{}) if isinstance(a,dict) else {}
     oc = pick(init,"cashBalance","cashAvailableForTrading","liquidationValue")
     if oc is None: oc = pick(curr,"cashBalance","cashAvailableForTrading","liquidationValue")
     return float(oc or 0.0)
 
-# ====== GammaWizard ======
+# ---------- GW fetch ----------
 def _sanitize_token(t: str) -> str:
     t=(t or "").strip().strip('"').strip("'");  return t.split(None,1)[1] if t.lower().startswith("bearer ") else t
 
@@ -102,22 +93,22 @@ def extract_trade(j):
                 t=extract_trade(v)
                 if t: return t
     if isinstance(j,list):
-        for it in reversed(j):
+        for it in reversed(j): 
             t=extract_trade(it)
             if t: return t
     return {}
 
-def fnum(x):
-    try: return float(x)
-    except: return None
+def infer_side(tr):
+    # CREDIT when Cat2 >= Cat1 (same rule the guard used)
+    try:
+        c1 = float(tr.get("Cat1"))
+        c2 = float(tr.get("Cat2"))
+        return "CREDIT" if (c2 >= c1) else "DEBIT"
+    except Exception:
+        # Fallback: treat as CREDIT (historical Leo IC short bias)
+        return "CREDIT"
 
-def is_credit_signal(tr: dict) -> bool:
-    c1=fnum(tr.get("Cat1")); c2=fnum(tr.get("Cat2"))
-    if (c1 is not None) and (c2 is not None):
-        return c2 >= c1
-    return False
-
-# ====== Main ======
+# ---------- main ----------
 def main():
     MODE = (os.environ.get("PLACER_MODE","NOW") or "NOW").upper()
 
@@ -126,77 +117,97 @@ def main():
     exp6 = yymmdd(str(tr.get("TDate","")))
     inner_put  = int(float(tr.get("Limit")))
     inner_call = int(float(tr.get("CLimit")))
+
+    # Decide side (CREDIT uses ratio ic; DEBIT uses symmetric 5-wide)
     side_override = (os.environ.get("SIDE_OVERRIDE","AUTO") or "AUTO").upper()
-    credit_sig = is_credit_signal(tr)
-    if side_override == "CREDIT": side = "CREDIT"
-    elif side_override == "DEBIT": side = "DEBIT"
-    else: side = "CREDIT" if credit_sig else "DEBIT"
+    side = side_override if side_override in ("CREDIT","DEBIT") else infer_side(tr)
 
-    # Schwab + sizing
     c = schwab_client()
-    oc = opening_cash_for_account(c)
+    oc = opening_cash(c)
 
+    # ----- CREDIT (ratio condor) -----
     if side == "CREDIT":
-        # Picker-driven (CREDIT ONLY)
-        put_w  = int(os.environ.get("PUT_WIDTH",  os.environ.get("CREDIT_SPREAD_WIDTH","20") or "20"))
-        call_w = int(os.environ.get("CALL_WIDTH", os.environ.get("CREDIT_SPREAD_WIDTH","20") or "20"))
-        call_mult = int(os.environ.get("CALL_MULT","1") or "1")
-        # $4k per 5‑wide; scale with *put* width (risk anchor); round half‑up; min 1
-        denom = 4000.0 * (max(5,put_w)/5.0)
+        # Inputs from picker when present
+        env_wp = os.environ.get("CREDIT_PUT_WIDTH") or os.environ.get("picked_put_width") or os.environ.get("CREDIT_SPREAD_WIDTH")
+        env_wc = os.environ.get("CREDIT_CALL_WIDTH") or os.environ.get("picked_call_width")
+        env_m  = os.environ.get("CALL_MULT") or os.environ.get("call_mult") or "2"
+
+        try: Wp = int(env_wp) if env_wp else 20
+        except: Wp = 20
+
+        def ceil_to5(x): return int(math.ceil(x/5.0)*5)
+        try: Wc = int(env_wc) if env_wc else ceil_to5(Wp/2.0)
+        except: Wc = ceil_to5(Wp/2.0)
+
+        try: m = max(1, int(env_m))
+        except: m = 2
+        # enforce design: call span x qty equals put span
+        # (keeps symmetric max risk both sides when m=2, Wc≈Wp/2)
+        # sizing: $4k per 5-wide of *put* span
+        denom = 4000.0 * (Wp/5.0)
         qty = max(1, _round_half_up((float(oc) if oc is not None else 0.0) / denom))
-        qov = os.environ.get("QTY_OVERRIDE","").strip()
-        if qov:
-            try: qty = max(1, int(qov))
-            except: pass
 
-        legs = build_condor_split(exp6, inner_put, inner_call, put_w, call_w, credit=True)
+        legs = build_legs_ratio(exp6, inner_put, inner_call, Wp, Wc)
 
         print(f"ORCH GATE disabled (MODE={MODE})")
-        print(f"ORCH CONFIG: side=CREDIT, Wp={put_w}, Wc={call_w}, call_mult={call_mult}, mode={MODE}")
-        print(f"ORCH SIZE: base_qty={qty} oc={oc:.2f} structure=CONDOR")
+        print(f"ORCH CONFIG: side=CREDIT, Wp={Wp}, Wc={Wc}, call_mult={m}, mode={MODE}")
+        print(f"ORCH SIZE: base_qty={qty} oc={oc:.2f} structure=RATIO_CONDOR")
+        print("ORCH → PLACER")
 
         env = dict(os.environ)
-        env["SIDE"] = "CREDIT"
-        env["QTY"]  = str(qty)
-        env["OCC_BUY_PUT"]  = legs[0]
-        env["OCC_SELL_PUT"] = legs[1]
-        env["OCC_SELL_CALL"]= legs[2]
-        env["OCC_BUY_CALL"] = legs[3]
-        env["CALL_MULT"]    = str(call_mult)  # placer may ignore if not supported
+        env["SIDE"]       = "CREDIT"
+        env["STRUCTURE"]  = "RATIO_CONDOR"
+        env["PUT_WIDTH"]  = str(Wp)
+        env["CALL_WIDTH"] = str(Wc)
+        env["CALL_MULT"]  = str(m)
+        env["QTY"]        = str(qty)
+        env["OCC_BUY_PUT"]   = legs[0]
+        env["OCC_SELL_PUT"]  = legs[1]
+        env["OCC_SELL_CALL"] = legs[2]
+        env["OCC_BUY_CALL"]  = legs[3]
 
+        # pass Schwab token file to placer
+        app_key=os.environ["SCHWAB_APP_KEY"]; app_secret=os.environ["SCHWAB_APP_SECRET"]; token_json=os.environ["SCHWAB_TOKEN_JSON"]
+        with open("schwab_token.json","w") as f: f.write(token_json)
+        env["SCHWAB_APP_KEY"]=app_key; env["SCHWAB_APP_SECRET"]=app_secret; env["SCHWAB_TOKEN_JSON"]=token_json
+
+        rc = os.spawnve(os.P_WAIT, sys.executable, [sys.executable, "scripts/trade/leocross_place_simple.py"], env)
+        return rc
+
+    # ----- DEBIT (long IC, symmetric 5-wide) -----
     else:
-        # DEBIT — ignore picker entirely; always 5-wide long IC
-        put_w = call_w = 5
-        qty = 1  # long IC size minimal by design; override via QTY_OVERRIDE if desired
-        qov = os.environ.get("QTY_OVERRIDE","").strip()
-        if qov:
-            try: qty = max(1, int(qov))
-            except: pass
+        W = 5
+        # long IC: buy wings closer; symmetric qty
+        bp = to_osi(f".SPXW{exp6}P{inner_put}")
+        sp = to_osi(f".SPXW{exp6}P{inner_put - W}")
+        sc = to_osi(f".SPXW{exp6}C{inner_call}")
+        bc = to_osi(f".SPXW{exp6}C{inner_call + W}")
+        legs=[bp,sp,sc,bc]
 
-        legs = build_condor_split(exp6, inner_put, inner_call, 5, 5, credit=False)
+        # $4k per condor
+        qty = max(1, int(max(0.0, (float(oc) if oc is not None else 0.0)) // 4000.0))
 
         print(f"ORCH GATE disabled (MODE={MODE})")
-        print(f"ORCH CONFIG: side=DEBIT, width=5, mode={MODE}")
-        print(f"ORCH SIZE: qty={qty} oc={oc:.2f}")
+        print(f"ORCH CONFIG: side=DEBIT, width={W}, mode={MODE}")
+        print(f"ORCH SIZE: qty={qty} oc={oc:.2f} structure=CONDOR")
+        print("ORCH → PLACER")
 
         env = dict(os.environ)
-        env["SIDE"] = "DEBIT"
-        env["QTY"]  = str(qty)
-        env["OCC_BUY_PUT"]  = legs[0]
-        env["OCC_SELL_PUT"] = legs[1]
-        env["OCC_SELL_CALL"]= legs[2]
-        env["OCC_BUY_CALL"] = legs[3]
+        env["SIDE"]       = "DEBIT"
+        env["STRUCTURE"]  = "CONDOR"
+        env["WIDTH"]      = str(W)
+        env["QTY"]        = str(qty)
+        env["OCC_BUY_PUT"]   = legs[0]
+        env["OCC_SELL_PUT"]  = legs[1]
+        env["OCC_SELL_CALL"] = legs[2]
+        env["OCC_BUY_CALL"]  = legs[3]
 
-    # Reuse Schwab token
-    app_key=os.environ["SCHWAB_APP_KEY"]; app_secret=os.environ["SCHWAB_APP_SECRET"]; token_json=os.environ["SCHWAB_TOKEN_JSON"]
-    with open("schwab_token.json","w") as f: f.write(token_json)
-    env["SCHWAB_APP_KEY"]=app_key
-    env["SCHWAB_APP_SECRET"]=app_secret
-    env["SCHWAB_TOKEN_JSON"]=token_json
+        app_key=os.environ["SCHWAB_APP_KEY"]; app_secret=os.environ["SCHWAB_APP_SECRET"]; token_json=os.environ["SCHWAB_TOKEN_JSON"]
+        with open("schwab_token.json","w") as f: f.write(token_json)
+        env["SCHWAB_APP_KEY"]=app_key; env["SCHWAB_APP_SECRET"]=app_secret; env["SCHWAB_TOKEN_JSON"]=token_json
 
-    print("ORCH → PLACER")
-    rc = os.spawnve(os.P_WAIT, sys.executable, [sys.executable, "scripts/trade/leocross_place_simple.py"], env)
-    return rc
+        rc = os.spawnve(os.P_WAIT, sys.executable, [sys.executable, "scripts/trade/leocross_place_simple.py"], env)
+        return rc
 
 if __name__=="__main__":
     sys.exit(main())
