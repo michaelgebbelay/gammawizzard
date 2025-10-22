@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-# WIDTH PICKER — CREDIT-ONLY. Skew-aware (split call width; optional call multiplicity).
-# Emits GHA outputs ONLY for CREDIT days:
+# WIDTH PICKER — CREDIT only shape: Call side = (Put width / 2) with 2x quantity
+# Emits GHA outputs:
 #   picked_put_width, picked_call_width, call_mult,
-#   picked_width (legacy = picked_put_width),
-#   picked_ref (total mid), picked_metric, picked_ev, base_ev, delta_ev, five_mid
+#   picked_width(=Wp for back-compat), picked_ref(mid), picked_metric, picked_ev, base_ev, delta_ev, five_mid
 
 import os, re, json, math, sys
 from datetime import date
@@ -12,7 +11,6 @@ from schwab.auth import client_from_token_file
 
 TICK = 0.05
 
-# ---------- small utils ----------
 def clamp_tick(x: float) -> float:
     return round(round(float(x) / TICK) * TICK + 1e-12, 2)
 
@@ -38,23 +36,46 @@ def orient_credit(bp,sp,sc,bc):
     if scS>bcS: sc,bc=bc,sc
     return [bp,sp,sc,bc]
 
-def build_put_legs(exp6: str, short_put: int, width_p: int):
-    p_low, p_high = short_put - width_p, short_put
-    return orient_credit(
-        to_osi(f".SPXW{exp6}P{p_low}"),
-        to_osi(f".SPXW{exp6}P{p_high}"),
-        "SPXW000000C00000000",  # placeholder to keep tuple shape (ignored)
-        "SPXW000000C00000000",
-    )[:2]
+def build_legs(exp6: str, inner_put: int, inner_call: int, Wp: int, Wc: int):
+    p_low, p_high = inner_put - Wp, inner_put
+    c_low, c_high = inner_call, inner_call + Wc
+    bp = to_osi(f".SPXW{exp6}P{p_low}")
+    sp = to_osi(f".SPXW{exp6}P{p_high}")
+    sc = to_osi(f".SPXW{exp6}C{c_low}")
+    bc = to_osi(f".SPXW{exp6}C{c_high}")
+    return orient_credit(bp,sp,sc,bc)
 
-def build_call_legs(exp6: str, short_call: int, width_c: int):
-    c_low, c_high = short_call, short_call + width_c
-    return orient_credit(
-        "SPXW000000P00000000",
-        "SPXW000000P00000000",
-        to_osi(f".SPXW{exp6}C{c_low}"),
-        to_osi(f".SPXW{exp6}C{c_high}")
-    )[2:]
+# --- Schwab + GW helpers ---
+def schwab_client():
+    app_key=os.environ["SCHWAB_APP_KEY"]; app_secret=os.environ["SCHWAB_APP_SECRET"]; token_json=os.environ["SCHWAB_TOKEN_JSON"]
+    with open("schwab_token.json","w") as f: f.write(token_json)
+    return client_from_token_file(api_key=app_key, app_secret=app_secret, token_path="schwab_token.json")
+
+def fetch_bid_ask(c, osi: str):
+    r=c.get_quote(osi)
+    if r.status_code!=200: return (None,None)
+    d=list(r.json().values())[0] if isinstance(r.json(), dict) else {}
+    q=d.get("quote", d)
+    b=q.get("bidPrice") or q.get("bid") or q.get("bidPriceInDouble")
+    a=q.get("askPrice") or q.get("ask") or q.get("askPriceInDouble")
+    return (float(b) if b is not None else None, float(a) if a is not None else None)
+
+def condor_nbbo_credit_ratio(c, legs, m: int):
+    # legs = [bp, sp, sc, bc]; call legs scaled by m
+    bp, sp, sc, bc = legs
+    bp_b, bp_a = fetch_bid_ask(c, bp); sp_b, sp_a = fetch_bid_ask(c, sp)
+    sc_b, sc_a = fetch_bid_ask(c, sc); bc_b, bc_a = fetch_bid_ask(c, bc)
+    if None in (bp_b, bp_a, sp_b, sp_a, sc_b, sc_a, bc_b, bc_a):
+        return (None, None, None, None, None)
+    # Per-package NBBO:
+    credit_bid = (sp_b + m*sc_b) - (bp_a + m*bc_a)
+    credit_ask = (sp_a + m*sc_a) - (bp_b + m*bc_b)
+    credit_mid = (credit_bid + credit_ask) / 2.0
+    # Simple leg mids for visibility (not used in pricing)
+    put_mid  = (sp_b + sp_a)/2.0 - (bp_b + bp_a)/2.0
+    call_mid = (sc_b + sc_a)/2.0 - (bc_b + bc_a)/2.0
+    return (clamp_tick(credit_bid), clamp_tick(credit_ask), clamp_tick(credit_mid),
+            clamp_tick(put_mid), clamp_tick(call_mid))
 
 def _sanitize_token(t: str) -> str:
     t=(t or "").strip().strip('"').strip("'")
@@ -71,6 +92,7 @@ def gw_fetch():
     r=hit(tok) if tok else None
     if (r is None) or (r.status_code in (401,403)):
         email=os.environ.get("GW_EMAIL",""); pwd=os.environ.get("GW_PASSWORD","")
+        if not (email and pwd): raise RuntimeError("GW_AUTH_REQUIRED")
         rr=requests.post(f"{base}/goauth/authenticateFireUser", data={"email":email,"password":pwd}, timeout=30)
         rr.raise_for_status()
         t=rr.json().get("token") or ""
@@ -81,7 +103,8 @@ def gw_fetch():
 def extract_trade(j):
     if isinstance(j,dict):
         if "Trade" in j:
-            tr=j["Trade"];  return tr[-1] if isinstance(tr,list) and tr else tr if isinstance(tr,dict) else {}
+            tr=j["Trade"]
+            return tr[-1] if isinstance(tr,list) and tr else tr if isinstance(tr,dict) else {}
         keys=("Date","TDate","Limit","CLimit","Cat1","Cat2")
         if any(k in j for k in keys): return j
         for v in j.values():
@@ -94,162 +117,99 @@ def extract_trade(j):
             if t: return t
     return {}
 
-# --- Schwab quote helpers ---
-def schwab_client():
-    app_key=os.environ["SCHWAB_APP_KEY"]; app_secret=os.environ["SCHWAB_APP_SECRET"]; token_json=os.environ["SCHWAB_TOKEN_JSON"]
-    with open("schwab_token.json","w") as f: f.write(token_json)
-    return client_from_token_file(api_key=app_key, app_secret=app_secret, token_path="schwab_token.json")
-
-def fetch_bid_ask(c, osi: str):
-    r=c.get_quote(osi)
-    if r.status_code!=200: return (None,None)
-    d=list(r.json().values())[0] if isinstance(r.json(), dict) else {}
-    q=d.get("quote", d)
-    b=q.get("bidPrice") or q.get("bid") or q.get("bidPriceInDouble")
-    a=q.get("askPrice") or q.get("ask") or q.get("askPriceInDouble")
-    return (float(b) if b is not None else None, float(a) if a is not None else None)
-
-def vertical_credit_mid(c, short_osi: str, long_osi: str):
-    sb, sa = fetch_bid_ask(c, short_osi)
-    lb, la = fetch_bid_ask(c, long_osi)
-    if None in (sb, sa, lb, la): return None
-    bid = sb - la
-    ask = sa - lb
-    return clamp_tick((bid + ask) / 2.0)
-
-# ---------- outputs ----------
-def emit_output(picked_put:int|None, picked_call:int|None, call_mult:int|None,
-                picked_ref:float, picked_metric:str,
-                picked_ev:float, base_ev:float, delta_ev:float,
-                five_mid:float|None, is_credit_flag:bool):
+# --- GHA outputs ---
+def emit_output(pW:int, cW:int, m:int, mid:float, ev:float, base_ev:float, five_mid:float):
     out_path = os.environ.get("GITHUB_OUTPUT","")
     def w(k,v):
         if not out_path: return
         with open(out_path,"a") as fh: fh.write(f"{k}={v}\n")
-    if is_credit_flag:
-        w("picked_put_width", str(picked_put or ""))
-        w("picked_call_width", str(picked_call or ""))
-        w("call_mult",        str(call_mult or "1"))
-        w("picked_width",     str(picked_put or ""))  # legacy
-        w("picked_ref",       f"{picked_ref:.2f}" if picked_ref else "")
-        w("picked_metric",    picked_metric)
-        w("picked_ev",        f"{picked_ev:.4f}")
-        w("base_ev",          f"{base_ev:.4f}")
-        w("delta_ev",         f"{delta_ev:.4f}")
-        w("five_mid",         f"{(five_mid or 0.0):.2f}")
-    else:
-        # blank everything for debit days
-        for k in ("picked_put_width","picked_call_width","call_mult",
-                  "picked_width","picked_ref","picked_metric","picked_ev","base_ev","delta_ev","five_mid"):
-            w(k, "")
-    print(f"::notice title=WidthPicker::{('CREDIT' if is_credit_flag else 'DEBIT')} day; outputs {'emitted' if is_credit_flag else 'suppressed'}")
+    w("picked_put_width", str(pW))
+    w("picked_call_width", str(cW))
+    w("call_mult", str(m))
+    w("picked_width", str(pW))                 # back-compat (old readers used one width)
+    w("picked_ref", f"{mid:.2f}" if mid else "")
+    w("picked_metric","EV")
+    w("picked_ev", f"{ev:.4f}")
+    w("base_ev",   f"{base_ev:.4f}")
+    w("delta_ev",  f"{(ev-base_ev):.4f}")
+    w("five_mid",  f"{five_mid:.2f}" if five_mid else "")
+    print(f"::notice title=WidthPicker::Wp={pW} Wc={cW} m={m} base_ev={base_ev:.2f} ΔEV={(ev-base_ev):+.2f} five_mid={(f'{five_mid:.2f}' if five_mid else 'NA')}")
 
-def fnum(x):
-    try: return float(x)
-    except: return None
+def grid_half_up_to5(x):
+    # ceil to nearest 5 (keeps call width >= exact half)
+    return int(math.ceil(x/5.0)*5)
 
-def is_credit_signal(tr: dict) -> bool:
-    c1=fnum(tr.get("Cat1")); c2=fnum(tr.get("Cat2"))
-    if (c1 is not None) and (c2 is not None):
-        return c2 >= c1
-    # Unknown? Do NOT apply picker.
-    return False
-
-# ---------- main ----------
 def main():
     # Knobs
-    DEFAULT_WIDTH = int(os.environ.get("DEFAULT_CREDIT_WIDTH","20"))
+    DEFAULT_PUT_WIDTH = int(os.environ.get("DEFAULT_CREDIT_WIDTH","20"))
     EV_MIN_ADV = float(os.environ.get("EV_MIN_ADVANTAGE","0.10"))
-    PUT_CANDS  = [int(x) for x in (os.environ.get("CANDIDATE_PUT_WIDTHS","15,20,25,30,40,50").split(","))]
-    CALL_CANDS = [int(x) for x in (os.environ.get("CANDIDATE_CALL_WIDTHS","15,20,25,30,40,50").split(","))]
-    CALL_MULTS = [int(x) for x in (os.environ.get("CALL_MULT_OPTIONS","1,2").split(","))]
+    CAND_P = [int(x) for x in (os.environ.get("CANDIDATE_CREDIT_WIDTHS","15,20,25,30,40,50").split(","))]
+    CALL_MULT = 2  # fixed by design
 
-    # Win% table by width
+    # Historical win% (per put width; ratio condor keeps max-loss = Wp - credit)
     WINP = json.loads(os.environ.get("WINP_STD_JSON",
         '{"5":0.714,"15":0.791,"20":0.816,"25":0.840,"30":0.863,"40":0.889,"50":0.916}'))
 
-    # GW
+    # Leo (limits)
     j=gw_fetch(); tr=extract_trade(j)
     if not tr:
-        emit_output(None,None,None,0.0,"EV",0.0,0.0,0.0,0.0,False); return 0
-
-    # CREDIT-ONLY gate
-    credit = is_credit_signal(tr)
+        print("WIDTH_PICKER: NO_TRADE_PAYLOAD — using default")
+        emit_output(DEFAULT_PUT_WIDTH, grid_half_up_to5(DEFAULT_PUT_WIDTH/2.0), CALL_MULT, 0.0, 0.0, 0.0, 0.0)
+        return 0
     exp6 = yymmdd(str(tr.get("TDate","")))
-    short_put  = int(float(tr.get("Limit")))
-    short_call = int(float(tr.get("CLimit")))
+    inner_put  = int(float(tr.get("Limit")))
+    inner_call = int(float(tr.get("CLimit")))
 
     # Schwab client
     c = schwab_client()
 
-    # 5‑wide reference condor mid (info only)
-    try:
-        p5 = vertical_credit_mid(c, *build_put_legs(exp6, short_put, 5))
-        c5 = vertical_credit_mid(c, *build_call_legs(exp6, short_call, 5))
-        five_mid = clamp_tick((p5 or 0.0) + (c5 or 0.0))
-    except Exception:
-        five_mid = 0.0
+    # 5‑wide symmetric ref (visibility only)
+    legs5 = build_legs(exp6, inner_put, inner_call, 5, 5)
+    _,_,five_mid,_,_ = condor_nbbo_credit_ratio(c, legs5, m=1)
 
-    if not credit:
-        print("WIDTH_PICKER: DEBIT signal → bypass (no outputs).")
-        emit_output(None,None,None,0.0,"NA",0.0,0.0,0.0,five_mid,False)
-        return 0
+    rows=[]
+    best=None
+    base_ev=None
 
-    # Baseline (symmetric DEFAULT_WIDTH, m=1)
-    base_put_mid  = vertical_credit_mid(c, *build_put_legs(exp6, short_put, DEFAULT_WIDTH))
-    base_call_mid = vertical_credit_mid(c, *build_call_legs(exp6, short_call, DEFAULT_WIDTH))
-    base_tot_mid  = clamp_tick((base_put_mid or 0.0) + (base_call_mid or 0.0))
-    p_base = float(WINP.get(str(DEFAULT_WIDTH), 0.80))
-    ev_base = p_base*(base_put_mid or 0.0) - (1-p_base)*(DEFAULT_WIDTH - (base_put_mid or 0.0)) \
-            + p_base*(base_call_mid or 0.0) - (1-p_base)*(DEFAULT_WIDTH - (base_call_mid or 0.0))
+    for Wp in CAND_P:
+        Wc = grid_half_up_to5(Wp/2.0)
+        legs = build_legs(exp6, inner_put, inner_call, Wp, Wc)
+        bid, ask, mid, put_mid, call_mid = condor_nbbo_credit_ratio(c, legs, m=CALL_MULT)
+        if mid is None or mid <= 0:
+            rows.append((Wp, Wc, None, None, None, None)); continue
+        p = float(WINP.get(str(Wp), WINP.get(Wp, 0.80)))
+        # With m=2 and Wc≈Wp/2, max loss per package is (Wp - mid) on either side.
+        ev = p*mid - (1.0-p)*(Wp - mid)
+        rows.append((Wp, Wc, put_mid, call_mid, mid, ev))
+        if Wp == DEFAULT_PUT_WIDTH and base_ev is None: base_ev = ev
+        if best is None or ev > best[5] + 1e-12: best = (Wp, Wc, put_mid, call_mid, mid, ev)
 
-    # Grid
+    # Table
     print("|Wp|Wc|m|PutMid|CallMid|TotMid|EV|")
     print("|--:|--:|--:|-----:|------:|-----:|--:|")
-
-    best=None
-    for Wp in PUT_CANDS:
-        p_mid = vertical_credit_mid(c, *build_put_legs(exp6, short_put, Wp))
-        if p_mid is None: 
-            for Wc in CALL_CANDS:
-                for m in CALL_MULTS:
-                    print(f"|{Wp}|{Wc}|{m}|NA|NA|NA|NA|")
-            continue
-        p_win = float(WINP.get(str(Wp), 0.80))
-        for Wc in CALL_CANDS:
-            c_mid = vertical_credit_mid(c, *build_call_legs(exp6, short_call, Wc))
-            if c_mid is None:
-                for m in CALL_MULTS:
-                    print(f"|{Wp}|{Wc}|{m}|{p_mid:.2f}|NA|NA|NA|")
-                continue
-            c_win = float(WINP.get(str(Wc), 0.80))
-            for m in CALL_MULTS:
-                tot_mid = clamp_tick(p_mid + m*c_mid)
-                ev = (p_win*p_mid - (1-p_win)*(Wp - p_mid)) \
-                   + m*(c_win*c_mid - (1-c_win)*(Wc - c_mid))
-                print(f"|{Wp}|{Wc}|{m}|{p_mid:.2f}|{c_mid:.2f}|{tot_mid:.2f}|{ev:.2f}|")
-                if (best is None) or (ev > best[5] + 1e-12):
-                    best=(Wp,Wc,m,p_mid,c_mid,ev,tot_mid)
+    for Wp, Wc, pMid, cMid, mid, ev in rows:
+        if mid is None:
+            print(f"|{Wp}|{Wc}|{CALL_MULT}|NA|NA|NA|NA|")
+        else:
+            print(f"|{Wp}|{Wc}|{CALL_MULT}|{pMid:.2f}|{cMid:.2f}|{mid:.2f}|{ev:.2f}|")
 
     if best is None:
-        emit_output(None,None,None,0.0,"EV",0.0,ev_base,0.0,five_mid,True)
+        print("WIDTH_PICKER: No quotes — using default")
+        emit_output(DEFAULT_PUT_WIDTH, grid_half_up_to5(DEFAULT_PUT_WIDTH/2.0), CALL_MULT, 0.0, 0.0, (base_ev or 0.0), (five_mid or 0.0))
         return 0
 
-    Wp_best, Wc_best, m_best, p_mid_b, c_mid_b, ev_best, tot_mid_b = best
-    delta = ev_best - ev_base
+    if base_ev is None: base_ev = next((ev for (Wp,Wc,_,_,_,ev) in rows if Wp==DEFAULT_PUT_WIDTH and ev is not None), 0.0)
+    Wp_sel, Wc_sel, pMidSel, cMidSel, midSel, evSel = best
+    delta = evSel - (base_ev or 0.0)
 
-    # EV gate vs baseline (DEFAULT_WIDTH, m=1)
-    if delta <= EV_MIN_ADV:
-        Wp_sel, Wc_sel, m_sel, tot_mid_sel, ev_sel = DEFAULT_WIDTH, DEFAULT_WIDTH, 1, base_tot_mid, ev_base
-        switch_txt = "→ Stay"
-    else:
-        Wp_sel, Wc_sel, m_sel, tot_mid_sel, ev_sel = Wp_best, Wc_best, m_best, tot_mid_b, ev_best
-        switch_txt = "→ Switch"
+    # EV gate
+    outWp = Wp_sel if (delta > EV_MIN_ADV) else DEFAULT_PUT_WIDTH
+    outWc = grid_half_up_to5(outWp/2.0)
 
-    print(f"**Picked:** Wp={Wp_sel}, Wc={Wc_sel}, m={m_sel}, cond_mid={tot_mid_sel:.2f} (metric=EV) base_ev={ev_base:.2f} ΔEV={delta:+.2f} {switch_txt}")
+    switch_txt = "→ Switch" if delta > EV_MIN_ADV else "→ Stay"
+    print(f"**Picked:** Wp={outWp}, Wc={outWc}, m={CALL_MULT}, cond_mid={(midSel or 0.0):.2f} (metric=EV) base_ev={(base_ev or 0.0):.2f} ΔEV={(delta):+.2f} {switch_txt}")
 
-    # Emit (CREDIT only)
-    emit_output(Wp_sel, Wc_sel, m_sel, tot_mid_sel, "EV", ev_sel, ev_base, delta, five_mid, True)
+    emit_output(outWp, outWc, CALL_MULT, (midSel or 0.0), (evSel or 0.0), (base_ev or 0.0), (five_mid or 0.0))
     return 0
 
 if __name__=="__main__":
