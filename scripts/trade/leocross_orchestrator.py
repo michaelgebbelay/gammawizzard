@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 # ORCHESTRATOR — CREDIT: unbalanced IC (Wp, Wc, m=2). DEBIT: symmetric 5‑wide IC.
-# Passes legs + qty + ratio to placer.
 
 import os, sys, re, math, json
 from datetime import date
@@ -41,7 +40,6 @@ def build_legs_credit(exp6: str, inner_put: int, inner_call: int, Wp: int, Wc: i
     )
 
 def build_legs_debit(exp6: str, inner_put: int, inner_call: int, W: int):
-    # Long IC (DEBIT) 5‑wide, oriented for DEBIT (buys closer, sells farther)
     p_low, p_high = inner_put - W, inner_put
     c_low, c_high = inner_call, inner_call + W
     bp = to_osi(f".SPXW{exp6}P{p_high}")   # buy higher put
@@ -149,13 +147,25 @@ def main():
 
     # Schwab + sizing
     c = schwab_client()
-    oc = opening_cash_for_account(c)
+    oc_real = opening_cash_for_account(c)
+
+    # Optional override for account value
+    oc_override_raw = os.environ.get("SIZING_DOLLARS_OVERRIDE","").strip()
+    oc = oc_real
+    if oc_override_raw:
+        try:
+            val = float(oc_override_raw)
+            if val > 0: oc = val
+        except:
+            pass
+
     # Risk driver is the put width (Wp) on CREDIT; 5 on DEBIT
     risk_w = Wp if is_credit else 5
     SIZING_PER_5WIDE = float(os.environ.get("SIZING_PER_5WIDE","6000"))
-    denom = SIZING_PER_5WIDE * (width/5.0)
+    denom = SIZING_PER_5WIDE * (risk_w/5.0)
     qty = max(1, _round_half_up((float(oc) if oc is not None else 0.0) / max(1e-9, denom)))
-    # Manual override if provided
+
+    # Manual qty override if provided
     qov = os.environ.get("BYPASS_QTY","").strip()
     if qov:
         try: qty = max(1, int(qov))
@@ -180,13 +190,11 @@ def main():
         "OCC_SELL_PUT": legs[1],
         "OCC_SELL_CALL":legs[2],
         "OCC_BUY_CALL":  legs[3],
-        # reuse Schwab token
         "SCHWAB_APP_KEY": os.environ["SCHWAB_APP_KEY"],
         "SCHWAB_APP_SECRET": os.environ["SCHWAB_APP_SECRET"],
         "SCHWAB_TOKEN_JSON": os.environ["SCHWAB_TOKEN_JSON"],
     })
 
-    # Run placer
     rc = os.spawnve(os.P_WAIT, sys.executable, [sys.executable, "scripts/trade/leocross_place_simple.py"], env)
     return rc
 
