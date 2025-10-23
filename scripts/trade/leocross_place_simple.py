@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# PLACER — Handles CREDIT (ratio condor) and DEBIT (symmetric 5‑wide). Minimal ladder with 429 backoff.
+# PLACER — CREDIT (ratio condor) and DEBIT (symmetric 5‑wide). Minimal ladder w/429 backoff.
 
 import os, sys, time, random
 from schwab.auth import client_from_token_file
@@ -24,35 +24,30 @@ def fetch_bid_ask(c, osi: str):
     return (float(b) if b is not None else None, float(a) if a is not None else None)
 
 def nbbo_credit_synth(c, legs, call_mult=1):
-    # legs = [bp, sp, sc, bc]
     bp, sp, sc, bc = legs
     bp_b, bp_a = fetch_bid_ask(c, bp); sp_b, sp_a = fetch_bid_ask(c, sp)
     sc_b, sc_a = fetch_bid_ask(c, sc); bc_b, bc_a = fetch_bid_ask(c, bc)
     if None in (bp_b, bp_a, sp_b, sp_a, sc_b, sc_a, bc_b, bc_a):
         return (None, None, None)
-    # Bid uses sell@bid, buy@ask; Ask uses sell@ask, buy@bid
     bid = (sp_b - bp_a) + call_mult * (sc_b - bc_a)
     ask = (sp_a - bp_b) + call_mult * (sc_a - bc_b)
     mid = (bid + ask) / 2.0
     return (clamp_tick(bid), clamp_tick(ask), clamp_tick(mid))
 
 def nbbo_debit_synth(c, legs):
-    # long IC (DEBIT): price = buys - sells (so bid/ask inverted vs credit)
     bp, sp, sc, bc = legs
     bp_b, bp_a = fetch_bid_ask(c, bp); sp_b, sp_a = fetch_bid_ask(c, sp)
     sc_b, sc_a = fetch_bid_ask(c, sc); bc_b, bc_a = fetch_bid_ask(c, bc)
     if None in (bp_b, bp_a, sp_b, sp_a, sc_b, sc_a, bc_b, bc_a):
         return (None, None, None)
-    # Bid = (buys@bid - sells@ask), Ask = (buys@ask - sells@bid)
     bid = (bp_b - sp_a) + (bc_b - sc_a)
     ask = (bp_a - sp_b) + (bc_a - sc_b)
     mid = (bid + ask) / 2.0
     return (clamp_tick(bid), clamp_tick(ask), clamp_tick(mid))
 
-def order_payload(side, legs, price, qty, call_mult, structure):
+def order_payload(side, legs, price, qty, call_mult):
     bp, sp, sc, bc = legs
     if side=="CREDIT":
-        # qty on calls is multiplied, puts stay at qty
         return {
             "orderType": "NET_CREDIT",
             "session": "NORMAL",
@@ -61,10 +56,10 @@ def order_payload(side, legs, price, qty, call_mult, structure):
             "orderStrategyType": "SINGLE",
             "complexOrderStrategyType": "IRON_CONDOR",
             "orderLegCollection":[
-                {"instruction":"BUY_TO_OPEN", "positionEffect":"OPENING","quantity":qty,             "instrument":{"symbol":bp,"assetType":"OPTION"}},
-                {"instruction":"SELL_TO_OPEN","positionEffect":"OPENING","quantity":qty,             "instrument":{"symbol":sp,"assetType":"OPTION"}},
-                {"instruction":"SELL_TO_OPEN","positionEffect":"OPENING","quantity":qty*call_mult,   "instrument":{"symbol":sc,"assetType":"OPTION"}},
-                {"instruction":"BUY_TO_OPEN", "positionEffect":"OPENING","quantity":qty*call_mult,   "instrument":{"symbol":bc,"assetType":"OPTION"}},
+                {"instruction":"BUY_TO_OPEN", "positionEffect":"OPENING","quantity":qty,           "instrument":{"symbol":bp,"assetType":"OPTION"}},
+                {"instruction":"SELL_TO_OPEN","positionEffect":"OPENING","quantity":qty,           "instrument":{"symbol":sp,"assetType":"OPTION"}},
+                {"instruction":"SELL_TO_OPEN","positionEffect":"OPENING","quantity":qty*call_mult, "instrument":{"symbol":sc,"assetType":"OPTION"}},
+                {"instruction":"BUY_TO_OPEN", "positionEffect":"OPENING","quantity":qty*call_mult, "instrument":{"symbol":bc,"assetType":"OPTION"}},
             ]
         }
     else:
@@ -140,7 +135,6 @@ def wait_settle(c, acct_hash: str, oid: str, max_wait=2.0):
 
 if __name__=="__main__":
     side = (os.environ.get("SIDE","CREDIT") or "CREDIT").upper()
-    struct = (os.environ.get("STRUCTURE","CONDOR") or "CONDOR").upper()
     qty = max(1, int(os.environ.get("QTY","1")))
     legs = [
         os.environ["OCC_BUY_PUT"],
@@ -162,7 +156,7 @@ if __name__=="__main__":
     CANCEL_SETTLE_SECS = float(os.environ.get("CANCEL_SETTLE_SECS","1.0"))
     MAX_CYCLES = int(os.environ.get("MAX_LADDER_CYCLES","2"))
 
-    print(f"PLACER START side={side} structure={struct} qty={qty}")
+    print(f"PLACER START side={side} structure={(os.environ.get('STRUCTURE') or '').upper()} qty={qty}")
 
     if side=="CREDIT":
         bid, ask, mid = nbbo_credit_synth(c, legs, call_mult=call_mult)
@@ -185,7 +179,6 @@ if __name__=="__main__":
                 base_ladder[-2] = max(base_ladder[-2], bid)
                 base_ladder[-1] = max(base_ladder[-1], bid)
     else:
-        # debit: walk from bid -> mid -> mid+ticks -> ask
         if bid is not None: base_ladder.append(bid)
         if mid is not None:
             base_ladder += [mid, clamp_tick(mid+0.05), clamp_tick(mid+0.10)]
@@ -218,7 +211,7 @@ if __name__=="__main__":
                 active_oid=None
                 time.sleep(0.20)
 
-            payload = order_payload(side, legs, price, to_place, call_mult, struct)
+            payload = order_payload(side, legs, price, to_place, call_mult)
             print(f"RUNG → price={price:.2f} to_place={to_place}")
             try:
                 r = post_with_retry(c, url_post, payload, tag=f"PLACE@{price:.2f}x{to_place}:{call_mult}")
@@ -240,7 +233,6 @@ if __name__=="__main__":
             if filled >= qty: break
 
         if filled >= qty: break
-        # (Optional) refresh NBBO here if you want; omitted for simplicity.
 
     if active_oid:
         url_del=f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{active_oid}"
