@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # ORCHESTRATOR — CREDIT: unbalanced IC (Wp, Wc, m=2). DEBIT: symmetric 5‑wide IC.
+# Sizing: CREDIT uses $SIZING_PER_5WIDE per 5‑wide of *put* width; DEBIT uses $SIZING_PER_LONG per 5‑wide long IC.
 
 import os, sys, re, math, json
 from datetime import date
@@ -40,6 +41,7 @@ def build_legs_credit(exp6: str, inner_put: int, inner_call: int, Wp: int, Wc: i
     )
 
 def build_legs_debit(exp6: str, inner_put: int, inner_call: int, W: int):
+    # Long IC (DEBIT) 5‑wide, oriented for DEBIT
     p_low, p_high = inner_put - W, inner_put
     c_low, c_high = inner_call, inner_call + W
     bp = to_osi(f".SPXW{exp6}P{p_high}")   # buy higher put
@@ -93,23 +95,75 @@ def schwab_client():
     with open("schwab_token.json","w") as f: f.write(token_json)
     return client_from_token_file(api_key=app_key, app_secret=app_secret, token_path="schwab_token.json")
 
-def opening_cash_for_account(c):
+def opening_cash_for_account(c, prefer_number=None):
+    """
+    Robust balance hunt. Returns (value, source_key, acct_number).
+    Prefers cashAvailableForTrading, then cashBalance, then liquidationValue, with several fallbacks.
+    """
     r=c.get_accounts(); r.raise_for_status()
-    j=r.json()
-    arr = j if isinstance(j,list) else [j]
-    def pick(d,*ks):
-        for k in ks:
-            v=(d or {}).get(k)
-            if isinstance(v,(int,float)): return float(v)
-    a=arr[0]
-    init=a.get("initialBalances",{}) if isinstance(a,dict) else {}
-    curr=a.get("currentBalances",{}) if isinstance(a,dict) else {}
-    oc = pick(init,"cashBalance","cashAvailableForTrading","liquidationValue")
-    if oc is None: oc = pick(curr,"cashBalance","cashAvailableForTrading","liquidationValue")
-    return float(oc or 0.0)
+    data = r.json()
+    arr = data if isinstance(data,list) else [data]
 
-def floor5(x: int) -> int:
-    return int(math.floor(x/5.0)*5)
+    # Pick the right account if multiple
+    if prefer_number is None:
+        try:
+            rr = c.get_account_numbers(); rr.raise_for_status()
+            prefer_number = str((rr.json() or [{}])[0].get("accountNumber") or "")
+        except Exception:
+            prefer_number = None
+
+    def hunt(a):
+        acct_id=None; init={}; curr={}
+        stack=[a]
+        while stack:
+            x=stack.pop()
+            if isinstance(x,dict):
+                if acct_id is None and x.get("accountNumber"): acct_id=str(x["accountNumber"])
+                if "initialBalances" in x and isinstance(x["initialBalances"], dict): init=x["initialBalances"]
+                if "currentBalances" in x and isinstance(x["currentBalances"], dict): curr=x["currentBalances"]
+                for v in x.values():
+                    if isinstance(v,(dict,list)): stack.append(v)
+            elif isinstance(x,list):
+                stack.extend(x)
+        return acct_id, init, curr
+
+    chosen = None
+    for a in arr:
+        aid, init, curr = hunt(a)
+        if prefer_number and aid == prefer_number:
+            chosen=(aid,init,curr); break
+        if chosen is None:
+            chosen=(aid,init,curr)
+
+    if not chosen: return 0.0, "none", ""
+    aid, init, curr = chosen
+
+    # Priority order
+    keys = [
+        "cashAvailableForTrading",
+        "cashBalance",
+        "availableFundsNonMarginableTrade",
+        "buyingPowerNonMarginableTrade",
+        "buyingPower",
+        "optionBuyingPower",
+        "liquidationValue",
+    ]
+
+    def pick(src):
+        for k in keys:
+            v = src.get(k)
+            if isinstance(v,(int,float)): return float(v), k
+        return None
+
+    for src in (init, curr):
+        got = pick(src)
+        if got: return got[0], got[1], aid
+
+    # Last resort
+    return 0.0, "none", aid
+
+def floor5(x: float) -> int:
+    return int(math.floor(float(x)/5.0)*5)
 
 def main():
     MODE = (os.environ.get("PLACER_MODE","NOW") or "NOW").upper()
@@ -130,10 +184,10 @@ def main():
     if SIDE_OVERRIDE == "CREDIT": is_credit=True
     elif SIDE_OVERRIDE == "DEBIT": is_credit=False
 
-    # Widths / ratio for CREDIT (from picker) — default to Wc=Wp/2, m=2 if picker not run
-    Wp_env = os.environ.get("CREDIT_PUT_WIDTH","").strip()
-    Wc_env = os.environ.get("CREDIT_CALL_WIDTH","").strip()
-    m_env  = os.environ.get("CALL_MULT","").strip()
+    # Widths / ratio for CREDIT (from picker) — default to Wc=floor(Wp/2), m=2
+    Wp_env = (os.environ.get("CREDIT_PUT_WIDTH","") or "").strip()
+    Wc_env = (os.environ.get("CREDIT_CALL_WIDTH","") or "").strip()
+    m_env  = (os.environ.get("CALL_MULT","") or "").strip()
 
     if is_credit:
         Wp = int(Wp_env) if Wp_env.isdigit() else int(os.environ.get("CREDIT_SPREAD_WIDTH","20"))
@@ -147,26 +201,28 @@ def main():
 
     # Schwab + sizing
     c = schwab_client()
-    oc_real = opening_cash_for_account(c)
+    oc_val, oc_src, acct_num = opening_cash_for_account(c)
 
-    # Optional override for account value
-    oc_override_raw = os.environ.get("SIZING_DOLLARS_OVERRIDE","").strip()
-    oc = oc_real
-    if oc_override_raw:
-        try:
-            val = float(oc_override_raw)
-            if val > 0: oc = val
-        except:
-            pass
+    # Allow override via workflow input
+    ov_raw = (os.environ.get("SIZING_DOLLARS_OVERRIDE","") or "").strip()
+    if ov_raw:
+        try: oc_val = float(ov_raw)
+        except: pass
 
-    # Risk driver is the put width (Wp) on CREDIT; 5 on DEBIT
-    risk_w = Wp if is_credit else 5
     SIZING_PER_5WIDE = float(os.environ.get("SIZING_PER_5WIDE","6000"))
-    denom = SIZING_PER_5WIDE * (risk_w/5.0)
-    qty = max(1, _round_half_up((float(oc) if oc is not None else 0.0) / max(1e-9, denom)))
+    SIZING_PER_LONG  = float(os.environ.get("SIZING_PER_LONG","6000"))
 
-    # Manual qty override if provided
-    qov = os.environ.get("BYPASS_QTY","").strip()
+    if is_credit:
+        risk_w = float(Wp)              # risk driver = put width
+        denom  = SIZING_PER_5WIDE * (risk_w/5.0)
+    else:
+        risk_w = 5.0                    # long IC is always 5‑wide in this flow
+        denom  = SIZING_PER_LONG        # 1 long IC per $SIZING_PER_LONG
+
+    qty = max(1, _round_half_up((float(oc_val) if oc_val is not None else 0.0) / max(1e-9, denom)))
+
+    # Manual qty override if provided (BYPASS_QTY in workflow)
+    qov = (os.environ.get("BYPASS_QTY","") or "").strip()
     if qov:
         try: qty = max(1, int(qov))
         except: pass
@@ -175,7 +231,7 @@ def main():
     struct = "CONDOR_RATIO" if (is_credit and m>1) else "CONDOR"
     print(f"ORCH GATE disabled (MODE={MODE})")
     print(f"ORCH CONFIG: side={side_txt}, Wp={Wp}, Wc={Wc}, call_mult={m}, mode={MODE}")
-    print(f"ORCH SIZE: base_qty={qty} oc={oc:.2f} structure={struct}")
+    print(f"ORCH SIZE: base_qty={qty} oc={oc_val:.2f} (src={oc_src}, acct={acct_num}) denom={denom:.2f} structure={struct}")
 
     # Pass to placer via env
     env = dict(os.environ)
@@ -190,6 +246,7 @@ def main():
         "OCC_SELL_PUT": legs[1],
         "OCC_SELL_CALL":legs[2],
         "OCC_BUY_CALL":  legs[3],
+        # reuse Schwab token
         "SCHWAB_APP_KEY": os.environ["SCHWAB_APP_KEY"],
         "SCHWAB_APP_SECRET": os.environ["SCHWAB_APP_SECRET"],
         "SCHWAB_TOKEN_JSON": os.environ["SCHWAB_TOKEN_JSON"],
