@@ -66,31 +66,24 @@ jobs:
           GW_EMAIL:          ${{ secrets.GW_EMAIL }}
           GW_PASSWORD:       ${{ secrets.GW_PASSWORD }}
 
-          # Picker knobs
-          DEFAULT_CREDIT_WIDTH: "20"               # base width for EV gate comparison
-          EV_MIN_ADVANTAGE: "0.10"                 # only switch if EV improves by > $0.10
+          # Picker knobs (credit-only; picker auto-bypasses on debit)
+          DEFAULT_CREDIT_WIDTH: "20"
+          EV_MIN_ADVANTAGE: "0.10"
           CANDIDATE_CREDIT_WIDTHS: "15,20,25,30,40,50"
-          SELECTOR: "EV"                            # explicit: EV | CREDIT_PER_WIDTH | CREDIT_PER_MAX_LOSS
 
-          # Historical win% used by EV math
+          # Historical win% used by EV math (keyed by put-width)
           WINP_STD_JSON:  '{"5":0.714,"15":0.791,"20":0.816,"25":0.840,"30":0.863,"40":0.889,"50":0.916}'
-
-          # Ratios only inform the “edge vs 5‑wide” column (cosmetic)
-          RATIO_STD_JSON:  '{"5":1.0,"15":2.55,"20":3.175,"25":3.6625,"30":4.15,"40":4.85,"50":5.375}'
         run: |
           python scripts/trade/leocross_width_picker.py
-          echo "Picked width: ${{ steps.widthpicker.outputs.picked_width }}"
-          echo "Picker metric: ${{ steps.widthpicker.outputs.picked_metric }}"
-          echo "EV picked/base/delta: ${{ steps.widthpicker.outputs.picked_ev }} / ${{ steps.widthpicker.outputs.base_ev }} / ${{ steps.widthpicker.outputs.delta_ev }}"
-          echo "5-wide mid: ${{ steps.widthpicker.outputs.five_mid }}"
 
       - name: Show picker outputs
         if: ${{ github.event.inputs.width_picker == 'true' }}
         run: |
-          echo "Picked width: ${{ steps.widthpicker.outputs.picked_width }}"
-          echo "Picker metric: ${{ steps.widthpicker.outputs.picked_metric }}"
+          echo "Picked put width:  ${{ steps.widthpicker.outputs.picked_put_width }}"
+          echo "Picked call width: ${{ steps.widthpicker.outputs.picked_call_width }}"
+          echo "Call mult:         ${{ steps.widthpicker.outputs.call_mult }}"
+          echo "5-wide mid:        ${{ steps.widthpicker.outputs.five_mid }}"
           echo "EV picked/base/delta: ${{ steps.widthpicker.outputs.picked_ev }} / ${{ steps.widthpicker.outputs.base_ev }} / ${{ steps.widthpicker.outputs.delta_ev }}"
-          echo "5-wide mid: ${{ steps.widthpicker.outputs.five_mid }}"
 
       - name: LeoCross orchestrator (guard + run)
         env:
@@ -98,10 +91,10 @@ jobs:
           PLACER_MODE: ${{ github.event.inputs.mode != '' && github.event.inputs.mode || 'NOW' }}
 
           # Guard bypass toggles (position/overlap checks only)
-          BYPASS_GUARD: ${{ github.event.inputs.force }}
-          BYPASS_QTY:   ${{ github.event.inputs.force_qty }}
+          BYPASS_GUARD:  ${{ github.event.inputs.force }}
+          BYPASS_QTY:    ${{ github.event.inputs.force_qty }}
           SIZING_DOLLARS_OVERRIDE: ${{ github.event.inputs.sizing_override }}
-          #SIDE_OVERRIDE: ${{ github.event.inputs.side_override }}
+          SIDE_OVERRIDE: ${{ github.event.inputs.side_override || 'AUTO' }}
 
           # Sizing risk budget (defaults are 6000 if omitted)
           SIZING_PER_5WIDE: "6000"  # credit: dollars per 5-wide risk
@@ -111,8 +104,6 @@ jobs:
           SCHWAB_APP_KEY:    ${{ secrets.SCHWAB_APP_KEY }}
           SCHWAB_APP_SECRET: ${{ secrets.SCHWAB_APP_SECRET }}
           SCHWAB_TOKEN_JSON: ${{ secrets.SCHWAB_TOKEN_JSON }}
-          GSHEET_ID:                   ${{ secrets.GSHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           GW_TOKEN:    ${{ secrets.GW_TOKEN }}
           GW_EMAIL:    ${{ secrets.GW_EMAIL }}
           GW_PASSWORD: ${{ secrets.GW_PASSWORD }}
@@ -121,8 +112,7 @@ jobs:
           CREDIT_PUT_WIDTH:  ${{ steps.widthpicker.outputs.picked_put_width  }}
           CREDIT_CALL_WIDTH: ${{ steps.widthpicker.outputs.picked_call_width }}
           CALL_MULT:         ${{ steps.widthpicker.outputs.call_mult || '2' }}
-          SIDE_OVERRIDE:     ${{ github.event.inputs.side_override || 'AUTO' }}
-          
+
           # ===== Trading knobs (fast two-pass) =====
           STEP_WAIT: "5"
           MIN_RUNG_WAIT: "5"
@@ -132,7 +122,7 @@ jobs:
           # Cutoff: flip to 23:59 when ignore_cutoff=true
           HARD_CUTOFF_HHMM: ${{ github.event.inputs.ignore_cutoff == 'true' && '23:59' || '16:15' }}
 
-          # Width chosen by picker (or default)
+          # For guard back-compat (not used by ratio placer but harmless)
           CREDIT_SPREAD_WIDTH: "${{ steps.widthpicker.outputs.picked_width != '' && steps.widthpicker.outputs.picked_width || '20' }}"
           CREDIT_MIN_WIDTH: "5"
 
