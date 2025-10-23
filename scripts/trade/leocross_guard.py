@@ -1,10 +1,6 @@
-# scripts/trade/leocross_guard.py
 #!/usr/bin/env python3
-# VERSION: 2025-10-05 ShortIC fixed-width + contracts-per-equity sizing
-__version__ = "3.3.0"
-
-# LeoCross GUARD (stateless): derive 4 legs from GW, inspect Schwab positions & open orders,
-# and emit a single decision for the orchestrator.
+# VERSION: 2025-10-16 Guard w/ 6k sizing (credit & debit), same‑shorts overlap checks
+__version__ = "3.4.0"
 
 import os, sys, json, re, time, math, random
 from decimal import Decimal, ROUND_HALF_UP
@@ -13,10 +9,9 @@ from zoneinfo import ZoneInfo
 import requests
 from schwab.auth import client_from_token_file
 
-# ----- Config knobs (credit spreads) -----
-# width stays on SPX 5-pt grid
-CREDIT_SPREAD_WIDTH         = int(os.environ.get("CREDIT_SPREAD_WIDTH", "20"))
-CREDIT_MIN_WIDTH            = 5  # SPX strikes trade in 5-point increments
+# ----- Config (credit spreads) -----
+CREDIT_SPREAD_WIDTH  = int(os.environ.get("CREDIT_SPREAD_WIDTH", "20"))
+CREDIT_MIN_WIDTH     = 5
 
 ET = ZoneInfo("America/New_York")
 GW_BASE = "https://gandalf.gammawizard.com"
@@ -41,44 +36,32 @@ def to_osi(sym: str) -> str:
         or re.match(r'^([A-Z.$^]{1,6})(\d{6})([CP])(\d{8})$', raw)
     if not m: raise ValueError("Cannot parse option symbol: " + sym)
     root, ymd, cp, strike, frac = (m.groups()+("",))[:5]
-    if len(strike)==8 and not frac:
-        mills = int(strike)
-    else:
-        mills = int(strike)*1000 + (int((frac or "0").ljust(3,'0')) if frac else 0)
+    mills = int(strike)*1000 + (int((frac or "0").ljust(3,'0')) if frac else 0) if len(strike)<8 else int(strike)
     return "{:<6s}{}{}{:08d}".format(root, ymd, cp, mills)
 
 def osi_canon(osi: str):
-    return (osi[6:12], osi[12], osi[-8:])  # (yymmdd, C/P, strike8)
+    return (osi[6:12], osi[12], osi[-8:])
 
 def strike_from_osi(osi: str) -> float:
     return int(osi[-8:]) / 1000.0
 
 def build_legs_same_shorts(exp6: str, inner_put: int, inner_call: int, width: int, *, is_credit: bool = True):
-    """Construct same-shorts iron condor legs for credit (default) or debit."""
     p_low, p_high = inner_put - width, inner_put
     c_low, c_high = inner_call, inner_call + width
-
     bp = to_osi(f".SPXW{exp6}P{p_low}")
     sp = to_osi(f".SPXW{exp6}P{p_high}")
     sc = to_osi(f".SPXW{exp6}C{c_low}")
     bc = to_osi(f".SPXW{exp6}C{c_high}")
 
-    bpS = strike_from_osi(bp)
-    spS = strike_from_osi(sp)
-    scS = strike_from_osi(sc)
-    bcS = strike_from_osi(bc)
+    bpS = strike_from_osi(bp); spS = strike_from_osi(sp)
+    scS = strike_from_osi(sc); bcS = strike_from_osi(bc)
 
     if is_credit:
-        if bpS > spS:
-            bp, sp = sp, bp
-        if scS > bcS:
-            sc, bc = bc, sc
+        if bpS > spS: bp, sp = sp, bp
+        if scS > bcS: sc, bc = bc, sc
     else:
-        if bpS < spS:
-            bp, sp = sp, bp
-        if bcS > scS:
-            sc, bc = bc, sc
-
+        if bpS < spS: bp, sp = sp, bp
+        if bcS > scS: sc, bc = bc, sc
     return [bp, sp, sc, bc]
 
 def iso_z(dt):
@@ -86,44 +69,35 @@ def iso_z(dt):
 
 def _credit_width() -> int:
     width = max(CREDIT_MIN_WIDTH, int(CREDIT_SPREAD_WIDTH))
-    # round to nearest 5 upward to stay on SPX grid
     return int(math.ceil(width / 5.0) * 5)
 
 def _round_half_up(x: float) -> int:
     return int(Decimal(x).quantize(Decimal('1'), rounding=ROUND_HALF_UP))
 
-def calc_short_ic_width(opening_cash: float | int) -> int:
-    """Retained for compatibility: ignores cash and returns configured credit width."""
-    return _credit_width()
-
 # ----- Sizing ($ per risk unit) -----
-# Allow env overrides; defaults bumped to 6000
 def _to_float_env(key, default):
     try:
         return float(os.environ.get(key, str(default)))
     except Exception:
         return float(default)
 
-SIZING_PER_5WIDE = _to_float_env("SIZING_PER_5WIDE", 6000.0)  # credit: per 5-wide risk
-SIZING_PER_LONG  = _to_float_env("SIZING_PER_LONG",  6000.0)  # debit: per long IC (5-wide)
+SIZING_PER_5WIDE = _to_float_env("SIZING_PER_5WIDE", 6000.0)
+SIZING_PER_LONG  = _to_float_env("SIZING_PER_LONG",  6000.0)
+
+def calc_short_ic_width(opening_cash: float | int) -> int:
+    return _credit_width()
 
 def calc_short_ic_contracts(opening_cash: float | int) -> int:
-    """Short IC sizing: $SIZING_PER_5WIDE per 5-wide risk, scaled by configured width, half-up, min 1."""
-    try:
-        oc = float(opening_cash)
-    except Exception:
-        oc = 0.0
+    try: oc = float(opening_cash)
+    except: oc = 0.0
     width = _credit_width()
     denom = SIZING_PER_5WIDE * (width / 5.0)
     units = _round_half_up(oc / max(1e-9, denom))
     return max(1, int(units))
 
 def calc_long_ic_contracts(opening_cash: float | int) -> int:
-    """Long IC sizing: $SIZING_PER_LONG per condor (always 5-wide), floor, min 1."""
-    try:
-        oc = float(opening_cash)
-    except Exception:
-        oc = 0.0
+    try: oc = float(opening_cash)
+    except: oc = 0.0
     return max(1, int(math.floor(oc / max(1e-9, SIZING_PER_LONG))))
 
 # ------------- Schwab helpers -------------
@@ -144,7 +118,6 @@ def _sleep_for_429(r, attempt):
             return max(1.0, float(ra))
         except Exception:
             pass
-    # exponential backoff + small jitter
     return min(10.0, 0.5 * (2 ** attempt)) + random.uniform(0.0, 0.25)
 
 def schwab_get_json(c, url, params=None, tries=6, tag=""):
@@ -155,8 +128,7 @@ def schwab_get_json(c, url, params=None, tries=6, tag=""):
             if r.status_code == 200:
                 return r.json()
             if r.status_code == 429:
-                time.sleep(_sleep_for_429(r, i))
-                continue
+                time.sleep(_sleep_for_429(r, i)); continue
             last = f"HTTP_{r.status_code}:{(r.text or '')[:160]}"
         except Exception as e:
             last = f"{type(e).__name__}:{str(e)}"
@@ -225,7 +197,7 @@ def list_matching_open_ids(c, acct_hash: str, canon_set):
             if oid: out.append(oid)
     return out
 
-# ------------- opening cash (for width) -------------
+# ------------- opening cash -------------
 def opening_cash_for_account(c, acct_number: str):
     r = c.get_accounts(); r.raise_for_status()
     data = r.json()
@@ -351,21 +323,17 @@ def main():
         except: return None
     cat1=fnum(tr.get("Cat1")); cat2=fnum(tr.get("Cat2"))
     is_credit = True if (cat2 is None or cat1 is None or cat2>=cat1) else False
-    SIDE_OVERRIDE = (os.environ.get("SIDE_OVERRIDE","AUTO") or "AUTO").upper()
-    if SIDE_OVERRIDE == "CREDIT":
-        is_credit = True
-    elif SIDE_OVERRIDE == "DEBIT":
-        is_credit = False
 
-    # determine width
-    # Allow manual override of account value for sizing (testing)
+    SIDE_OVERRIDE = (os.environ.get("SIDE_OVERRIDE","AUTO") or "AUTO").upper()
+    if SIDE_OVERRIDE == "CREDIT": is_credit = True
+    elif SIDE_OVERRIDE == "DEBIT": is_credit = False
+
+    # opening cash (for sizing)
     oc_override_raw = os.environ.get("SIZING_DOLLARS_OVERRIDE", "").strip()
     oc_override = None
     if oc_override_raw:
-        try:
-            oc_override = float(oc_override_raw)
-        except Exception:
-            oc_override = None
+        try: oc_override = float(oc_override_raw)
+        except: oc_override = None
 
     oc_real = opening_cash_for_account(c, acct_num)
     oc = oc_override if (oc_override is not None and oc_override > 0) else oc_real
@@ -378,11 +346,7 @@ def main():
         return 0
 
     width = calc_short_ic_width(oc) if is_credit else 5
-
-    if is_credit:
-        legs = build_legs_same_shorts(exp6, inner_put, inner_call, width, is_credit=True)
-    else:
-        legs = build_legs_same_shorts(exp6, inner_put, inner_call, width, is_credit=False)
+    legs = build_legs_same_shorts(exp6, inner_put, inner_call, width, is_credit=is_credit)
     canon = {osi_canon(x) for x in legs}
 
     # positions
@@ -415,7 +379,6 @@ def main():
     open_ids = list_matching_open_ids(c, acct_hash, canon) or []
     action=""; rem_qty=""; reason=""
 
-    # units open (only meaningful when all 4 aligned)
     def condor_units_open(pos_map, legs):
         b1 = max(0.0,  pos_map.get(osi_canon(legs[0]), 0.0))
         b2 = max(0.0,  pos_map.get(osi_canon(legs[3]), 0.0))
@@ -436,12 +399,10 @@ def main():
         else:
             action="NEW"; rem_qty=str(target_qty - uo)
     else:
-        action="REPRICE_EXISTING"
-        reason = "PARTIAL_OVERLAP or WORKING_ORDER"
+        action="REPRICE_EXISTING"; reason = "PARTIAL_OVERLAP or WORKING_ORDER"
 
     canon_key = f"{legs[0][6:12]}:P{legs[0][-8:]}-{legs[1][-8:]}:C{legs[2][-8:]}-{legs[3][-8:]}"
 
-    # Emit outputs
     outs = {
         "action": action,
         "reason": reason,
@@ -451,9 +412,9 @@ def main():
         "is_credit": "true" if is_credit else "false",
         "open_order_ids": ",".join(open_ids),
         "signal_date": sig_date,
+        "width": str(width),
+        "legs_kind": "SAME_SHORTS",
     }
-    outs["width"] = str(width)
-    outs["legs_kind"] = "SAME_SHORTS"
     for k,v in outs.items(): goutput(k, v)
 
     print(f"GUARD DECISION: action={action} rem_qty={rem_qty or 'NA'} width={width} open_order_ids={outs['open_order_ids']}")
