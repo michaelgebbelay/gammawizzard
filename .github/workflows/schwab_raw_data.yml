@@ -35,8 +35,21 @@ jobs:
 
       - name: Install deps
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install --upgrade pip setuptools wheel
+          # Ensure transitive import requirement is present even if requirements.txt misses it
+          python -m pip install -U packaging
+          python -m pip install -r requirements.txt
+          # Catch missing/contradictory deps early
+          pip check
+
+      - name: Import smoke test
+        run: |
+          python - <<'PY'
+          import googleapiclient.discovery
+          import google.api_core
+          import packaging
+          print("Imports OK")
+          PY
 
       - name: Compute dump params
         id: dump_params
@@ -91,6 +104,7 @@ jobs:
       #     SETTLE_BACKFILL_DAYS: "180"
       #   run: |
       #     python scripts/data/gw_settlements_to_sheet.py
+
       - name: Build Standard orig orders from sw_txn_raw (only)
         env:
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
