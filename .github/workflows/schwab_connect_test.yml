@@ -25,4 +25,4 @@ jobs:
           # Optional if you want to test an option quote too:
           # TEST_OCC:          ${{ secrets.TEST_OCC }}
         run: |
-          python scripts/data/test_schwab_connect.py
+          python scripts/trade/accelerator/test_schwab_connect.py
