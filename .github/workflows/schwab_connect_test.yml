@@ -13,9 +13,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: |
+
+      - name: Install deps
+        run: |
           python -m pip install --upgrade pip
-          pip install pandas schwab-py pytz
+          pip install pandas pytz schwab-py
+
+      - name: Write test script
+        run: |
+          mkdir -p scripts/trade/accelerator
+          cat > scripts/trade/accelerator/test_schwab_for_date.py << 'PY'
+          # (contents exactly as in Option A above)
+          PY
+
       - name: Run test for date
         env:
           SCHWAB_APP_KEY:    ${{ secrets.SCHWAB_APP_KEY }}
