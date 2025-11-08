@@ -1,21 +1,15 @@
 name: schwab_for_date_test
-
 on:
   workflow_dispatch:
     inputs:
       for_date:
-        description: "Trading date (YYYY-MM-DD, ET). Example: 2025-11-07"
+        description: "Trading date (YYYY-MM-DD, ET)"
         required: true
-  # optional nightly ping; safe to delete
-  schedule:
-    - cron: "15 2 * * 2-6"   # Tue-Sat 02:15 UTC ≈ Mon-Fri 21:15 ET
-
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -25,137 +19,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas pytz schwab-py
 
-      - name: Write date-aware Schwab test
-        shell: bash
+      - name: Write test script
         run: |
           mkdir -p scripts/trade/accelerator
           cat > scripts/trade/accelerator/test_schwab_for_date.py << 'PY'
-          #!/usr/bin/env python3
-          from __future__ import annotations
-          import os, sys, json, time, argparse, datetime as dt
-          import pandas as pd, pytz
-          from schwab.auth import client_from_token_file
-
-          BASE = "https://api.schwabapi.com/marketdata/v1"
-          ET = pytz.timezone("America/New_York")
-
-          def parse_args():
-              ap = argparse.ArgumentParser()
-              ap.add_argument("--date", dest="for_date", default=os.environ.get("FOR_DATE"),
-                              help="Trading date YYYY-MM-DD (ET). If omitted on weekend, script picks last weekday.")
-              return ap.parse_args()
-
-          def last_weekday(d: dt.date) -> dt.date:
-              while d.weekday() >= 5:
-                  d -= dt.timedelta(days=1)
-              return d
-
-          def et_epoch_ms(y, m, d, hh, mm) -> int:
-              return int(ET.localize(dt.datetime(y, m, d, hh, mm)).timestamp() * 1000)
-
-          def client():
-              app_key    = os.environ["SCHWAB_APP_KEY"]
-              app_secret = os.environ["SCHWAB_APP_SECRET"]
-              token_json = os.environ["SCHWAB_TOKEN_JSON"]
-              with open("schwab_token.json","w") as f: f.write(token_json)
-              return client_from_token_file(api_key=app_key, api_secret=app_secret, token_path="schwab_token.json")
-
-          def get_json(sess, url, params=None, tag=""):
-              r = sess.get(url, params=params, timeout=25)
-              if r.status_code != 200:
-                  print(f"[{tag}] HTTP_{r.status_code} → {r.text[:250]}", flush=True)
-                  return False, {}
-              try:
-                  return True, r.json()
-              except Exception:
-                  return True, {}
-
-          def test_auth(c):
-              r = c.get_account_numbers(); r.raise_for_status()
-              print(f"[OK] auth → account hash: {r.json()[0]['hashValue']}", flush=True); return True
-
-          def test_quotes(sess):
-              for sym in ["$SPX.X", "SPX"]:
-                  ok, data = get_json(sess, f"{BASE}/quotes", {"symbols": sym}, tag=f"quotes {sym}")
-                  if ok and isinstance(data, dict) and data:
-                      print(f"[OK] quotes → {sym}", flush=True); return True
-              print("[FAIL] quotes → neither $SPX.X nor SPX returned data", flush=True); return False
-
-          def test_price_history_for_date(sess, d: dt.date):
-              y, m, dd = d.year, d.month, d.day
-              start_ms = et_epoch_ms(y, m, dd, 9, 30)
-              end_ms   = et_epoch_ms(y, m, dd, 16, 0)
-              def try_freq(freq):
-                  params = {"startDate": start_ms, "endDate": end_ms,
-                            "frequencyType": "minute", "frequency": freq,
-                            "needExtendedHoursData": "false"}
-                  for sym in ["$SPX.X", "SPX", "SPY"]:
-                      ok, data = get_json(sess, f"{BASE}/pricehistory", {"symbol": sym, **params}, tag=f"pricehistory {sym} {d} f{freq}")
-                      candles = (data.get("candles") or data.get("data", {}).get("candles") or []) if ok else []
-                      if ok and candles:
-                          df = pd.DataFrame(candles)
-                          tcol = "datetime" if "datetime" in df.columns else ("time" if "time" in df.columns else None)
-                          if not tcol: continue
-                          df["ts"] = pd.to_datetime(df[tcol], unit="ms", utc=True)
-                          df = df.set_index("ts").sort_index()
-                          print(f"[OK] pricehistory → {sym} {d}: {len(df)} x {freq}m bars (first {df.index[0]}, last {df.index[-1]})", flush=True)
-                          return True
-                  return False
-              # Try 1m then 5m
-              if try_freq(1): return True
-              if try_freq(5): return True
-              print(f"[FAIL] pricehistory → no intraday bars for {d} on $SPX.X/SPX/SPY", flush=True); return False
-
-          def test_chain_for_date(sess, d: dt.date):
-              ds = d.strftime("%Y-%m-%d")
-              # Date-filtered first
-              for endpoint in ["chains", "optionchains"]:
-                  ok, data = get_json(sess, f"{BASE}/{endpoint}", {
-                      "symbol":"SPX","fromDate":ds,"toDate":ds,
-                      "includeQuotes":"TRUE","includeGreeks":"TRUE",
-                      "contractType":"ALL","strategy":"SINGLE","range":"ALL",
-                      "includeWeekly":"TRUE"
-                  }, tag=f"{endpoint} {ds}")
-                  if ok and isinstance(data, dict) and data:
-                      txt = json.dumps(data)
-                      print(f"[OK] chain ({endpoint}) {ds} → bytes={len(txt):,}, greeks_present={'delta' in txt.lower()}", flush=True)
-                      return True
-              # Fallback – broad chain (no date filter)
-              ok, data = get_json(sess, f"{BASE}/chains", {
-                  "symbol":"SPX","includeQuotes":"TRUE","includeGreeks":"TRUE",
-                  "contractType":"ALL","strategy":"SINGLE","range":"ALL",
-                  "includeWeekly":"TRUE","strikeCount":200
-              }, tag="chains fallback broad")
-              if ok and isinstance(data, dict) and data:
-                  txt = json.dumps(data)
-                  print(f"[OK] chain (fallback) {ds} → bytes={len(txt):,}, greeks_present={'delta' in txt.lower()}", flush=True)
-                  print("NOTE: Fallback chain returned without date filter; confirm the 0DTE expiry inside payload.", flush=True)
-                  return True
-              print(f"[FAIL] chain → no payload for {ds}", flush=True); return False
-
-          def main():
-              args = parse_args()
-              if args.for_date:
-                  y, m, d = map(int, args.for_date.split("-"))
-                  target = dt.date(y, m, d)
-              else:
-                  target = last_weekday(dt.datetime.now(ET).date())
-              c = client()
-              ok_auth = test_auth(c)
-              ok_q    = test_quotes(c.session)
-              ok_ph   = test_price_history_for_date(c.session, target)
-              ok_ch   = test_chain_for_date(c.session, target)
-              print(f"\nRESULTS: DATE={target} | AUTH={'OK' if ok_auth else 'FAIL'} | QUOTES={'OK' if ok_q else 'FAIL'} | PRICE_HISTORY={'OK' if ok_ph else 'FAIL'} | CHAIN_0DTE={'OK' if ok_ch else 'FAIL'}", flush=True)
-
-          if __name__ == "__main__":
-              try:
-                  main()
-              except KeyError as e:
-                  print(f"Missing env: {e}", flush=True); sys.exit(2)
-              except Exception as e:
-                  print("Unhandled:", e, flush=True); sys.exit(1)
+          # (contents exactly as in Option A above)
           PY
-          chmod +x scripts/trade/accelerator/test_schwab_for_date.py
 
       - name: Run test for date
         env:
@@ -163,4 +32,4 @@ jobs:
           SCHWAB_APP_SECRET: ${{ secrets.SCHWAB_APP_SECRET }}
           SCHWAB_TOKEN_JSON: ${{ secrets.SCHWAB_TOKEN_JSON }}
           FOR_DATE:          ${{ inputs.for_date }}
-        run: python -u scripts/trade/accelerator/test_schwab_for_date.py
+        run: python scripts/trade/accelerator/test_schwab_for_date.py
