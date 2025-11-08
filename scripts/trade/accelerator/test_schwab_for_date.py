@@ -2,14 +2,13 @@
 """
 Schwab data test for a specific trading date (ET):
 - Auth sanity
-- Quotes ($SPX.X / SPX)
+- Quotes ($SPX.X / SPX fallback)
 - 1m price history for the requested date (09:30–16:00 ET)
 - SPXW 0DTE option chain for that date (quotes+greeks)
 
 Usage:
   FOR_DATE=2025-11-07 python scripts/trade/accelerator/test_schwab_for_date.py
-or:
-  python scripts/trade/accelerator/test_schwab_for_date.py --date 2025-11-07
+  or: python .../test_schwab_for_date.py --date 2025-11-07
 
 Env required (same as your placer):
   SCHWAB_APP_KEY, SCHWAB_APP_SECRET, SCHWAB_TOKEN_JSON
@@ -30,7 +29,7 @@ def parse_args():
     return ap.parse_args()
 
 def last_weekday(d: dt.date) -> dt.date:
-    while d.weekday() >= 5:  # 5=Sat, 6=Sun
+    while d.weekday() >= 5:
         d -= dt.timedelta(days=1)
     return d
 
@@ -74,15 +73,13 @@ def test_price_history_for_date(sess, d: dt.date):
         "frequencyType": "minute", "frequency": 1,
         "needExtendedHoursData": "false"
     }
-    # Try SPX index first; if tenant doesn’t return 1m for SPX, fall back to SPY
     for sym in ["$SPX.X", "SPX", "SPY"]:
         ok, data = get_json(sess, f"{BASE}/pricehistory", {"symbol": sym, **params}, tag=f"pricehistory {sym} {d}")
         candles = (data.get("candles") or data.get("data", {}).get("candles") or []) if ok else []
         if ok and candles:
             df = pd.DataFrame(candles)
             tcol = "datetime" if "datetime" in df.columns else ("time" if "time" in df.columns else None)
-            if not tcol:
-                continue
+            if not tcol: continue
             df["ts"] = pd.to_datetime(df[tcol], unit="ms", utc=True)
             df = df.set_index("ts").sort_index()
             print(f"[OK] pricehistory → {sym} {d}: {len(df)} x 1m bars (first {df.index[0]}, last {df.index[-1]})")
@@ -92,6 +89,7 @@ def test_price_history_for_date(sess, d: dt.date):
 
 def test_chain_for_date(sess, d: dt.date):
     ds = d.strftime("%Y-%m-%d")
+    # Try date-filtered first
     for endpoint in ["chains", "optionchains"]:
         ok, data = get_json(sess, f"{BASE}/{endpoint}", {
             "symbol": "SPX",
@@ -104,6 +102,18 @@ def test_chain_for_date(sess, d: dt.date):
             has_delta = "delta" in txt.lower()
             print(f"[OK] chain ({endpoint}) {ds} → payload {len(txt):,} bytes; greeks_present={has_delta}")
             return True
+    # Fallback: broad chain, then you can filter expirations client-side
+    ok, data = get_json(sess, f"{BASE}/chains", {
+        "symbol": "SPX", "includeQuotes": "TRUE", "includeGreeks": "TRUE",
+        "strategy": "SINGLE", "contractType": "ALL", "range": "ALL",
+        "includeWeekly": "TRUE", "strikeCount": 200
+    }, tag="chains fallback broad")
+    if ok and isinstance(data, dict) and data:
+        txt = json.dumps(data)
+        has_delta = "delta" in txt.lower()
+        print(f"[OK] chain (fallback) {ds} → payload {len(txt):,} bytes; greeks_present={has_delta}")
+        print("NOTE: Chain returned without date filter; confirm the expiry for 0DTE in payload.")
+        return True
     print(f"[FAIL] chain → no payload for {ds} (check entitlements or endpoint)")
     return False
 
@@ -113,7 +123,7 @@ def main():
         y, m, d = map(int, args.for_date.split("-"))
         target = dt.date(y, m, d)
     else:
-        target = last_weekday(dt.datetime.now(ET).date())  # if weekend, use last Friday
+        target = last_weekday(dt.datetime.now(ET).date())
 
     c = client()
     ok_auth = test_auth(c)
