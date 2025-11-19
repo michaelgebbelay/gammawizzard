@@ -219,7 +219,12 @@ def main():
         risk_w = 5.0                    # long IC is always 5‑wide in this flow
         denom  = SIZING_PER_LONG        # 1 long IC per $SIZING_PER_LONG
 
-    qty = max(1, _round_half_up((float(oc_val) if oc_val is not None else 0.0) / max(1e-9, denom)))
+    # Fixed quantity (defaults to 2) regardless of balance unless FIXED_QTY overridden.
+    fixed_qty_raw = (os.environ.get("FIXED_QTY","2") or "").strip()
+    try:
+        qty = max(1, int(fixed_qty_raw))
+    except Exception:
+        qty = 2
 
     # Manual qty override if provided (BYPASS_QTY in workflow)
     qov = (os.environ.get("BYPASS_QTY","") or "").strip()
