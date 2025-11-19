@@ -130,4 +130,4 @@ jobs:
         VERBOSE: "1"
         PYTHONUNBUFFERED: "1"
       run: |
-        python scripts/trade/leoprofit_orchestrator.py
+        python scripts/trade/leoprofit/leoprofit_orchestrator.py
