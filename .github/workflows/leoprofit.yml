@@ -74,7 +74,7 @@ jobs:
         # Historical win% used by EV math (keyed by put-width)
         WINP_STD_JSON: '{"5":0.714,"15":0.791,"20":0.816,"25":0.840,"30":0.863,"40":0.889,"50":0.916}'
       run: |
-        python scripts/trade/leoprofit_width_picker.py
+        python scripts/trade/leoprofit/leoprofit_width_picker.py
 
     - name: Show picker outputs
       if: ${{ github.event.inputs.width_picker == 'true' }}
