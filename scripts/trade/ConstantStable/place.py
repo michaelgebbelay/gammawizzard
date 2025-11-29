@@ -1,129 +1,25 @@
 #!/usr/bin/env python3
-# CONSTANT STABLE — vertical orchestrator (10k sizing)
-#
-# - Fetches ConstantStable payload from GammaWizard (UltraPureConstantStable).
-# - Builds 5-wide SPX verticals around Limit / CLimit.
-# - Per side:
-#     LeftGo < 0  → short put vertical (credit)
-#     LeftGo > 0  → long put vertical  (debit)
-#     RightGo < 0 → short call vertical (credit)
-#     RightGo > 0 → long call vertical  (debit)
-# - Sizing:
-#     CS_UNIT_DOLLARS (default 10,000) → units = floor(equity / CS_UNIT_DOLLARS)
-#     per-leg qty = units * (1x weak, 2x strong), strong if |Go| >= CS_STRONG_THRESHOLD
-#   If equity is unavailable or <= 0 → fall back to units = 1 (so it still trades).
-# - Delegates placement + logging to ConstantStable/place.py via VERT_* envs.
+# CONSTANT STABLE — vertical placer
+#  - Places a single SPX vertical (2 legs) as CREDIT or DEBIT
+#  - 0.95 / 1.00 / 1.05 ladder, clamped into NBBO
+#  - Logs trade info to CS_LOG_PATH
 
 import os
 import sys
-import re
-import subprocess
-from datetime import date
-import requests
+import time
+import random
+import csv
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from schwab.auth import client_from_token_file
 
-__version__ = "1.1.0"
-
-GW_BASE = os.environ.get("GW_BASE", "https://gandalf.gammawizard.com").rstrip("/")
-GW_ENDPOINT = os.environ.get("GW_ENDPOINT", "/rapi/GetUltraPureConstantStable").lstrip("/")
-
-CS_UNIT_DOLLARS     = float(os.environ.get("CS_UNIT_DOLLARS", "10000"))
-CS_STRONG_THRESHOLD = float(os.environ.get("CS_STRONG_THRESHOLD", "0.66"))
-CS_LOG_PATH         = os.environ.get("CS_LOG_PATH", "logs/constantstable_vertical_trades.csv")
+TICK = 0.05
+ET = ZoneInfo("America/New_York")
 
 
-# ---------- Utility helpers ----------
+def clamp_tick(x: float) -> float:
+    return round(round(float(x) / TICK) * TICK + 1e-12, 2)
 
-def yymmdd(iso: str) -> str:
-    d = date.fromisoformat((iso or "")[:10])
-    return f"{d:%y%m%d}"
-
-
-def to_osi(sym: str) -> str:
-    raw = (sym or "").strip().upper().lstrip(".").replace("_", "")
-    m = (
-        re.match(r"^([A-Z.$^]{1,6})(\d{6})([CP])(\d{1,5})(?:\.(\d{1,3}))?$", raw)
-        or re.match(r"^([A-Z.$^]{1,6})(\d{6})([CP])(\d{8})$", raw)
-    )
-    if not m:
-        raise ValueError(f"Cannot parse option symbol: {sym}")
-    root, ymd, cp, strike, frac = (m.groups() + ("",))[:5]
-    if len(strike) < 8:
-        mills = int(strike) * 1000 + (int((frac or "0").ljust(3, "0")) if frac else 0)
-    else:
-        mills = int(strike)
-    return f"{root:<6}{ymd}{cp}{int(mills):08d}"
-
-
-def fnum(x):
-    try:
-        return float(x)
-    except Exception:
-        return None
-
-
-# ---------- GammaWizard (ConstantStable) ----------
-
-def _sanitize_token(t: str) -> str:
-    t = (t or "").strip().strip('"').strip("'")
-    return t.split(None, 1)[1] if t.lower().startswith("bearer ") else t
-
-
-def gw_fetch():
-    base = GW_BASE
-    endpoint = GW_ENDPOINT
-    tok = _sanitize_token(os.environ.get("GW_TOKEN", "") or "")
-
-    url = f"{base}/{endpoint}"
-    print("CS_VERT_RUN GW URL:", url)
-
-    def hit(tkn):
-        h = {"Accept": "application/json"}
-        if tkn:
-            h["Authorization"] = f"Bearer {_sanitize_token(tkn)}"
-        return requests.get(url, headers=h, timeout=30)
-
-    r = hit(tok) if tok else None
-    if (r is None) or (r.status_code in (401, 403)):
-        email = os.environ.get("GW_EMAIL", "")
-        pwd = os.environ.get("GW_PASSWORD", "")
-        if not (email and pwd):
-            raise RuntimeError("GW_AUTH_REQUIRED")
-        rr = requests.post(
-            f"{base}/goauth/authenticateFireUser",
-            data={"email": email, "password": pwd},
-            timeout=30,
-        )
-        rr.raise_for_status()
-        t = rr.json().get("token") or ""
-        r = hit(t)
-
-    r.raise_for_status()
-    return r.json()
-
-
-def extract_trade(j):
-    if isinstance(j, dict):
-        if "Trade" in j:
-            tr = j["Trade"]
-            return tr[-1] if isinstance(tr, list) and tr else tr if isinstance(tr, dict) else {}
-        keys = ("Date", "TDate", "Limit", "CLimit", "Cat1", "Cat2", "LeftGo", "RightGo")
-        if any(k in j for k in keys):
-            return j
-        for v in j.values():
-            if isinstance(v, (dict, list)):
-                t = extract_trade(v)
-                if t:
-                    return t
-    if isinstance(j, list):
-        for it in reversed(j):
-            t = extract_trade(it)
-            if t:
-                return t
-    return {}
-
-
-# ---------- Schwab helpers ----------
 
 def schwab_client():
     app_key = os.environ["SCHWAB_APP_KEY"]
@@ -131,304 +27,341 @@ def schwab_client():
     token_json = os.environ["SCHWAB_TOKEN_JSON"]
     with open("schwab_token.json", "w") as f:
         f.write(token_json)
-    c = client_from_token_file(
-        api_key=app_key,
-        app_secret=app_secret,
-        token_path="schwab_token.json",
-    )
-    return c
-
-
-def opening_cash_for_account(c, prefer_number=None):
-    """
-    Try to find a reasonable "equity / cash available" number.
-
-    Returns (value_or_None, source_key, acct_number).
-    """
-    r = c.get_accounts()
-    r.raise_for_status()
-    data = r.json()
-    arr = data if isinstance(data, list) else [data]
-
-    if prefer_number is None:
-        try:
-            rr = c.get_account_numbers()
-            rr.raise_for_status()
-            prefer_number = str((rr.json() or [{}])[0].get("accountNumber") or "")
-        except Exception:
-            prefer_number = None
-
-    def hunt(a):
-        acct_id = None
-        init = {}
-        curr = {}
-        stack = [a]
-        while stack:
-            x = stack.pop()
-            if isinstance(x, dict):
-                if acct_id is None and x.get("accountNumber"):
-                    acct_id = str(x["accountNumber"])
-                if "initialBalances" in x and isinstance(x["initialBalances"], dict):
-                    init = x["initialBalances"]
-                if "currentBalances" in x and isinstance(x["currentBalances"], dict):
-                    curr = x["currentBalances"]
-                for v in x.values():
-                    if isinstance(v, (dict, list)):
-                        stack.append(v)
-            elif isinstance(x, list):
-                stack.extend(x)
-        return acct_id, init, curr
-
-    chosen = None
-    acct_num = ""
-    for a in arr:
-        aid, init, curr = hunt(a)
-        if prefer_number and aid == prefer_number:
-            chosen = (init, curr)
-            acct_num = aid
-            break
-        if chosen is None:
-            chosen = (init, curr)
-            acct_num = aid
-
-    if not chosen:
-        return None, "none", ""
-
-    init, curr = chosen
-
-    keys = [
-        "cashAvailableForTrading",
-        "cashBalance",
-        "availableFundsNonMarginableTrade",
-        "buyingPowerNonMarginableTrade",
-        "buyingPower",
-        "optionBuyingPower",
-        "liquidationValue",
-    ]
-
-    def pick(src):
-        for k in keys:
-            v = (src or {}).get(k)
-            if isinstance(v, (int, float)):
-                return float(v), k
-        return None
-
-    for src in (init, curr):
-        got = pick(src)
-        if got:
-            return got[0], got[1], acct_num
-
-    return None, "none", acct_num
-
-
-def get_account_hash(c):
+    c = client_from_token_file(api_key=app_key,
+                               app_secret=app_secret,
+                               token_path="schwab_token.json")
     r = c.get_account_numbers()
     r.raise_for_status()
-    arr = r.json() or []
-    if not arr:
-        return ""
-    info = arr[0]
-    return str(info.get("hashValue") or info.get("hashvalue") or "")
+    info = (r.json() or [{}])[0]
+    acct_hash = str(info.get("hashValue") or "")
+    return c, acct_hash
 
 
-def ensure_log_dir():
-    d = os.path.dirname(CS_LOG_PATH)
+def fetch_bid_ask(c, osi: str):
+    r = c.get_quote(osi)
+    if r.status_code != 200:
+        return (None, None)
+    d = list(r.json().values())[0] if isinstance(r.json(), dict) else {}
+    q = d.get("quote", d)
+    b = q.get("bidPrice") or q.get("bid") or q.get("bidPriceInDouble")
+    a = q.get("askPrice") or q.get("ask") or q.get("askPriceInDouble")
+    return (
+        float(b) if b is not None else None,
+        float(a) if a is not None else None,
+    )
+
+
+def vertical_nbbo(side: str, short_osi: str, long_osi: str, c):
+    """
+    NBBO for a vertical built from legs:
+      CREDIT: vertical = short - long
+      DEBIT : vertical = long - short
+    """
+    sb, sa = fetch_bid_ask(c, short_osi)
+    lb, la = fetch_bid_ask(c, long_osi)
+    if None in (sb, sa, lb, la):
+        return (None, None, None)
+
+    if side == "CREDIT":
+        bid = sb - la
+        ask = sa - lb
+    else:  # DEBIT
+        bid = lb - sa
+        ask = la - sb
+
+    bid = clamp_tick(bid)
+    ask = clamp_tick(ask)
+    mid = clamp_tick((bid + ask) / 2.0)
+    return bid, ask, mid
+
+
+def order_payload_vertical(side: str,
+                           short_osi: str,
+                           long_osi: str,
+                           price: float,
+                           qty: int):
+    """
+    side = "CREDIT" or "DEBIT"
+
+    We always BUY the long leg and SELL the short leg.
+    """
+    side = side.upper()
+    if side not in ("CREDIT", "DEBIT"):
+        raise ValueError("VERT_SIDE must be CREDIT or DEBIT")
+
+    order_type = "NET_CREDIT" if side == "CREDIT" else "NET_DEBIT"
+
+    return {
+        "orderType": order_type,
+        "session": "NORMAL",
+        "price": f"{clamp_tick(price):.2f}",
+        "duration": "DAY",
+        "orderStrategyType": "SINGLE",
+        "complexOrderStrategyType": "VERTICAL",
+        "orderLegCollection": [
+            {
+                "instruction": "BUY_TO_OPEN",
+                "positionEffect": "OPENING",
+                "quantity": qty,
+                "instrument": {"symbol": long_osi, "assetType": "OPTION"},
+            },
+            {
+                "instruction": "SELL_TO_OPEN",
+                "positionEffect": "OPENING",
+                "quantity": qty,
+                "instrument": {"symbol": short_osi, "assetType": "OPTION"},
+            },
+        ],
+    }
+
+
+def parse_order_id(r):
+    try:
+        j = r.json()
+        if isinstance(j, dict):
+            oid = j.get("orderId") or j.get("order_id")
+            if oid:
+                return str(oid)
+    except Exception:
+        pass
+    loc = r.headers.get("Location", "")
+    return loc.rstrip("/").split("/")[-1] if loc else ""
+
+
+def post_with_retry(c, url, payload, tag="", tries=6):
+    last = ""
+    for i in range(tries):
+        r = c.session.post(url, json=payload, timeout=20)
+        if r.status_code in (200, 201, 202):
+            return r
+        if r.status_code == 429:
+            wait = min(12.0, 0.6 * (2**i)) + random.uniform(0.0, 0.3)
+            print(f"WARN: place failed — HTTP_429 — backoff {wait:.2f}s [{tag}]")
+            time.sleep(wait)
+            continue
+        last = f"HTTP_{r.status_code}:{(r.text or '')[:200]}"
+        time.sleep(min(6.0, 0.4 * (2**i)))
+    raise RuntimeError(f"POST_FAIL({tag}) {last or 'unknown'}")
+
+
+def get_status(c, acct_hash: str, oid: str):
+    url = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
+    try:
+        r = c.session.get(url, timeout=20)
+        if r.status_code != 200:
+            return {}
+        return r.json() or {}
+    except Exception:
+        return {}
+
+
+def delete_with_retry(c, url, tag="", tries=6):
+    for i in range(tries):
+        r = c.session.delete(url, timeout=20)
+        if r.status_code in (200, 201, 202, 204):
+            return True
+        if r.status_code == 429:
+            wait = min(8.0, 0.5 * (2**i)) + random.uniform(0.0, 0.25)
+            print(f"WARN: cancel failed — HTTP_429 — backoff {wait:.2f}s [{tag}]")
+            time.sleep(wait)
+            continue
+        time.sleep(min(4.0, 0.3 * (2**i)))
+    return False
+
+
+def log_row(row: dict):
+    path = os.environ.get("CS_LOG_PATH", "logs/constantstable_vertical_trades.csv")
+    d = os.path.dirname(path)
     if d and not os.path.exists(d):
         os.makedirs(d, exist_ok=True)
 
+    cols = [
+        "ts_utc",
+        "ts_et",
+        "trade_date",
+        "tdate",
+        "name",
+        "kind",
+        "side",
+        "direction",
+        "short_osi",
+        "long_osi",
+        "go",
+        "strength",
+        "is_strong",
+        "unit_dollars",
+        "oc",
+        "units",
+        "qty_requested",
+        "qty_filled",
+        "ladder_prices",
+        "last_price",
+        "nbbo_bid",
+        "nbbo_ask",
+        "nbbo_mid",
+        "order_ids",
+    ]
 
-# ---------- main ----------
+    write_header = not os.path.exists(path)
+    with open(path, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=cols)
+        if write_header:
+            w.writeheader()
+        w.writerow({k: row.get(k, "") for k in cols})
+
 
 def main():
-    # --- Schwab + equity (with override & fallback) ---
+    side = (os.environ.get("VERT_SIDE", "CREDIT") or "CREDIT").upper()
+    kind = (os.environ.get("VERT_KIND", "PUT") or "PUT").upper()
+    name = os.environ.get("VERT_NAME", "")
+    direction = os.environ.get("VERT_DIRECTION", "")
+    short_osi = os.environ["VERT_SHORT_OSI"]
+    long_osi = os.environ["VERT_LONG_OSI"]
+
+    qty_raw = os.environ.get("VERT_QTY", "1")
     try:
-        c = schwab_client()
-        oc_val, oc_src, acct_num = opening_cash_for_account(c)
-        acct_hash = get_account_hash(c)
-    except Exception as e:
-        print(f"CS_VERT_RUN SKIP: Schwab init failed: {e}")
+        qty = max(1, int(qty_raw))
+    except Exception:
+        qty = 1
+
+    go = os.environ.get("VERT_GO", "")
+    strength = os.environ.get("VERT_STRENGTH", "")
+    is_strong = os.environ.get("VERT_IS_STRONG", "false").lower() == "true"
+
+    trade_date = os.environ.get("VERT_TRADE_DATE", "")
+    tdate = os.environ.get("VERT_TDATE", "")
+    unit_d = os.environ.get("VERT_UNIT_DOLLARS", "")
+    oc = os.environ.get("VERT_OC", "")
+    units = os.environ.get("VERT_UNITS", "")
+
+    STEP_WAIT = float(os.environ.get("VERT_STEP_WAIT", "6"))
+    MAX_LADDER_RUNGS = int(os.environ.get("VERT_MAX_LADDER", "3"))
+
+    print(
+        f"CS_VERT_PLACE START name={name} side={side} kind={kind} "
+        f"short={short_osi} long={long_osi} qty={qty}"
+    )
+
+    c, acct_hash = schwab_client()
+
+    bid, ask, mid = vertical_nbbo(side, short_osi, long_osi, c)
+    print(f"CS_VERT_PLACE NBBO: bid={bid} ask={ask} mid={mid}")
+    if bid is None and ask is None:
+        print("CS_VERT_PLACE: no NBBO — abort")
         return 0
 
-    # Optional manual override for sizing
-    ov_raw = (os.environ.get("SIZING_DOLLARS_OVERRIDE", "") or "").strip()
-    if ov_raw:
-        try:
-            oc_val = float(ov_raw)
-            print(f"CS_VERT_RUN INFO: using SIZING_DOLLARS_OVERRIDE={oc_val}")
-        except Exception:
-            print("CS_VERT_RUN WARN: bad SIZING_DOLLARS_OVERRIDE, ignoring override.")
-
-    print(f"CS_VERT_RUN EQUITY_RAW: {oc_val} (src={oc_src}, acct={acct_num})")
-
-    if oc_val is None or oc_val <= 0:
-        print("CS_VERT_RUN WARN: equity unavailable/<=0 — defaulting to 1 unit for sizing")
-        oc_val = 0.0
-        units = 1
+    # Build ladder 0.95/1.00/1.05, clamped into [bid, ask]
+    if side == "CREDIT":
+        base_ladder = [1.05, 1.00, 0.95]
     else:
-        if CS_UNIT_DOLLARS <= 0:
-            print("CS_VERT_RUN FATAL: CS_UNIT_DOLLARS must be > 0")
-            return 1
-        units = max(1, int(oc_val // CS_UNIT_DOLLARS))
+        base_ladder = [0.95, 1.00, 1.05]
 
-    print(f"CS_VERT_RUN UNITS: {units} (CS_UNIT_DOLLARS={CS_UNIT_DOLLARS}, oc_val={oc_val})")
+    ladder = []
+    seen = set()
+    for p in base_ladder:
+        p_adj = p
+        if bid is not None:
+            p_adj = max(p_adj, bid)
+        if ask is not None:
+            p_adj = min(p_adj, ask)
+        p_adj = clamp_tick(p_adj)
+        if p_adj not in seen:
+            seen.add(p_adj)
+            ladder.append(p_adj)
 
-    # --- ConstantStable payload from GammaWizard ---
-    try:
-        api = gw_fetch()
-        tr = extract_trade(api)
-    except Exception as e:
-        print(f"CS_VERT_RUN SKIP: GW fetch failed: {e}")
+    print(f"CS_VERT_PLACE ladder={ladder}")
+    if not ladder:
+        print("CS_VERT_PLACE: empty ladder after clamping — abort")
         return 0
 
-    if not tr:
-        print("CS_VERT_RUN SKIP: NO_TRADE_PAYLOAD")
-        return 0
+    url_post = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
 
-    trade_date = str(tr.get("Date", ""))
-    tdate_iso = str(tr.get("TDate", ""))
+    filled = 0
+    order_ids = []
+    last_price = None
 
-    exp6 = yymmdd(tdate_iso)
-    inner_put = int(float(tr.get("Limit")))
-    inner_call = int(float(tr.get("CLimit")))
-    width = 5
+    for price in ladder[:MAX_LADDER_RUNGS]:
+        remaining = max(0, qty - filled)
+        if remaining <= 0:
+            break
 
-    # strikes
-    p_low = inner_put - width
-    p_high = inner_put
-    c_low = inner_call
-    c_high = inner_call + width
+        last_price = price
+        payload = order_payload_vertical(side, short_osi, long_osi, price, remaining)
+        print(f"CS_VERT_PLACE rung: price={price:.2f} remaining={remaining}")
 
-    put_low_osi = to_osi(f".SPXW{exp6}P{p_low}")
-    put_high_osi = to_osi(f".SPXW{exp6}P{p_high}")
-    call_low_osi = to_osi(f".SPXW{exp6}C{c_low}")
-    call_high_osi = to_osi(f".SPXW{exp6}C{c_high}")
+        try:
+            r = post_with_retry(c, url_post, payload, tag=f"{name}@{price:.2f}x{remaining}")
+        except Exception as e:
+            print(f"CS_VERT_PLACE ERROR posting order: {e}")
+            continue
 
-    left_go = fnum(tr.get("LeftGo"))
-    right_go = fnum(tr.get("RightGo"))
+        oid = parse_order_id(r)
+        if oid:
+            order_ids.append(oid)
 
-    print(f"CS_VERT_RUN TRADE: Date={trade_date} TDate={tdate_iso}")
-    print(f"  PUT strikes : {p_low} / {p_high}  OSI=({put_low_osi},{put_high_osi})  LeftGo={left_go}")
-    print(f"  CALL strikes: {c_low} / {c_high}  OSI=({call_low_osi},{call_high_osi})  RightGo={right_go}")
-    print(f"CS_VERT_RUN STRONG_THRESHOLD={CS_STRONG_THRESHOLD:.3f} LOG_PATH={CS_LOG_PATH}")
+        t_end = time.time() + STEP_WAIT
+        while time.time() < t_end and oid:
+            st = get_status(c, acct_hash, oid)
+            fq = st.get("filledQuantity") or st.get("filled_quantity") or 0
+            try:
+                fq_int = int(round(float(fq)))
+            except Exception:
+                fq_int = 0
+            if fq_int > filled:
+                filled = fq_int
 
-    ensure_log_dir()
+            s = str(st.get("status") or st.get("orderStatus") or "").upper()
+            if s in ("FILLED", "CANCELED", "REJECTED", "EXPIRED"):
+                break
+            time.sleep(0.4)
 
-    verts = []
+        if filled >= qty:
+            break
 
-    # ----- PUT side: one vertical only -----
-    if left_go is not None and left_go != 0.0:
-        strength = abs(left_go)
-        is_strong = strength >= CS_STRONG_THRESHOLD
-        mult = 2 if is_strong else 1
-        qty = max(1, units * mult)
+        # Cancel unfilled rung before moving to the next price
+        if oid:
+            url_del = (
+                f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
+            )
+            ok = delete_with_retry(c, url_del, tag=f"CANCEL {oid}")
+            print(f"CS_VERT_PLACE CANCEL {oid} → {'OK' if ok else 'FAIL'}")
 
-        if left_go < 0:
-            # Short put vertical (credit): short higher strike, long lower
-            name = "PUT_SHORT"
-            side = "CREDIT"
-            direction = "SHORT"
-            short_osi = put_high_osi
-            long_osi = put_low_osi
-        else:
-            # Long put vertical (debit): buy higher, sell lower
-            name = "PUT_LONG"
-            side = "DEBIT"
-            direction = "LONG"
-            short_osi = put_low_osi
-            long_osi = put_high_osi
+    ts_utc = datetime.now(timezone.utc)
+    ts_et = ts_utc.astimezone(ET)
+    ladder_str = ",".join(f"{p:.2f}" for p in ladder)
 
-        verts.append({
-            "name": name,
-            "kind": "PUT",
-            "side": side,
-            "direction": direction,
-            "short_osi": short_osi,
-            "long_osi": long_osi,
-            "go": left_go,
-            "strength": strength,
-            "is_strong": is_strong,
-            "qty": qty,
-        })
+    row = {
+        "ts_utc": ts_utc.isoformat(),
+        "ts_et": ts_et.isoformat(),
+        "trade_date": trade_date,
+        "tdate": tdate,
+        "name": name,
+        "kind": kind,
+        "side": side,
+        "direction": direction,
+        "short_osi": short_osi,
+        "long_osi": long_osi,
+        "go": go,
+        "strength": strength,
+        "is_strong": str(is_strong).lower(),
+        "unit_dollars": unit_d,
+        "oc": oc,
+        "units": units,
+        "qty_requested": qty,
+        "qty_filled": filled,
+        "ladder_prices": ladder_str,
+        "last_price": f"{last_price:.2f}" if last_price is not None else "",
+        "nbbo_bid": "" if bid is None else f"{bid:.2f}",
+        "nbbo_ask": "" if ask is None else f"{ask:.2f}",
+        "nbbo_mid": "" if mid is None else f"{mid:.2f}",
+        "order_ids": ",".join(order_ids),
+    }
 
-    # ----- CALL side: one vertical only -----
-    if right_go is not None and right_go != 0.0:
-        strength = abs(right_go)
-        is_strong = strength >= CS_STRONG_THRESHOLD
-        mult = 2 if is_strong else 1
-        qty = max(1, units * mult)
-
-        if right_go < 0:
-            # Short call vertical (credit): short LOWER strike, long HIGHER strike
-            name = "CALL_SHORT"
-            side = "CREDIT"
-            direction = "SHORT"
-            short_osi = call_low_osi
-            long_osi = call_high_osi
-        else:
-            # Long call vertical (debit): buy LOWER strike, sell HIGHER strike
-            name = "CALL_LONG"
-            side = "DEBIT"
-            direction = "LONG"
-            short_osi = call_high_osi
-            long_osi = call_low_osi
-
-        verts.append({
-            "name": name,
-            "kind": "CALL",
-            "side": side,
-            "direction": direction,
-            "short_osi": short_osi,
-            "long_osi": long_osi,
-            "go": right_go,
-            "strength": strength,
-            "is_strong": is_strong,
-            "qty": qty,
-        })
-
-    if not verts:
-        print("CS_VERT_RUN SKIP: no nonzero LeftGo/RightGo — no verticals to trade.")
-        return 0
-
-    # ----- Spawn placer per vertical -----
-    for v in verts:
-        strength_s = f"{v['strength']:.3f}"
-        print(
-            f"CS_VERT_RUN {v['name']}: side={v['side']} kind={v['kind']} "
-            f"short={v['short_osi']} long={v['long_osi']} "
-            f"go={v['go']} strength={strength_s} is_strong={v['is_strong']} qty={v['qty']}"
-        )
-
-        env = dict(os.environ)
-        env.update({
-            "VERT_SIDE":        v["side"],
-            "VERT_KIND":        v["kind"],
-            "VERT_NAME":        v["name"],
-            "VERT_DIRECTION":   v["direction"],
-            "VERT_SHORT_OSI":   v["short_osi"],
-            "VERT_LONG_OSI":    v["long_osi"],
-            "VERT_QTY":         str(v["qty"]),
-            "VERT_GO":          "" if v["go"] is None else str(v["go"]),
-            "VERT_STRENGTH":    strength_s,
-            "VERT_IS_STRONG":   "true" if v["is_strong"] else "false",
-            "VERT_TRADE_DATE":  trade_date,
-            "VERT_TDATE":       tdate_iso,
-            "VERT_UNIT_DOLLARS": str(CS_UNIT_DOLLARS),
-            "VERT_OC":          str(oc_val),
-            "VERT_UNITS":       str(units),
-            "SCHWAB_APP_KEY":     os.environ["SCHWAB_APP_KEY"],
-            "SCHWAB_APP_SECRET":  os.environ["SCHWAB_APP_SECRET"],
-            "SCHWAB_TOKEN_JSON":  os.environ["SCHWAB_TOKEN_JSON"],
-            "SCHWAB_ACCT_HASH":   acct_hash,
-            "CS_LOG_PATH":        CS_LOG_PATH,
-        })
-
-        rc = subprocess.call(
-            [sys.executable, "scripts/trade/ConstantStable/place.py"],
-            env=env,
-        )
-        if rc != 0:
-            print(f"CS_VERT_RUN {v['name']}: placer rc={rc}")
-
+    log_row(row)
+    print(
+        f"CS_VERT_PLACE DONE name={name} side={side} kind={kind} "
+        f"qty_req={qty} qty_filled={filled} last_price={last_price}"
+    )
     return 0
 
 
