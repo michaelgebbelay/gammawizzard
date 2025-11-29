@@ -1,0 +1,42 @@
+name: ConstantStableVerticals
+
+on:
+  schedule:
+    # Example: Mon–Fri at 4:10pm ET (21:10 UTC) — adjust as needed
+    - cron: "10 21 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+
+    env:
+      SCHWAB_APP_KEY:     ${{ secrets.SCHWAB_APP_KEY }}
+      SCHWAB_APP_SECRET:  ${{ secrets.SCHWAB_APP_SECRET }}
+      SCHWAB_TOKEN_JSON:  ${{ secrets.SCHWAB_TOKEN_JSON }}
+
+      GW_EMAIL:           ${{ secrets.GW_EMAIL }}
+      GW_PASSWORD:        ${{ secrets.GW_PASSWORD }}
+
+      GW_BASE:            "https://gandalf.gammawizard.com"
+      GW_ENDPOINT:        "/rapi/GetLeoCross"   # override if ConstantStable uses a different API route
+
+      # ConstantStable vertical config
+      CS_UNIT_DOLLARS:     "10000"              # 10k sizing
+      CS_STRONG_THRESHOLD: "0.66"               # 1x vs 2x legs
+      CS_LOG_PATH:         "logs/constantstable_vertical_trades.csv"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run ConstantStable vertical orchestrator
+        run: |
+          python scripts/trade/ConstantStable/orchestrator.py
