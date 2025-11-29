@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 # CONSTANT STABLE — vertical placer
 #  - Places a single SPX vertical (2 legs) as CREDIT or DEBIT
-#  - 0.95 / 1.00 / 1.05 ladder, clamped into NBBO
-#  - Logs trade info to CS_LOG_PATH
+#  - Ladder pricing:
+#       CREDIT: mid+0.05, mid, mid-0.05
+#       DEBIT : mid-0.05, mid, mid+0.05
+#  - Each rung is clamped into NBBO [bid, ask]
+#  - Logs to CS_LOG_PATH
 
 import os
 import sys
@@ -62,6 +65,7 @@ def vertical_nbbo(side: str, short_osi: str, long_osi: str, c):
     if None in (sb, sa, lb, la):
         return (None, None, None)
 
+    side = side.upper()
     if side == "CREDIT":
         bid = sb - la
         ask = sa - lb
@@ -82,8 +86,7 @@ def order_payload_vertical(side: str,
                            qty: int):
     """
     side = "CREDIT" or "DEBIT"
-
-    We always BUY the long leg and SELL the short leg.
+    Always BUY long_osi, SELL short_osi.
     """
     side = side.upper()
     if side not in ("CREDIT", "DEBIT"):
@@ -128,7 +131,7 @@ def parse_order_id(r):
     return loc.rstrip("/").split("/")[-1] if loc else ""
 
 
-def post_with_retry(c, url, payload, tag="", tries=6):
+def post_with_retry(c, url, payload, tag="", tries=3):
     last = ""
     for i in range(tries):
         r = c.session.post(url, json=payload, timeout=20)
@@ -249,17 +252,21 @@ def main():
     if bid is None and ask is None:
         print("CS_VERT_PLACE: no NBBO — abort")
         return 0
+    if mid is None:
+        print("CS_VERT_PLACE: no mid price — abort")
+        return 0
 
-    # Build ladder 0.95/1.00/1.05, clamped into [bid, ask]
+    # Ladder from mid, as requested
     if side == "CREDIT":
-        base_ladder = [1.05, 1.00, 0.95]
-    else:
-        base_ladder = [0.95, 1.00, 1.05]
+        base_ladder = [mid + 0.05, mid, mid - 0.05]
+    else:  # DEBIT
+        base_ladder = [mid - 0.05, mid, mid + 0.05]
 
     ladder = []
     seen = set()
     for p in base_ladder:
         p_adj = p
+        # Clamp into [bid, ask] if those exist
         if bid is not None:
             p_adj = max(p_adj, bid)
         if ask is not None:
@@ -290,7 +297,9 @@ def main():
         print(f"CS_VERT_PLACE rung: price={price:.2f} remaining={remaining}")
 
         try:
-            r = post_with_retry(c, url_post, payload, tag=f"{name}@{price:.2f}x{remaining}")
+            r = post_with_retry(
+                c, url_post, payload, tag=f"{name}@{price:.2f}x{remaining}"
+            )
         except Exception as e:
             print(f"CS_VERT_PLACE ERROR posting order: {e}")
             continue
@@ -318,7 +327,7 @@ def main():
         if filled >= qty:
             break
 
-        # Cancel unfilled rung before moving to the next price
+        # Cancel unfilled rung before moving to next price
         if oid:
             url_del = (
                 f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
