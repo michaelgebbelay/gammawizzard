@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 # CONSTANT STABLE — vertical orchestrator (10k sizing)
-#  - Uses GammaWizard ConstantStable payload.
-#  - Builds 4 SPX 5‑wide verticals:
-#       PUT_SHORT, PUT_LONG, CALL_SHORT, CALL_LONG
-#  - Sizing:
-#       CS_UNIT_DOLLARS (default 10,000) → units = floor(equity / CS_UNIT_DOLLARS)
-#       per‑leg qty = units * (1x weak, 2x strong) where |Go| >= CS_STRONG_THRESHOLD
-#  - If equity is unavailable / <= 0 → fall back to units=1 so it still trades.
-#  - Delegates NBBO + ladder + logging to ConstantStable/place.py via VERT_* envs.
+#
+# - Fetches ConstantStable payload from GammaWizard (UltraPureConstantStable).
+# - Builds 5-wide SPX verticals around Limit / CLimit.
+# - Per side:
+#     LeftGo < 0  → short put vertical (credit)
+#     LeftGo > 0  → long put vertical  (debit)
+#     RightGo < 0 → short call vertical (credit)
+#     RightGo > 0 → long call vertical  (debit)
+# - Sizing:
+#     CS_UNIT_DOLLARS (default 10,000) → units = floor(equity / CS_UNIT_DOLLARS)
+#     per-leg qty = units * (1x weak, 2x strong), strong if |Go| >= CS_STRONG_THRESHOLD
+#   If equity is unavailable or <= 0 → fall back to units = 1 (so it still trades).
+# - Delegates placement + logging to ConstantStable/place.py via VERT_* envs.
 
 import os
 import sys
@@ -17,16 +22,15 @@ from datetime import date
 import requests
 from schwab.auth import client_from_token_file
 
-__version__ = "1.0.3"
+__version__ = "1.1.0"
 
 GW_BASE = os.environ.get("GW_BASE", "https://gandalf.gammawizard.com").rstrip("/")
-# Default endpoint: same as your original ConstantStable orchestrator (GetUltraPureConstantStable path).
-# You can override via env: GW_ENDPOINT="/rapi/WhateverYouActuallyUse"
 GW_ENDPOINT = os.environ.get("GW_ENDPOINT", "/rapi/GetUltraPureConstantStable").lstrip("/")
 
-CS_UNIT_DOLLARS     = float(os.environ.get("CS_UNIT_DOLLARS", "10000"))   # 10k per unit
+CS_UNIT_DOLLARS     = float(os.environ.get("CS_UNIT_DOLLARS", "10000"))
 CS_STRONG_THRESHOLD = float(os.environ.get("CS_STRONG_THRESHOLD", "0.66"))
 CS_LOG_PATH         = os.environ.get("CS_LOG_PATH", "logs/constantstable_vertical_trades.csv")
+
 
 # ---------- Utility helpers ----------
 
@@ -34,15 +38,12 @@ def yymmdd(iso: str) -> str:
     d = date.fromisoformat((iso or "")[:10])
     return f"{d:%y%m%d}"
 
+
 def to_osi(sym: str) -> str:
-    """
-    Normalize an option symbol into OCC OSI.
-    Expects things like .SPXW250321P5000 etc.
-    """
     raw = (sym or "").strip().upper().lstrip(".").replace("_", "")
     m = (
-        re.match(r'^([A-Z.$^]{1,6})(\d{6})([CP])(\d{1,5})(?:\.(\d{1,3}))?$', raw)
-        or re.match(r'^([A-Z.$^]{1,6})(\d{6})([CP])(\d{8})$', raw)
+        re.match(r"^([A-Z.$^]{1,6})(\d{6})([CP])(\d{1,5})(?:\.(\d{1,3}))?$", raw)
+        or re.match(r"^([A-Z.$^]{1,6})(\d{6})([CP])(\d{8})$", raw)
     )
     if not m:
         raise ValueError(f"Cannot parse option symbol: {sym}")
@@ -53,11 +54,13 @@ def to_osi(sym: str) -> str:
         mills = int(strike)
     return f"{root:<6}{ymd}{cp}{int(mills):08d}"
 
+
 def fnum(x):
     try:
         return float(x)
     except Exception:
         return None
+
 
 # ---------- GammaWizard (ConstantStable) ----------
 
@@ -65,21 +68,25 @@ def _sanitize_token(t: str) -> str:
     t = (t or "").strip().strip('"').strip("'")
     return t.split(None, 1)[1] if t.lower().startswith("bearer ") else t
 
+
 def gw_fetch():
     base = GW_BASE
     endpoint = GW_ENDPOINT
     tok = _sanitize_token(os.environ.get("GW_TOKEN", "") or "")
 
+    url = f"{base}/{endpoint}"
+    print("CS_VERT_RUN GW URL:", url)
+
     def hit(tkn):
         h = {"Accept": "application/json"}
         if tkn:
             h["Authorization"] = f"Bearer {_sanitize_token(tkn)}"
-        return requests.get(f"{base}/{endpoint}", headers=h, timeout=30)
+        return requests.get(url, headers=h, timeout=30)
 
     r = hit(tok) if tok else None
     if (r is None) or (r.status_code in (401, 403)):
         email = os.environ.get("GW_EMAIL", "")
-        pwd   = os.environ.get("GW_PASSWORD", "")
+        pwd = os.environ.get("GW_PASSWORD", "")
         if not (email and pwd):
             raise RuntimeError("GW_AUTH_REQUIRED")
         rr = requests.post(
@@ -94,10 +101,8 @@ def gw_fetch():
     r.raise_for_status()
     return r.json()
 
+
 def extract_trade(j):
-    """
-    Walk arbitrary GW payloads and extract the innermost ConstantStable trade dict.
-    """
     if isinstance(j, dict):
         if "Trade" in j:
             tr = j["Trade"]
@@ -117,26 +122,28 @@ def extract_trade(j):
                 return t
     return {}
 
+
 # ---------- Schwab helpers ----------
 
 def schwab_client():
-    app_key    = os.environ["SCHWAB_APP_KEY"]
+    app_key = os.environ["SCHWAB_APP_KEY"]
     app_secret = os.environ["SCHWAB_APP_SECRET"]
     token_json = os.environ["SCHWAB_TOKEN_JSON"]
     with open("schwab_token.json", "w") as f:
         f.write(token_json)
-    # Correct signature: app_secret (not api_secret)
-    return client_from_token_file(
+    c = client_from_token_file(
         api_key=app_key,
         app_secret=app_secret,
         token_path="schwab_token.json",
     )
+    return c
+
 
 def opening_cash_for_account(c, prefer_number=None):
     """
     Try to find a reasonable "equity / cash available" number.
 
-    Returns (value, source_key, acct_number).
+    Returns (value_or_None, source_key, acct_number).
     """
     r = c.get_accounts()
     r.raise_for_status()
@@ -213,6 +220,7 @@ def opening_cash_for_account(c, prefer_number=None):
 
     return None, "none", acct_num
 
+
 def get_account_hash(c):
     r = c.get_account_numbers()
     r.raise_for_status()
@@ -222,91 +230,12 @@ def get_account_hash(c):
     info = arr[0]
     return str(info.get("hashValue") or info.get("hashvalue") or "")
 
-# ---------- Vertical building ----------
-
-def build_verticals(tr: dict):
-    """
-    Build the 4 ConstantStable verticals, each 5‑wide around Limit / CLimit.
-
-    Returns a list of dicts with:
-      name, kind, side, direction, short_osi, long_osi, go, strength, width
-    """
-    exp_iso = str(tr.get("TDate", ""))
-    exp6    = yymmdd(exp_iso)
-
-    inner_put  = int(float(tr.get("Limit")))
-    inner_call = int(float(tr.get("CLimit")))
-    W = 5
-
-    # Put strikes
-    p_low  = inner_put - W
-    p_high = inner_put
-
-    # Call strikes
-    c_low  = inner_call
-    c_high = inner_call + W
-
-    put_low_osi   = to_osi(f".SPXW{exp6}P{p_low}")
-    put_high_osi  = to_osi(f".SPXW{exp6}P{p_high}")
-    call_low_osi  = to_osi(f".SPXW{exp6}C{c_low}")
-    call_high_osi = to_osi(f".SPXW{exp6}C{c_high}")
-
-    left_go  = fnum(tr.get("LeftGo"))
-    right_go = fnum(tr.get("RightGo"))
-    lg_abs = abs(left_go)  if left_go  is not None else 0.0
-    rg_abs = abs(right_go) if right_go is not None else 0.0
-
-    return [
-        {
-            "name": "PUT_SHORT",
-            "kind": "PUT",
-            "side": "CREDIT",
-            "direction": "SHORT",
-            "short_osi": put_high_osi,
-            "long_osi":  put_low_osi,
-            "go": left_go,
-            "strength": lg_abs,
-            "width": W,
-        },
-        {
-            "name": "PUT_LONG",
-            "kind": "PUT",
-            "side": "DEBIT",
-            "direction": "LONG",
-            "short_osi": put_low_osi,
-            "long_osi":  put_high_osi,
-            "go": left_go,
-            "strength": lg_abs,
-            "width": W,
-        },
-        {
-            "name": "CALL_SHORT",
-            "kind": "CALL",
-            "side": "CREDIT",
-            "direction": "SHORT",
-            "short_osi": call_high_osi,
-            "long_osi":  call_low_osi,
-            "go": right_go,
-            "strength": rg_abs,
-            "width": W,
-        },
-        {
-            "name": "CALL_LONG",
-            "kind": "CALL",
-            "side": "DEBIT",
-            "direction": "LONG",
-            "short_osi": call_low_osi,
-            "long_osi":  call_high_osi,
-            "go": right_go,
-            "strength": rg_abs,
-            "width": W,
-        },
-    ]
 
 def ensure_log_dir():
     d = os.path.dirname(CS_LOG_PATH)
     if d and not os.path.exists(d):
         os.makedirs(d, exist_ok=True)
+
 
 # ---------- main ----------
 
@@ -320,7 +249,7 @@ def main():
         print(f"CS_VERT_RUN SKIP: Schwab init failed: {e}")
         return 0
 
-    # Optional manual override for sizing (e.g. in CI / if Schwab fields are funky)
+    # Optional manual override for sizing
     ov_raw = (os.environ.get("SIZING_DOLLARS_OVERRIDE", "") or "").strip()
     if ov_raw:
         try:
@@ -331,7 +260,6 @@ def main():
 
     print(f"CS_VERT_RUN EQUITY_RAW: {oc_val} (src={oc_src}, acct={acct_num})")
 
-    # Fallback: if equity missing /<=0, force 1 unit so we don't perma‑skip
     if oc_val is None or oc_val <= 0:
         print("CS_VERT_RUN WARN: equity unavailable/<=0 — defaulting to 1 unit for sizing")
         oc_val = 0.0
@@ -347,7 +275,7 @@ def main():
     # --- ConstantStable payload from GammaWizard ---
     try:
         api = gw_fetch()
-        tr  = extract_trade(api)
+        tr = extract_trade(api)
     except Exception as e:
         print(f"CS_VERT_RUN SKIP: GW fetch failed: {e}")
         return 0
@@ -357,31 +285,117 @@ def main():
         return 0
 
     trade_date = str(tr.get("Date", ""))
-    tdate_iso  = str(tr.get("TDate", ""))
+    tdate_iso = str(tr.get("TDate", ""))
 
-    verts = build_verticals(tr)
+    exp6 = yymmdd(tdate_iso)
+    inner_put = int(float(tr.get("Limit")))
+    inner_call = int(float(tr.get("CLimit")))
+    width = 5
+
+    # strikes
+    p_low = inner_put - width
+    p_high = inner_put
+    c_low = inner_call
+    c_high = inner_call + width
+
+    put_low_osi = to_osi(f".SPXW{exp6}P{p_low}")
+    put_high_osi = to_osi(f".SPXW{exp6}P{p_high}")
+    call_low_osi = to_osi(f".SPXW{exp6}C{c_low}")
+    call_high_osi = to_osi(f".SPXW{exp6}C{c_high}")
+
+    left_go = fnum(tr.get("LeftGo"))
+    right_go = fnum(tr.get("RightGo"))
 
     print(f"CS_VERT_RUN TRADE: Date={trade_date} TDate={tdate_iso}")
+    print(f"  PUT strikes : {p_low} / {p_high}  OSI=({put_low_osi},{put_high_osi})  LeftGo={left_go}")
+    print(f"  CALL strikes: {c_low} / {c_high}  OSI=({call_low_osi},{call_high_osi})  RightGo={right_go}")
     print(f"CS_VERT_RUN STRONG_THRESHOLD={CS_STRONG_THRESHOLD:.3f} LOG_PATH={CS_LOG_PATH}")
 
     ensure_log_dir()
 
-    # --- Per‑vertical sizing and spawn placer ---
+    verts = []
+
+    # ----- PUT side: one vertical only -----
+    if left_go is not None and left_go != 0.0:
+        strength = abs(left_go)
+        is_strong = strength >= CS_STRONG_THRESHOLD
+        mult = 2 if is_strong else 1
+        qty = max(1, units * mult)
+
+        if left_go < 0:
+            # Short put vertical (credit): short higher strike, long lower
+            name = "PUT_SHORT"
+            side = "CREDIT"
+            direction = "SHORT"
+            short_osi = put_high_osi
+            long_osi = put_low_osi
+        else:
+            # Long put vertical (debit): buy higher, sell lower
+            name = "PUT_LONG"
+            side = "DEBIT"
+            direction = "LONG"
+            short_osi = put_low_osi
+            long_osi = put_high_osi
+
+        verts.append({
+            "name": name,
+            "kind": "PUT",
+            "side": side,
+            "direction": direction,
+            "short_osi": short_osi,
+            "long_osi": long_osi,
+            "go": left_go,
+            "strength": strength,
+            "is_strong": is_strong,
+            "qty": qty,
+        })
+
+    # ----- CALL side: one vertical only -----
+    if right_go is not None and right_go != 0.0:
+        strength = abs(right_go)
+        is_strong = strength >= CS_STRONG_THRESHOLD
+        mult = 2 if is_strong else 1
+        qty = max(1, units * mult)
+
+        if right_go < 0:
+            # Short call vertical (credit): short LOWER strike, long HIGHER strike
+            name = "CALL_SHORT"
+            side = "CREDIT"
+            direction = "SHORT"
+            short_osi = call_low_osi
+            long_osi = call_high_osi
+        else:
+            # Long call vertical (debit): buy LOWER strike, sell HIGHER strike
+            name = "CALL_LONG"
+            side = "DEBIT"
+            direction = "LONG"
+            short_osi = call_high_osi
+            long_osi = call_low_osi
+
+        verts.append({
+            "name": name,
+            "kind": "CALL",
+            "side": side,
+            "direction": direction,
+            "short_osi": short_osi,
+            "long_osi": long_osi,
+            "go": right_go,
+            "strength": strength,
+            "is_strong": is_strong,
+            "qty": qty,
+        })
+
+    if not verts:
+        print("CS_VERT_RUN SKIP: no nonzero LeftGo/RightGo — no verticals to trade.")
+        return 0
+
+    # ----- Spawn placer per vertical -----
     for v in verts:
-        strength   = v["strength"]
-        is_strong  = (strength is not None) and (strength >= CS_STRONG_THRESHOLD)
-        mult       = 2 if is_strong else 1
-        qty        = units * mult
-        strength_s = f"{strength:.3f}" if strength is not None else "0.000"
-
-        if qty <= 0:
-            print(f"CS_VERT_RUN {v['name']}: qty=0 — skip")
-            continue
-
+        strength_s = f"{v['strength']:.3f}"
         print(
             f"CS_VERT_RUN {v['name']}: side={v['side']} kind={v['kind']} "
             f"short={v['short_osi']} long={v['long_osi']} "
-            f"go={v['go']} strength={strength_s} is_strong={is_strong} qty={qty}"
+            f"go={v['go']} strength={strength_s} is_strong={v['is_strong']} qty={v['qty']}"
         )
 
         env = dict(os.environ)
@@ -392,10 +406,10 @@ def main():
             "VERT_DIRECTION":   v["direction"],
             "VERT_SHORT_OSI":   v["short_osi"],
             "VERT_LONG_OSI":    v["long_osi"],
-            "VERT_QTY":         str(qty),
+            "VERT_QTY":         str(v["qty"]),
             "VERT_GO":          "" if v["go"] is None else str(v["go"]),
             "VERT_STRENGTH":    strength_s,
-            "VERT_IS_STRONG":   "true" if is_strong else "false",
+            "VERT_IS_STRONG":   "true" if v["is_strong"] else "false",
             "VERT_TRADE_DATE":  trade_date,
             "VERT_TDATE":       tdate_iso,
             "VERT_UNIT_DOLLARS": str(CS_UNIT_DOLLARS),
@@ -416,6 +430,7 @@ def main():
             print(f"CS_VERT_RUN {v['name']}: placer rc={rc}")
 
     return 0
+
 
 if __name__ == "__main__":
     sys.exit(main())
