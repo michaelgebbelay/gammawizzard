@@ -20,9 +20,9 @@ from schwab.auth import client_from_token_file
 __version__ = "1.0.3"
 
 GW_BASE = os.environ.get("GW_BASE", "https://gandalf.gammawizard.com").rstrip("/")
-# Default endpoint: same as your original ConstantStable orchestrator (LeoProfit path).
+# Default endpoint: same as your original ConstantStable orchestrator (GetUltraPureConstantStable path).
 # You can override via env: GW_ENDPOINT="/rapi/WhateverYouActuallyUse"
-GW_ENDPOINT = os.environ.get("GW_ENDPOINT", "/rapi/GetLeoProfit").lstrip("/")
+GW_ENDPOINT = os.environ.get("GW_ENDPOINT", "/rapi/GetUltraPureConstantStable").lstrip("/")
 
 CS_UNIT_DOLLARS     = float(os.environ.get("CS_UNIT_DOLLARS", "10000"))   # 10k per unit
 CS_STRONG_THRESHOLD = float(os.environ.get("CS_STRONG_THRESHOLD", "0.66"))
