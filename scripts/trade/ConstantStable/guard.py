@@ -15,7 +15,7 @@ CREDIT_MIN_WIDTH     = 5
 
 ET = ZoneInfo("America/New_York")
 GW_BASE = "https://gandalf.gammawizard.com"
-GW_ENDPOINT = "/rapi/GetLeoCross"
+GW_ENDPOINT = "/rapi/GetLeoProfit"
 
 # ------------- small utils -------------
 def goutput(name: str, val: str):
