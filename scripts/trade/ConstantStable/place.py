@@ -191,9 +191,9 @@ if __name__ == "__main__":
 
     # Build 0.95 / 1.00 / 1.05 ladder, clamped into [bid, ask]
     if side == "CREDIT":
-        order_prices = [1.05, 1.00, 0.95]  # richer credit first
+        order_prices = [1.10, 1.05, 1.00, 0.95]  # richer credit first
     else:
-        order_prices = [0.95, 1.00, 1.05]  # cheaper debit first
+        order_prices = [0.90, 0.95, 1.00, 1.05]  # cheaper debit first
 
     ladder = []
     seen = set()
