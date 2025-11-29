@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # CONSTANT STABLE — vertical orchestrator (10k sizing)
-#  - Uses GammaWizard ConstantStable payload (GetLeoCross by default).
+#  - Uses GammaWizard ConstantStable payload.
 #  - Builds 4 SPX 5‑wide verticals:
 #       PUT_SHORT, PUT_LONG, CALL_SHORT, CALL_LONG
 #  - Sizing:
 #       CS_UNIT_DOLLARS (default 10,000) → units = floor(equity / CS_UNIT_DOLLARS)
 #       per‑leg qty = units * (1x weak, 2x strong) where |Go| >= CS_STRONG_THRESHOLD
-#  - If equity is unavailable / <= 0 → fall back to units=1 (so it doesn’t perma‑skip).
+#  - If equity is unavailable / <= 0 → fall back to units=1 so it still trades.
 #  - Delegates NBBO + ladder + logging to ConstantStable/place.py via VERT_* envs.
 
 import os
@@ -17,12 +17,14 @@ from datetime import date
 import requests
 from schwab.auth import client_from_token_file
 
-# ---------- Config ----------
-GW_BASE = os.environ.get("GW_BASE", "https://gandalf.gammawizard.com").rstrip("/")
-# ConstantStable endpoint (override if you have a dedicated one)
-GW_ENDPOINT = os.environ.get("GW_ENDPOINT", "/rapi/GetLeoCross").lstrip("/")
+__version__ = "1.0.3"
 
-CS_UNIT_DOLLARS     = float(os.environ.get("CS_UNIT_DOLLARS", "10000"))   # 10k per "unit"
+GW_BASE = os.environ.get("GW_BASE", "https://gandalf.gammawizard.com").rstrip("/")
+# Default endpoint: same as your original ConstantStable orchestrator (LeoProfit path).
+# You can override via env: GW_ENDPOINT="/rapi/WhateverYouActuallyUse"
+GW_ENDPOINT = os.environ.get("GW_ENDPOINT", "/rapi/GetLeoProfit").lstrip("/")
+
+CS_UNIT_DOLLARS     = float(os.environ.get("CS_UNIT_DOLLARS", "10000"))   # 10k per unit
 CS_STRONG_THRESHOLD = float(os.environ.get("CS_STRONG_THRESHOLD", "0.66"))
 CS_LOG_PATH         = os.environ.get("CS_LOG_PATH", "logs/constantstable_vertical_trades.csv")
 
@@ -123,19 +125,31 @@ def schwab_client():
     token_json = os.environ["SCHWAB_TOKEN_JSON"]
     with open("schwab_token.json", "w") as f:
         f.write(token_json)
-    # NOTE: the correct keyword is app_secret, NOT api_secret
-    return client_from_token_file(api_key=app_key, app_secret=app_secret, token_path="schwab_token.json")
+    # Correct signature: app_secret (not api_secret)
+    return client_from_token_file(
+        api_key=app_key,
+        app_secret=app_secret,
+        token_path="schwab_token.json",
+    )
 
-def opening_cash_for_account(c):
+def opening_cash_for_account(c, prefer_number=None):
     """
     Try to find a reasonable "equity / cash available" number.
 
-    Returns (value_or_None, acct_number_or_empty).
+    Returns (value, source_key, acct_number).
     """
     r = c.get_accounts()
     r.raise_for_status()
     data = r.json()
     arr = data if isinstance(data, list) else [data]
+
+    if prefer_number is None:
+        try:
+            rr = c.get_account_numbers()
+            rr.raise_for_status()
+            prefer_number = str((rr.json() or [{}])[0].get("accountNumber") or "")
+        except Exception:
+            prefer_number = None
 
     def hunt(a):
         acct_id = None
@@ -158,37 +172,46 @@ def opening_cash_for_account(c):
                 stack.extend(x)
         return acct_id, init, curr
 
-    def pick(src):
-        keys = [
-            "cashAvailableForTrading",
-            "cashBalance",
-            "availableFundsNonMarginableTrade",
-            "buyingPowerNonMarginableTrade",
-            "buyingPower",
-            "optionBuyingPower",
-            "liquidationValue",
-        ]
-        for k in keys:
-            v = (src or {}).get(k)
-            if isinstance(v, (int, float)):
-                return float(v)
-        return None
-
-    oc_val = None
+    chosen = None
     acct_num = ""
     for a in arr:
         aid, init, curr = hunt(a)
-        oc_candidate = pick(init)
-        if oc_candidate is None:
-            oc_candidate = pick(curr)
-        if oc_candidate is not None:
-            oc_val = oc_candidate
+        if prefer_number and aid == prefer_number:
+            chosen = (init, curr)
             acct_num = aid
             break
-        if acct_num == "":
-            acct_num = aid or ""
+        if chosen is None:
+            chosen = (init, curr)
+            acct_num = aid
 
-    return oc_val, acct_num
+    if not chosen:
+        return None, "none", ""
+
+    init, curr = chosen
+
+    keys = [
+        "cashAvailableForTrading",
+        "cashBalance",
+        "availableFundsNonMarginableTrade",
+        "buyingPowerNonMarginableTrade",
+        "buyingPower",
+        "optionBuyingPower",
+        "liquidationValue",
+    ]
+
+    def pick(src):
+        for k in keys:
+            v = (src or {}).get(k)
+            if isinstance(v, (int, float)):
+                return float(v), k
+        return None
+
+    for src in (init, curr):
+        got = pick(src)
+        if got:
+            return got[0], got[1], acct_num
+
+    return None, "none", acct_num
 
 def get_account_hash(c):
     r = c.get_account_numbers()
@@ -291,7 +314,7 @@ def main():
     # --- Schwab + equity (with override & fallback) ---
     try:
         c = schwab_client()
-        oc_val, acct_num = opening_cash_for_account(c)
+        oc_val, oc_src, acct_num = opening_cash_for_account(c)
         acct_hash = get_account_hash(c)
     except Exception as e:
         print(f"CS_VERT_RUN SKIP: Schwab init failed: {e}")
@@ -306,7 +329,7 @@ def main():
         except Exception:
             print("CS_VERT_RUN WARN: bad SIZING_DOLLARS_OVERRIDE, ignoring override.")
 
-    print(f"CS_VERT_RUN EQUITY_RAW: {oc_val} (acct={acct_num})")
+    print(f"CS_VERT_RUN EQUITY_RAW: {oc_val} (src={oc_src}, acct={acct_num})")
 
     # Fallback: if equity missing /<=0, force 1 unit so we don't perma‑skip
     if oc_val is None or oc_val <= 0:
