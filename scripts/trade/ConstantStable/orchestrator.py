@@ -262,7 +262,7 @@ def main():
 
     if oc_val is None or oc_val <= 0:
         print("CS_VERT_RUN WARN: equity unavailable/<=0 — defaulting to 1 unit for sizing")
-        oc_val = 0.0
+        oc_val = CS_UNIT_DOLLARS
         units = 1
     else:
         if CS_UNIT_DOLLARS <= 0:
