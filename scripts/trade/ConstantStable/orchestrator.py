@@ -1,12 +1,27 @@
 #!/usr/bin/env python3
 # ORCHESTRATOR — CREDIT: unbalanced IC (Wp, Wc, m=2). DEBIT: symmetric 5‑wide IC.
-# Sizing: CREDIT uses $SIZING_PER_5WIDE per 5‑wide of *put* width; DEBIT uses $SIZING_PER_LONG per 5‑wide long IC.
+# Sizing (this variant): per $ACCOUNT_UNIT_DOLLARS of equity:
+#   - 1x size if both tails are "weak"
+#   - 2x size if either tail is "strong" (|Go| >= GO_STRONG_THRESHOLD)
 
 import os, sys, re, math, json
 from datetime import date
 import requests
 from decimal import Decimal, ROUND_HALF_UP
 from schwab.auth import client_from_token_file
+
+# ---- ConstantStable_1x2x_10K sizing config ----
+GO_STRONG_THRESHOLD = float(os.environ.get("GO_STRONG_THRESHOLD", "0.66"))
+ACCOUNT_UNIT_DOLLARS = float(os.environ.get("ACCOUNT_UNIT_DOLLARS", "10000"))
+
+def fnum(x):
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+def is_strong(go_val: float | None) -> bool:
+    return (go_val is not None) and (abs(go_val) >= GO_STRONG_THRESHOLD)
 
 def yymmdd(iso: str) -> str:
     d = date.fromisoformat((iso or "")[:10]); return f"{d:%y%m%d}"
@@ -174,10 +189,12 @@ def main():
     inner_put  = int(float(tr.get("Limit")))
     inner_call = int(float(tr.get("CLimit")))
 
-    def fnum(x): 
-        try: return float(x)
-        except: return None
-    cat1=fnum(tr.get("Cat1")); cat2=fnum(tr.get("Cat2"))
+    # per-tail signals for strength
+    left_go  = fnum(tr.get("LeftGo"))
+    right_go = fnum(tr.get("RightGo"))
+
+    cat1 = fnum(tr.get("Cat1"))
+    cat2 = fnum(tr.get("Cat2"))
     is_credit = True if (cat2 is None or cat1 is None or cat2>=cat1) else False
 
     SIDE_OVERRIDE = (os.environ.get("SIDE_OVERRIDE","AUTO") or "AUTO").upper()
@@ -209,34 +226,42 @@ def main():
         try: oc_val = float(ov_raw)
         except: pass
 
-    SIZING_PER_5WIDE = float(os.environ.get("SIZING_PER_5WIDE","6000"))
-    SIZING_PER_LONG  = float(os.environ.get("SIZING_PER_LONG","6000"))
-
-    if is_credit:
-        risk_w = float(Wp)              # risk driver = put width
-        denom  = SIZING_PER_5WIDE * (risk_w/5.0)
-    else:
-        risk_w = 5.0                    # long IC is always 5‑wide in this flow
-        denom  = SIZING_PER_LONG        # 1 long IC per $SIZING_PER_LONG
-
-    # Fixed quantity (defaults to 2) regardless of balance unless FIXED_QTY overridden.
-    fixed_qty_raw = (os.environ.get("FIXED_QTY","2") or "").strip()
+    # --- ConstantStable_1x2x_10K sizing ---
     try:
-        qty = max(1, int(fixed_qty_raw))
+        oc_float = float(oc_val)
     except Exception:
-        qty = 2
+        oc_float = 0.0
+
+    base_units = 0
+    if oc_float > 0 and ACCOUNT_UNIT_DOLLARS > 0:
+        base_units = int(oc_float // ACCOUNT_UNIT_DOLLARS)
+        if base_units < 1:
+            base_units = 1
+
+    strong_put = is_strong(left_go)
+    strong_call = is_strong(right_go)
+    structure_mult = 2 if (strong_put or strong_call) else 1
+
+    qty = max(1, base_units * structure_mult) if base_units > 0 else 1
 
     # Manual qty override if provided (BYPASS_QTY in workflow)
     qov = (os.environ.get("BYPASS_QTY","") or "").strip()
     if qov:
-        try: qty = max(1, int(qov))
-        except: pass
+        try:
+            qty = max(1, int(qov))
+        except Exception:
+            pass
 
     side_txt = "CREDIT" if is_credit else "DEBIT"
     struct = "CONDOR_RATIO" if (is_credit and m>1) else "CONDOR"
     print(f"ORCH GATE disabled (MODE={MODE})")
-    print(f"ORCH CONFIG: side={side_txt}, Wp={Wp}, Wc={Wc}, call_mult={m}, mode={MODE}")
-    print(f"ORCH SIZE: base_qty={qty} oc={oc_val:.2f} (src={oc_src}, acct={acct_num}) denom={denom:.2f} structure={struct}")
+    print(
+        f"ORCH SIZE (ConstantStable_1x2x_10K): "
+        f"side={side_txt}, Wp={Wp}, Wc={Wc}, call_mult={m}, "
+        f"qty={qty}, base_units={base_units}, "
+        f"strong_put={strong_put}, strong_call={strong_call}, "
+        f"oc={oc_val:.2f} (src={oc_src}, acct={acct_num}) structure={struct}"
+    )
 
     # Pass to placer via env
     env = dict(os.environ)
