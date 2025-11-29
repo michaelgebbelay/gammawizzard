@@ -123,7 +123,8 @@ def schwab_client():
     token_json = os.environ["SCHWAB_TOKEN_JSON"]
     with open("schwab_token.json", "w") as f:
         f.write(token_json)
-    return client_from_token_file(api_key=app_key, api_secret=app_secret, token_path="schwab_token.json")
+    # NOTE: the correct keyword is app_secret, NOT api_secret
+    return client_from_token_file(api_key=app_key, app_secret=app_secret, token_path="schwab_token.json")
 
 def opening_cash_for_account(c):
     """
