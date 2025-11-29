@@ -19,7 +19,7 @@ jobs:
       GW_PASSWORD:        ${{ secrets.GW_PASSWORD }}
 
       GW_BASE:            "https://gandalf.gammawizard.com"
-      GW_ENDPOINT:        "/rapi/GetLeoCross"   # override if ConstantStable uses a different API route
+      GW_ENDPOINT:        "/rapi/GetUltraPureConstantStable"   # override if ConstantStable uses a different API route
 
       # ConstantStable vertical config
       CS_UNIT_DOLLARS:     "10000"              # 10k sizing
