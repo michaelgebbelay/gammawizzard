@@ -40,3 +40,17 @@ jobs:
       - name: Run ConstantStable vertical orchestrator
         run: |
           python scripts/trade/ConstantStable/orchestrator.py
+
+      - name: Run ConstantStable vertical orchestrator
+        run: |
+          python scripts/trade/ConstantStable/orchestrator.py
+      
+      - name: Push ConstantStable trades to Google Sheets
+        env:
+          GSHEET_ID: ${{ secrets.GSHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          CS_LOG_PATH: logs/constantstable_vertical_trades.csv
+          CS_GSHEET_TAB: "ConstantStableTrades"
+        run: |
+          python scripts/data/cs_trades_to_gsheet.py
+     
