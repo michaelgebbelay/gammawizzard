@@ -1,9 +1,6 @@
 name: ConstantStableVerticals
 
 on:
-  schedule:
-    # Example: Mon–Fri at 4:10pm ET (21:10 UTC) — adjust as needed
-    - cron: "10 21 * * 1-5"
   workflow_dispatch:
 
 jobs:
