@@ -5,13 +5,20 @@
 # - Builds 5-wide SPX verticals around Limit / CLimit.
 # - Per side:
 #     LeftGo < 0  → short put vertical (credit)
-#     LeftGo > 0  → long put vertical  (debit)
+#     LeftGo > 0  → long  put vertical (debit)
 #     RightGo < 0 → short call vertical (credit)
-#     RightGo > 0 → long call vertical  (debit)
+#     RightGo > 0 → long  call vertical (debit)
+#
+# - Strength per leg:
+#     PUT strength  = LImp  if present, else abs(LeftGo)
+#     CALL strength = RImp  if present, else abs(RightGo)
+#     strong if strength >= CS_STRONG_THRESHOLD (default 0.66)
+#     strong → qty = 2 * units; weak → qty = 1 * units
+#
 # - Sizing:
 #     CS_UNIT_DOLLARS (default 10,000) → units = floor(equity / CS_UNIT_DOLLARS)
-#     per-leg qty = units * (1x weak, 2x strong), strong if |Go| >= CS_STRONG_THRESHOLD
-#   If equity is unavailable or <= 0 → fall back to units = 1 (so it still trades).
+#     If Schwab equity is unavailable / <=0 → pretend equity = CS_UNIT_DOLLARS and units = 1.
+#
 # - Delegates placement + logging to ConstantStable/place.py via VERT_* envs.
 
 import os
@@ -22,7 +29,7 @@ from datetime import date
 import requests
 from schwab.auth import client_from_token_file
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 GW_BASE = os.environ.get("GW_BASE", "https://gandalf.gammawizard.com").rstrip("/")
 GW_ENDPOINT = os.environ.get("GW_ENDPOINT", "/rapi/GetUltraPureConstantStable").lstrip("/")
@@ -107,7 +114,7 @@ def extract_trade(j):
         if "Trade" in j:
             tr = j["Trade"]
             return tr[-1] if isinstance(tr, list) and tr else tr if isinstance(tr, dict) else {}
-        keys = ("Date", "TDate", "Limit", "CLimit", "Cat1", "Cat2", "LeftGo", "RightGo")
+        keys = ("Date", "TDate", "Limit", "CLimit", "Cat1", "Cat2", "LeftGo", "RightGo", "LImp", "RImp")
         if any(k in j for k in keys):
             return j
         for v in j.values():
@@ -261,7 +268,7 @@ def main():
     print(f"CS_VERT_RUN EQUITY_RAW: {oc_val} (src={oc_src}, acct={acct_num})")
 
     if oc_val is None or oc_val <= 0:
-        print("CS_VERT_RUN WARN: equity unavailable/<=0 — defaulting to 1 unit for sizing")
+        print("CS_VERT_RUN WARN: equity unavailable/<=0 — defaulting to CS_UNIT_DOLLARS for sizing")
         oc_val = CS_UNIT_DOLLARS
         units = 1
     else:
@@ -303,12 +310,23 @@ def main():
     call_low_osi = to_osi(f".SPXW{exp6}C{c_low}")
     call_high_osi = to_osi(f".SPXW{exp6}C{c_high}")
 
-    left_go = fnum(tr.get("LeftGo"))
-    right_go = fnum(tr.get("RightGo"))
+    left_go   = fnum(tr.get("LeftGo"))
+    right_go  = fnum(tr.get("RightGo"))
+    left_imp  = fnum(tr.get("LImp"))
+    right_imp = fnum(tr.get("RImp"))
+
+    # Strength per leg: prefer LImp/RImp, fallback to abs(Go)
+    put_strength  = left_imp  if left_imp  is not None else (abs(left_go)  if left_go  is not None else 0.0)
+    call_strength = right_imp if right_imp is not None else (abs(right_go) if right_go is not None else 0.0)
 
     print(f"CS_VERT_RUN TRADE: Date={trade_date} TDate={tdate_iso}")
-    print(f"  PUT strikes : {p_low} / {p_high}  OSI=({put_low_osi},{put_high_osi})  LeftGo={left_go}")
-    print(f"  CALL strikes: {c_low} / {c_high}  OSI=({call_low_osi},{call_high_osi})  RightGo={right_go}")
+    print(f"  PUT strikes : {p_low} / {p_high}  OSI=({put_low_osi},{put_high_osi})  LeftGo={left_go} LImp={left_imp}")
+    print(f"  CALL strikes: {c_low} / {c_high}  OSI=({call_low_osi},{call_high_osi})  RightGo={right_go} RImp={right_imp}")
+    print(
+        "CS_VERT_RUN RAW_STRENGTH:",
+        f"put_strength={put_strength:.3f} call_strength={call_strength:.3f}",
+        f"(threshold={CS_STRONG_THRESHOLD:.3f})",
+    )
     print(f"CS_VERT_RUN STRONG_THRESHOLD={CS_STRONG_THRESHOLD:.3f} LOG_PATH={CS_LOG_PATH}")
 
     ensure_log_dir()
@@ -317,7 +335,7 @@ def main():
 
     # ----- PUT side: one vertical only -----
     if left_go is not None and left_go != 0.0:
-        strength = abs(left_go)
+        strength = put_strength
         is_strong = strength >= CS_STRONG_THRESHOLD
         mult = 2 if is_strong else 1
         qty = max(1, units * mult)
@@ -352,7 +370,7 @@ def main():
 
     # ----- CALL side: one vertical only -----
     if right_go is not None and right_go != 0.0:
-        strength = abs(right_go)
+        strength = call_strength
         is_strong = strength >= CS_STRONG_THRESHOLD
         mult = 2 if is_strong else 1
         qty = max(1, units * mult)
