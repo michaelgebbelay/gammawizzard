@@ -1,34 +1,30 @@
 #!/usr/bin/env python3
-# CONSTANT STABLE — vertical placer (fixed waits + refresh rung)
-#  - Places a single SPX vertical (2 legs) as CREDIT or DEBIT
+# CONSTANT STABLE — vertical placer (no gates, fixed waits)
+#  - Starts immediately (no not-before/deadline)
 #  - Ladder (per spec):
 #       CREDIT: mid, mid - 0.05, REFRESH(mid - 0.05)
 #       DEBIT : mid, mid + 0.05, REFRESH(mid + 0.05)
 #  - Fixed timings: 15s per rung, 2s cancel settle (configurable via env)
-#  - Start not before 13:12 ET; stop before 13:15 ET (no wait compression)
-#  - Emits GITHUB_OUTPUT tags: placed, reason, qty_filled, order_ids
+#  - Emits GITHUB_OUTPUT: placed, reason, qty_filled, order_ids
 #  - Logs CSV to CS_LOG_PATH
 #
 # Required env (set by orchestrator/workflow):
 #   SCHWAB_APP_KEY, SCHWAB_APP_SECRET, SCHWAB_TOKEN_JSON
 #   VERT_SIDE, VERT_KIND, VERT_NAME, VERT_DIRECTION, VERT_SHORT_OSI, VERT_LONG_OSI, VERT_QTY
-# Optional env:
+# Optional env (for logging only):
 #   VERT_GO, VERT_STRENGTH, VERT_IS_STRONG, VERT_TRADE_DATE, VERT_TDATE,
-#   VERT_UNIT_DOLLARS, VERT_OC, VERT_UNITS, CS_LOG_PATH, SCHWAB_ACCT_HASH
-#   VERT_STEP_WAIT (default 15), VERT_CANCEL_SETTLE (default 2.0),
-#   VERT_MAX_LADDER (default 3), VERT_MIN_START_HHMM (default 13:12),
-#   VERT_DEADLINE_HHMM (default 13:15)
-#
+#   VERT_UNIT_DOLLARS, VERT_OC, VERT_UNITS, CS_LOG_PATH
+# Optional timings (defaults shown):
+#   VERT_STEP_WAIT=15, VERT_CANCEL_SETTLE=2.0, VERT_MAX_LADDER=3
 import os, sys, time, random, csv
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from schwab.auth import client_from_token_file
 
 TICK = 0.05
 ET = ZoneInfo("America/New_York")
 
-# ---------------- utilities ----------------
-
+# ---------- utils ----------
 def goutput(name: str, val: str):
     p = os.environ.get("GITHUB_OUTPUT")
     if p:
@@ -38,35 +34,14 @@ def goutput(name: str, val: str):
 def clamp_tick(x: float) -> float:
     return round(round(float(x) / TICK) * TICK + 1e-12, 2)
 
-def _parse_hhmm_local_et(hhmm: str | None) -> float | None:
-    if not hhmm or ":" not in hhmm:
-        return None
-    try:
-        h, m = hhmm.split(":")
-        now = datetime.now(ET)
-        ts = now.replace(hour=int(h), minute=int(m), second=0, microsecond=0)
-        if (now - ts) > timedelta(hours=12):
-            ts = ts + timedelta(days=1)
-        return ts.astimezone(timezone.utc).timestamp()
-    except Exception:
-        return None
-
-def now_utc() -> float:
-    return time.time()
-
-def seconds_left(deadline_ts: float | None) -> float | None:
-    return None if deadline_ts is None else max(0.0, deadline_ts - now_utc())
-
-# ---------------- Schwab client ----------------
-
+# ---------- Schwab ----------
 def schwab_client():
     app_key = os.environ["SCHWAB_APP_KEY"]
     app_secret = os.environ["SCHWAB_APP_SECRET"]
     token_json = os.environ["SCHWAB_TOKEN_JSON"]
     with open("schwab_token.json", "w") as f:
         f.write(token_json)
-    c = client_from_token_file(api_key=app_key, app_secret=app_secret, token_path="schwab_token.json")
-    return c
+    return client_from_token_file(api_key=app_key, app_secret=app_secret, token_path="schwab_token.json")
 
 def resolve_acct_hash(c):
     ah = (os.environ.get("SCHWAB_ACCT_HASH") or "").strip()
@@ -187,8 +162,7 @@ def log_row(row: dict):
         if write_header: w.writeheader()
         w.writerow({k: row.get(k, "") for k in cols})
 
-# ---------------- main ----------------
-
+# ---------- main ----------
 def main():
     placed_reason = "UNKNOWN"
     saw_429 = False
@@ -201,6 +175,7 @@ def main():
     long_osi = os.environ["VERT_LONG_OSI"]
     qty = max(1, int(os.environ.get("VERT_QTY", "1")))
 
+    # passthrough for logging
     go = os.environ.get("VERT_GO", "")
     strength = os.environ.get("VERT_STRENGTH", "")
     is_strong = (os.environ.get("VERT_IS_STRONG", "false") or "").lower() == "true"
@@ -210,30 +185,17 @@ def main():
     oc = os.environ.get("VERT_OC", "")
     units = os.environ.get("VERT_UNITS", "")
 
-    STEP_WAIT = float(os.environ.get("VERT_STEP_WAIT", "15"))       # fixed 15s rung
+    # Fixed timings
+    STEP_WAIT = float(os.environ.get("VERT_STEP_WAIT", "15"))       # seconds per rung
     CANCEL_SETTLE = float(os.environ.get("VERT_CANCEL_SETTLE", "2.0"))
     MAX_LADDER = int(os.environ.get("VERT_MAX_LADDER", "3"))
-
-    # timing window: default to 13:12 → 13:15 ET
-    min_start = os.environ.get("VERT_MIN_START_HHMM", "13:12")
-    deadline  = os.environ.get("VERT_DEADLINE_HHMM",  "13:15")
-    start_not_before = _parse_hhmm_local_et(min_start)
-    hard_deadline = _parse_hhmm_local_et(deadline)
-
-    # wait until not-before (but never past the deadline)
-    if start_not_before is not None:
-        while True:
-            now = now_utc()
-            if hard_deadline is not None and now >= hard_deadline: break
-            if now >= start_not_before: break
-            time.sleep(min(0.5, start_not_before - now))
 
     print(f"CS_VERT_PLACE START name={name} side={side} kind={kind} short={short_osi} long={long_osi} qty={qty}")
 
     c = schwab_client()
     acct_hash = resolve_acct_hash(c)
 
-    # initial NBBO
+    # Initial NBBO
     bid, ask, mid = vertical_nbbo(side, short_osi, long_osi, c)
     print(f"CS_VERT_PLACE NBBO: bid={bid} ask={ask} mid={mid}")
     if bid is None and ask is None:
@@ -243,7 +205,7 @@ def main():
         placed_reason = "NO_MID"
         goutput("placed","0"); goutput("reason", placed_reason); return 0
 
-    # ladder spec: (offset, refresh_nbbo)
+    # Ladder spec: (offset, refresh_nbbo_on_this_rung)
     if side == "CREDIT":
         ladder_spec = [(0.00, False), (-0.05, False), (-0.05, True)]
     else:
@@ -268,14 +230,7 @@ def main():
         if remaining <= 0:
             break
 
-        # stop if we're out of time to run another full rung
-        if hard_deadline is not None:
-            left = seconds_left(hard_deadline)
-            if left is not None and left < (STEP_WAIT + CANCEL_SETTLE + 1.0):
-                placed_reason = "DEADLINE_HIT"
-                break
-
-        # refresh NBBO just before the last rung
+        # Refresh NBBO on demand (3rd rung)
         cur_bid, cur_ask, cur_mid = (bid, ask, mid)
         if refresh:
             cur_bid, cur_ask, cur_mid = vertical_nbbo(side, short_osi, long_osi, c)
@@ -299,22 +254,24 @@ def main():
         oid = parse_order_id(r)
         if oid: order_ids.append(oid)
 
-        t_end = now_utc() + STEP_WAIT
-        while now_utc() < t_end and oid:
+        # Work the rung
+        t_end = time.time() + STEP_WAIT
+        while time.time() < t_end and oid:
             st = get_status(c, acct_hash, oid) or {}
             fq = st.get("filledQuantity") or st.get("filled_quantity") or 0
             try: fq = int(round(float(fq)))
             except Exception: fq = 0
-            filled = max(filled, fq)
+            if fq > filled: filled = fq
             s = str(st.get("status") or st.get("orderStatus") or "").upper()
-            if s in ("FILLED", "CANCELED", "REJECTED", "EXPIRED"): break
+            if s in ("FILLED", "CANCELED", "REJECTED", "EXPIRED"):
+                break
             time.sleep(0.4)
 
         if filled >= qty:
             placed_reason = "OK"
             break
 
-        # cancel before moving on
+        # Cancel before next rung
         if oid:
             url_del = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
             ok = delete_with_retry(c, url_del, tag=f"CANCEL {oid}")
@@ -337,8 +294,7 @@ def main():
         "nbbo_bid": "", "nbbo_ask": "", "nbbo_mid": "", "order_ids": ",".join(order_ids),
         "reason": placed_reason,
     }
-    # write NBBOs if available
-    b,a,m = bid,ask,mid
+    b,a,m = vertical_nbbo(side, short_osi, long_osi, c)
     if b is not None: row["nbbo_bid"] = f"{b:.2f}"
     if a is not None: row["nbbo_ask"] = f"{a:.2f}"
     if m is not None: row["nbbo_mid"] = f"{m:.2f}"
