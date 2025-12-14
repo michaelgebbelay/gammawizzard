@@ -37,10 +37,6 @@ jobs:
       - name: Run ConstantStable vertical orchestrator
         run: |
           python scripts/trade/ConstantStable/orchestrator.py
-
-      - name: Run ConstantStable vertical orchestrator
-        run: |
-          python scripts/trade/ConstantStable/orchestrator.py
       
       - name: Push ConstantStable trades to Google Sheets
         env:
