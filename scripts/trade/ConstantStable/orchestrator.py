@@ -1,42 +1,47 @@
 #!/usr/bin/env python3
-# CONSTANT STABLE — vertical orchestrator (10k sizing)
+# CONSTANT STABLE — vertical orchestrator
 #
-# - Fetches ConstantStable payload from GammaWizard (UltraPureConstantStable).
+# What it does:
+# - Fetches ConstantStable payload from GammaWizard (GetUltraPureConstantStable).
 # - Builds 5-wide SPX verticals around Limit / CLimit.
-# - Per side:
-#     LeftGo < 0  → short put vertical (credit)
-#     LeftGo > 0  → long  put vertical (debit)
-#     RightGo < 0 → short call vertical (credit)
-#     RightGo > 0 → long  call vertical (debit)
+# - PUT leg:
+#     LeftGo < 0  -> short put vertical (credit)
+#     LeftGo > 0  -> long  put vertical (debit)
+# - CALL leg:
+#     RightGo < 0 -> short call vertical (credit)
+#     RightGo > 0 -> long  call vertical (debit)
 #
-# - Strength per leg:
-#     PUT strength  = LImp  if present, else abs(LeftGo)
-#     CALL strength = RImp  if present, else abs(RightGo)
-#     strong if strength >= CS_STRONG_THRESHOLD (default 0.66)
-#     strong → qty = 2 * units; weak → qty = 1 * units
+# Sizing:
+# - units = floor(account_value / CS_UNIT_DOLLARS)
+# - VIX bucket multiplier: 5 buckets -> multipliers from CS_VIX_MULTS (default 1,1,2,4,6)
+# - qty per leg = max(1, units * vix_mult)   (if vix_mult == 0 -> leg is skipped)
 #
-# - Sizing:
-#     CS_UNIT_DOLLARS (default 10,000) → units = floor(equity / CS_UNIT_DOLLARS)
-#     If Schwab equity is unavailable / <=0 → pretend equity = CS_UNIT_DOLLARS and units = 1.
+# Manual overrides:
+# - SIZING_DOLLARS_OVERRIDE: forces account_value used for sizing (USD)
 #
-# - Delegates placement + logging to ConstantStable/place.py via VERT_* envs.
+# Delegates placement + logging to scripts/trade/ConstantStable/place.py via VERT_* envs.
 
 import os
 import sys
 import re
 import subprocess
 from datetime import date
+from typing import Any, Dict, Tuple
 import requests
 from schwab.auth import client_from_token_file
 
-__version__ = "1.2.0"
+__version__ = "2.0.0"
 
 GW_BASE = os.environ.get("GW_BASE", "https://gandalf.gammawizard.com").rstrip("/")
-GW_ENDPOINT = os.environ.get("GW_ENDPOINT", "/rapi/GetUltraPureConstantStable").lstrip("/")
+GW_ENDPOINT = os.environ.get("GW_ENDPOINT", "rapi/GetUltraPureConstantStable").lstrip("/")
 
-CS_UNIT_DOLLARS     = float(os.environ.get("CS_UNIT_DOLLARS", "10000"))
-CS_STRONG_THRESHOLD = float(os.environ.get("CS_STRONG_THRESHOLD", "0.66"))
-CS_LOG_PATH         = os.environ.get("CS_LOG_PATH", "logs/constantstable_vertical_trades.csv")
+CS_UNIT_DOLLARS = float(os.environ.get("CS_UNIT_DOLLARS", "10000"))
+CS_LOG_PATH = os.environ.get("CS_LOG_PATH", "logs/constantstable_vertical_trades.csv")
+
+# Vol bucket config
+CS_VOL_FIELD = (os.environ.get("CS_VOL_FIELD", "VIX") or "VIX").strip()
+CS_VIX_BREAKS = os.environ.get("CS_VIX_BREAKS", "14,16,18,22")
+CS_VIX_MULTS = os.environ.get("CS_VIX_MULTS", "1,1,2,4,6")
 
 
 # ---------- Utility helpers ----------
@@ -69,7 +74,74 @@ def fnum(x):
         return None
 
 
-# ---------- GammaWizard (ConstantStable) ----------
+def parse_csv_floats(s: str):
+    out = []
+    for part in (s or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        out.append(float(part))
+    return out
+
+
+def get_case_insensitive(d: Dict[str, Any], key: str):
+    if key in d:
+        return d.get(key)
+    lk = key.lower()
+    for k, v in d.items():
+        if str(k).lower() == lk:
+            return v
+    return None
+
+
+def pick_vol_value(tr: Dict[str, Any], vol_field: str) -> Tuple[str, float | None]:
+    """
+    Returns (field_used, value_or_None).
+    vol_field supports:
+      - "VIX" / "VixOne" / etc
+      - "AUTO": try common candidates
+    """
+    if (vol_field or "").strip().upper() == "AUTO":
+        candidates = ["VIX", "Vix", "VixOne", "VIXONE", "Vix1", "VIX1"]
+    else:
+        candidates = [vol_field]
+
+    for k in candidates:
+        v = get_case_insensitive(tr, k)
+        fv = fnum(v)
+        if fv is not None:
+            return (k, fv)
+    return (vol_field, None)
+
+
+def vix_bucket_and_mult(vix_val: float | None, breaks_csv: str, mults_csv: str) -> Tuple[int, int]:
+    """
+    5 buckets => 4 breaks and 5 multipliers.
+    Example:
+      breaks = 14,16,18,22
+      mults  = 1,1,2,4,6
+    Buckets are 1..5.
+    """
+    breaks = parse_csv_floats(breaks_csv)
+    mults = parse_csv_floats(mults_csv)
+
+    if len(breaks) < 1:
+        raise ValueError("CS_VIX_BREAKS must contain at least 1 cutoff")
+    if len(mults) != len(breaks) + 1:
+        raise ValueError("CS_VIX_MULTS must have exactly len(CS_VIX_BREAKS)+1 values")
+
+    if vix_val is None:
+        # neutral bucket (middle)
+        mid = len(mults) // 2
+        return (mid + 1, int(mults[mid]))
+
+    for i, b in enumerate(breaks):
+        if vix_val < b:
+            return (i + 1, int(mults[i]))
+    return (len(mults), int(mults[-1]))
+
+
+# ---------- GammaWizard ----------
 
 def _sanitize_token(t: str) -> str:
     t = (t or "").strip().strip('"').strip("'")
@@ -114,7 +186,7 @@ def extract_trade(j):
         if "Trade" in j:
             tr = j["Trade"]
             return tr[-1] if isinstance(tr, list) and tr else tr if isinstance(tr, dict) else {}
-        keys = ("Date", "TDate", "Limit", "CLimit", "Cat1", "Cat2", "LeftGo", "RightGo", "LImp", "RImp")
+        keys = ("Date", "TDate", "Limit", "CLimit", "LeftGo", "RightGo", "LImp", "RImp", "VIX", "VixOne")
         if any(k in j for k in keys):
             return j
         for v in j.values():
@@ -148,9 +220,8 @@ def schwab_client():
 
 def opening_cash_for_account(c, prefer_number=None):
     """
-    Try to find a reasonable "equity / cash available" number.
-
     Returns (value_or_None, source_key, acct_number).
+    Fix: ignores 0/negative values; prefers liquidationValue first.
     """
     r = c.get_accounts()
     r.raise_for_status()
@@ -204,20 +275,22 @@ def opening_cash_for_account(c, prefer_number=None):
     init, curr = chosen
 
     keys = [
+        "liquidationValue",
         "cashAvailableForTrading",
         "cashBalance",
         "availableFundsNonMarginableTrade",
         "buyingPowerNonMarginableTrade",
-        "buyingPower",
         "optionBuyingPower",
-        "liquidationValue",
+        "buyingPower",
     ]
 
     def pick(src):
         for k in keys:
             v = (src or {}).get(k)
             if isinstance(v, (int, float)):
-                return float(v), k
+                fv = float(v)
+                if fv > 0:
+                    return fv, k
         return None
 
     for src in (init, curr):
@@ -238,12 +311,6 @@ def get_account_hash(c):
     return str(info.get("hashValue") or info.get("hashvalue") or "")
 
 
-def ensure_log_dir():
-    d = os.path.dirname(CS_LOG_PATH)
-    if d and not os.path.exists(d):
-        os.makedirs(d, exist_ok=True)
-
-
 # ---------- main ----------
 
 def main():
@@ -256,25 +323,26 @@ def main():
         print(f"CS_VERT_RUN SKIP: Schwab init failed: {e}")
         return 0
 
-    # Optional manual override for sizing
     ov_raw = (os.environ.get("SIZING_DOLLARS_OVERRIDE", "") or "").strip()
     if ov_raw:
         try:
             oc_val = float(ov_raw)
+            oc_src = "SIZING_DOLLARS_OVERRIDE"
             print(f"CS_VERT_RUN INFO: using SIZING_DOLLARS_OVERRIDE={oc_val}")
         except Exception:
             print("CS_VERT_RUN WARN: bad SIZING_DOLLARS_OVERRIDE, ignoring override.")
 
     print(f"CS_VERT_RUN EQUITY_RAW: {oc_val} (src={oc_src}, acct={acct_num})")
 
+    if CS_UNIT_DOLLARS <= 0:
+        print("CS_VERT_RUN FATAL: CS_UNIT_DOLLARS must be > 0")
+        return 1
+
     if oc_val is None or oc_val <= 0:
         print("CS_VERT_RUN WARN: equity unavailable/<=0 — defaulting to CS_UNIT_DOLLARS for sizing")
         oc_val = CS_UNIT_DOLLARS
         units = 1
     else:
-        if CS_UNIT_DOLLARS <= 0:
-            print("CS_VERT_RUN FATAL: CS_UNIT_DOLLARS must be > 0")
-            return 1
         units = max(1, int(oc_val // CS_UNIT_DOLLARS))
 
     print(f"CS_VERT_RUN UNITS: {units} (CS_UNIT_DOLLARS={CS_UNIT_DOLLARS}, oc_val={oc_val})")
@@ -310,35 +378,31 @@ def main():
     call_low_osi = to_osi(f".SPXW{exp6}C{c_low}")
     call_high_osi = to_osi(f".SPXW{exp6}C{c_high}")
 
-    left_go   = fnum(tr.get("LeftGo"))
-    right_go  = fnum(tr.get("RightGo"))
-    left_imp  = fnum(tr.get("LImp"))
+    left_go = fnum(tr.get("LeftGo"))
+    right_go = fnum(tr.get("RightGo"))
+    left_imp = fnum(tr.get("LImp"))
     right_imp = fnum(tr.get("RImp"))
 
-    # Strength per leg: prefer LImp/RImp, fallback to abs(Go)
-    put_strength  = left_imp  if left_imp  is not None else (abs(left_go)  if left_go  is not None else 0.0)
+    # Just for logging / introspection
+    put_strength = left_imp if left_imp is not None else (abs(left_go) if left_go is not None else 0.0)
     call_strength = right_imp if right_imp is not None else (abs(right_go) if right_go is not None else 0.0)
+
+    # Vol bucket sizing
+    field_used, vol_val = pick_vol_value(tr, CS_VOL_FIELD)
+    bucket, vix_mult = vix_bucket_and_mult(vol_val, CS_VIX_BREAKS, CS_VIX_MULTS)
+    print(f"CS_VERT_RUN VOL: field={CS_VOL_FIELD} used={field_used} value={vol_val} bucket={bucket} mult={vix_mult}")
+    print(f"CS_VERT_RUN VIX_BREAKS={CS_VIX_BREAKS} VIX_MULTS={CS_VIX_MULTS}")
 
     print(f"CS_VERT_RUN TRADE: Date={trade_date} TDate={tdate_iso}")
     print(f"  PUT strikes : {p_low} / {p_high}  OSI=({put_low_osi},{put_high_osi})  LeftGo={left_go} LImp={left_imp}")
     print(f"  CALL strikes: {c_low} / {c_high}  OSI=({call_low_osi},{call_high_osi})  RightGo={right_go} RImp={right_imp}")
-    print(
-        "CS_VERT_RUN RAW_STRENGTH:",
-        f"put_strength={put_strength:.3f} call_strength={call_strength:.3f}",
-        f"(threshold={CS_STRONG_THRESHOLD:.3f})",
-    )
-    print(f"CS_VERT_RUN STRONG_THRESHOLD={CS_STRONG_THRESHOLD:.3f} LOG_PATH={CS_LOG_PATH}")
-
-    ensure_log_dir()
+    print(f"CS_VERT_RUN RAW_STRENGTH: put_strength={put_strength:.3f} call_strength={call_strength:.3f}")
 
     verts = []
 
-    # ----- PUT side: one vertical only -----
-    if left_go is not None and left_go != 0.0:
-        strength = put_strength
-        is_strong = strength >= CS_STRONG_THRESHOLD
-        mult = 2 if is_strong else 1
-        qty = max(1, units * mult)
+    # ----- PUT side -----
+    if left_go is not None and left_go != 0.0 and vix_mult != 0:
+        qty = max(1, units * int(vix_mult))
 
         if left_go < 0:
             # Short put vertical (credit): short higher strike, long lower
@@ -363,17 +427,13 @@ def main():
             "short_osi": short_osi,
             "long_osi": long_osi,
             "go": left_go,
-            "strength": strength,
-            "is_strong": is_strong,
+            "strength": put_strength,
             "qty": qty,
         })
 
-    # ----- CALL side: one vertical only -----
-    if right_go is not None and right_go != 0.0:
-        strength = call_strength
-        is_strong = strength >= CS_STRONG_THRESHOLD
-        mult = 2 if is_strong else 1
-        qty = max(1, units * mult)
+    # ----- CALL side -----
+    if right_go is not None and right_go != 0.0 and vix_mult != 0:
+        qty = max(1, units * int(vix_mult))
 
         if right_go < 0:
             # Short call vertical (credit): short LOWER strike, long HIGHER strike
@@ -398,13 +458,12 @@ def main():
             "short_osi": short_osi,
             "long_osi": long_osi,
             "go": right_go,
-            "strength": strength,
-            "is_strong": is_strong,
+            "strength": call_strength,
             "qty": qty,
         })
 
     if not verts:
-        print("CS_VERT_RUN SKIP: no nonzero LeftGo/RightGo — no verticals to trade.")
+        print("CS_VERT_RUN SKIP: no verticals to trade (LeftGo/RightGo zero or vix_mult=0).")
         return 0
 
     # ----- Spawn placer per vertical -----
@@ -413,26 +472,38 @@ def main():
         print(
             f"CS_VERT_RUN {v['name']}: side={v['side']} kind={v['kind']} "
             f"short={v['short_osi']} long={v['long_osi']} "
-            f"go={v['go']} strength={strength_s} is_strong={v['is_strong']} qty={v['qty']}"
+            f"go={v['go']} qty={v['qty']} "
+            f"(units={units} vix_mult={vix_mult} bucket={bucket})"
         )
 
         env = dict(os.environ)
         env.update({
-            "VERT_SIDE":        v["side"],
-            "VERT_KIND":        v["kind"],
-            "VERT_NAME":        v["name"],
-            "VERT_DIRECTION":   v["direction"],
-            "VERT_SHORT_OSI":   v["short_osi"],
-            "VERT_LONG_OSI":    v["long_osi"],
-            "VERT_QTY":         str(v["qty"]),
-            "VERT_GO":          "" if v["go"] is None else str(v["go"]),
-            "VERT_STRENGTH":    strength_s,
-            "VERT_IS_STRONG":   "true" if v["is_strong"] else "false",
-            "VERT_TRADE_DATE":  trade_date,
-            "VERT_TDATE":       tdate_iso,
+            "VERT_SIDE":         v["side"],
+            "VERT_KIND":         v["kind"],
+            "VERT_NAME":         v["name"],
+            "VERT_DIRECTION":    v["direction"],
+            "VERT_SHORT_OSI":    v["short_osi"],
+            "VERT_LONG_OSI":     v["long_osi"],
+            "VERT_QTY":          str(v["qty"]),
+            "VERT_GO":           "" if v["go"] is None else str(v["go"]),
+            "VERT_STRENGTH":     strength_s,
+            "VERT_TRADE_DATE":   trade_date,
+            "VERT_TDATE":        tdate_iso,
+
+            # sizing context
             "VERT_UNIT_DOLLARS": str(CS_UNIT_DOLLARS),
-            "VERT_OC":          str(oc_val),
-            "VERT_UNITS":       str(units),
+            "VERT_OC":           str(oc_val),
+            "VERT_UNITS":        str(units),
+
+            # vol context
+            "VERT_VOL_FIELD":    CS_VOL_FIELD,
+            "VERT_VOL_USED":     field_used,
+            "VERT_VOL_VALUE":    "" if vol_val is None else str(vol_val),
+            "VERT_VOL_BUCKET":   str(bucket),
+            "VERT_VOL_MULT":     str(vix_mult),
+            "VERT_QTY_RULE":     "VIX_BUCKET",
+
+            # needed by placer
             "SCHWAB_APP_KEY":     os.environ["SCHWAB_APP_KEY"],
             "SCHWAB_APP_SECRET":  os.environ["SCHWAB_APP_SECRET"],
             "SCHWAB_TOKEN_JSON":  os.environ["SCHWAB_TOKEN_JSON"],
@@ -440,10 +511,7 @@ def main():
             "CS_LOG_PATH":        CS_LOG_PATH,
         })
 
-        rc = subprocess.call(
-            [sys.executable, "scripts/trade/ConstantStable/place.py"],
-            env=env,
-        )
+        rc = subprocess.call([sys.executable, "scripts/trade/ConstantStable/place.py"], env=env)
         if rc != 0:
             print(f"CS_VERT_RUN {v['name']}: placer rc={rc}")
 
