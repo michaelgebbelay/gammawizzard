@@ -21,7 +21,7 @@ on:
       vix_breaks:
         description: "CS_VIX_BREAKS: 4 comma-separated cutoffs (5 buckets)."
         required: true
-        default: "14,16,18,22"
+        default: "0.14,0.16,0.18,0.22"
 
       vix_mults:
         description: "CS_VIX_MULTS: 5 comma-separated multipliers (default 1/1/2/4/6)."
