@@ -2,26 +2,95 @@ name: ConstantStableVerticals
 
 on:
   workflow_dispatch:
+    inputs:
+      sizing_override:
+        description: "Override account value used for sizing (USD). Blank = use Schwab."
+        required: false
+        default: ""
+
+      unit_dollars:
+        description: "CS_UNIT_DOLLARS (USD per unit). Default 10000."
+        required: true
+        default: "10000"
+
+      vol_field:
+        description: "CS_VOL_FIELD: VIX | VixOne | AUTO"
+        required: true
+        default: "VIX"
+
+      vix_breaks:
+        description: "CS_VIX_BREAKS: 4 comma-separated cutoffs (5 buckets)."
+        required: true
+        default: "14,16,18,22"
+
+      vix_mults:
+        description: "CS_VIX_MULTS: 5 comma-separated multipliers (default 1/1/2/4/6)."
+        required: true
+        default: "1,1,2,4,6"
+
+      step_wait:
+        description: "VERT_STEP_WAIT seconds per rung"
+        required: true
+        default: "12"
+
+      poll_secs:
+        description: "VERT_POLL_SECS seconds between order status polls (reduce 429s)"
+        required: true
+        default: "1.5"
+
+      cancel_settle:
+        description: "VERT_CANCEL_SETTLE seconds after cancel"
+        required: true
+        default: "1.0"
+
+      max_ladder:
+        description: "VERT_MAX_LADDER number of rungs (max 3)"
+        required: true
+        default: "3"
+
+      dry_run:
+        description: "VERT_DRY_RUN true/false (true = no orders, still logs)"
+        required: true
+        default: "false"
 
 jobs:
   trade:
     runs-on: ubuntu-latest
+    timeout-minutes: 12
 
     env:
+      PYTHONUNBUFFERED: "1"
+
+      # Schwab
       SCHWAB_APP_KEY:     ${{ secrets.SCHWAB_APP_KEY }}
       SCHWAB_APP_SECRET:  ${{ secrets.SCHWAB_APP_SECRET }}
       SCHWAB_TOKEN_JSON:  ${{ secrets.SCHWAB_TOKEN_JSON }}
 
+      # GammaWizard
       GW_EMAIL:           ${{ secrets.GW_EMAIL }}
       GW_PASSWORD:        ${{ secrets.GW_PASSWORD }}
-
       GW_BASE:            "https://gandalf.gammawizard.com"
-      GW_ENDPOINT:        "/rapi/GetUltraPureConstantStable"   # override if ConstantStable uses a different API route
+      GW_ENDPOINT:        "rapi/GetUltraPureConstantStable"
 
-      # ConstantStable vertical config
-      CS_UNIT_DOLLARS:     "10000"              # 10k sizing
-      CS_STRONG_THRESHOLD: "0.66"               # 1x vs 2x legs
-      CS_LOG_PATH:         "logs/constantstable_vertical_trades.csv"
+      # ConstantStable sizing
+      SIZING_DOLLARS_OVERRIDE: ${{ github.event.inputs.sizing_override }}
+      CS_UNIT_DOLLARS:         ${{ github.event.inputs.unit_dollars }}
+
+      # VIX bucket sizing (1/1/2/4/6 by default)
+      CS_VOL_FIELD:  ${{ github.event.inputs.vol_field }}
+      CS_VIX_BREAKS: ${{ github.event.inputs.vix_breaks }}
+      CS_VIX_MULTS:  ${{ github.event.inputs.vix_mults }}
+
+      # Logging
+      CS_LOG_PATH: "logs/constantstable_vertical_trades.csv"
+
+      # Placer timing knobs
+      VERT_STEP_WAIT:      ${{ github.event.inputs.step_wait }}
+      VERT_POLL_SECS:      ${{ github.event.inputs.poll_secs }}
+      VERT_CANCEL_SETTLE:  ${{ github.event.inputs.cancel_settle }}
+      VERT_MAX_LADDER:     ${{ github.event.inputs.max_ladder }}
+      VERT_DRY_RUN:        ${{ github.event.inputs.dry_run }}
+      VERT_CANCEL_TRIES:   "4"
 
     steps:
       - uses: actions/checkout@v4
@@ -32,18 +101,18 @@ jobs:
 
       - name: Install deps
         run: |
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Run ConstantStable vertical orchestrator
         run: |
           python scripts/trade/ConstantStable/orchestrator.py
-      
+
       - name: Push ConstantStable trades to Google Sheets
         env:
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          CS_LOG_PATH: logs/constantstable_vertical_trades.csv
           CS_GSHEET_TAB: "ConstantStableTrades"
+          CS_LOG_PATH: "logs/constantstable_vertical_trades.csv"
         run: |
           python scripts/data/cs_trades_to_gsheet.py
-     
