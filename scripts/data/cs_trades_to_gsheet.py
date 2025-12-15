@@ -1,60 +1,30 @@
 #!/usr/bin/env python3
-# Push ConstantStable vertical trade log (CSV) to Google Sheets.
-#
-# Env:
-#   GSHEET_ID (required)                  — target spreadsheet ID
-#   GOOGLE_SERVICE_ACCOUNT_JSON (req'd)   — service account JSON (entire JSON string)
-#   CS_LOG_PATH (opt)                     — log CSV path; default logs/constantstable_vertical_trades.csv
-#   CS_GSHEET_TAB (opt)                  — tab name; default "ConstantStableTrades"
-#
-# Behavior:
-#   - Reads the CSV log written by ConstantStable/place.py
-#   - Ensures a tab exists
-#   - Writes header if missing
-#   - UPSERTS rows keyed by (trade_date, tdate, name, side, short_osi, long_osi)
+"""
+Push ConstantStable trades CSV to Google Sheets (UPSERT).
 
-import os
-import sys
-import csv
-import json
-from typing import List, Dict, Tuple
+Env:
+  GSHEET_ID (required)
+  GOOGLE_SERVICE_ACCOUNT_JSON (required) - full JSON string
+  CS_LOG_PATH (optional) default logs/constantstable_vertical_trades.csv
+  CS_GSHEET_TAB (optional) default ConstantStableTrades
 
+UPSERT KEY:
+  (trade_date, tdate, name)
+"""
+
+import os, sys, json, csv
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 
-# ---------- Google Sheets helpers ----------
-
 def creds_from_env():
-    raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    raw = (os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip()
     if not raw:
         raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON env is required")
-    try:
-        info = json.loads(raw)
-    except Exception as e:
-        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON must be a full JSON string") from e
+    info = json.loads(raw)
     return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
-
-
-def ensure_sheet_tab(svc, spreadsheet_id: str, title: str) -> int:
-    meta = svc.spreadsheets().get(
-        spreadsheetId=spreadsheet_id,
-        fields="sheets.properties"
-    ).execute()
-    for s in (meta.get("sheets") or []):
-        p = s.get("properties") or {}
-        if (p.get("title") or "") == title:
-            return int(p.get("sheetId"))
-    # create
-    req = {"requests": [{"addSheet": {"properties": {"title": title}}}]}
-    r = svc.spreadsheets().batchUpdate(
-        spreadsheetId=spreadsheet_id,
-        body=req
-    ).execute()
-    sid = r["replies"][0]["addSheet"]["properties"]["sheetId"]
-    return int(sid)
 
 
 def col_letter(idx_zero_based: int) -> str:
@@ -66,83 +36,68 @@ def col_letter(idx_zero_based: int) -> str:
     return s
 
 
+def ensure_sheet_tab(svc, spreadsheet_id: str, title: str) -> int:
+    meta = svc.spreadsheets().get(spreadsheetId=spreadsheet_id, fields="sheets.properties").execute()
+    for s in (meta.get("sheets") or []):
+        p = s.get("properties") or {}
+        if (p.get("title") or "") == title:
+            return int(p.get("sheetId"))
+    req = {"requests": [{"addSheet": {"properties": {"title": title}}}]}
+    r = svc.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=req).execute()
+    sid = r["replies"][0]["addSheet"]["properties"]["sheetId"]
+    return int(sid)
+
+
 def read_sheet_all(svc, spreadsheet_id: str, title: str):
-    r = svc.spreadsheets().values().get(
-        spreadsheetId=spreadsheet_id,
-        range=f"{title}!A1:ZZ"
-    ).execute()
+    r = svc.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=f"{title}!A1:ZZ").execute()
     return r.get("values") or []
 
 
-def upsert_log_rows(
-    svc,
-    spreadsheet_id: str,
-    title: str,
-    rows: List[Dict[str, str]],
-    header: List[str],
-):
+def upsert_rows(svc, spreadsheet_id: str, title: str, rows: list[dict], header: list[str]):
     existing = read_sheet_all(svc, spreadsheet_id, title)
 
-    # Ensure header in sheet
+    # Ensure header row
     if not existing:
-        existing = [header]
         svc.spreadsheets().values().update(
             spreadsheetId=spreadsheet_id,
-            range=f"{title}!A1:{col_letter(len(header) - 1)}1",
+            range=f"{title}!A1:{col_letter(len(header)-1)}1",
             valueInputOption="RAW",
             body={"values": [header]},
         ).execute()
+        existing = [header]
     else:
         cur_header = existing[0]
         if cur_header != header:
-            # Rewrite header to match CSV header order
             svc.spreadsheets().values().update(
                 spreadsheetId=spreadsheet_id,
-                range=f"{title}!A1:{col_letter(len(header) - 1)}1",
+                range=f"{title}!A1:{col_letter(len(header)-1)}1",
                 valueInputOption="RAW",
                 body={"values": [header]},
             ).execute()
             existing = [header] + existing[1:]
 
-    # Build index: (trade_date, tdate, name, side, short_osi, long_osi) → row_number
-    hdr_index = {h: i for i, h in enumerate(header)}
+    def key_from_dict(d):
+        return (str(d.get("trade_date", "")), str(d.get("tdate", "")), str(d.get("name", "")))
 
-    key_fields = [
-        "trade_date",
-        "tdate",
-        "name",
-        "side",
-        "short_osi",
-        "long_osi",
-    ]
-    # Filter key_fields to only those present in the header
-    key_fields = [k for k in key_fields if k in hdr_index]
-
-    def make_key(d: Dict[str, str]) -> Tuple[str, ...]:
-        if key_fields:
-            return tuple(str(d.get(k, "")) for k in key_fields)
-        # fallback: full row in header order
-        return tuple(str(d.get(h, "")) for h in header)
-
+    # Build existing key -> row number map
     existing_map = {}
     for rnum, row in enumerate(existing[1:], start=2):
         d = {header[i]: (row[i] if i < len(row) else "") for i in range(len(header))}
-        existing_map[make_key(d)] = rnum
+        existing_map[key_from_dict(d)] = rnum
 
     updates = []
     appends = []
 
     for d in rows:
-        key = make_key(d)
-        values = [d.get(h, "") for h in header]
+        key = key_from_dict(d)
+        values = [str(d.get(h, "")) for h in header]
         if key in existing_map:
             rnum = existing_map[key]
-            rng = f"{title}!A{rnum}:{col_letter(len(header) - 1)}{rnum}"
+            rng = f"{title}!A{rnum}:{col_letter(len(header)-1)}{rnum}"
             updates.append((rng, values))
         else:
             appends.append(values)
 
-    # Batch updates
     if updates:
         data = [{"range": rng, "values": [vals]} for (rng, vals) in updates]
         svc.spreadsheets().values().batchUpdate(
@@ -150,12 +105,10 @@ def upsert_log_rows(
             body={"valueInputOption": "RAW", "data": data},
         ).execute()
 
-    # Appends
     if appends:
         svc.spreadsheets().values().append(
             spreadsheetId=spreadsheet_id,
             range=f"{title}!A1",
-            includeValuesInResponse=False,
             valueInputOption="RAW",
             insertDataOption="INSERT_ROWS",
             body={"values": appends},
@@ -164,46 +117,35 @@ def upsert_log_rows(
     return {"updated": len(updates), "appended": len(appends)}
 
 
-# ---------- main ----------
-
 def main():
-    spreadsheet_id = os.environ.get("GSHEET_ID", "").strip()
+    spreadsheet_id = (os.environ.get("GSHEET_ID") or "").strip()
     if not spreadsheet_id:
         print("ERROR: GSHEET_ID env is required", file=sys.stderr)
         return 2
 
-    log_path = os.environ.get(
-        "CS_LOG_PATH", "logs/constantstable_vertical_trades.csv"
-    ).strip()
-    if not os.path.exists(log_path):
-        print(f"CS_TRADES_TO_GSHEET: log file not found: {log_path}")
+    tab = (os.environ.get("CS_GSHEET_TAB") or "ConstantStableTrades").strip()
+    path = (os.environ.get("CS_LOG_PATH") or "logs/constantstable_vertical_trades.csv").strip()
+
+    if not os.path.exists(path):
+        print(f"CS_TRADES_TO_GSHEET: {path} missing — nothing to do")
         return 0
 
-    # Read CSV log
-    with open(log_path, newline="") as f:
-        reader = csv.DictReader(f)
-        header = reader.fieldnames or []
-        rows = [row for row in reader]
+    with open(path, "r", newline="") as f:
+        rdr = csv.DictReader(f)
+        header = rdr.fieldnames or []
+        rows = list(rdr)
 
-    if not header or not rows:
-        print(f"CS_TRADES_TO_GSHEET: nothing to write from {log_path}")
+    if not header:
+        print(f"CS_TRADES_TO_GSHEET: {path} has no header — nothing to do")
         return 0
-
-    tab_title = (
-        os.environ.get("CS_GSHEET_TAB", "").strip() or "ConstantStableTrades"
-    )
 
     creds = creds_from_env()
     svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
 
-    ensure_sheet_tab(svc, spreadsheet_id, tab_title)
-    res = upsert_log_rows(svc, spreadsheet_id, tab_title, rows, header)
+    ensure_sheet_tab(svc, spreadsheet_id, tab)
+    res = upsert_rows(svc, spreadsheet_id, tab, rows, header)
 
-    print(
-        f"CS_TRADES_TO_GSHEET: {log_path} → {tab_title} "
-        f"appended={res['appended']} updated={res['updated']}"
-    )
-
+    print(f"CS_TRADES_TO_GSHEET: {path} → {tab} appended={res['appended']} updated={res['updated']}")
     return 0
 
 
