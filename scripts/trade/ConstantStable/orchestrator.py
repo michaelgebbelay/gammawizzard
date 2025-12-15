@@ -1,186 +1,725 @@
 #!/usr/bin/env python3
-"""
-Push ConstantStable trades CSV to Google Sheets (UPSERT or "append-ish").
+# CONSTANT STABLE — vertical orchestrator
+#
+# What it does:
+# - Fetches ConstantStable payload from GammaWizard (GetUltraPureConstantStable).
+# - Builds 5-wide SPX verticals around Limit / CLimit.
+# - PUT leg:
+#     LeftGo < 0  -> short put vertical (credit)
+#     LeftGo > 0  -> long  put vertical (debit)
+# - CALL leg:
+#     RightGo < 0 -> short call vertical (credit)
+#     RightGo > 0 -> long  call vertical (debit)
+#
+# Sizing:
+# - units = floor(account_value / CS_UNIT_DOLLARS)
+# - VIX bucket multiplier: 5 buckets -> multipliers from CS_VIX_MULTS (default 1,1,2,4,6)
+# - target_qty per leg = max(1, units * vix_mult)   (if vix_mult == 0 -> leg is skipped)
+#
+# Top-up (daily target):
+# - If CS_TOPUP_TO_TARGET=1 (default), only place the REMAINING qty needed to reach target_qty
+#   based on current positions in the two legs. Never place "extra" beyond target.
+#
+# Manual overrides:
+# - SIZING_DOLLARS_OVERRIDE: forces account_value used for sizing (USD)
+#
+# Guard (NO-CLOSE):
+# - If an opening vertical would net/close an existing position leg, SKIP that vertical.
+#   (Adding to existing same-direction is OK.)
+#   Controlled by:
+#     CS_GUARD_NO_CLOSE=1 (default)
+#     CS_GUARD_FAIL_ACTION=SKIP_ALL (default) or CONTINUE
+#
+# Delegates placement + logging to scripts/trade/ConstantStable/place.py via VERT_* envs.
 
-Env:
-  GSHEET_ID (required)
-  GOOGLE_SERVICE_ACCOUNT_JSON (required) - full JSON string
-  CS_LOG_PATH (optional) default logs/constantstable_vertical_trades.csv
-  CS_GSHEET_TAB (optional) default ConstantStableTrades
+import os
+import sys
+import re
+import time
+import random
+import math
+import subprocess
+from datetime import date
+from typing import Any, Dict, Tuple
+import requests
+from schwab.auth import client_from_token_file
 
-UPSERT KEYS:
-  By default this preserves one row per (trade_date, tdate, name).
-  If you want every execution attempt to show up as a new row, set:
-      CS_UPSERT_KEYS=ts_utc,name
-  (ts_utc is already in the CSV, so each run becomes unique.)
+__version__ = "2.2.0"
 
-  Default:
-      CS_UPSERT_KEYS=trade_date,tdate,name
-"""
+GW_BASE = os.environ.get("GW_BASE", "https://gandalf.gammawizard.com").rstrip("/")
+GW_ENDPOINT = os.environ.get("GW_ENDPOINT", "rapi/GetUltraPureConstantStable").lstrip("/")
 
-import os, sys, json, csv
-from googleapiclient.discovery import build
-from google.oauth2 import service_account
+CS_UNIT_DOLLARS = float(os.environ.get("CS_UNIT_DOLLARS", "10000"))
+CS_LOG_PATH = os.environ.get("CS_LOG_PATH", "logs/constantstable_vertical_trades.csv")
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+# Vol bucket config
+CS_VOL_FIELD = (os.environ.get("CS_VOL_FIELD", "VIX") or "VIX").strip()
+CS_VIX_BREAKS = os.environ.get("CS_VIX_BREAKS", "14,16,18,22")
+CS_VIX_MULTS = os.environ.get("CS_VIX_MULTS", "1,1,2,4,6")
 
+# --- NO-CLOSE guard config ---
+CS_GUARD_NO_CLOSE = (os.environ.get("CS_GUARD_NO_CLOSE", "1") or "1").strip().lower() in ("1", "true", "yes", "y")
+CS_GUARD_FAIL_ACTION = (os.environ.get("CS_GUARD_FAIL_ACTION", "SKIP_ALL") or "SKIP_ALL").strip().upper()
+#   SKIP_ALL  -> safest: if we cannot load positions, skip everything
+#   CONTINUE  -> proceed without guard (not recommended)
 
-def creds_from_env():
-    raw = (os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip()
-    if not raw:
-        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON env is required")
-    info = json.loads(raw)
-    return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
-
-
-def col_letter(idx_zero_based: int) -> str:
-    n = idx_zero_based + 1
-    s = ""
-    while n:
-        n, r = divmod(n - 1, 26)
-        s = chr(65 + r) + s
-    return s
-
-
-def ensure_sheet_tab(svc, spreadsheet_id: str, title: str) -> int:
-    meta = svc.spreadsheets().get(spreadsheetId=spreadsheet_id, fields="sheets.properties").execute()
-    for s in (meta.get("sheets") or []):
-        p = s.get("properties") or {}
-        if (p.get("title") or "") == title:
-            return int(p.get("sheetId"))
-    req = {"requests": [{"addSheet": {"properties": {"title": title}}}]}
-    r = svc.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=req).execute()
-    sid = r["replies"][0]["addSheet"]["properties"]["sheetId"]
-    return int(sid)
-
-
-def read_sheet_all(svc, spreadsheet_id: str, title: str):
-    r = svc.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=f"{title}!A1:ZZ").execute()
-    return r.get("values") or []
-
-
-def parse_upsert_keys(header: list[str]) -> list[str]:
-    raw = (os.environ.get("CS_UPSERT_KEYS") or "trade_date,tdate,name").strip()
-    keys = [k.strip() for k in raw.split(",") if k.strip()]
-    missing = [k for k in keys if k not in header]
-    if missing:
-        raise RuntimeError(
-            f"CS_UPSERT_KEYS refers to missing columns: {missing}. "
-            f"Available columns include: {header[:12]}..."
-        )
-    return keys
+# --- Top-up config ---
+CS_TOPUP_TO_TARGET = (os.environ.get("CS_TOPUP_TO_TARGET", "1") or "1").strip().lower() in ("1", "true", "yes", "y")
 
 
-def upsert_rows(svc, spreadsheet_id: str, title: str, rows: list[dict], header: list[str]):
-    existing = read_sheet_all(svc, spreadsheet_id, title)
+# ---------- Utility helpers ----------
 
-    # Ensure header row
-    if not existing:
-        svc.spreadsheets().values().update(
-            spreadsheetId=spreadsheet_id,
-            range=f"{title}!A1:{col_letter(len(header)-1)}1",
-            valueInputOption="RAW",
-            body={"values": [header]},
-        ).execute()
-        existing = [header]
+def yymmdd(iso: str) -> str:
+    d = date.fromisoformat((iso or "")[:10])
+    return f"{d:%y%m%d}"
+
+
+def to_osi(sym: str) -> str:
+    raw = (sym or "").strip().upper().lstrip(".").replace("_", "")
+    m = (
+        re.match(r"^([A-Z.$^]{1,6})(\d{6})([CP])(\d{1,5})(?:\.(\d{1,3}))?$", raw)
+        or re.match(r"^([A-Z.$^]{1,6})(\d{6})([CP])(\d{8})$", raw)
+    )
+    if not m:
+        raise ValueError(f"Cannot parse option symbol: {sym}")
+    root, ymd, cp, strike, frac = (m.groups() + ("",))[:5]
+    if len(strike) < 8:
+        mills = int(strike) * 1000 + (int((frac or "0").ljust(3, "0")) if frac else 0)
     else:
-        cur_header = existing[0]
-        if cur_header != header:
-            svc.spreadsheets().values().update(
-                spreadsheetId=spreadsheet_id,
-                range=f"{title}!A1:{col_letter(len(header)-1)}1",
-                valueInputOption="RAW",
-                body={"values": [header]},
-            ).execute()
-            existing = [header] + existing[1:]
+        mills = int(strike)
+    return f"{root:<6}{ymd}{cp}{int(mills):08d}"
 
-    upsert_keys = parse_upsert_keys(header)
 
-    def key_from_dict(d):
-        return tuple(str(d.get(k, "")) for k in upsert_keys)
+def osi_canon(osi: str) -> Tuple[str, str, str]:
+    """
+    Canonical key for an OSI-like string:
+      (YYMMDD, 'C'/'P', strike_8digits)
+    Assumes OSI formatted like: ROOT(6) + YYMMDD(6) + C/P(1) + STRIKE(8).
+    """
+    s = (osi or "")
+    if len(s) < 21:
+        return ("", "", "")
+    return (s[6:12], s[12], s[-8:])
 
-    # Build existing key -> row number map
-    existing_map = {}
-    for rnum, row in enumerate(existing[1:], start=2):
-        d = {header[i]: (row[i] if i < len(row) else "") for i in range(len(header))}
-        existing_map[key_from_dict(d)] = rnum
 
-    # De-dupe CSV rows by key (keep the LAST occurrence per key)
-    last_by_key = {}
-    for d in rows:
-        last_by_key[key_from_dict(d)] = d
-    rows = list(last_by_key.values())
+def fnum(x):
+    try:
+        return float(x)
+    except Exception:
+        return None
 
-    updates = []
-    appends = []
 
-    for d in rows:
-        key = key_from_dict(d)
-        values = [str(d.get(h, "")) for h in header]
-        if key in existing_map:
-            rnum = existing_map[key]
-            rng = f"{title}!A{rnum}:{col_letter(len(header)-1)}{rnum}"
-            updates.append((rng, values))
-        else:
-            appends.append(values)
+def parse_csv_floats(s: str):
+    out = []
+    for part in (s or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        out.append(float(part))
+    return out
 
-    if updates:
-        data = [{"range": rng, "values": [vals]} for (rng, vals) in updates]
-        svc.spreadsheets().values().batchUpdate(
-            spreadsheetId=spreadsheet_id,
-            body={"valueInputOption": "RAW", "data": data},
-        ).execute()
 
-    if appends:
-        svc.spreadsheets().values().append(
-            spreadsheetId=spreadsheet_id,
-            range=f"{title}!A1",
-            valueInputOption="RAW",
-            insertDataOption="INSERT_ROWS",
-            body={"values": appends},
-        ).execute()
+def get_case_insensitive(d: Dict[str, Any], key: str):
+    if key in d:
+        return d.get(key)
+    lk = key.lower()
+    for k, v in d.items():
+        if str(k).lower() == lk:
+            return v
+    return None
 
-    return {"updated": len(updates), "appended": len(appends), "keys": upsert_keys, "dedup_rows": len(rows)}
 
+def pick_vol_value(tr: Dict[str, Any], vol_field: str) -> Tuple[str, float | None]:
+    """
+    Returns (field_used, value_or_None).
+    vol_field supports:
+      - "VIX" / "VixOne" / etc
+      - "AUTO": try common candidates
+    """
+    if (vol_field or "").strip().upper() == "AUTO":
+        candidates = ["VIX", "Vix", "VixOne", "VIXONE", "Vix1", "VIX1"]
+    else:
+        candidates = [vol_field]
+
+    for k in candidates:
+        v = get_case_insensitive(tr, k)
+        fv = fnum(v)
+        if fv is not None:
+            return (k, fv)
+    return (vol_field, None)
+
+
+def vix_bucket_and_mult(vix_val: float | None, breaks_csv: str, mults_csv: str) -> Tuple[int, int]:
+    """
+    5 buckets => 4 breaks and 5 multipliers.
+    Example:
+      breaks = 14,16,18,22
+      mults  = 1,1,2,4,6
+    Buckets are 1..5.
+    """
+    breaks = parse_csv_floats(breaks_csv)
+    mults = parse_csv_floats(mults_csv)
+
+    if len(breaks) < 1:
+        raise ValueError("CS_VIX_BREAKS must contain at least 1 cutoff")
+    if len(mults) != len(breaks) + 1:
+        raise ValueError("CS_VIX_MULTS must have exactly len(CS_VIX_BREAKS)+1 values")
+
+    if vix_val is None:
+        # neutral bucket (middle)
+        mid = len(mults) // 2
+        return (mid + 1, int(mults[mid]))
+
+    for i, b in enumerate(breaks):
+        if vix_val < b:
+            return (i + 1, int(mults[i]))
+    return (len(mults), int(mults[-1]))
+
+
+# ---------- GammaWizard ----------
+
+def _sanitize_token(t: str) -> str:
+    t = (t or "").strip().strip('"').strip("'")
+    return t.split(None, 1)[1] if t.lower().startswith("bearer ") else t
+
+
+def gw_fetch():
+    base = GW_BASE
+    endpoint = GW_ENDPOINT
+    tok = _sanitize_token(os.environ.get("GW_TOKEN", "") or "")
+
+    url = f"{base}/{endpoint}"
+    print("CS_VERT_RUN GW URL:", url)
+
+    def hit(tkn):
+        h = {"Accept": "application/json"}
+        if tkn:
+            h["Authorization"] = f"Bearer {_sanitize_token(tkn)}"
+        return requests.get(url, headers=h, timeout=30)
+
+    r = hit(tok) if tok else None
+    if (r is None) or (r.status_code in (401, 403)):
+        email = os.environ.get("GW_EMAIL", "")
+        pwd = os.environ.get("GW_PASSWORD", "")
+        if not (email and pwd):
+            raise RuntimeError("GW_AUTH_REQUIRED")
+        rr = requests.post(
+            f"{base}/goauth/authenticateFireUser",
+            data={"email": email, "password": pwd},
+            timeout=30,
+        )
+        rr.raise_for_status()
+        t = rr.json().get("token") or ""
+        r = hit(t)
+
+    r.raise_for_status()
+    return r.json()
+
+
+def extract_trade(j):
+    if isinstance(j, dict):
+        if "Trade" in j:
+            tr = j["Trade"]
+            return tr[-1] if isinstance(tr, list) and tr else tr if isinstance(tr, dict) else {}
+        keys = ("Date", "TDate", "Limit", "CLimit", "LeftGo", "RightGo", "LImp", "RImp", "VIX", "VixOne")
+        if any(k in j for k in keys):
+            return j
+        for v in j.values():
+            if isinstance(v, (dict, list)):
+                t = extract_trade(v)
+                if t:
+                    return t
+    if isinstance(j, list):
+        for it in reversed(j):
+            t = extract_trade(it)
+            if t:
+                return t
+    return {}
+
+
+# ---------- Schwab helpers ----------
+
+def schwab_client():
+    app_key = os.environ["SCHWAB_APP_KEY"]
+    app_secret = os.environ["SCHWAB_APP_SECRET"]
+    token_json = os.environ["SCHWAB_TOKEN_JSON"]
+    with open("schwab_token.json", "w") as f:
+        f.write(token_json)
+    c = client_from_token_file(
+        api_key=app_key,
+        app_secret=app_secret,
+        token_path="schwab_token.json",
+    )
+    return c
+
+
+def opening_cash_for_account(c, prefer_number=None):
+    """
+    Returns (value_or_None, source_key, acct_number).
+    Fix: ignores 0/negative values; prefers liquidationValue first.
+    """
+    r = c.get_accounts()
+    r.raise_for_status()
+    data = r.json()
+    arr = data if isinstance(data, list) else [data]
+
+    if prefer_number is None:
+        try:
+            rr = c.get_account_numbers()
+            rr.raise_for_status()
+            prefer_number = str((rr.json() or [{}])[0].get("accountNumber") or "")
+        except Exception:
+            prefer_number = None
+
+    def hunt(a):
+        acct_id = None
+        init = {}
+        curr = {}
+        stack = [a]
+        while stack:
+            x = stack.pop()
+            if isinstance(x, dict):
+                if acct_id is None and x.get("accountNumber"):
+                    acct_id = str(x["accountNumber"])
+                if "initialBalances" in x and isinstance(x["initialBalances"], dict):
+                    init = x["initialBalances"]
+                if "currentBalances" in x and isinstance(x["currentBalances"], dict):
+                    curr = x["currentBalances"]
+                for v in x.values():
+                    if isinstance(v, (dict, list)):
+                        stack.append(v)
+            elif isinstance(x, list):
+                stack.extend(x)
+        return acct_id, init, curr
+
+    chosen = None
+    acct_num = ""
+    for a in arr:
+        aid, init, curr = hunt(a)
+        if prefer_number and aid == prefer_number:
+            chosen = (init, curr)
+            acct_num = aid
+            break
+        if chosen is None:
+            chosen = (init, curr)
+            acct_num = aid
+
+    if not chosen:
+        return None, "none", ""
+
+    init, curr = chosen
+
+    keys = [
+        "liquidationValue",
+        "cashAvailableForTrading",
+        "cashBalance",
+        "availableFundsNonMarginableTrade",
+        "buyingPowerNonMarginableTrade",
+        "optionBuyingPower",
+        "buyingPower",
+    ]
+
+    def pick(src):
+        for k in keys:
+            v = (src or {}).get(k)
+            if isinstance(v, (int, float)):
+                fv = float(v)
+                if fv > 0:
+                    return fv, k
+        return None
+
+    for src in (init, curr):
+        got = pick(src)
+        if got:
+            return got[0], got[1], acct_num
+
+    return None, "none", acct_num
+
+
+def get_account_hash(c):
+    r = c.get_account_numbers()
+    r.raise_for_status()
+    arr = r.json() or []
+    if not arr:
+        return ""
+    info = arr[0]
+    return str(info.get("hashValue") or info.get("hashvalue") or "")
+
+
+# ----- Positions map (for NO-CLOSE guard + TOPUP) -----
+
+def _sleep_for_429(resp, attempt: int) -> float:
+    ra = resp.headers.get("Retry-After")
+    if ra:
+        try:
+            return max(1.0, float(ra))
+        except Exception:
+            pass
+    return min(8.0, 0.6 * (2 ** attempt)) + random.uniform(0.0, 0.25)
+
+
+def schwab_get_json(c, url: str, params=None, tries: int = 6, tag: str = ""):
+    last = ""
+    for i in range(tries):
+        try:
+            r = c.session.get(url, params=(params or {}), timeout=20)
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code == 429:
+                time.sleep(_sleep_for_429(r, i))
+                continue
+            last = f"HTTP_{r.status_code}:{(r.text or '')[:200]}"
+        except Exception as e:
+            last = f"{type(e).__name__}:{str(e)}"
+        time.sleep(min(6.0, 0.5 * (2 ** i)))
+    raise RuntimeError(f"SCHWAB_GET_FAIL({tag}) {last or 'unknown'}")
+
+
+def _osi_from_instrument(ins: Dict[str, Any]) -> str | None:
+    """
+    Build OSI from Schwab instrument payload. Prefer symbol if parsable, else build from fields.
+    """
+    sym = (ins.get("symbol") or "").strip()
+    if sym:
+        try:
+            sym_clean = re.sub(r"\s+", "", sym)
+            return to_osi(sym_clean)
+        except Exception:
+            pass
+
+    exp = ins.get("optionExpirationDate") or ins.get("expirationDate") or ""
+    pc = (ins.get("putCall") or ins.get("type") or "").upper()
+    strike = ins.get("strikePrice") or ins.get("strike")
+
+    try:
+        if exp and strike is not None and pc:
+            ymd = date.fromisoformat(str(exp)[:10]).strftime("%y%m%d")
+            cp = "C" if pc.startswith("C") else "P"
+            mills = int(round(float(strike) * 1000))
+            return f"{'SPXW':<6}{ymd}{cp}{mills:08d}"
+    except Exception:
+        return None
+
+    return None
+
+
+def positions_map(c, acct_hash: str) -> Dict[Tuple[str, str, str], float]:
+    """
+    Returns dict: canon -> net_qty (positive=long, negative=short)
+    """
+    url = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}"
+    j = schwab_get_json(c, url, params={"fields": "positions"}, tag="POSITIONS")
+
+    sa = j[0]["securitiesAccount"] if isinstance(j, list) else (j.get("securitiesAccount") or j)
+    out: Dict[Tuple[str, str, str], float] = {}
+
+    for p in (sa.get("positions") or []):
+        ins = p.get("instrument", {}) or {}
+        atype = (ins.get("assetType") or ins.get("type") or "").upper()
+        if atype != "OPTION":
+            continue
+
+        osi = _osi_from_instrument(ins)
+        if not osi:
+            continue
+
+        try:
+            qty = float(p.get("longQuantity", 0)) - float(p.get("shortQuantity", 0))
+        except Exception:
+            continue
+
+        if abs(qty) < 1e-9:
+            continue
+
+        key = osi_canon(osi)
+        out[key] = out.get(key, 0.0) + qty
+
+    return out
+
+
+def vertical_units_open(pos: Dict[Tuple[str, str, str], float], buy_osi: str, sell_osi: str) -> int:
+    """
+    How many COMPLETE vertical units are currently open for the given legs, assuming:
+      BUY leg should be long (+)
+      SELL leg should be short (-)
+    """
+    buy_pos = float(pos.get(osi_canon(buy_osi), 0.0))
+    sell_pos = float(pos.get(osi_canon(sell_osi), 0.0))
+    buy_long = max(0.0, buy_pos)
+    sell_short = max(0.0, -sell_pos)
+    u = min(buy_long, sell_short)
+    return int(math.floor(u + 1e-9))
+
+
+# ---------- main ----------
 
 def main():
-    spreadsheet_id = (os.environ.get("GSHEET_ID") or "").strip()
-    if not spreadsheet_id:
-        print("ERROR: GSHEET_ID env is required", file=sys.stderr)
-        return 2
-
-    tab = (os.environ.get("CS_GSHEET_TAB") or "ConstantStableTrades").strip()
-    path = (os.environ.get("CS_LOG_PATH") or "logs/constantstable_vertical_trades.csv").strip()
-
-    if not os.path.exists(path):
-        print(f"CS_TRADES_TO_GSHEET: {path} missing — nothing to do")
+    # --- Schwab + equity (with override & fallback) ---
+    try:
+        c = schwab_client()
+        oc_val, oc_src, acct_num = opening_cash_for_account(c)
+        acct_hash = get_account_hash(c)
+    except Exception as e:
+        print(f"CS_VERT_RUN SKIP: Schwab init failed: {e}")
         return 0
 
-    with open(path, "r", newline="") as f:
-        rdr = csv.DictReader(f)
-        header = rdr.fieldnames or []
-        rows = list(rdr)
+    ov_raw = (os.environ.get("SIZING_DOLLARS_OVERRIDE", "") or "").strip()
+    if ov_raw:
+        try:
+            oc_val = float(ov_raw)
+            oc_src = "SIZING_DOLLARS_OVERRIDE"
+            print(f"CS_VERT_RUN INFO: using SIZING_DOLLARS_OVERRIDE={oc_val}")
+        except Exception:
+            print("CS_VERT_RUN WARN: bad SIZING_DOLLARS_OVERRIDE, ignoring override.")
 
-    if not header:
-        print(f"CS_TRADES_TO_GSHEET: {path} has no header — nothing to do")
+    print(f"CS_VERT_RUN EQUITY_RAW: {oc_val} (src={oc_src}, acct={acct_num})")
+
+    if CS_UNIT_DOLLARS <= 0:
+        print("CS_VERT_RUN FATAL: CS_UNIT_DOLLARS must be > 0")
+        return 1
+
+    if oc_val is None or oc_val <= 0:
+        print("CS_VERT_RUN WARN: equity unavailable/<=0 — defaulting to CS_UNIT_DOLLARS for sizing")
+        oc_val = CS_UNIT_DOLLARS
+        units = 1
+    else:
+        units = max(1, int(oc_val // CS_UNIT_DOLLARS))
+
+    print(f"CS_VERT_RUN UNITS: {units} (CS_UNIT_DOLLARS={CS_UNIT_DOLLARS}, oc_val={oc_val})")
+
+    # --- ConstantStable payload from GammaWizard ---
+    try:
+        api = gw_fetch()
+        tr = extract_trade(api)
+    except Exception as e:
+        print(f"CS_VERT_RUN SKIP: GW fetch failed: {e}")
         return 0
 
-    # Quick sanity output (helps debug "why am I not seeing anything?")
-    print(f"CS_TRADES_TO_GSHEET: loaded_csv_rows={len(rows)} cols={len(header)} tab={tab}")
-    if rows:
-        print("CS_TRADES_TO_GSHEET: first_row_keys_sample:", {k: rows[0].get(k, "") for k in header[:8]})
+    if not tr:
+        print("CS_VERT_RUN SKIP: NO_TRADE_PAYLOAD")
+        return 0
 
-    creds = creds_from_env()
-    svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
+    trade_date = str(tr.get("Date", ""))
+    tdate_iso = str(tr.get("TDate", ""))
 
-    ensure_sheet_tab(svc, spreadsheet_id, tab)
-    res = upsert_rows(svc, spreadsheet_id, tab, rows, header)
+    exp6 = yymmdd(tdate_iso)
+    inner_put = int(float(tr.get("Limit")))
+    inner_call = int(float(tr.get("CLimit")))
+    width = 5
 
-    print(
-        f"CS_TRADES_TO_GSHEET: {path} → {tab} "
-        f"appended={res['appended']} updated={res['updated']} "
-        f"upsert_keys={','.join(res['keys'])} dedup_rows={res['dedup_rows']}"
-    )
+    # strikes
+    p_low = inner_put - width
+    p_high = inner_put
+    c_low = inner_call
+    c_high = inner_call + width
+
+    put_low_osi = to_osi(f".SPXW{exp6}P{p_low}")
+    put_high_osi = to_osi(f".SPXW{exp6}P{p_high}")
+    call_low_osi = to_osi(f".SPXW{exp6}C{c_low}")
+    call_high_osi = to_osi(f".SPXW{exp6}C{c_high}")
+
+    left_go = fnum(tr.get("LeftGo"))
+    right_go = fnum(tr.get("RightGo"))
+    left_imp = fnum(tr.get("LImp"))
+    right_imp = fnum(tr.get("RImp"))
+
+    # Just for logging / introspection
+    put_strength = left_imp if left_imp is not None else (abs(left_go) if left_go is not None else 0.0)
+    call_strength = right_imp if right_imp is not None else (abs(right_go) if right_go is not None else 0.0)
+
+    # Vol bucket sizing
+    field_used, vol_val = pick_vol_value(tr, CS_VOL_FIELD)
+    bucket, vix_mult = vix_bucket_and_mult(vol_val, CS_VIX_BREAKS, CS_VIX_MULTS)
+    print(f"CS_VERT_RUN VOL: field={CS_VOL_FIELD} used={field_used} value={vol_val} bucket={bucket} mult={vix_mult}")
+    print(f"CS_VERT_RUN VIX_BREAKS={CS_VIX_BREAKS} VIX_MULTS={CS_VIX_MULTS}")
+
+    print(f"CS_VERT_RUN TRADE: Date={trade_date} TDate={tdate_iso}")
+    print(f"  PUT strikes : {p_low} / {p_high}  OSI=({put_low_osi},{put_high_osi})  LeftGo={left_go} LImp={left_imp}")
+    print(f"  CALL strikes: {c_low} / {c_high}  OSI=({call_low_osi},{call_high_osi})  RightGo={right_go} RImp={right_imp}")
+    print(f"CS_VERT_RUN RAW_STRENGTH: put_strength={put_strength:.3f} call_strength={call_strength:.3f}")
+
+    verts = []
+
+    # ----- PUT side -----
+    if left_go is not None and left_go != 0.0 and vix_mult != 0:
+        target_qty = max(1, units * int(vix_mult))
+
+        if left_go < 0:
+            # Short put vertical (credit): short higher strike, long lower
+            name = "PUT_SHORT"
+            side = "CREDIT"
+            direction = "SHORT"
+            short_osi = put_high_osi  # SELL_TO_OPEN leg
+            long_osi = put_low_osi    # BUY_TO_OPEN leg
+        else:
+            # Long put vertical (debit): buy higher, sell lower
+            name = "PUT_LONG"
+            side = "DEBIT"
+            direction = "LONG"
+            short_osi = put_low_osi   # SELL_TO_OPEN leg
+            long_osi = put_high_osi   # BUY_TO_OPEN leg
+
+        verts.append({
+            "name": name,
+            "kind": "PUT",
+            "side": side,
+            "direction": direction,
+            "short_osi": short_osi,
+            "long_osi": long_osi,
+            "go": left_go,
+            "strength": put_strength,
+            "target_qty": int(target_qty),
+        })
+
+    # ----- CALL side -----
+    if right_go is not None and right_go != 0.0 and vix_mult != 0:
+        target_qty = max(1, units * int(vix_mult))
+
+        if right_go < 0:
+            # Short call vertical (credit): short LOWER strike, long HIGHER strike
+            name = "CALL_SHORT"
+            side = "CREDIT"
+            direction = "SHORT"
+            short_osi = call_low_osi   # SELL_TO_OPEN leg
+            long_osi = call_high_osi   # BUY_TO_OPEN leg
+        else:
+            # Long call vertical (debit): buy LOWER strike, sell HIGHER strike
+            name = "CALL_LONG"
+            side = "DEBIT"
+            direction = "LONG"
+            short_osi = call_high_osi  # SELL_TO_OPEN leg
+            long_osi = call_low_osi    # BUY_TO_OPEN leg
+
+        verts.append({
+            "name": name,
+            "kind": "CALL",
+            "side": side,
+            "direction": direction,
+            "short_osi": short_osi,
+            "long_osi": long_osi,
+            "go": right_go,
+            "strength": call_strength,
+            "target_qty": int(target_qty),
+        })
+
+    if not verts:
+        print("CS_VERT_RUN SKIP: no verticals to trade (LeftGo/RightGo zero or vix_mult=0).")
+        return 0
+
+    # ----- Load positions once (for NO-CLOSE guard + TOPUP) -----
+    pos = None
+    need_positions = CS_GUARD_NO_CLOSE or CS_TOPUP_TO_TARGET
+    if need_positions:
+        try:
+            pos = positions_map(c, acct_hash)
+            print(
+                "CS_VERT_RUN POSITIONS: loaded",
+                f"count={len(pos)}",
+                f"(guard={'on' if CS_GUARD_NO_CLOSE else 'off'}, topup={'on' if CS_TOPUP_TO_TARGET else 'off'})",
+            )
+        except Exception as e:
+            msg = str(e)[:220]
+            if CS_GUARD_FAIL_ACTION == "CONTINUE":
+                print(f"CS_VERT_RUN POSITIONS WARN: fetch failed ({msg}) — continuing WITHOUT guard/topup.")
+                pos = None
+            else:
+                print(f"CS_VERT_RUN POSITIONS SKIP: fetch failed ({msg}) — skipping ALL trades.")
+                return 0
+    else:
+        print("CS_VERT_RUN POSITIONS: not needed (guard=off, topup=off)")
+
+    # ----- Spawn placer per vertical -----
+    for v in verts:
+        strength_s = f"{v['strength']:.3f}"
+        target_qty = int(v["target_qty"])
+
+        # --- TOPUP (cap at target qty) ---
+        rem_qty = target_qty
+        open_units = None
+        if CS_TOPUP_TO_TARGET and pos is not None:
+            open_units = vertical_units_open(pos, v["long_osi"], v["short_osi"])
+            rem_qty = max(0, target_qty - int(open_units))
+            print(f"CS_VERT_RUN TOPUP {v['name']}: target={target_qty} open={open_units} rem={rem_qty}")
+            if rem_qty <= 0:
+                print(f"CS_VERT_RUN SKIP {v['name']}: AT_OR_ABOVE_TARGET")
+                continue
+
+        print(
+            f"CS_VERT_RUN {v['name']}: side={v['side']} kind={v['kind']} "
+            f"short={v['short_osi']} long={v['long_osi']} "
+            f"go={v['go']} target_qty={target_qty} send_qty={rem_qty} "
+            f"(units={units} vix_mult={vix_mult} bucket={bucket})"
+        )
+
+        # --- NO-CLOSE guard check per vertical ---
+        if CS_GUARD_NO_CLOSE and pos is not None:
+            buy_leg_key = osi_canon(v["long_osi"])   # BUY_TO_OPEN leg
+            sell_leg_key = osi_canon(v["short_osi"]) # SELL_TO_OPEN leg
+
+            buy_leg_pos = float(pos.get(buy_leg_key, 0.0))
+            sell_leg_pos = float(pos.get(sell_leg_key, 0.0))
+
+            print(
+                f"CS_VERT_RUN GUARD_CHECK {v['name']}: "
+                f"BUY_TO_OPEN {v['long_osi']} pos={buy_leg_pos:+g} ; "
+                f"SELL_TO_OPEN {v['short_osi']} pos={sell_leg_pos:+g}"
+            )
+
+            # If BUY_TO_OPEN would net/close an existing short -> skip
+            if buy_leg_pos < -1e-9:
+                print(f"CS_VERT_RUN GUARD_SKIP {v['name']}: WOULD_CLOSE (buy leg is short)")
+                continue
+
+            # If SELL_TO_OPEN would net/close an existing long -> skip
+            if sell_leg_pos > 1e-9:
+                print(f"CS_VERT_RUN GUARD_SKIP {v['name']}: WOULD_CLOSE (sell leg is long)")
+                continue
+
+        # nothing to do?
+        if rem_qty <= 0:
+            continue
+
+        env = dict(os.environ)
+        env.update({
+            "VERT_SIDE":         v["side"],
+            "VERT_KIND":         v["kind"],
+            "VERT_NAME":         v["name"],
+            "VERT_DIRECTION":    v["direction"],
+            "VERT_SHORT_OSI":    v["short_osi"],
+            "VERT_LONG_OSI":     v["long_osi"],
+            "VERT_QTY":          str(rem_qty),
+            "VERT_GO":           "" if v["go"] is None else str(v["go"]),
+            "VERT_STRENGTH":     strength_s,
+            "VERT_TRADE_DATE":   trade_date,
+            "VERT_TDATE":        tdate_iso,
+
+            # sizing context
+            "VERT_UNIT_DOLLARS": str(CS_UNIT_DOLLARS),
+            "VERT_OC":           str(oc_val),
+            "VERT_UNITS":        str(units),
+
+            # vol context
+            "VERT_VOL_FIELD":    CS_VOL_FIELD,
+            "VERT_VOL_USED":     field_used,
+            "VERT_VOL_VALUE":    "" if vol_val is None else str(vol_val),
+            "VERT_VOL_BUCKET":   str(bucket),
+            "VERT_VOL_MULT":     str(vix_mult),
+            "VERT_QTY_RULE":     "VIX_BUCKET_TOPUP",
+            "VERT_TARGET_QTY":   str(target_qty),
+            "VERT_OPEN_UNITS":   "" if open_units is None else str(open_units),
+
+            # needed by placer
+            "SCHWAB_APP_KEY":     os.environ["SCHWAB_APP_KEY"],
+            "SCHWAB_APP_SECRET":  os.environ["SCHWAB_APP_SECRET"],
+            "SCHWAB_TOKEN_JSON":  os.environ["SCHWAB_TOKEN_JSON"],
+            "SCHWAB_ACCT_HASH":   acct_hash,
+            "CS_LOG_PATH":        CS_LOG_PATH,
+        })
+
+        rc = subprocess.call([sys.executable, "scripts/trade/ConstantStable/place.py"], env=env)
+        if rc != 0:
+            print(f"CS_VERT_RUN {v['name']}: placer rc={rc}")
+
     return 0
 
 
