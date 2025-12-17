@@ -12,11 +12,6 @@
 #   VERT_MAX_LADDER=3
 #   VERT_CANCEL_TRIES=4
 #   VERT_DRY_RUN=true/false
-#
-# Fix (2025-12-15):
-# - Correctly handle the case where cancel fails due to HTTP_429 but the order is already FILLED.
-#   In that case we mark the run as OK and record qty_filled properly.
-# - Correctly accumulate fills across multiple rungs/orders (handles partial fills + top-up safely).
 
 import os, sys, time, random, csv
 from datetime import datetime, timezone
@@ -41,13 +36,6 @@ def clamp_tick(x: float) -> float:
 
 def truthy(s: str) -> bool:
     return str(s or "").strip().lower() in ("1", "true", "yes", "y", "on")
-
-
-def _to_int(x, default=0) -> int:
-    try:
-        return int(round(float(x)))
-    except Exception:
-        return int(default)
 
 
 # ---------- Schwab ----------
@@ -184,14 +172,6 @@ def delete_with_retry(c, url, tag="", tries=4):
     return False
 
 
-def _status_upper(st: dict) -> str:
-    return str(st.get("status") or st.get("orderStatus") or "").upper()
-
-
-def _filled_qty(st: dict) -> int:
-    return _to_int(st.get("filledQuantity") or st.get("filled_quantity") or 0, default=0)
-
-
 def log_row(row: dict):
     path = os.environ.get("CS_LOG_PATH", "logs/constantstable_vertical_trades.csv")
     d = os.path.dirname(path)
@@ -271,8 +251,6 @@ def main():
         return 0
 
     # Option B ladder:
-    # CREDIT: mid+0.05, mid, mid-0.05 (refresh last)
-    # DEBIT : mid-0.05, mid, mid+0.05 (refresh last)
     if side == "CREDIT":
         ladder_spec = [(+0.05, False), (0.00, False), (-0.05, True)]
     else:
@@ -280,7 +258,6 @@ def main():
 
     def price_from_mid(m, off, b, a):
         p = clamp_tick(m + off)
-        # Keep within [bid,ask]
         p = max(p, b)
         p = min(p, a)
         return p
@@ -320,13 +297,10 @@ def main():
         return 0
 
     url_post = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
-    filled_total, order_ids, last_price = 0, [], None
-
-    # For safety: treat any cancel failure with a still-working order as workflow-fail
-    cancel_left_working = False
+    filled, order_ids, last_price = 0, [], None
 
     for idx, (off, refresh) in enumerate(ladder_spec[:MAX_LADDER], start=1):
-        remaining = max(0, qty - filled_total)
+        remaining = max(0, qty - filled)
         if remaining <= 0:
             break
 
@@ -355,32 +329,27 @@ def main():
         if oid:
             order_ids.append(oid)
 
-        # Track cumulative fills correctly across orders/rungs
-        filled_this_order = 0
-
         # Work the rung
         t_end = time.time() + STEP_WAIT
         while time.time() < t_end and oid:
             st = get_status(c, acct_hash, oid) or {}
-            fq = _filled_qty(st)
-            if fq > filled_this_order:
-                delta = fq - filled_this_order
-                filled_total += max(0, delta)
-                filled_this_order = fq
+            fq = st.get("filledQuantity") or st.get("filled_quantity") or 0
+            try:
+                fq = int(round(float(fq)))
+            except Exception:
+                fq = 0
 
-            s = _status_upper(st)
-            if filled_total >= qty:
-                placed_reason = "OK"
-                break
+            if fq > filled:
+                filled = fq
 
-            if s in ("FILLED", "CANCELED", "REJECTED", "EXPIRED"):
+            s = str(st.get("status") or st.get("orderStatus") or "").upper()
+            if s in ("FILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED"):
                 break
 
             time.sleep(POLL_SECS)
 
-        if filled_total >= qty:
-            if placed_reason == "UNKNOWN":
-                placed_reason = "OK"
+        if filled >= qty:
+            placed_reason = "OK"
             break
 
         # Cancel before next rung
@@ -390,41 +359,39 @@ def main():
             print(f"CS_VERT_PLACE CANCEL {oid} → {'OK' if ok else 'FAIL'}")
 
             if not ok:
-                # Cancel can fail due to 429 even if the order is already FILLED/CANCELED.
+                # IMPORTANT FIX:
+                # If cancel fails, re-check status. If it's FILLED (or already CANCELED),
+                # that is NOT a dangerous stray-working-order situation.
                 st = get_status(c, acct_hash, oid) or {}
-                s = _status_upper(st)
-                fq = _filled_qty(st)
+                s = str(st.get("status") or st.get("orderStatus") or "").upper()
+                fq = st.get("filledQuantity") or st.get("filled_quantity") or 0
+                try:
+                    fq = int(round(float(fq)))
+                except Exception:
+                    fq = 0
+                if fq > filled:
+                    filled = fq
 
-                if fq > filled_this_order:
-                    delta = fq - filled_this_order
-                    filled_total += max(0, delta)
-                    filled_this_order = fq
-
-                # 1) If it's FILLED, that's a success. Stop cleanly.
                 if s == "FILLED":
-                    if filled_total >= qty:
-                        placed_reason = "OK_STATUS_FILLED"
-                    else:
-                        # Extremely defensive fallback (shouldn't happen, but avoids logging 0)
-                        filled_total = max(filled_total, qty)
-                        placed_reason = "OK_STATUS_FILLED"
+                    if filled < qty:
+                        filled = qty
+                    placed_reason = "OK"
                     break
 
-                # 2) If it's already CANCELED/REJECTED/EXPIRED, treat as safe and continue
-                if s in ("CANCELED", "REJECTED", "EXPIRED"):
-                    print(f"CS_VERT_PLACE CANCEL_FAIL_BUT_STATUS_{s}: treating as safe and continuing.")
+                if s in ("CANCELED", "CANCELLED", "REJECTED", "EXPIRED"):
+                    # safe to continue ladder
                     time.sleep(CANCEL_SETTLE)
                     continue
 
-                # 3) Otherwise it's dangerous (likely still WORKING). Stop to avoid duplicates.
-                cancel_left_working = True
                 placed_reason = f"CANCEL_FAILED_STATUS_{s or 'UNKNOWN'}"
                 break
 
             time.sleep(CANCEL_SETTLE)
 
-    if filled_total == 0 and placed_reason == "UNKNOWN":
+    if filled == 0 and placed_reason == "UNKNOWN":
         placed_reason = "HTTP_429_RATE_LIMIT" if saw_429 else "NO_FILL"
+    elif filled > 0 and placed_reason == "UNKNOWN":
+        placed_reason = "PARTIAL_FILL"
 
     # Final NBBO snapshot (best-effort)
     b2, a2, m2 = vertical_nbbo(side, short_osi, long_osi, c)
@@ -443,7 +410,7 @@ def main():
         "vol_field": vol_field, "vol_used": vol_used, "vol_value": vol_value,
         "vol_bucket": vol_bucket, "vol_mult": vol_mult,
         "unit_dollars": unit_d, "oc": oc, "units": units,
-        "qty_requested": qty, "qty_filled": filled_total,
+        "qty_requested": qty, "qty_filled": filled,
         "ladder_prices": ladder_str,
         "last_price": f"{last_price:.2f}" if last_price is not None else "",
         "nbbo_bid": f"{b2:.2f}" if b2 is not None else "",
@@ -454,15 +421,15 @@ def main():
     }
     log_row(row)
 
-    print(f"CS_VERT_PLACE DONE name={name} side={side} kind={kind} qty_req={qty} qty_filled={filled_total} last_price={last_price} reason={placed_reason}")
+    print(f"CS_VERT_PLACE DONE name={name} side={side} kind={kind} qty_req={qty} qty_filled={filled} last_price={last_price} reason={placed_reason}")
 
-    goutput("placed", "1" if filled_total > 0 else "0")
+    goutput("placed", "1" if filled > 0 else "0")
     goutput("reason", placed_reason)
-    goutput("qty_filled", str(filled_total))
+    goutput("qty_filled", str(filled))
     goutput("order_ids", ",".join(order_ids))
 
-    # Fail workflow ONLY if cancel failed and the order may still be live/working
-    if cancel_left_working or placed_reason.startswith("CANCEL_FAILED"):
+    # Fail workflow ONLY if cancel failed and status was not safe
+    if placed_reason.startswith("CANCEL_FAILED"):
         return 2
 
     return 0
