@@ -24,14 +24,17 @@ jobs:
 
       # ConstantStable sizing
       CS_UNIT_DOLLARS: "10000"
+      SIZING_DOLLARS_OVERRIDE: ""
 
-      # ===============================
-      # 7-BUCKET VixOne DEFAULT CONFIG
-      # ===============================
-      # 7 buckets => 6 breaks + 7 mults
+      # Vol sizing defaults (VixOne + 7 buckets)
       CS_VOL_FIELD:  "VixOne"
       CS_VIX_BREAKS: "0.14,0.15,0.16,0.18,0.20,0.22"
       CS_VIX_MULTS:  "1,1,1,2,3,4,6"
+
+      # Controls
+      CS_TOPUP_ENABLED: "1"
+      CS_GUARD_NO_CLOSE: "1"
+      CS_GUARD_FAIL_ACTION: "SKIP_ALL"
 
       # Logging
       CS_LOG_PATH: "logs/constantstable_vertical_trades.csv"
