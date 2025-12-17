@@ -22,24 +22,27 @@ jobs:
       GW_BASE:            "https://gandalf.gammawizard.com"
       GW_ENDPOINT:        "rapi/GetUltraPureConstantStable"
 
-      # ConstantStable sizing (defaults)
-      CS_UNIT_DOLLARS:    "10000"
+      # ConstantStable sizing
+      CS_UNIT_DOLLARS: "10000"
 
-      # Vol regime sizing (defaults)
-      CS_VOL_FIELD:       "VIX"
-      CS_VIX_BREAKS:      "0.14,0.16,0.18,0.22"
-      CS_VIX_MULTS:       "1,1,2,4,6"
+      # ===============================
+      # 7-BUCKET VixOne DEFAULT CONFIG
+      # ===============================
+      # 7 buckets => 6 breaks + 7 mults
+      CS_VOL_FIELD:  "VixOne"
+      CS_VIX_BREAKS: "0.14,0.15,0.16,0.18,0.20,0.22"
+      CS_VIX_MULTS:  "1,1,1,2,3,4,6"
 
       # Logging
-      CS_LOG_PATH:        "logs/constantstable_vertical_trades.csv"
+      CS_LOG_PATH: "logs/constantstable_vertical_trades.csv"
 
-      # Placer timing knobs (defaults)
-      VERT_STEP_WAIT:     "12"
-      VERT_POLL_SECS:     "1.5"
-      VERT_CANCEL_SETTLE: "1.0"
-      VERT_MAX_LADDER:    "3"
-      VERT_DRY_RUN:       "false"
-      VERT_CANCEL_TRIES:  "4"
+      # Placer timing knobs
+      VERT_STEP_WAIT:      "12"
+      VERT_POLL_SECS:      "1.5"
+      VERT_CANCEL_SETTLE:  "1.0"
+      VERT_MAX_LADDER:     "3"
+      VERT_DRY_RUN:        "false"
+      VERT_CANCEL_TRIES:   "4"
 
     steps:
       - uses: actions/checkout@v4
