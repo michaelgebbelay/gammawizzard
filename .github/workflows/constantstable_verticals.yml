@@ -28,7 +28,7 @@ jobs:
 
       # Vol sizing defaults (VixOne + 7 buckets)
       CS_VOL_FIELD:  "VixOne"
-      CS_VIX_BREAKS: "0.14,0.15,0.16,0.18,0.20,0.22"
+      CS_VIX_BREAKS: "0.1123,0.1341,0.1640,0.2029,0.2867,0.3478"
       CS_VIX_MULTS:  "1,1,1,2,3,4,6"
 
       # Controls
