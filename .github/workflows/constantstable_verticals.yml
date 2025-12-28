@@ -6,7 +6,7 @@ on:
 jobs:
   trade:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 15
 
     env:
       PYTHONUNBUFFERED: "1"
@@ -22,24 +22,29 @@ jobs:
       GW_BASE:            "https://gandalf.gammawizard.com"
       GW_ENDPOINT:        "rapi/GetUltraPureConstantStable"
 
-      # ConstantStable sizing
-      CS_UNIT_DOLLARS: "10000"
-      SIZING_DOLLARS_OVERRIDE: ""
-
-      # Vol sizing defaults (VixOne + 7 buckets)
+      # --- Sizing / Vol regime defaults (VixOne 5 buckets) ---
+      # NOTE:
+      # - Breaks are for VixOne (decimal), not VIX.
+      # - 5 buckets => 4 breaks + 5 multipliers
+      CS_UNIT_DOLLARS: "15000"
       CS_VOL_FIELD:  "VixOne"
-      CS_VIX_BREAKS: "0.089,0.111,0.131,0.158,0.192,0.253"
-      CS_VIX_MULTS:  "1,1,1,2,3,4,6"
-
-      # Controls
-      CS_TOPUP_ENABLED: "1"
-      CS_GUARD_NO_CLOSE: "1"
-      CS_GUARD_FAIL_ACTION: "SKIP_ALL"
+      CS_VIX_BREAKS: "0.1636779,0.3276571,0.3702533,0.4514141"
+      CS_VIX_MULTS:  "1,2,4,8,10"
 
       # Logging
       CS_LOG_PATH: "logs/constantstable_vertical_trades.csv"
 
-      # Placer timing knobs
+      # Guardrails (keep as-is)
+      CS_GUARD_NO_CLOSE: "1"
+      CS_GUARD_FAIL_ACTION: "SKIP_ALL"
+      CS_TOPUP_ENABLE: "1"
+
+      # Edge guard sheet (already in your repo flow)
+      GSHEET_ID: ${{ secrets.GSHEET_ID }}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+      CS_EDGE_GSHEET_TAB: "ConstantStableEdge"
+
+      # Placer timing knobs (keep as-is unless you want to tweak)
       VERT_STEP_WAIT:      "12"
       VERT_POLL_SECS:      "1.5"
       VERT_CANCEL_SETTLE:  "1.0"
@@ -65,9 +70,11 @@ jobs:
 
       - name: Push ConstantStable trades to Google Sheets
         env:
-          GSHEET_ID: ${{ secrets.GSHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           CS_GSHEET_TAB: "ConstantStableTrades"
           CS_LOG_PATH: "logs/constantstable_vertical_trades.csv"
         run: |
           python scripts/data/cs_trades_to_gsheet.py
+
+      - name: Edge guard (write/update daily stats)
+        run: |
+          python scripts/trade/ConstantStable/edge_guard.py
