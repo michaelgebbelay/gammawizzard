@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# CONSTANT STABLE — vertical orchestrator
+# CONSTANT STABLE — vertical orchestrator (with NO-CLOSE guard, TOPUP, and optional 4-leg bundling)
 #
 # What it does:
 # - Fetches ConstantStable payload from GammaWizard (GetUltraPureConstantStable).
@@ -11,25 +11,22 @@
 #     RightGo < 0 -> short call vertical (credit)
 #     RightGo > 0 -> long  call vertical (debit)
 #
-# Sizing (base):
-# - units = floor(account_value / CS_UNIT_DOLLARS) with a floor of 1
-# - vol bucket multiplier: N buckets -> multipliers from CS_VIX_MULTS
-# - base target qty per leg = units * vol_mult  (if vol_mult == 0 -> leg is skipped)
+# Sizing:
+# - units = floor(account_value / CS_UNIT_DOLLARS)   (min 1)
+# - Vol bucket multiplier from CS_VIX_MULTS (len = len(CS_VIX_BREAKS)+1).
+# - target_qty = max(1, units * vix_mult)  (if vix_mult == 0 -> skip)
 #
-# Top-up sizing:
-# - Only place additional qty to reach today's target (never exceed).
-# - Controlled by CS_TOPUP=1 (default).
+# TOPUP (default ON):
+# - If you already have open spreads for today's strikes, only top up to target_qty.
+#   (Avoids "adding more just because".)
 #
-# Guard (NO-CLOSE):
-# - If an opening vertical would net/close an existing position leg, SKIP that vertical.
+# Guard (NO-CLOSE, default ON):
+# - If an opening vertical would net/close an existing option position leg, SKIP that vertical.
 #   (Adding to existing same-direction is OK.)
-# - Controlled by:
-#     CS_GUARD_NO_CLOSE=1 (default)
-#     CS_GUARD_FAIL_ACTION=SKIP_ALL (default) or CONTINUE
 #
-# Drawdown throttle + edge monitor (optional, non-blocking):
-# - Uses scripts/trade/ConstantStable/edge_guard.py (Google Sheets persisted).
-# - If Sheet creds are missing, it disables itself (does NOT block trading).
+# 4-leg bundling (default ON):
+# - If both PUT and CALL legs are eligible AND have the same send_qty, place as ONE 4-leg order.
+# - If asymmetric, fallback to placing each vertical separately.
 #
 # Delegates placement + logging to scripts/trade/ConstantStable/place.py via VERT_* envs.
 
@@ -38,27 +35,25 @@ import sys
 import re
 import time
 import random
-import math
 import subprocess
-import importlib.util
 from datetime import date
-from typing import Any, Dict, Tuple, Optional
+from typing import Any, Dict, Tuple
 
 import requests
 from schwab.auth import client_from_token_file
 
-__version__ = "2.4.0"
+__version__ = "2.3.0"
 
 GW_BASE = os.environ.get("GW_BASE", "https://gandalf.gammawizard.com").rstrip("/")
 GW_ENDPOINT = os.environ.get("GW_ENDPOINT", "rapi/GetUltraPureConstantStable").lstrip("/")
 
-CS_UNIT_DOLLARS = float(os.environ.get("CS_UNIT_DOLLARS", "15000"))
+CS_UNIT_DOLLARS = float(os.environ.get("CS_UNIT_DOLLARS", "10000"))
 CS_LOG_PATH = os.environ.get("CS_LOG_PATH", "logs/constantstable_vertical_trades.csv")
 
-# Vol bucket config (defaults: VixOne 5-bucket calibrated breaks)
-CS_VOL_FIELD = (os.environ.get("CS_VOL_FIELD", "VixOne") or "VixOne").strip()
-CS_VIX_BREAKS = os.environ.get("CS_VIX_BREAKS", "0.1636779,0.3276571,0.3702533,0.4514141")
-CS_VIX_MULTS = os.environ.get("CS_VIX_MULTS", "1,2,4,8,10")
+# Vol bucket config
+CS_VOL_FIELD = (os.environ.get("CS_VOL_FIELD", "VixOne") or "VixOne").strip()  # default changed to VixOne
+CS_VIX_BREAKS = os.environ.get("CS_VIX_BREAKS", "0.089,0.111,0.131,0.158,0.192,0.253")
+CS_VIX_MULTS = os.environ.get("CS_VIX_MULTS", "1,1,1,2,3,4,6")
 
 # --- NO-CLOSE guard config ---
 CS_GUARD_NO_CLOSE = (os.environ.get("CS_GUARD_NO_CLOSE", "1") or "1").strip().lower() in ("1", "true", "yes", "y")
@@ -66,33 +61,16 @@ CS_GUARD_FAIL_ACTION = (os.environ.get("CS_GUARD_FAIL_ACTION", "SKIP_ALL") or "S
 #   SKIP_ALL  -> safest: if we cannot load positions, skip everything
 #   CONTINUE  -> proceed without guard (not recommended)
 
-# --- Top-up config ---
+# --- TOPUP config ---
 CS_TOPUP = (os.environ.get("CS_TOPUP", "1") or "1").strip().lower() in ("1", "true", "yes", "y")
+CS_TOPUP_FAIL_ACTION = (os.environ.get("CS_TOPUP_FAIL_ACTION", "SKIP_ALL") or "SKIP_ALL").strip().upper()
+#   SKIP_ALL  -> safest: if we cannot load positions, skip everything
+#   CONTINUE  -> proceed without topup
 
+# --- 4-leg bundle config ---
+CS_BUNDLE_4LEG = (os.environ.get("CS_BUNDLE_4LEG", "1") or "1").strip().lower() in ("1", "true", "yes", "y")
+CS_BUNDLE_REQUIRE_EQUAL_QTY = (os.environ.get("CS_BUNDLE_REQUIRE_EQUAL_QTY", "1") or "1").strip().lower() in ("1", "true", "yes", "y")
 
-def _load_edge_guard():
-    """
-    Best-effort loader for scripts/trade/ConstantStable/edge_guard.py.
-
-    We avoid normal package imports because this repo path is often not a Python package.
-    """
-    try:
-        here = os.path.dirname(os.path.abspath(__file__))
-        path = os.path.join(here, "edge_guard.py")
-        if not os.path.exists(path):
-            return None
-        spec = importlib.util.spec_from_file_location("cs_edge_guard", path)
-        if not spec or not spec.loader:
-            return None
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)  # type: ignore[attr-defined]
-        return mod
-    except Exception as e:
-        print(f"CS_VERT_RUN EDGE_GUARD WARN: failed to load edge_guard.py ({type(e).__name__}: {e})")
-        return None
-
-
-edge_guard = _load_edge_guard()
 
 # ---------- Utility helpers ----------
 
@@ -129,7 +107,7 @@ def osi_canon(osi: str) -> Tuple[str, str, str]:
     return (s[6:12], s[12], s[-8:])
 
 
-def fnum(x) -> Optional[float]:
+def fnum(x):
     try:
         return float(x)
     except Exception:
@@ -156,7 +134,7 @@ def get_case_insensitive(d: Dict[str, Any], key: str):
     return None
 
 
-def pick_vol_value(tr: Dict[str, Any], vol_field: str) -> Tuple[str, Optional[float]]:
+def pick_vol_value(tr: Dict[str, Any], vol_field: str) -> Tuple[str, float | None]:
     """
     Returns (field_used, value_or_None).
     vol_field supports:
@@ -176,48 +154,30 @@ def pick_vol_value(tr: Dict[str, Any], vol_field: str) -> Tuple[str, Optional[fl
     return (vol_field, None)
 
 
-def normalize_vol_to_breaks(v: Optional[float], breaks: list[float]) -> Optional[float]:
-    """
-    GammaWizard has historically used BOTH:
-      - fraction form: 0.165 (i.e., 16.5%)
-      - percent form: 16.5
-    This normalizes v to the same "scale" as breaks to avoid VIX vs VixOne confusion.
-    """
-    if v is None or not breaks:
-        return v
-
-    mx = max(breaks)
-    if v > 2.0 and mx <= 2.0:
-        return v / 100.0
-    if v <= 2.0 and mx > 2.0:
-        return v * 100.0
-    return v
-
-
-def vix_bucket_and_mult(v_val: Optional[float], breaks_csv: str, mults_csv: str) -> Tuple[int, int, list[float]]:
+def vix_bucket_and_mult(vix_val: float | None, breaks_csv: str, mults_csv: str) -> Tuple[int, int]:
     """
     N buckets => (N-1) breaks and N multipliers.
     Example (7 buckets):
       breaks = 0.089,0.111,0.131,0.158,0.192,0.253
-      mults  = 1,2,2,4,4,5,6
+      mults  = 1,1,1,2,3,4,6
     Buckets are 1..N.
     """
     breaks = parse_csv_floats(breaks_csv)
     mults = parse_csv_floats(mults_csv)
 
+    if len(breaks) < 1:
+        raise ValueError("CS_VIX_BREAKS must contain at least 1 cutoff")
     if len(mults) != len(breaks) + 1:
         raise ValueError("CS_VIX_MULTS must have exactly len(CS_VIX_BREAKS)+1 values")
 
-    v = normalize_vol_to_breaks(v_val, breaks)
-
-    if v is None:
+    if vix_val is None:
         mid = len(mults) // 2
-        return (mid + 1, int(mults[mid]), breaks)
+        return (mid + 1, int(mults[mid]))
 
     for i, b in enumerate(breaks):
-        if v < b:
-            return (i + 1, int(mults[i]), breaks)
-    return (len(mults), int(mults[-1]), breaks)
+        if vix_val < b:
+            return (i + 1, int(mults[i]))
+    return (len(mults), int(mults[-1]))
 
 
 # ---------- GammaWizard ----------
@@ -390,7 +350,7 @@ def get_account_hash(c):
     return str(info.get("hashValue") or info.get("hashvalue") or "")
 
 
-# ----- Positions map (for NO-CLOSE guard & TOPUP) -----
+# ----- Positions map (for NO-CLOSE guard + TOPUP) -----
 
 def _sleep_for_429(resp, attempt: int) -> float:
     ra = resp.headers.get("Retry-After")
@@ -419,10 +379,7 @@ def schwab_get_json(c, url: str, params=None, tries: int = 6, tag: str = ""):
     raise RuntimeError(f"SCHWAB_GET_FAIL({tag}) {last or 'unknown'}")
 
 
-def _osi_from_instrument(ins: Dict[str, Any]) -> Optional[str]:
-    """
-    Build OSI from Schwab instrument payload. Prefer symbol if parsable, else build from fields.
-    """
+def _osi_from_instrument(ins: Dict[str, Any]) -> str | None:
     sym = (ins.get("symbol") or "").strip()
     if sym:
         try:
@@ -481,24 +438,52 @@ def positions_map(c, acct_hash: str) -> Dict[Tuple[str, str, str], float]:
     return out
 
 
-def open_structures(pos: Dict[Tuple[str, str, str], float], long_osi: str, short_osi: str) -> int:
+def open_spreads_for_vertical(v: Dict[str, Any], pos: Dict[Tuple[str, str, str], float]) -> int:
     """
-    For a vertical where we BUY_TO_OPEN long_osi and SELL_TO_OPEN short_osi,
-    an "open structure" is approximated as:
-      min(long_pos, -short_pos) when long_pos>0 and short_pos<0.
-    Otherwise returns 0.
+    Computes open spread count for a vertical from option leg net positions.
+    For a properly opened spread:
+      BUY leg should be > 0
+      SELL leg should be < 0
+    Spread count ~= min(buy_qty, abs(sell_qty))
     """
-    lp = float(pos.get(osi_canon(long_osi), 0.0))
-    sp = float(pos.get(osi_canon(short_osi), 0.0))
-    if lp > 0 and sp < 0:
-        return int(max(0.0, min(lp, -sp)))
-    return 0
+    buy_key = osi_canon(v["long_osi"])   # BUY_TO_OPEN
+    sell_key = osi_canon(v["short_osi"]) # SELL_TO_OPEN
+
+    buy_pos = float(pos.get(buy_key, 0.0))
+    sell_pos = float(pos.get(sell_key, 0.0))
+
+    b = buy_pos if buy_pos > 0 else 0.0
+    s = (-sell_pos) if sell_pos < 0 else 0.0
+    return int(min(b, s) + 1e-9)
+
+
+def would_close_guard(v: Dict[str, Any], pos: Dict[Tuple[str, str, str], float]) -> bool:
+    """
+    Returns True if this opening order would net/close an existing position (unsafe).
+    """
+    buy_key = osi_canon(v["long_osi"])   # BUY_TO_OPEN
+    sell_key = osi_canon(v["short_osi"]) # SELL_TO_OPEN
+
+    buy_leg_pos = float(pos.get(buy_key, 0.0))
+    sell_leg_pos = float(pos.get(sell_key, 0.0))
+
+    print(
+        f"CS_VERT_RUN GUARD_CHECK {v['name']}: "
+        f"BUY_TO_OPEN {v['long_osi']} pos={buy_leg_pos:+g} ; "
+        f"SELL_TO_OPEN {v['short_osi']} pos={sell_leg_pos:+g}"
+    )
+
+    if buy_leg_pos < -1e-9:
+        return True
+    if sell_leg_pos > 1e-9:
+        return True
+    return False
 
 
 # ---------- main ----------
 
 def main():
-    # --- Schwab + equity ---
+    # --- Schwab + equity (with override & fallback) ---
     try:
         c = schwab_client()
         oc_val, oc_src, acct_num = opening_cash_for_account(c)
@@ -522,11 +507,13 @@ def main():
         print("CS_VERT_RUN FATAL: CS_UNIT_DOLLARS must be > 0")
         return 1
 
-    if oc_val is None or float(oc_val) <= 0:
+    if oc_val is None or oc_val <= 0:
         print("CS_VERT_RUN WARN: equity unavailable/<=0 — defaulting to CS_UNIT_DOLLARS for sizing")
         oc_val = CS_UNIT_DOLLARS
+        units = 1
+    else:
+        units = max(1, int(oc_val // CS_UNIT_DOLLARS))
 
-    units = max(1, int(float(oc_val) // CS_UNIT_DOLLARS))
     print(f"CS_VERT_RUN UNITS: {units} (CS_UNIT_DOLLARS={CS_UNIT_DOLLARS}, oc_val={oc_val})")
 
     # --- ConstantStable payload from GammaWizard ---
@@ -541,41 +528,15 @@ def main():
         print("CS_VERT_RUN SKIP: NO_TRADE_PAYLOAD")
         return 0
 
-    trade_date = str(tr.get("Date", "")).strip()
-    tdate_iso = str(tr.get("TDate", "")).strip()
+    trade_date = str(tr.get("Date", ""))
+    tdate_iso = str(tr.get("TDate", ""))
 
-    # --- Edge guard (optional) ---
-    throttle = 1.0
-    edge_action = "OK"
-    edge_reason = ""
-    try:
-        if edge_guard is not None and hasattr(edge_guard, "evaluate") and trade_date and oc_val is not None and float(oc_val) > 0:
-            eg = edge_guard.evaluate(trade_date=trade_date, equity=float(oc_val))
-            throttle = float(eg.get("throttle", 1.0) or 1.0)
-            edge_action = str(eg.get("action", "OK") or "OK").upper()
-            edge_reason = str(eg.get("reason", "") or "")
-            print(
-                "CS_VERT_RUN EDGE_GUARD:"
-                f" action={edge_action}"
-                f" throttle={throttle:.3f}"
-                + (f" reason={edge_reason}" if edge_reason else "")
-            )
-    except Exception as e:
-        print(f"CS_VERT_RUN EDGE_GUARD WARN: {type(e).__name__}: {e} — continuing without edge guard")
-        throttle = 1.0
-        edge_action = "OK"
-        edge_reason = ""
-
-    if edge_action == "STOP":
-        print(f"CS_VERT_RUN SKIP: EDGE_GUARD_STOP {edge_reason}".strip())
-        return 0
-
-    # --- Build 5-wide verticals ---
     exp6 = yymmdd(tdate_iso)
     inner_put = int(float(tr.get("Limit")))
     inner_call = int(float(tr.get("CLimit")))
     width = 5
 
+    # strikes
     p_low = inner_put - width
     p_high = inner_put
     c_low = inner_call
@@ -595,10 +556,8 @@ def main():
     call_strength = right_imp if right_imp is not None else (abs(right_go) if right_go is not None else 0.0)
 
     # Vol bucket sizing
-    field_used, vol_val_raw = pick_vol_value(tr, CS_VOL_FIELD)
-    bucket, vix_mult, breaks = vix_bucket_and_mult(vol_val_raw, CS_VIX_BREAKS, CS_VIX_MULTS)
-    vol_val = normalize_vol_to_breaks(vol_val_raw, breaks)
-
+    field_used, vol_val = pick_vol_value(tr, CS_VOL_FIELD)
+    bucket, vix_mult = vix_bucket_and_mult(vol_val, CS_VIX_BREAKS, CS_VIX_MULTS)
     print(f"CS_VERT_RUN VOL: field={CS_VOL_FIELD} used={field_used} value={vol_val} bucket={bucket} mult={vix_mult}")
     print(f"CS_VERT_RUN VIX_BREAKS={CS_VIX_BREAKS} VIX_MULTS={CS_VIX_MULTS}")
 
@@ -607,133 +566,128 @@ def main():
     print(f"  CALL strikes: {c_low} / {c_high}  OSI=({call_low_osi},{call_high_osi})  RightGo={right_go} RImp={right_imp}")
     print(f"CS_VERT_RUN RAW_STRENGTH: put_strength={put_strength:.3f} call_strength={call_strength:.3f}")
 
-    verts = []
+    # Build candidate verticals
+    v_put = None
+    v_call = None
 
-    # ----- PUT side -----
-    if left_go is not None and left_go != 0.0:
+    if left_go is not None and left_go != 0.0 and vix_mult != 0:
+        target = max(1, units * int(vix_mult))
         if left_go < 0:
-            name, side, direction = "PUT_SHORT", "CREDIT", "SHORT"
-            short_osi, long_osi = put_high_osi, put_low_osi
+            v_put = {
+                "name": "PUT_SHORT", "kind": "PUT", "side": "CREDIT", "direction": "SHORT",
+                "short_osi": put_high_osi, "long_osi": put_low_osi,
+                "go": left_go, "strength": put_strength, "target_qty": target,
+            }
         else:
-            name, side, direction = "PUT_LONG", "DEBIT", "LONG"
-            short_osi, long_osi = put_low_osi, put_high_osi
+            v_put = {
+                "name": "PUT_LONG", "kind": "PUT", "side": "DEBIT", "direction": "LONG",
+                "short_osi": put_low_osi, "long_osi": put_high_osi,
+                "go": left_go, "strength": put_strength, "target_qty": target,
+            }
 
-        verts.append({
-            "name": name,
-            "kind": "PUT",
-            "side": side,
-            "direction": direction,
-            "short_osi": short_osi,  # SELL_TO_OPEN leg
-            "long_osi": long_osi,    # BUY_TO_OPEN leg
-            "go": left_go,
-            "strength": put_strength,
-        })
-
-    # ----- CALL side -----
-    if right_go is not None and right_go != 0.0:
+    if right_go is not None and right_go != 0.0 and vix_mult != 0:
+        target = max(1, units * int(vix_mult))
         if right_go < 0:
-            name, side, direction = "CALL_SHORT", "CREDIT", "SHORT"
-            short_osi, long_osi = call_low_osi, call_high_osi
+            v_call = {
+                "name": "CALL_SHORT", "kind": "CALL", "side": "CREDIT", "direction": "SHORT",
+                "short_osi": call_low_osi, "long_osi": call_high_osi,
+                "go": right_go, "strength": call_strength, "target_qty": target,
+            }
         else:
-            name, side, direction = "CALL_LONG", "DEBIT", "LONG"
-            short_osi, long_osi = call_high_osi, call_low_osi
+            v_call = {
+                "name": "CALL_LONG", "kind": "CALL", "side": "DEBIT", "direction": "LONG",
+                "short_osi": call_high_osi, "long_osi": call_low_osi,
+                "go": right_go, "strength": call_strength, "target_qty": target,
+            }
 
-        verts.append({
-            "name": name,
-            "kind": "CALL",
-            "side": side,
-            "direction": direction,
-            "short_osi": short_osi,  # SELL_TO_OPEN leg
-            "long_osi": long_osi,    # BUY_TO_OPEN leg
-            "go": right_go,
-            "strength": call_strength,
-        })
-
-    if not verts:
-        print("CS_VERT_RUN SKIP: no verticals to trade (LeftGo/RightGo missing/zero).")
+    if not v_put and not v_call:
+        print("CS_VERT_RUN SKIP: no verticals to trade (LeftGo/RightGo zero or vix_mult=0).")
         return 0
 
-    # ----- Load positions once (guard/topup need it) -----
+    # Load positions once if needed (guard and/or topup)
+    need_positions = CS_GUARD_NO_CLOSE or CS_TOPUP
     pos = None
-    need_pos = CS_GUARD_NO_CLOSE or CS_TOPUP
-    if need_pos:
+    if need_positions:
         try:
             pos = positions_map(c, acct_hash)
-            print(f"CS_VERT_RUN POSITIONS: loaded count={len(pos)} (guard={'on' if CS_GUARD_NO_CLOSE else 'off'}, topup={'on' if CS_TOPUP else 'off'})")
+            print(
+                f"CS_VERT_RUN POSITIONS: loaded count={len(pos)} "
+                f"(guard={'on' if CS_GUARD_NO_CLOSE else 'off'}, topup={'on' if CS_TOPUP else 'off'})"
+            )
         except Exception as e:
             msg = str(e)[:220]
-            if CS_GUARD_NO_CLOSE and (CS_GUARD_FAIL_ACTION != "CONTINUE"):
-                print(f"CS_VERT_RUN GUARD SKIP: positions fetch failed ({msg}) — skipping ALL trades.")
+            # decide fail action
+            guard_ok = (not CS_GUARD_NO_CLOSE) or (CS_GUARD_FAIL_ACTION == "CONTINUE")
+            topup_ok = (not CS_TOPUP) or (CS_TOPUP_FAIL_ACTION == "CONTINUE")
+            if guard_ok and topup_ok:
+                print(f"CS_VERT_RUN POSITIONS WARN: fetch failed ({msg}) — continuing WITHOUT positions (guard/topup degraded).")
+                pos = None
+            else:
+                print(f"CS_VERT_RUN POSITIONS SKIP: fetch failed ({msg}) — skipping ALL trades.")
                 return 0
-            print(f"CS_VERT_RUN POSITIONS WARN: positions fetch failed ({msg}) — continuing without positions map.")
-            pos = None
 
-    # ----- Spawn placer per vertical -----
-    for v in verts:
-        base_target = units * int(vix_mult)
+    # Apply TOPUP + GUARD to determine send_qty
+    def finalize(v: Dict[str, Any]) -> Dict[str, Any] | None:
+        if not v:
+            return None
 
-        # Apply throttle (0..1) from edge guard
-        if throttle <= 0:
-            target_qty = 0
-        else:
-            target_qty = int(math.floor(base_target * float(throttle) + 1e-9))
-            if base_target > 0 and target_qty < 1:
-                target_qty = 1
-
-        if target_qty <= 0:
-            print(f"CS_VERT_RUN SKIP {v['name']}: TARGET_ZERO (base_target={base_target} throttle={throttle:.3f})")
-            continue
-
+        target_qty = int(v["target_qty"])
         open_qty = 0
-        if CS_TOPUP and pos is not None:
-            open_qty = open_structures(pos, v["long_osi"], v["short_osi"])
-            rem = max(0, int(target_qty) - int(open_qty))
+
+        if CS_TOPUP:
+            if pos is None:
+                # If topup is enabled but we couldn't load positions, safest is to skip
+                if CS_TOPUP_FAIL_ACTION != "CONTINUE":
+                    print(f"CS_VERT_RUN SKIP {v['name']}: TOPUP_NEEDS_POSITIONS")
+                    return None
+            else:
+                open_qty = open_spreads_for_vertical(v, pos)
+
+        rem = max(0, target_qty - open_qty) if CS_TOPUP else target_qty
+        if CS_TOPUP:
             print(f"CS_VERT_RUN TOPUP {v['name']}: target={target_qty} open={open_qty} rem={rem}")
-            if rem <= 0:
-                print(f"CS_VERT_RUN SKIP {v['name']}: AT_OR_ABOVE_TARGET")
-                continue
-            send_qty = rem
-            qty_rule = "VOL_BUCKET_TOPUP_THROTTLE"
-        else:
-            send_qty = target_qty
-            qty_rule = "VOL_BUCKET_THROTTLE" if throttle != 1.0 else "VOL_BUCKET"
 
-        print(
-            f"CS_VERT_RUN {v['name']}: side={v['side']} kind={v['kind']} "
-            f"short={v['short_osi']} long={v['long_osi']} "
-            f"go={v['go']} target_qty={target_qty} send_qty={send_qty} "
-            f"(units={units} vol_mult={vix_mult} bucket={bucket} throttle={throttle:.3f})"
-        )
+        if rem <= 0:
+            print(f"CS_VERT_RUN SKIP {v['name']}: AT_OR_ABOVE_TARGET")
+            return None
 
-        # --- NO-CLOSE guard check per vertical ---
-        if CS_GUARD_NO_CLOSE and pos is not None:
-            buy_leg_pos = float(pos.get(osi_canon(v["long_osi"]), 0.0))
-            sell_leg_pos = float(pos.get(osi_canon(v["short_osi"]), 0.0))
+        # Guard check
+        if CS_GUARD_NO_CLOSE:
+            if pos is None:
+                if CS_GUARD_FAIL_ACTION != "CONTINUE":
+                    print(f"CS_VERT_RUN SKIP {v['name']}: GUARD_NEEDS_POSITIONS")
+                    return None
+            else:
+                if would_close_guard(v, pos):
+                    print(f"CS_VERT_RUN GUARD_SKIP {v['name']}: WOULD_CLOSE")
+                    return None
 
-            print(
-                f"CS_VERT_RUN GUARD_CHECK {v['name']}: "
-                f"BUY_TO_OPEN {v['long_osi']} pos={buy_leg_pos:+g} ; "
-                f"SELL_TO_OPEN {v['short_osi']} pos={sell_leg_pos:+g}"
-            )
+        v2 = dict(v)
+        v2["send_qty"] = int(rem)
+        return v2
 
-            if buy_leg_pos < -1e-9:
-                print(f"CS_VERT_RUN GUARD_SKIP {v['name']}: WOULD_CLOSE (buy leg is short)")
-                continue
-            if sell_leg_pos > 1e-9:
-                print(f"CS_VERT_RUN GUARD_SKIP {v['name']}: WOULD_CLOSE (sell leg is long)")
-                continue
+    v_put_f = finalize(v_put) if v_put else None
+    v_call_f = finalize(v_call) if v_call else None
 
-        env = dict(os.environ)
-        env.update({
+    if not v_put_f and not v_call_f:
+        print("CS_VERT_RUN SKIP: nothing to place after TOPUP/GUARD.")
+        return 0
+
+    qty_rule = "VIX_BUCKET_TOPUP" if CS_TOPUP else "VIX_BUCKET"
+
+    def env_for_vertical(v: Dict[str, Any]) -> Dict[str, str]:
+        strength_s = f"{float(v['strength']):.3f}"
+        e = dict(os.environ)
+        e.update({
             "VERT_SIDE":         v["side"],
             "VERT_KIND":         v["kind"],
             "VERT_NAME":         v["name"],
             "VERT_DIRECTION":    v["direction"],
             "VERT_SHORT_OSI":    v["short_osi"],
             "VERT_LONG_OSI":     v["long_osi"],
-            "VERT_QTY":          str(int(send_qty)),
-            "VERT_GO":           "" if v["go"] is None else str(v["go"]),
-            "VERT_STRENGTH":     f"{float(v['strength']):.3f}",
+            "VERT_QTY":          str(v["send_qty"]),
+            "VERT_GO":           "" if v.get("go") is None else str(v["go"]),
+            "VERT_STRENGTH":     strength_s,
             "VERT_TRADE_DATE":   trade_date,
             "VERT_TDATE":        tdate_iso,
 
@@ -743,15 +697,12 @@ def main():
             "VERT_UNITS":        str(units),
 
             # vol context
-            "VERT_QTY_RULE":     qty_rule,
             "VERT_VOL_FIELD":    CS_VOL_FIELD,
             "VERT_VOL_USED":     field_used,
             "VERT_VOL_VALUE":    "" if vol_val is None else str(vol_val),
             "VERT_VOL_BUCKET":   str(bucket),
             "VERT_VOL_MULT":     str(vix_mult),
-            "VERT_VOL_BREAKS":   CS_VIX_BREAKS,
-            "VERT_VOL_MULTS":    CS_VIX_MULTS,
-            "VERT_THROTTLE":     f"{throttle:.6f}",
+            "VERT_QTY_RULE":     qty_rule,
 
             # needed by placer
             "SCHWAB_APP_KEY":     os.environ["SCHWAB_APP_KEY"],
@@ -760,7 +711,56 @@ def main():
             "SCHWAB_ACCT_HASH":   acct_hash,
             "CS_LOG_PATH":        CS_LOG_PATH,
         })
+        return e
 
+    # ----- Place bundled 4-leg order if possible -----
+    if CS_BUNDLE_4LEG and v_put_f and v_call_f:
+        q_put = int(v_put_f["send_qty"])
+        q_call = int(v_call_f["send_qty"])
+
+        can_bundle = (q_put == q_call) if CS_BUNDLE_REQUIRE_EQUAL_QTY else True
+        if can_bundle and q_put > 0 and q_call > 0:
+            q = min(q_put, q_call) if not CS_BUNDLE_REQUIRE_EQUAL_QTY else q_put
+
+            print(
+                f"CS_VERT_RUN BUNDLE4: qty={q} "
+                f"PUT={v_put_f['name']}({v_put_f['short_osi']}|{v_put_f['long_osi']}) "
+                f"CALL={v_call_f['name']}({v_call_f['short_osi']}|{v_call_f['long_osi']})"
+            )
+
+            env = env_for_vertical({**v_put_f, "send_qty": q})
+            # add second vertical into env
+            env.update({
+                "VERT_BUNDLE": "true",
+                "VERT2_SIDE":       v_call_f["side"],
+                "VERT2_KIND":       v_call_f["kind"],
+                "VERT2_NAME":       v_call_f["name"],
+                "VERT2_DIRECTION":  v_call_f["direction"],
+                "VERT2_SHORT_OSI":  v_call_f["short_osi"],
+                "VERT2_LONG_OSI":   v_call_f["long_osi"],
+                "VERT2_QTY":        str(q),
+                "VERT2_GO":         "" if v_call_f.get("go") is None else str(v_call_f["go"]),
+                "VERT2_STRENGTH":   f"{float(v_call_f['strength']):.3f}",
+            })
+
+            rc = subprocess.call([sys.executable, "scripts/trade/ConstantStable/place.py"], env=env)
+            if rc != 0:
+                print(f"CS_VERT_RUN BUNDLE4: placer rc={rc}")
+            return 0  # done (we deliberately do not chase leftovers in asymmetric scenarios)
+
+        print(f"CS_VERT_RUN BUNDLE4 SKIP: qty mismatch (put={q_put} call={q_call}) — placing separately")
+
+    # ----- Fallback: place separately -----
+    for v in (v_put_f, v_call_f):
+        if not v:
+            continue
+        print(
+            f"CS_VERT_RUN {v['name']}: side={v['side']} kind={v['kind']} "
+            f"short={v['short_osi']} long={v['long_osi']} "
+            f"go={v['go']} target_qty={v['target_qty']} send_qty={v['send_qty']} "
+            f"(units={units} vix_mult={vix_mult} bucket={bucket})"
+        )
+        env = env_for_vertical(v)
         rc = subprocess.call([sys.executable, "scripts/trade/ConstantStable/place.py"], env=env)
         if rc != 0:
             print(f"CS_VERT_RUN {v['name']}: placer rc={rc}")
