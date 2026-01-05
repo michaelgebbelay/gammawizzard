@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-# CONSTANT STABLE — vertical placer (fast, deterministic)
+# CONSTANT STABLE — placer (vertical or 4-leg bundle)
 #
 # Ladder (Option B):
 #   CREDIT: mid+0.05, mid, mid-0.05 (refresh on last rung)
 #   DEBIT : mid-0.05, mid, mid+0.05 (refresh on last rung)
+#
+# Bundle mode:
+#   If VERT_BUNDLE=true and VERT2_NAME present, places one 4-leg NET_DEBIT/NET_CREDIT "CUSTOM" order.
+#   Logs TWO rows (one per vertical) sharing the same order_ids / fills.
 #
 # Timing knobs via env:
 #   VERT_STEP_WAIT=12
@@ -47,6 +51,16 @@ def _fnum(x):
         return None
 
 
+def _retry_after_seconds(resp, default_wait):
+    ra = resp.headers.get("Retry-After")
+    if ra:
+        try:
+            return max(1.0, float(ra))
+        except Exception:
+            pass
+    return default_wait
+
+
 # ---------- Schwab ----------
 def schwab_client():
     app_key = os.environ["SCHWAB_APP_KEY"]
@@ -67,11 +81,30 @@ def resolve_acct_hash(c):
     return str((arr[0] or {}).get("hashValue") or "")
 
 
+def get_quote_json_with_retry(c, osi: str, tries: int = 4):
+    last = None
+    for i in range(tries):
+        r = c.get_quote(osi)
+        if r.status_code == 200:
+            try:
+                return r.json()
+            except Exception:
+                return None
+        if r.status_code == 429:
+            base = min(6.0, 0.5 * (2 ** i))
+            wait = _retry_after_seconds(r, base) + random.uniform(0.0, 0.25)
+            time.sleep(wait)
+            continue
+        last = r.status_code
+        time.sleep(min(2.0, 0.35 * (2 ** i)))
+    return None
+
+
 def fetch_bid_ask(c, osi: str):
-    r = c.get_quote(osi)
-    if r.status_code != 200:
+    j = get_quote_json_with_retry(c, osi)
+    if not j:
         return (None, None)
-    d = list(r.json().values())[0] if isinstance(r.json(), dict) else {}
+    d = list(j.values())[0] if isinstance(j, dict) else {}
     q = d.get("quote", d)
     b = q.get("bidPrice") or q.get("bid") or q.get("bidPriceInDouble")
     a = q.get("askPrice") or q.get("ask") or q.get("askPriceInDouble")
@@ -95,6 +128,59 @@ def vertical_nbbo(side: str, short_osi: str, long_osi: str, c):
     return bid, ask, mid
 
 
+def bundle_nbbo(long_osi_1: str, short_osi_1: str, long_osi_2: str, short_osi_2: str, c):
+    """
+    Compute NBBO for a 4-leg opening package with instructions:
+      BUY_TO_OPEN  long_osi_1, long_osi_2
+      SELL_TO_OPEN short_osi_1, short_osi_2
+
+    We compute net_cash range:
+      worst = sum(sell_bid) - sum(buy_ask)
+      best  = sum(sell_ask) - sum(buy_bid)
+
+    If net_cash is positive -> NET_CREDIT
+    If net_cash is negative -> NET_DEBIT  (debit = -net_cash)
+    """
+    s1b, s1a = fetch_bid_ask(c, short_osi_1)
+    l1b, l1a = fetch_bid_ask(c, long_osi_1)
+    s2b, s2a = fetch_bid_ask(c, short_osi_2)
+    l2b, l2a = fetch_bid_ask(c, long_osi_2)
+
+    if None in (s1b, s1a, l1b, l1a, s2b, s2a, l2b, l2a):
+        return (None, None, None, None)
+
+    net_cash_worst = (s1b + s2b) - (l1a + l2a)
+    net_cash_best = (s1a + s2a) - (l1b + l2b)
+
+    # Decide credit/debit
+    if net_cash_best <= 0:
+        # Always a debit
+        side = "DEBIT"
+        bid = -net_cash_best  # smaller debit
+        ask = -net_cash_worst # larger debit
+    elif net_cash_worst >= 0:
+        # Always a credit
+        side = "CREDIT"
+        bid = net_cash_worst  # smaller credit
+        ask = net_cash_best   # larger credit
+    else:
+        # Crosses zero; choose by mid sign
+        mid_cash = 0.5 * (net_cash_worst + net_cash_best)
+        if mid_cash >= 0:
+            side = "CREDIT"
+            bid = max(0.0, net_cash_worst)
+            ask = max(bid, net_cash_best)
+        else:
+            side = "DEBIT"
+            bid = max(0.0, -net_cash_best)
+            ask = max(bid, -net_cash_worst)
+
+    bid = clamp_tick(bid)
+    ask = clamp_tick(ask)
+    mid = clamp_tick((bid + ask) / 2.0)
+    return side, bid, ask, mid
+
+
 def order_payload_vertical(side: str, short_osi: str, long_osi: str, price: float, qty: int):
     side = side.upper()
     if side not in ("CREDIT", "DEBIT"):
@@ -115,6 +201,32 @@ def order_payload_vertical(side: str, short_osi: str, long_osi: str, price: floa
     }
 
 
+def order_payload_bundle(side: str, price: float, qty: int,
+                        long_osi_1: str, short_osi_1: str,
+                        long_osi_2: str, short_osi_2: str):
+    side = side.upper()
+    if side not in ("CREDIT", "DEBIT"):
+        raise ValueError("bundle side must be CREDIT or DEBIT")
+    return {
+        "orderType": "NET_CREDIT" if side == "CREDIT" else "NET_DEBIT",
+        "session": "NORMAL",
+        "price": f"{clamp_tick(price):.2f}",
+        "duration": "DAY",
+        "orderStrategyType": "SINGLE",
+        "complexOrderStrategyType": "CUSTOM",
+        "orderLegCollection": [
+            {"instruction": "BUY_TO_OPEN",  "positionEffect": "OPENING", "quantity": qty,
+             "instrument": {"symbol": long_osi_1,  "assetType": "OPTION"}},
+            {"instruction": "SELL_TO_OPEN", "positionEffect": "OPENING", "quantity": qty,
+             "instrument": {"symbol": short_osi_1, "assetType": "OPTION"}},
+            {"instruction": "BUY_TO_OPEN",  "positionEffect": "OPENING", "quantity": qty,
+             "instrument": {"symbol": long_osi_2,  "assetType": "OPTION"}},
+            {"instruction": "SELL_TO_OPEN", "positionEffect": "OPENING", "quantity": qty,
+             "instrument": {"symbol": short_osi_2, "assetType": "OPTION"}},
+        ],
+    }
+
+
 def parse_order_id(r):
     try:
         j = r.json()
@@ -126,16 +238,6 @@ def parse_order_id(r):
         pass
     loc = r.headers.get("Location", "")
     return loc.rstrip("/").split("/")[-1] if loc else ""
-
-
-def _retry_after_seconds(resp, default_wait):
-    ra = resp.headers.get("Retry-After")
-    if ra:
-        try:
-            return max(1.0, float(ra))
-        except Exception:
-            pass
-    return default_wait
 
 
 def post_with_retry(c, url, payload, tag="", tries=5):
@@ -161,12 +263,10 @@ def status_upper(st: dict) -> str:
 
 def extract_filled_quantity(st: dict) -> int:
     """
-    Robust filled qty extractor for Schwab orders.
+    Robust filled qty extractor for Schwab complex orders.
     1) Try top-level filledQuantity-ish fields.
     2) Fall back to summing executions in orderActivityCollection.
-       For multi-leg executions, each execution has multiple legs with identical quantities;
-       use min(quantity across legs) as "spreads filled" for that execution.
-    Returns integer # of spreads/contracts filled.
+       For multi-leg executions, legs share same execution quantity; use min across legs as combo qty.
     """
     for k in (
         "filledQuantity", "filled_quantity", "filledQty", "filledQtyInDouble",
@@ -193,13 +293,11 @@ def extract_filled_quantity(st: dict) -> int:
 
     if total > 0:
         return int(round(total))
-
     return 0
 
 
 def get_status(c, acct_hash: str, oid: str, tries: int = 4):
     url = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
-    last = {}
     for i in range(tries):
         try:
             r = c.session.get(url, timeout=20)
@@ -210,11 +308,10 @@ def get_status(c, acct_hash: str, oid: str, tries: int = 4):
                 wait = _retry_after_seconds(r, base) + random.uniform(0.0, 0.25)
                 time.sleep(wait)
                 continue
-            last = {}
         except Exception:
-            last = {}
+            pass
         time.sleep(min(2.0, 0.4 * (2 ** i)))
-    return last
+    return {}
 
 
 def delete_with_retry(c, url, tag="", tries=4):
@@ -259,71 +356,47 @@ def log_row(row: dict):
         w.writerow({k: row.get(k, "") for k in cols})
 
 
-# ---------- main ----------
-def main():
+# ---------- core placement routine ----------
+def place_order_with_ladder(
+    c,
+    acct_hash: str,
+    side: str,
+    qty: int,
+    nbbo_fn,            # callable() -> (bid,ask,mid) or (side,bid,ask,mid) depending
+    payload_fn,         # callable(price, qty) -> payload
+    tag_prefix: str,
+):
     placed_reason = "UNKNOWN"
     saw_429 = False
-    danger_stray_order = False  # only True if we cannot confirm order is canceled/filled
+    danger_stray_order = False
 
-    side = (os.environ.get("VERT_SIDE", "CREDIT") or "CREDIT").upper()
-    kind = (os.environ.get("VERT_KIND", "PUT") or "PUT").upper()
-    name = os.environ.get("VERT_NAME", "")
-    direction = os.environ.get("VERT_DIRECTION", "")
-    short_osi = os.environ["VERT_SHORT_OSI"]
-    long_osi = os.environ["VERT_LONG_OSI"]
-    qty = max(1, int(os.environ.get("VERT_QTY", "1")))
-
-    # passthrough for logging
-    go = os.environ.get("VERT_GO", "")
-    strength = os.environ.get("VERT_STRENGTH", "")
-    trade_date = os.environ.get("VERT_TRADE_DATE", "")
-    tdate = os.environ.get("VERT_TDATE", "")
-    unit_d = os.environ.get("VERT_UNIT_DOLLARS", "")
-    oc = os.environ.get("VERT_OC", "")
-    units = os.environ.get("VERT_UNITS", "")
-
-    qty_rule = os.environ.get("VERT_QTY_RULE", "")
-    vol_field = os.environ.get("VERT_VOL_FIELD", "")
-    vol_used = os.environ.get("VERT_VOL_USED", "")
-    vol_value = os.environ.get("VERT_VOL_VALUE", "")
-    vol_bucket = os.environ.get("VERT_VOL_BUCKET", "")
-    vol_mult = os.environ.get("VERT_VOL_MULT", "")
-
-    # Timing knobs
     STEP_WAIT = float(os.environ.get("VERT_STEP_WAIT", "12"))
     POLL_SECS = float(os.environ.get("VERT_POLL_SECS", "1.5"))
     CANCEL_SETTLE = float(os.environ.get("VERT_CANCEL_SETTLE", "1.0"))
     MAX_LADDER = int(os.environ.get("VERT_MAX_LADDER", "3"))
     CANCEL_TRIES = int(os.environ.get("VERT_CANCEL_TRIES", "4"))
-    DRY_RUN = truthy(os.environ.get("VERT_DRY_RUN", "false"))
 
-    print(f"CS_VERT_PLACE START name={name} side={side} kind={kind} short={short_osi} long={long_osi} qty={qty} dry_run={DRY_RUN}")
-
-    c = schwab_client()
-    acct_hash = resolve_acct_hash(c)
+    url_post = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
 
     # Initial NBBO
-    bid, ask, mid = vertical_nbbo(side, short_osi, long_osi, c)
-    print(f"CS_VERT_PLACE NBBO: bid={bid} ask={ask} mid={mid}")
+    bid, ask, mid = nbbo_fn(refresh=False)
     if bid is None or ask is None or mid is None:
-        placed_reason = "NBBO_UNAVAILABLE"
-        goutput("placed", "0")
-        goutput("reason", placed_reason)
-        goutput("qty_filled", "0")
-        goutput("order_ids", "")
-        return 0
+        return {
+            "filled": 0, "order_ids": [], "last_price": None,
+            "nbbo_bid": bid, "nbbo_ask": ask, "nbbo_mid": mid,
+            "reason": "NBBO_UNAVAILABLE", "danger": False,
+        }
 
-    # Option B ladder:
-    # CREDIT: mid+0.05, mid, mid-0.05 (refresh last)
-    # DEBIT : mid-0.05, mid, mid+0.05 (refresh last)
-    if side == "CREDIT":
+    print(f"CS_VERT_PLACE NBBO: bid={bid} ask={ask} mid={mid}")
+
+    # Ladder spec (Option B)
+    if side.upper() == "CREDIT":
         ladder_spec = [(+0.05, False), (0.00, False), (-0.05, True)]
     else:
         ladder_spec = [(-0.05, False), (0.00, False), (+0.05, True)]
 
     def price_from_mid(m, off, b, a):
         p = clamp_tick(m + off)
-        # Keep within [bid,ask]
         p = max(p, b)
         p = min(p, a)
         return p
@@ -333,52 +406,18 @@ def main():
         preview.append("REFRESH" if refresh else f"{price_from_mid(mid, off, bid, ask):.2f}")
     print(f"CS_VERT_PLACE ladder_plan={preview}")
 
-    ts_utc = datetime.now(timezone.utc)
-    ts_et = ts_utc.astimezone(ET)
-
-    ladder_str = ",".join(
-        ["REFRESH" if r[1] else f"{price_from_mid(mid, r[0], bid, ask):.2f}" for r in ladder_spec[:MAX_LADDER]]
-    )
-
-    if DRY_RUN:
-        placed_reason = "DRY_RUN"
-        row = {
-            "ts_utc": ts_utc.isoformat(), "ts_et": ts_et.isoformat(),
-            "trade_date": trade_date, "tdate": tdate,
-            "name": name, "kind": kind, "side": side, "direction": direction,
-            "short_osi": short_osi, "long_osi": long_osi,
-            "go": go, "strength": strength,
-            "qty_rule": qty_rule,
-            "vol_field": vol_field, "vol_used": vol_used, "vol_value": vol_value,
-            "vol_bucket": vol_bucket, "vol_mult": vol_mult,
-            "unit_dollars": unit_d, "oc": oc, "units": units,
-            "qty_requested": qty, "qty_filled": 0,
-            "ladder_prices": ladder_str, "last_price": "",
-            "nbbo_bid": f"{bid:.2f}", "nbbo_ask": f"{ask:.2f}", "nbbo_mid": f"{mid:.2f}",
-            "order_ids": "", "reason": placed_reason,
-        }
-        log_row(row)
-        print("CS_VERT_PLACE DONE (DRY_RUN)")
-        goutput("placed", "0")
-        goutput("reason", placed_reason)
-        goutput("qty_filled", "0")
-        goutput("order_ids", "")
-        return 0
-
-    url_post = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
-
-    total_filled = 0
+    filled_total = 0
     order_ids = []
     last_price = None
 
     for idx, (off, refresh) in enumerate(ladder_spec[:MAX_LADDER], start=1):
-        remaining = max(0, qty - total_filled)
+        remaining = max(0, qty - filled_total)
         if remaining <= 0:
             break
 
         cur_bid, cur_ask, cur_mid = (bid, ask, mid)
         if refresh:
-            cur_bid, cur_ask, cur_mid = vertical_nbbo(side, short_osi, long_osi, c)
+            cur_bid, cur_ask, cur_mid = nbbo_fn(refresh=True)
             print(f"CS_VERT_PLACE REFRESH NBBO: bid={cur_bid} ask={cur_ask} mid={cur_mid}")
             if None in (cur_bid, cur_ask, cur_mid):
                 placed_reason = "NBBO_REFRESH_FAIL"
@@ -388,9 +427,10 @@ def main():
         last_price = price
         print(f"CS_VERT_PLACE rung#{idx}: price={price:.2f} remaining={remaining} wait={STEP_WAIT:.2f}s poll={POLL_SECS:.2f}s")
 
-        payload = order_payload_vertical(side, short_osi, long_osi, price, remaining)
+        payload = payload_fn(price, remaining)
+
         try:
-            r = post_with_retry(c, url_post, payload, tag=f"{name}@{price:.2f}x{remaining}")
+            r = post_with_retry(c, url_post, payload, tag=f"{tag_prefix}@{price:.2f}x{remaining}")
         except Exception as e:
             if "HTTP_429" in str(e):
                 saw_429 = True
@@ -401,21 +441,20 @@ def main():
         if oid:
             order_ids.append(oid)
 
-        # Track fills for THIS order so we can accumulate total_filled correctly
         this_order_filled = 0
 
+        # Work the rung
         t_end = time.time() + STEP_WAIT
         while time.time() < t_end and oid:
             st = get_status(c, acct_hash, oid) or {}
             s = status_upper(st)
 
             fq = extract_filled_quantity(st)
-            # If Schwab says FILLED but doesn't expose quantities cleanly, assume full fill for this order.
             if s == "FILLED" and fq <= 0:
-                fq = remaining
+                fq = remaining  # if FILLED but qty missing, assume full fill for this order
 
             if fq > this_order_filled:
-                total_filled += (fq - this_order_filled)
+                filled_total += (fq - this_order_filled)
                 this_order_filled = fq
 
             if s in FINAL_STATUSES:
@@ -423,7 +462,7 @@ def main():
 
             time.sleep(POLL_SECS)
 
-        if total_filled >= qty:
+        if filled_total >= qty:
             placed_reason = "OK"
             break
 
@@ -437,17 +476,17 @@ def main():
                 time.sleep(CANCEL_SETTLE)
                 continue
 
-            # Cancel request failed. Resolve by checking status a few times.
+            # cancel failed -> resolve status
             s_final = ""
             for j in range(6):
                 st = get_status(c, acct_hash, oid) or {}
                 s_final = status_upper(st)
+
                 fq = extract_filled_quantity(st)
                 if s_final == "FILLED" and fq <= 0:
                     fq = remaining
-
                 if fq > this_order_filled:
-                    total_filled += (fq - this_order_filled)
+                    filled_total += (fq - this_order_filled)
                     this_order_filled = fq
 
                 if s_final in FINAL_STATUSES:
@@ -455,59 +494,305 @@ def main():
 
                 time.sleep(min(4.0, 0.6 * (2 ** j)) + random.uniform(0.0, 0.2))
 
-            # If it filled, it's not a cancel-fail problem.
-            if s_final == "FILLED" or total_filled >= qty:
-                placed_reason = "OK" if total_filled >= qty else "PARTIAL_FILL"
+            if s_final == "FILLED" or filled_total > 0:
+                placed_reason = "OK" if filled_total >= qty else "PARTIAL_FILL"
                 break
 
-            # If it is canceled/rejected/expired, it's safe to continue (no stray working order).
             if s_final in ("CANCELED", "REJECTED", "EXPIRED"):
                 time.sleep(CANCEL_SETTLE)
                 continue
 
-            # Otherwise we cannot confirm it's dead — stop to avoid stray working order.
             placed_reason = f"CANCEL_FAILED_STATUS_{s_final or 'UNKNOWN'}"
             danger_stray_order = True
             break
 
-    if total_filled == 0 and placed_reason == "UNKNOWN":
+    if filled_total == 0 and placed_reason == "UNKNOWN":
         placed_reason = "HTTP_429_RATE_LIMIT" if saw_429 else "NO_FILL"
 
-    # Final NBBO snapshot (best-effort)
-    b2, a2, m2 = vertical_nbbo(side, short_osi, long_osi, c)
+    # final nbbo snapshot best-effort
+    b2, a2, m2 = nbbo_fn(refresh=True)
+    return {
+        "filled": filled_total,
+        "order_ids": order_ids,
+        "last_price": last_price,
+        "nbbo_bid": b2 if b2 is not None else bid,
+        "nbbo_ask": a2 if a2 is not None else ask,
+        "nbbo_mid": m2 if m2 is not None else mid,
+        "reason": placed_reason,
+        "danger": danger_stray_order,
+        "init_bid": bid, "init_ask": ask, "init_mid": mid,
+    }
+
+
+# ---------- main ----------
+def main():
+    DRY_RUN = truthy(os.environ.get("VERT_DRY_RUN", "false"))
+
+    bundle_mode = truthy(os.environ.get("VERT_BUNDLE", "false")) and bool((os.environ.get("VERT2_NAME") or "").strip())
+
+    # primary vertical (for logging + single mode)
+    v1 = {
+        "side": (os.environ.get("VERT_SIDE", "CREDIT") or "CREDIT").upper(),
+        "kind": (os.environ.get("VERT_KIND", "PUT") or "PUT").upper(),
+        "name": os.environ.get("VERT_NAME", ""),
+        "direction": os.environ.get("VERT_DIRECTION", ""),
+        "short_osi": os.environ.get("VERT_SHORT_OSI", ""),
+        "long_osi": os.environ.get("VERT_LONG_OSI", ""),
+        "qty": max(1, int(os.environ.get("VERT_QTY", "1"))),
+        "go": os.environ.get("VERT_GO", ""),
+        "strength": os.environ.get("VERT_STRENGTH", ""),
+    }
+
+    # passthrough for logging (shared)
+    trade_date = os.environ.get("VERT_TRADE_DATE", "")
+    tdate = os.environ.get("VERT_TDATE", "")
+    unit_d = os.environ.get("VERT_UNIT_DOLLARS", "")
+    oc = os.environ.get("VERT_OC", "")
+    units = os.environ.get("VERT_UNITS", "")
+
+    qty_rule = os.environ.get("VERT_QTY_RULE", "")
+    vol_field = os.environ.get("VERT_VOL_FIELD", "")
+    vol_used = os.environ.get("VERT_VOL_USED", "")
+    vol_value = os.environ.get("VERT_VOL_VALUE", "")
+    vol_bucket = os.environ.get("VERT_VOL_BUCKET", "")
+    vol_mult = os.environ.get("VERT_VOL_MULT", "")
+
+    if bundle_mode:
+        v2 = {
+            "side": (os.environ.get("VERT2_SIDE", "") or "").upper(),
+            "kind": (os.environ.get("VERT2_KIND", "") or "").upper(),
+            "name": os.environ.get("VERT2_NAME", ""),
+            "direction": os.environ.get("VERT2_DIRECTION", ""),
+            "short_osi": os.environ.get("VERT2_SHORT_OSI", ""),
+            "long_osi": os.environ.get("VERT2_LONG_OSI", ""),
+            "go": os.environ.get("VERT2_GO", ""),
+            "strength": os.environ.get("VERT2_STRENGTH", ""),
+        }
+        qty = v1["qty"]  # common qty
+        print(
+            f"CS_VERT_PLACE START MODE=BUNDLE4 qty={qty} "
+            f"V1={v1['name']}({v1['short_osi']}|{v1['long_osi']}) "
+            f"V2={v2['name']}({v2['short_osi']}|{v2['long_osi']}) dry_run={DRY_RUN}"
+        )
+    else:
+        v2 = None
+        qty = v1["qty"]
+        print(f"CS_VERT_PLACE START MODE=VERT name={v1['name']} side={v1['side']} kind={v1['kind']} short={v1['short_osi']} long={v1['long_osi']} qty={qty} dry_run={DRY_RUN}")
+
+    c = schwab_client()
+    acct_hash = resolve_acct_hash(c)
+
+    ts_utc = datetime.now(timezone.utc)
+    ts_et = ts_utc.astimezone(ET)
+
+    if DRY_RUN:
+        reason = "DRY_RUN"
+        order_ids = ""
+        nbbo_bid = nbbo_ask = nbbo_mid = ""
+        last_price = ""
+
+        def write_one(v):
+            row = {
+                "ts_utc": ts_utc.isoformat(), "ts_et": ts_et.isoformat(),
+                "trade_date": trade_date, "tdate": tdate,
+                "name": v["name"], "kind": v["kind"], "side": v["side"], "direction": v["direction"],
+                "short_osi": v["short_osi"], "long_osi": v["long_osi"],
+                "go": v.get("go", ""), "strength": v.get("strength", ""),
+                "qty_rule": qty_rule,
+                "vol_field": vol_field, "vol_used": vol_used, "vol_value": vol_value,
+                "vol_bucket": vol_bucket, "vol_mult": vol_mult,
+                "unit_dollars": unit_d, "oc": oc, "units": units,
+                "qty_requested": qty, "qty_filled": 0,
+                "ladder_prices": "", "last_price": last_price,
+                "nbbo_bid": nbbo_bid, "nbbo_ask": nbbo_ask, "nbbo_mid": nbbo_mid,
+                "order_ids": order_ids, "reason": reason,
+            }
+            log_row(row)
+
+        write_one(v1)
+        if bundle_mode and v2:
+            write_one(v2)
+
+        goutput("placed", "0")
+        goutput("reason", reason)
+        goutput("qty_filled", "0")
+        goutput("order_ids", "")
+        print("CS_VERT_PLACE DONE (DRY_RUN)")
+        return 0
+
+    # ---------- run placement ----------
+    if bundle_mode and v2:
+        # Determine bundle net side + NBBO
+        def nbbo_fn(refresh: bool):
+            side_pkg, bid, ask, mid = bundle_nbbo(
+                long_osi_1=v1["long_osi"], short_osi_1=v1["short_osi"],
+                long_osi_2=v2["long_osi"], short_osi_2=v2["short_osi"],
+                c=c,
+            )
+            if side_pkg is None:
+                return (None, None, None)
+            # bundle_nbbo returns side too, but this ladder engine already has "side" externally.
+            return (bid, ask, mid)
+
+        # Need bundle side for ladder + payload
+        side_pkg, bid0, ask0, mid0 = bundle_nbbo(
+            long_osi_1=v1["long_osi"], short_osi_1=v1["short_osi"],
+            long_osi_2=v2["long_osi"], short_osi_2=v2["short_osi"],
+            c=c,
+        )
+        if side_pkg is None or None in (bid0, ask0, mid0):
+            reason = "NBBO_UNAVAILABLE"
+            # log both rows
+            for v in (v1, v2):
+                row = {
+                    "ts_utc": ts_utc.isoformat(), "ts_et": ts_et.isoformat(),
+                    "trade_date": trade_date, "tdate": tdate,
+                    "name": v["name"], "kind": v["kind"], "side": v["side"], "direction": v["direction"],
+                    "short_osi": v["short_osi"], "long_osi": v["long_osi"],
+                    "go": v.get("go", ""), "strength": v.get("strength", ""),
+                    "qty_rule": qty_rule,
+                    "vol_field": vol_field, "vol_used": vol_used, "vol_value": vol_value,
+                    "vol_bucket": vol_bucket, "vol_mult": vol_mult,
+                    "unit_dollars": unit_d, "oc": oc, "units": units,
+                    "qty_requested": qty, "qty_filled": 0,
+                    "ladder_prices": "", "last_price": "",
+                    "nbbo_bid": "", "nbbo_ask": "", "nbbo_mid": "",
+                    "order_ids": "", "reason": reason,
+                }
+                log_row(row)
+
+            goutput("placed", "0")
+            goutput("reason", reason)
+            goutput("qty_filled", "0")
+            goutput("order_ids", "")
+            print("CS_VERT_PLACE DONE MODE=BUNDLE4 reason=NBBO_UNAVAILABLE")
+            return 0
+
+        # Place bundle with ladder
+        def nbbo_fn2(refresh: bool):
+            s, b, a, m = bundle_nbbo(
+                long_osi_1=v1["long_osi"], short_osi_1=v1["short_osi"],
+                long_osi_2=v2["long_osi"], short_osi_2=v2["short_osi"],
+                c=c,
+            )
+            return (b, a, m)
+
+        def payload_fn(price: float, q: int):
+            return order_payload_bundle(
+                side=side_pkg, price=price, qty=q,
+                long_osi_1=v1["long_osi"], short_osi_1=v1["short_osi"],
+                long_osi_2=v2["long_osi"], short_osi_2=v2["short_osi"],
+            )
+
+        # For ladder we use bundle side
+        res = place_order_with_ladder(
+            c=c,
+            acct_hash=acct_hash,
+            side=side_pkg,
+            qty=qty,
+            nbbo_fn=nbbo_fn2,
+            payload_fn=payload_fn,
+            tag_prefix=f"BUNDLE4:{v1['name']}+{v2['name']}",
+        )
+
+        filled = int(res["filled"])
+        placed_reason = res["reason"]
+        order_ids = ",".join(res["order_ids"])
+        last_price = res["last_price"]
+        b2, a2, m2 = res["nbbo_bid"], res["nbbo_ask"], res["nbbo_mid"]
+
+        # log BOTH rows
+        for v in (v1, v2):
+            row = {
+                "ts_utc": ts_utc.isoformat(), "ts_et": ts_et.isoformat(),
+                "trade_date": trade_date, "tdate": tdate,
+                "name": v["name"], "kind": v["kind"], "side": v["side"], "direction": v["direction"],
+                "short_osi": v["short_osi"], "long_osi": v["long_osi"],
+                "go": v.get("go", ""), "strength": v.get("strength", ""),
+                "qty_rule": qty_rule,
+                "vol_field": vol_field, "vol_used": vol_used, "vol_value": vol_value,
+                "vol_bucket": vol_bucket, "vol_mult": vol_mult,
+                "unit_dollars": unit_d, "oc": oc, "units": units,
+                "qty_requested": qty, "qty_filled": filled,
+                "ladder_prices": "",  # ladder plan already printed; keep CSV schema stable
+                "last_price": f"{last_price:.2f}" if last_price is not None else "",
+                "nbbo_bid": f"{b2:.2f}" if b2 is not None else "",
+                "nbbo_ask": f"{a2:.2f}" if a2 is not None else "",
+                "nbbo_mid": f"{m2:.2f}" if m2 is not None else "",
+                "order_ids": order_ids,
+                "reason": placed_reason,
+            }
+            log_row(row)
+
+        print(f"CS_VERT_PLACE DONE MODE=BUNDLE4 qty_req={qty} qty_filled={filled} last_price={last_price} reason={placed_reason}")
+
+        goutput("placed", "1" if filled > 0 else "0")
+        goutput("reason", placed_reason)
+        goutput("qty_filled", str(filled))
+        goutput("order_ids", order_ids)
+
+        if res.get("danger"):
+            return 2
+        return 0
+
+    # ---------- single vertical mode ----------
+    side = v1["side"]
+    short_osi = v1["short_osi"]
+    long_osi = v1["long_osi"]
+
+    def nbbo_single(refresh: bool):
+        b, a, m = vertical_nbbo(side, short_osi, long_osi, c)
+        return (b, a, m)
+
+    def payload_single(price: float, q: int):
+        return order_payload_vertical(side, short_osi, long_osi, price, q)
+
+    res = place_order_with_ladder(
+        c=c,
+        acct_hash=acct_hash,
+        side=side,
+        qty=qty,
+        nbbo_fn=nbbo_single,
+        payload_fn=payload_single,
+        tag_prefix=f"{v1['name']}",
+    )
+
+    filled = int(res["filled"])
+    placed_reason = res["reason"]
+    order_ids = ",".join(res["order_ids"])
+    last_price = res["last_price"]
+    b2, a2, m2 = res["nbbo_bid"], res["nbbo_ask"], res["nbbo_mid"]
 
     row = {
         "ts_utc": ts_utc.isoformat(), "ts_et": ts_et.isoformat(),
         "trade_date": trade_date, "tdate": tdate,
-        "name": name, "kind": kind, "side": side, "direction": direction,
-        "short_osi": short_osi, "long_osi": long_osi,
-        "go": go, "strength": strength,
+        "name": v1["name"], "kind": v1["kind"], "side": v1["side"], "direction": v1["direction"],
+        "short_osi": v1["short_osi"], "long_osi": v1["long_osi"],
+        "go": v1.get("go", ""), "strength": v1.get("strength", ""),
         "qty_rule": qty_rule,
         "vol_field": vol_field, "vol_used": vol_used, "vol_value": vol_value,
         "vol_bucket": vol_bucket, "vol_mult": vol_mult,
         "unit_dollars": unit_d, "oc": oc, "units": units,
-        "qty_requested": qty, "qty_filled": total_filled,
-        "ladder_prices": ladder_str,
+        "qty_requested": qty, "qty_filled": filled,
+        "ladder_prices": "",
         "last_price": f"{last_price:.2f}" if last_price is not None else "",
         "nbbo_bid": f"{b2:.2f}" if b2 is not None else "",
         "nbbo_ask": f"{a2:.2f}" if a2 is not None else "",
         "nbbo_mid": f"{m2:.2f}" if m2 is not None else "",
-        "order_ids": ",".join(order_ids),
+        "order_ids": order_ids,
         "reason": placed_reason,
     }
     log_row(row)
 
-    print(f"CS_VERT_PLACE DONE name={name} side={side} kind={kind} qty_req={qty} qty_filled={total_filled} last_price={last_price} reason={placed_reason}")
+    print(f"CS_VERT_PLACE DONE MODE=VERT name={v1['name']} qty_req={qty} qty_filled={filled} last_price={last_price} reason={placed_reason}")
 
-    goutput("placed", "1" if total_filled > 0 else "0")
+    goutput("placed", "1" if filled > 0 else "0")
     goutput("reason", placed_reason)
-    goutput("qty_filled", str(total_filled))
-    goutput("order_ids", ",".join(order_ids))
+    goutput("qty_filled", str(filled))
+    goutput("order_ids", order_ids)
 
-    # Fail workflow ONLY when we truly have a stray-order risk
-    if danger_stray_order:
+    if res.get("danger"):
         return 2
-
     return 0
 
 
