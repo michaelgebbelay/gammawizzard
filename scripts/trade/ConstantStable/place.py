@@ -21,6 +21,8 @@ from schwab.auth import client_from_token_file
 TICK = 0.05
 ET = ZoneInfo("America/New_York")
 
+FINAL_STATUSES = {"FILLED", "CANCELED", "REJECTED", "EXPIRED"}
+
 
 # ---------- utils ----------
 def goutput(name: str, val: str):
@@ -36,6 +38,13 @@ def clamp_tick(x: float) -> float:
 
 def truthy(s: str) -> bool:
     return str(s or "").strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _fnum(x):
+    try:
+        return float(x)
+    except Exception:
+        return None
 
 
 # ---------- Schwab ----------
@@ -146,15 +155,66 @@ def post_with_retry(c, url, payload, tag="", tries=5):
     raise RuntimeError(f"POST_FAIL({tag}) {last or 'unknown'}")
 
 
-def get_status(c, acct_hash: str, oid: str):
+def status_upper(st: dict) -> str:
+    return str(st.get("status") or st.get("orderStatus") or "").upper().strip()
+
+
+def extract_filled_quantity(st: dict) -> int:
+    """
+    Robust filled qty extractor for Schwab orders.
+    1) Try top-level filledQuantity-ish fields.
+    2) Fall back to summing executions in orderActivityCollection.
+       For multi-leg executions, each execution has multiple legs with identical quantities;
+       use min(quantity across legs) as "spreads filled" for that execution.
+    Returns integer # of spreads/contracts filled.
+    """
+    for k in (
+        "filledQuantity", "filled_quantity", "filledQty", "filledQtyInDouble",
+        "filledQuantityInDouble", "filledQtyInDbl"
+    ):
+        if k in st:
+            v = _fnum(st.get(k))
+            if v is not None:
+                return int(round(v))
+
+    acts = st.get("orderActivityCollection") or st.get("orderActivities") or []
+    total = 0.0
+    for act in acts:
+        if str(act.get("activityType") or "").upper() != "EXECUTION":
+            continue
+        legs = act.get("executionLegs") or []
+        qtys = []
+        for leg in legs:
+            q = _fnum(leg.get("quantity"))
+            if q is not None:
+                qtys.append(q)
+        if qtys:
+            total += min(qtys)
+
+    if total > 0:
+        return int(round(total))
+
+    return 0
+
+
+def get_status(c, acct_hash: str, oid: str, tries: int = 4):
     url = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
-    try:
-        r = c.session.get(url, timeout=20)
-        if r.status_code != 200:
-            return {}
-        return r.json() or {}
-    except Exception:
-        return {}
+    last = {}
+    for i in range(tries):
+        try:
+            r = c.session.get(url, timeout=20)
+            if r.status_code == 200:
+                return r.json() or {}
+            if r.status_code == 429:
+                base = min(6.0, 0.5 * (2 ** i))
+                wait = _retry_after_seconds(r, base) + random.uniform(0.0, 0.25)
+                time.sleep(wait)
+                continue
+            last = {}
+        except Exception:
+            last = {}
+        time.sleep(min(2.0, 0.4 * (2 ** i)))
+    return last
 
 
 def delete_with_retry(c, url, tag="", tries=4):
@@ -203,6 +263,7 @@ def log_row(row: dict):
 def main():
     placed_reason = "UNKNOWN"
     saw_429 = False
+    danger_stray_order = False  # only True if we cannot confirm order is canceled/filled
 
     side = (os.environ.get("VERT_SIDE", "CREDIT") or "CREDIT").upper()
     kind = (os.environ.get("VERT_KIND", "PUT") or "PUT").upper()
@@ -248,9 +309,13 @@ def main():
         placed_reason = "NBBO_UNAVAILABLE"
         goutput("placed", "0")
         goutput("reason", placed_reason)
+        goutput("qty_filled", "0")
+        goutput("order_ids", "")
         return 0
 
     # Option B ladder:
+    # CREDIT: mid+0.05, mid, mid-0.05 (refresh last)
+    # DEBIT : mid-0.05, mid, mid+0.05 (refresh last)
     if side == "CREDIT":
         ladder_spec = [(+0.05, False), (0.00, False), (-0.05, True)]
     else:
@@ -258,6 +323,7 @@ def main():
 
     def price_from_mid(m, off, b, a):
         p = clamp_tick(m + off)
+        # Keep within [bid,ask]
         p = max(p, b)
         p = min(p, a)
         return p
@@ -270,9 +336,12 @@ def main():
     ts_utc = datetime.now(timezone.utc)
     ts_et = ts_utc.astimezone(ET)
 
+    ladder_str = ",".join(
+        ["REFRESH" if r[1] else f"{price_from_mid(mid, r[0], bid, ask):.2f}" for r in ladder_spec[:MAX_LADDER]]
+    )
+
     if DRY_RUN:
         placed_reason = "DRY_RUN"
-        ladder_str = ",".join(["REFRESH" if r[1] else f"{clamp_tick(mid + r[0]):.2f}" for r in ladder_spec[:MAX_LADDER]])
         row = {
             "ts_utc": ts_utc.isoformat(), "ts_et": ts_et.isoformat(),
             "trade_date": trade_date, "tdate": tdate,
@@ -297,10 +366,13 @@ def main():
         return 0
 
     url_post = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
-    filled, order_ids, last_price = 0, [], None
+
+    total_filled = 0
+    order_ids = []
+    last_price = None
 
     for idx, (off, refresh) in enumerate(ladder_spec[:MAX_LADDER], start=1):
-        remaining = max(0, qty - filled)
+        remaining = max(0, qty - total_filled)
         if remaining <= 0:
             break
 
@@ -329,26 +401,29 @@ def main():
         if oid:
             order_ids.append(oid)
 
-        # Work the rung
+        # Track fills for THIS order so we can accumulate total_filled correctly
+        this_order_filled = 0
+
         t_end = time.time() + STEP_WAIT
         while time.time() < t_end and oid:
             st = get_status(c, acct_hash, oid) or {}
-            fq = st.get("filledQuantity") or st.get("filled_quantity") or 0
-            try:
-                fq = int(round(float(fq)))
-            except Exception:
-                fq = 0
+            s = status_upper(st)
 
-            if fq > filled:
-                filled = fq
+            fq = extract_filled_quantity(st)
+            # If Schwab says FILLED but doesn't expose quantities cleanly, assume full fill for this order.
+            if s == "FILLED" and fq <= 0:
+                fq = remaining
 
-            s = str(st.get("status") or st.get("orderStatus") or "").upper()
-            if s in ("FILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED"):
+            if fq > this_order_filled:
+                total_filled += (fq - this_order_filled)
+                this_order_filled = fq
+
+            if s in FINAL_STATUSES:
                 break
 
             time.sleep(POLL_SECS)
 
-        if filled >= qty:
+        if total_filled >= qty:
             placed_reason = "OK"
             break
 
@@ -358,47 +433,48 @@ def main():
             ok = delete_with_retry(c, url_del, tag=f"CANCEL {oid}", tries=CANCEL_TRIES)
             print(f"CS_VERT_PLACE CANCEL {oid} → {'OK' if ok else 'FAIL'}")
 
-            if not ok:
-                # IMPORTANT FIX:
-                # If cancel fails, re-check status. If it's FILLED (or already CANCELED),
-                # that is NOT a dangerous stray-working-order situation.
-                st = get_status(c, acct_hash, oid) or {}
-                s = str(st.get("status") or st.get("orderStatus") or "").upper()
-                fq = st.get("filledQuantity") or st.get("filled_quantity") or 0
-                try:
-                    fq = int(round(float(fq)))
-                except Exception:
-                    fq = 0
-                if fq > filled:
-                    filled = fq
+            if ok:
+                time.sleep(CANCEL_SETTLE)
+                continue
 
-                if s == "FILLED":
-                    if filled < qty:
-                        filled = qty
-                    placed_reason = "OK"
+            # Cancel request failed. Resolve by checking status a few times.
+            s_final = ""
+            for j in range(6):
+                st = get_status(c, acct_hash, oid) or {}
+                s_final = status_upper(st)
+                fq = extract_filled_quantity(st)
+                if s_final == "FILLED" and fq <= 0:
+                    fq = remaining
+
+                if fq > this_order_filled:
+                    total_filled += (fq - this_order_filled)
+                    this_order_filled = fq
+
+                if s_final in FINAL_STATUSES:
                     break
 
-                if s in ("CANCELED", "CANCELLED", "REJECTED", "EXPIRED"):
-                    # safe to continue ladder
-                    time.sleep(CANCEL_SETTLE)
-                    continue
+                time.sleep(min(4.0, 0.6 * (2 ** j)) + random.uniform(0.0, 0.2))
 
-                placed_reason = f"CANCEL_FAILED_STATUS_{s or 'UNKNOWN'}"
+            # If it filled, it's not a cancel-fail problem.
+            if s_final == "FILLED" or total_filled >= qty:
+                placed_reason = "OK" if total_filled >= qty else "PARTIAL_FILL"
                 break
 
-            time.sleep(CANCEL_SETTLE)
+            # If it is canceled/rejected/expired, it's safe to continue (no stray working order).
+            if s_final in ("CANCELED", "REJECTED", "EXPIRED"):
+                time.sleep(CANCEL_SETTLE)
+                continue
 
-    if filled == 0 and placed_reason == "UNKNOWN":
+            # Otherwise we cannot confirm it's dead — stop to avoid stray working order.
+            placed_reason = f"CANCEL_FAILED_STATUS_{s_final or 'UNKNOWN'}"
+            danger_stray_order = True
+            break
+
+    if total_filled == 0 and placed_reason == "UNKNOWN":
         placed_reason = "HTTP_429_RATE_LIMIT" if saw_429 else "NO_FILL"
-    elif filled > 0 and placed_reason == "UNKNOWN":
-        placed_reason = "PARTIAL_FILL"
 
     # Final NBBO snapshot (best-effort)
     b2, a2, m2 = vertical_nbbo(side, short_osi, long_osi, c)
-
-    ladder_str = ",".join(
-        ["REFRESH" if r[1] else f"{clamp_tick(mid + r[0]):.2f}" for r in ladder_spec[:MAX_LADDER]]
-    )
 
     row = {
         "ts_utc": ts_utc.isoformat(), "ts_et": ts_et.isoformat(),
@@ -410,7 +486,7 @@ def main():
         "vol_field": vol_field, "vol_used": vol_used, "vol_value": vol_value,
         "vol_bucket": vol_bucket, "vol_mult": vol_mult,
         "unit_dollars": unit_d, "oc": oc, "units": units,
-        "qty_requested": qty, "qty_filled": filled,
+        "qty_requested": qty, "qty_filled": total_filled,
         "ladder_prices": ladder_str,
         "last_price": f"{last_price:.2f}" if last_price is not None else "",
         "nbbo_bid": f"{b2:.2f}" if b2 is not None else "",
@@ -421,15 +497,15 @@ def main():
     }
     log_row(row)
 
-    print(f"CS_VERT_PLACE DONE name={name} side={side} kind={kind} qty_req={qty} qty_filled={filled} last_price={last_price} reason={placed_reason}")
+    print(f"CS_VERT_PLACE DONE name={name} side={side} kind={kind} qty_req={qty} qty_filled={total_filled} last_price={last_price} reason={placed_reason}")
 
-    goutput("placed", "1" if filled > 0 else "0")
+    goutput("placed", "1" if total_filled > 0 else "0")
     goutput("reason", placed_reason)
-    goutput("qty_filled", str(filled))
+    goutput("qty_filled", str(total_filled))
     goutput("order_ids", ",".join(order_ids))
 
-    # Fail workflow ONLY if cancel failed and status was not safe
-    if placed_reason.startswith("CANCEL_FAILED"):
+    # Fail workflow ONLY when we truly have a stray-order risk
+    if danger_stray_order:
         return 2
 
     return 0
