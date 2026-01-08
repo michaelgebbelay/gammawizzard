@@ -13,8 +13,8 @@ on:
         default: "4"
   # Nightly at ~8:05pm ET (handles DST with two crons)
   schedule:
-    - cron: "5 0 * * *"  # 20:05 ET while DST (UTC-4)
-    - cron: "5 1 * * *"  # 20:05 ET while Standard (UTC-5)
+    - cron: "0 11 * * *"  # 11:00 UTC = 4:00 AM PDT (Summer)
+    - cron: "0 12 * * *"  # 12:00 UTC = 4:00 AM PST (Winter)
 
 concurrency:
   group: schwab-sheets
