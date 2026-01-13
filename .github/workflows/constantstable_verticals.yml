@@ -26,7 +26,7 @@ jobs:
       # NOTE:
       # - Breaks are for VixOne (decimal), not VIX.
       # - 5 buckets => 4 breaks + 5 multipliers
-      CS_UNIT_DOLLARS: "20000"
+      CS_UNIT_DOLLARS: "10000"
       CS_VOL_FIELD:  "VixOne"
       CS_VIX_BREAKS: "0.1636779,0.3276571,0.3702533,0.4514141"
       CS_VIX_MULTS:  "1,2,4,8,10"
