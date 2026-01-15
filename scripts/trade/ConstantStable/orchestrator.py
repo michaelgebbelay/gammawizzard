@@ -70,6 +70,7 @@ CS_TOPUP_FAIL_ACTION = (os.environ.get("CS_TOPUP_FAIL_ACTION", "SKIP_ALL") or "S
 # --- 4-leg bundle config ---
 CS_BUNDLE_4LEG = (os.environ.get("CS_BUNDLE_4LEG", "1") or "1").strip().lower() in ("1", "true", "yes", "y")
 CS_BUNDLE_REQUIRE_EQUAL_QTY = (os.environ.get("CS_BUNDLE_REQUIRE_EQUAL_QTY", "1") or "1").strip().lower() in ("1", "true", "yes", "y")
+CS_BUNDLE_FALLBACK = (os.environ.get("CS_BUNDLE_FALLBACK", "1") or "1").strip().lower() in ("1", "true", "yes", "y")
 
 
 # ---------- Utility helpers ----------
@@ -732,6 +733,7 @@ def main():
             # add second vertical into env
             env.update({
                 "VERT_BUNDLE": "true",
+                "VERT_BUNDLE_FALLBACK": "separate" if CS_BUNDLE_FALLBACK else "false",
                 "VERT2_SIDE":       v_call_f["side"],
                 "VERT2_KIND":       v_call_f["kind"],
                 "VERT2_NAME":       v_call_f["name"],

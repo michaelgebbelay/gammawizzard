@@ -365,6 +365,7 @@ def place_order_with_ladder(
     nbbo_fn,            # callable() -> (bid,ask,mid) or (side,bid,ask,mid) depending
     payload_fn,         # callable(price, qty) -> payload
     tag_prefix: str,
+    ladder_spec=None,   # list of (offset, refresh) tuples; if None, uses default by side
 ):
     placed_reason = "UNKNOWN"
     saw_429 = False
@@ -390,10 +391,11 @@ def place_order_with_ladder(
     print(f"CS_VERT_PLACE NBBO: bid={bid} ask={ask} mid={mid}")
 
     # Ladder spec (Option B)
-    if side.upper() == "CREDIT":
-        ladder_spec = [(+0.05, False), (0.00, False), (-0.05, True)]
-    else:
-        ladder_spec = [(-0.05, False), (0.00, False), (+0.05, True)]
+    if ladder_spec is None:
+        if side.upper() == "CREDIT":
+            ladder_spec = [(+0.05, False), (0.00, False), (-0.05, True)]
+        else:
+            ladder_spec = [(-0.05, False), (0.00, False), (+0.05, True)]
 
     def price_from_mid(m, off, b, a):
         p = clamp_tick(m + off)
@@ -404,6 +406,7 @@ def place_order_with_ladder(
     preview = []
     for off, refresh in ladder_spec[:MAX_LADDER]:
         preview.append("REFRESH" if refresh else f"{price_from_mid(mid, off, bid, ask):.2f}")
+    preview_str = "[" + ", ".join(preview) + "]"
     print(f"CS_VERT_PLACE ladder_plan={preview}")
 
     filled_total = 0
@@ -521,7 +524,33 @@ def place_order_with_ladder(
         "reason": placed_reason,
         "danger": danger_stray_order,
         "init_bid": bid, "init_ask": ask, "init_mid": mid,
+        "ladder_plan": preview_str,
     }
+
+
+def run_single_vertical(c, acct_hash: str, v: dict, qty: int, tag_prefix: str):
+    side = v["side"]
+    short_osi = v["short_osi"]
+    long_osi = v["long_osi"]
+
+    def nbbo_single(refresh: bool):
+        b, a, m = vertical_nbbo(side, short_osi, long_osi, c)
+        return (b, a, m)
+
+    def payload_single(price: float, q: int):
+        return order_payload_vertical(side, short_osi, long_osi, price, q)
+
+    ladder_spec = [(-0.05, False), (0.00, False), (+0.05, True)]
+    return place_order_with_ladder(
+        c=c,
+        acct_hash=acct_hash,
+        side=side,
+        qty=qty,
+        nbbo_fn=nbbo_single,
+        payload_fn=payload_single,
+        tag_prefix=tag_prefix,
+        ladder_spec=ladder_spec,
+    )
 
 
 # ---------- main ----------
@@ -529,6 +558,8 @@ def main():
     DRY_RUN = truthy(os.environ.get("VERT_DRY_RUN", "false"))
 
     bundle_mode = truthy(os.environ.get("VERT_BUNDLE", "false")) and bool((os.environ.get("VERT2_NAME") or "").strip())
+    bundle_fallback = (os.environ.get("VERT_BUNDLE_FALLBACK", "") or "").strip().lower()
+    bundle_fallback_separate = bundle_fallback in ("1", "true", "yes", "y", "separate", "split", "verticals")
 
     # primary vertical (for logging + single mode)
     v1 = {
@@ -574,10 +605,12 @@ def main():
             f"V1={v1['name']}({v1['short_osi']}|{v1['long_osi']}) "
             f"V2={v2['name']}({v2['short_osi']}|{v2['long_osi']}) dry_run={DRY_RUN}"
         )
+        print("CS_VERT_PLACE LADDER=BUNDLE4 [mid-0.05, mid, mid+0.10]")
     else:
         v2 = None
         qty = v1["qty"]
         print(f"CS_VERT_PLACE START MODE=VERT name={v1['name']} side={v1['side']} kind={v1['kind']} short={v1['short_osi']} long={v1['long_osi']} qty={qty} dry_run={DRY_RUN}")
+        print("CS_VERT_PLACE LADDER=VERT [mid-0.05, mid, mid+0.05]")
 
     c = schwab_client()
     acct_hash = resolve_acct_hash(c)
@@ -590,6 +623,7 @@ def main():
         order_ids = ""
         nbbo_bid = nbbo_ask = nbbo_mid = ""
         last_price = ""
+        ladder_prices = "[mid-0.05, mid, mid+0.10]" if bundle_mode else "[mid-0.05, mid, mid+0.05]"
 
         def write_one(v):
             row = {
@@ -603,7 +637,7 @@ def main():
                 "vol_bucket": vol_bucket, "vol_mult": vol_mult,
                 "unit_dollars": unit_d, "oc": oc, "units": units,
                 "qty_requested": qty, "qty_filled": 0,
-                "ladder_prices": "", "last_price": last_price,
+                "ladder_prices": ladder_prices, "last_price": last_price,
                 "nbbo_bid": nbbo_bid, "nbbo_ask": nbbo_ask, "nbbo_mid": nbbo_mid,
                 "order_ids": order_ids, "reason": reason,
             }
@@ -685,6 +719,7 @@ def main():
             )
 
         # For ladder we use bundle side
+        ladder_spec = [(-0.05, False), (0.00, False), (+0.10, True)]
         res = place_order_with_ladder(
             c=c,
             acct_hash=acct_hash,
@@ -693,6 +728,7 @@ def main():
             nbbo_fn=nbbo_fn2,
             payload_fn=payload_fn,
             tag_prefix=f"BUNDLE4:{v1['name']}+{v2['name']}",
+            ladder_spec=ladder_spec,
         )
 
         filled = int(res["filled"])
@@ -700,8 +736,9 @@ def main():
         order_ids = ",".join(res["order_ids"])
         last_price = res["last_price"]
         b2, a2, m2 = res["nbbo_bid"], res["nbbo_ask"], res["nbbo_mid"]
+        ladder_plan = res.get("ladder_plan", "")
 
-        # log BOTH rows
+        # log BOTH rows (bundle attempt)
         for v in (v1, v2):
             row = {
                 "ts_utc": ts_utc.isoformat(), "ts_et": ts_et.isoformat(),
@@ -714,7 +751,7 @@ def main():
                 "vol_bucket": vol_bucket, "vol_mult": vol_mult,
                 "unit_dollars": unit_d, "oc": oc, "units": units,
                 "qty_requested": qty, "qty_filled": filled,
-                "ladder_prices": "",  # ladder plan already printed; keep CSV schema stable
+                "ladder_prices": ladder_plan,
                 "last_price": f"{last_price:.2f}" if last_price is not None else "",
                 "nbbo_bid": f"{b2:.2f}" if b2 is not None else "",
                 "nbbo_ask": f"{a2:.2f}" if a2 is not None else "",
@@ -725,6 +762,54 @@ def main():
             log_row(row)
 
         print(f"CS_VERT_PLACE DONE MODE=BUNDLE4 qty_req={qty} qty_filled={filled} last_price={last_price} reason={placed_reason}")
+
+        if bundle_fallback_separate and filled == 0 and placed_reason == "NO_FILL":
+            print("CS_VERT_PLACE FALLBACK: bundle no fill — placing verticals separately")
+            res_v1 = run_single_vertical(c, acct_hash, v1, qty, tag_prefix=f"{v1['name']}:FALLBACK")
+            res_v2 = run_single_vertical(c, acct_hash, v2, qty, tag_prefix=f"{v2['name']}:FALLBACK")
+
+            def log_fallback(v, r):
+                r_filled = int(r["filled"])
+                r_reason = f"FALLBACK_{r['reason']}"
+                r_order_ids = ",".join(r["order_ids"])
+                r_last_price = r["last_price"]
+                r_b2, r_a2, r_m2 = r["nbbo_bid"], r["nbbo_ask"], r["nbbo_mid"]
+                r_ladder = r.get("ladder_plan", "")
+                row = {
+                    "ts_utc": ts_utc.isoformat(), "ts_et": ts_et.isoformat(),
+                    "trade_date": trade_date, "tdate": tdate,
+                    "name": v["name"], "kind": v["kind"], "side": v["side"], "direction": v["direction"],
+                    "short_osi": v["short_osi"], "long_osi": v["long_osi"],
+                    "go": v.get("go", ""), "strength": v.get("strength", ""),
+                    "qty_rule": qty_rule,
+                    "vol_field": vol_field, "vol_used": vol_used, "vol_value": vol_value,
+                    "vol_bucket": vol_bucket, "vol_mult": vol_mult,
+                    "unit_dollars": unit_d, "oc": oc, "units": units,
+                    "qty_requested": qty, "qty_filled": r_filled,
+                    "ladder_prices": r_ladder,
+                    "last_price": f"{r_last_price:.2f}" if r_last_price is not None else "",
+                    "nbbo_bid": f"{r_b2:.2f}" if r_b2 is not None else "",
+                    "nbbo_ask": f"{r_a2:.2f}" if r_a2 is not None else "",
+                    "nbbo_mid": f"{r_m2:.2f}" if r_m2 is not None else "",
+                    "order_ids": r_order_ids,
+                    "reason": r_reason,
+                }
+                log_row(row)
+                return r_filled, r_reason, r_order_ids, r.get("danger")
+
+            f1, _, o1, d1 = log_fallback(v1, res_v1)
+            f2, _, o2, d2 = log_fallback(v2, res_v2)
+
+            total_filled = f1 + f2
+            fallback_order_ids = ",".join([x for x in (o1, o2) if x])
+            goutput("placed", "1" if total_filled > 0 else "0")
+            goutput("reason", "FALLBACK_SEPARATE")
+            goutput("qty_filled", str(total_filled))
+            goutput("order_ids", fallback_order_ids)
+
+            if res.get("danger") or d1 or d2:
+                return 2
+            return 0
 
         goutput("placed", "1" if filled > 0 else "0")
         goutput("reason", placed_reason)
@@ -740,28 +825,14 @@ def main():
     short_osi = v1["short_osi"]
     long_osi = v1["long_osi"]
 
-    def nbbo_single(refresh: bool):
-        b, a, m = vertical_nbbo(side, short_osi, long_osi, c)
-        return (b, a, m)
-
-    def payload_single(price: float, q: int):
-        return order_payload_vertical(side, short_osi, long_osi, price, q)
-
-    res = place_order_with_ladder(
-        c=c,
-        acct_hash=acct_hash,
-        side=side,
-        qty=qty,
-        nbbo_fn=nbbo_single,
-        payload_fn=payload_single,
-        tag_prefix=f"{v1['name']}",
-    )
+    res = run_single_vertical(c, acct_hash, v1, qty, tag_prefix=f"{v1['name']}")
 
     filled = int(res["filled"])
     placed_reason = res["reason"]
     order_ids = ",".join(res["order_ids"])
     last_price = res["last_price"]
     b2, a2, m2 = res["nbbo_bid"], res["nbbo_ask"], res["nbbo_mid"]
+    ladder_plan = res.get("ladder_plan", "")
 
     row = {
         "ts_utc": ts_utc.isoformat(), "ts_et": ts_et.isoformat(),
@@ -774,7 +845,7 @@ def main():
         "vol_bucket": vol_bucket, "vol_mult": vol_mult,
         "unit_dollars": unit_d, "oc": oc, "units": units,
         "qty_requested": qty, "qty_filled": filled,
-        "ladder_prices": "",
+        "ladder_prices": ladder_plan,
         "last_price": f"{last_price:.2f}" if last_price is not None else "",
         "nbbo_bid": f"{b2:.2f}" if b2 is not None else "",
         "nbbo_ask": f"{a2:.2f}" if a2 is not None else "",
