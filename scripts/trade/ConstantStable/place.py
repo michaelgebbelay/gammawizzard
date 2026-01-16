@@ -18,6 +18,7 @@
 #   VERT_DRY_RUN=true/false
 
 import os, sys, time, random, csv
+import requests
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from schwab.auth import client_from_token_file
@@ -77,6 +78,152 @@ def ladder_offsets_for_side(side: str):
     if side.upper() == "CREDIT":
         return [-x for x in base]
     return base
+
+
+def _sanitize_token(t: str) -> str:
+    t = (t or "").strip().strip('"').strip("'")
+    return t.split(None, 1)[1] if t.lower().startswith("bearer ") else t
+
+
+def gw_fetch_trade():
+    base = (os.environ.get("GW_BASE", "") or "").rstrip("/")
+    endpoint = (os.environ.get("GW_ENDPOINT", "") or "").lstrip("/")
+    if not base or not endpoint:
+        return {}
+    url = f"{base}/{endpoint}"
+    tok = _sanitize_token(os.environ.get("GW_TOKEN", "") or "")
+
+    def hit(tkn):
+        h = {"Accept": "application/json"}
+        if tkn:
+            h["Authorization"] = f"Bearer {_sanitize_token(tkn)}"
+        return requests.get(url, headers=h, timeout=20)
+
+    r = hit(tok) if tok else None
+    if (r is None) or (r.status_code in (401, 403)):
+        email = os.environ.get("GW_EMAIL", "")
+        pwd = os.environ.get("GW_PASSWORD", "")
+        if not (email and pwd):
+            return {}
+        rr = requests.post(
+            f"{base}/goauth/authenticateFireUser",
+            data={"email": email, "password": pwd},
+            timeout=20,
+        )
+        rr.raise_for_status()
+        t = rr.json().get("token") or ""
+        r = hit(t)
+    r.raise_for_status()
+    return extract_trade(r.json())
+
+
+def extract_trade(j):
+    if isinstance(j, dict):
+        if "Trade" in j:
+            tr = j["Trade"]
+            return tr[-1] if isinstance(tr, list) and tr else tr if isinstance(tr, dict) else {}
+        keys = ("Date", "TDate", "Limit", "CLimit", "LeftGo", "RightGo", "LImp", "RImp", "VIX", "VixOne")
+        if any(k in j for k in keys):
+            return j
+        for v in j.values():
+            if isinstance(v, (dict, list)):
+                t = extract_trade(v)
+                if t:
+                    return t
+    if isinstance(j, list):
+        for it in reversed(j):
+            t = extract_trade(it)
+            if t:
+                return t
+    return {}
+
+
+def osi_strike_int(osi: str):
+    s = (osi or "").strip()
+    if len(s) < 8:
+        return None
+    digits = s[-8:]
+    if not digits.isdigit():
+        return None
+    return int(int(digits) / 1000)
+
+
+def expected_inner_strikes(v_put: dict, v_call: dict):
+    put_strikes = []
+    call_strikes = []
+    if v_put:
+        put_strikes = [osi_strike_int(v_put["short_osi"]), osi_strike_int(v_put["long_osi"])]
+    if v_call:
+        call_strikes = [osi_strike_int(v_call["short_osi"]), osi_strike_int(v_call["long_osi"])]
+    put_strikes = [s for s in put_strikes if s is not None]
+    call_strikes = [s for s in call_strikes if s is not None]
+    inner_put = max(put_strikes) if put_strikes else None
+    inner_call = min(call_strikes) if call_strikes else None
+    return inner_put, inner_call
+
+
+def parse_osi(osi: str):
+    s = (osi or "")
+    if len(s) < 21:
+        return None
+    root = s[:6]
+    exp6 = s[6:12]
+    cp = s[12]
+    strike8 = s[13:21]
+    if not strike8.isdigit():
+        return None
+    return root, exp6, cp, int(strike8)
+
+
+def build_osi(root: str, exp6: str, cp: str, strike_int: int):
+    mills = int(round(float(strike_int) * 1000))
+    return f"{root}{exp6}{cp}{mills:08d}"
+
+
+def update_vertical_strikes(v: dict, inner_put: int | None, inner_call: int | None):
+    if not v:
+        return False
+    short_parsed = parse_osi(v.get("short_osi", ""))
+    long_parsed = parse_osi(v.get("long_osi", ""))
+    if not short_parsed or not long_parsed:
+        return False
+    root, exp6, cp, s_strike = short_parsed
+    _, _, _, l_strike = long_parsed
+    width = abs(int(s_strike / 1000) - int(l_strike / 1000))
+    if width <= 0:
+        return False
+
+    if v.get("kind", "").upper() == "PUT":
+        if inner_put is None:
+            return False
+        p_low = int(inner_put - width)
+        p_high = int(inner_put)
+        if v.get("direction", "").upper() == "LONG":
+            short_k = p_low
+            long_k = p_high
+        else:
+            short_k = p_high
+            long_k = p_low
+        v["short_osi"] = build_osi(root, exp6, "P", short_k)
+        v["long_osi"] = build_osi(root, exp6, "P", long_k)
+        return True
+
+    if v.get("kind", "").upper() == "CALL":
+        if inner_call is None:
+            return False
+        c_low = int(inner_call)
+        c_high = int(inner_call + width)
+        if v.get("direction", "").upper() == "LONG":
+            short_k = c_high
+            long_k = c_low
+        else:
+            short_k = c_low
+            long_k = c_high
+        v["short_osi"] = build_osi(root, exp6, "C", short_k)
+        v["long_osi"] = build_osi(root, exp6, "C", long_k)
+        return True
+
+    return False
 
 
 # ---------- Schwab ----------
@@ -820,6 +967,8 @@ def place_two_verticals_alternating(
     POLL_SECS = float(os.environ.get("VERT_POLL_SECS", "1.5"))
     CANCEL_SETTLE = float(os.environ.get("VERT_CANCEL_SETTLE", "1.0"))
     CANCEL_TRIES = int(os.environ.get("VERT_CANCEL_TRIES", "4"))
+    STRIKE_CHECK = truthy(os.environ.get("VERT_STRIKE_CHECK", "1"))
+    STRIKE_REPEAT_MAX = int(os.environ.get("VERT_STRIKE_REPEAT_MAX", "2"))
 
     offs1 = ladder_offsets_for_side(v1["side"])
     offs2 = ladder_offsets_for_side(v2["side"])
@@ -849,8 +998,12 @@ def place_two_verticals_alternating(
 
     s1 = {"qty_total": qty1, "filled": 0, "order_ids": [], "danger": False, "last_price": None}
     s2 = {"qty_total": qty2, "filled": 0, "order_ids": [], "danger": False, "last_price": None}
+    strikes_changed = False
+    exp_put, exp_call = expected_inner_strikes(v2 if v2["kind"] == "PUT" else v1, v1 if v1["kind"] == "CALL" else v2)
 
-    for i in range(max(len(offs1), len(offs2))):
+    i = 0
+    repeat_count = 0
+    while i < max(len(offs1), len(offs2)):
         rung_idx = i + 1
         o1 = {"oid": "", "cur_qty": 0, "cur_filled": 0}
         o2 = {"oid": "", "cur_qty": 0, "cur_filled": 0}
@@ -911,8 +1064,32 @@ def place_two_verticals_alternating(
         s1["filled"] += int(o1["cur_filled"])
         s2["filled"] += int(o2["cur_filled"])
 
+        if STRIKE_CHECK and (s1["filled"] + s2["filled"] == 0):
+            try:
+                tr = gw_fetch_trade()
+                inner_put = int(float(tr.get("Limit"))) if tr.get("Limit") is not None else None
+                inner_call = int(float(tr.get("CLimit"))) if tr.get("CLimit") is not None else None
+                if (exp_put is not None and inner_put is not None and exp_put != inner_put) or (
+                    exp_call is not None and inner_call is not None and exp_call != inner_call
+                ):
+                    strikes_changed = True
+                    print(f"CS_VERT_PLACE STRIKES_CHANGED: put {exp_put}->{inner_put} call {exp_call}->{inner_call}")
+                    updated = False
+                    updated |= update_vertical_strikes(v1, inner_put, inner_call)
+                    updated |= update_vertical_strikes(v2, inner_put, inner_call)
+                    exp_put, exp_call = inner_put, inner_call
+                    if updated and repeat_count < STRIKE_REPEAT_MAX:
+                        repeat_count += 1
+                        print(f"CS_VERT_PLACE STRIKES_REPEAT: rung={rung_idx} repeat={repeat_count}")
+                        continue
+                    break
+            except Exception as e:
+                print(f"CS_VERT_PLACE STRIKES_CHECK_WARN: {str(e)[:160]}")
+
         if s1["filled"] >= s1["qty_total"] and s2["filled"] >= s2["qty_total"]:
             break
+        repeat_count = 0
+        i += 1
 
     def finalize(st, ladder_plan):
         filled = int(st["filled"])
@@ -920,6 +1097,8 @@ def place_two_verticals_alternating(
             reason = "OK"
         elif filled > 0:
             reason = "PARTIAL_FILL"
+        elif strikes_changed:
+            reason = "STRIKES_CHANGED"
         else:
             reason = "NO_FILL"
         return {
