@@ -45,8 +45,8 @@ jobs:
       CS_EDGE_GSHEET_TAB: "ConstantStableEdge"
 
       # Placer timing knobs (keep as-is unless you want to tweak)
-      VERT_STEP_WAIT:      "12"
-      VERT_POLL_SECS:      "1.5"
+      VERT_STEP_WAIT:      "30"
+      VERT_POLL_SECS:      "2.0"
       VERT_CANCEL_SETTLE:  "1.0"
       VERT_MAX_LADDER:     "3"
       VERT_DRY_RUN:        "false"
