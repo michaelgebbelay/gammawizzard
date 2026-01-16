@@ -817,48 +817,99 @@ def place_two_verticals_alternating(
     qty2: int,
 ):
     STEP_WAIT = float(os.environ.get("VERT_STEP_WAIT", "12"))
+    POLL_SECS = float(os.environ.get("VERT_POLL_SECS", "1.5"))
+    CANCEL_SETTLE = float(os.environ.get("VERT_CANCEL_SETTLE", "1.0"))
+    CANCEL_TRIES = int(os.environ.get("VERT_CANCEL_TRIES", "4"))
 
     offs1 = ladder_offsets_for_side(v1["side"])
     offs2 = ladder_offsets_for_side(v2["side"])
     ladder_plan_1 = "[" + ", ".join([f"mid{off:+.2f}" if off != 0 else "mid" for off in offs1]) + "]"
     ladder_plan_2 = "[" + ", ".join([f"mid{off:+.2f}" if off != 0 else "mid" for off in offs2]) + "]"
 
-    def run_one(v, off, remaining):
+    def submit_one(v, off, remaining, rung_idx, label):
+        print(f"CS_VERT_PLACE ALT STEP={rung_idx} SIDE={label}")
         b, a, m = vertical_nbbo(v["side"], v["short_osi"], v["long_osi"], c)
         if None in (b, a, m):
-            return {"filled": 0, "order_ids": [], "reason": "NBBO_UNAVAILABLE", "danger": False, "last_price": None}
+            return {"oid": "", "cur_qty": 0, "reason": "NBBO_UNAVAILABLE", "last_price": None}
         price = price_from_mid(m, off, b, a)
         print(f"CS_VERT_PLACE ALT rung: {v['name']} price={price:.2f} rem={remaining}")
         payload = order_payload_vertical(v["side"], v["short_osi"], v["long_osi"], price, remaining)
-        res = place_order_at_price(
-            c=c,
-            acct_hash=acct_hash,
-            payload=payload,
-            qty=remaining,
-            tag_prefix=f"{v['name']}@{price:.2f}x{remaining}",
-            wait_secs=STEP_WAIT,
-        )
-        res["last_price"] = price
-        return res
+        try:
+            r = post_with_retry(
+                c,
+                f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders",
+                payload,
+                tag=f"{v['name']}@{price:.2f}x{remaining}",
+            )
+        except Exception as e:
+            print(f"CS_VERT_PLACE ERROR posting order: {e}")
+            return {"oid": "", "cur_qty": 0, "reason": "POST_FAIL", "last_price": price}
+        oid = parse_order_id(r)
+        return {"oid": oid, "cur_qty": remaining, "reason": "PLACED", "last_price": price}
 
     s1 = {"qty_total": qty1, "filled": 0, "order_ids": [], "danger": False, "last_price": None}
     s2 = {"qty_total": qty2, "filled": 0, "order_ids": [], "danger": False, "last_price": None}
 
     for i in range(max(len(offs1), len(offs2))):
+        rung_idx = i + 1
+        o1 = {"oid": "", "cur_qty": 0, "cur_filled": 0}
+        o2 = {"oid": "", "cur_qty": 0, "cur_filled": 0}
+
         if s1["filled"] < s1["qty_total"] and i < len(offs1):
             rem1 = s1["qty_total"] - s1["filled"]
-            r1 = run_one(v1, offs1[i], rem1)
-            s1["filled"] += int(r1["filled"])
-            s1["order_ids"].extend(r1["order_ids"])
-            s1["danger"] = s1["danger"] or r1.get("danger", False)
+            r1 = submit_one(v1, offs1[i], rem1, rung_idx, v1["name"])
+            o1["oid"] = r1["oid"]
+            o1["cur_qty"] = r1["cur_qty"]
             s1["last_price"] = r1.get("last_price")
+            if o1["oid"]:
+                s1["order_ids"].append(o1["oid"])
         if s2["filled"] < s2["qty_total"] and i < len(offs2):
             rem2 = s2["qty_total"] - s2["filled"]
-            r2 = run_one(v2, offs2[i], rem2)
-            s2["filled"] += int(r2["filled"])
-            s2["order_ids"].extend(r2["order_ids"])
-            s2["danger"] = s2["danger"] or r2.get("danger", False)
+            r2 = submit_one(v2, offs2[i], rem2, rung_idx, v2["name"])
+            o2["oid"] = r2["oid"]
+            o2["cur_qty"] = r2["cur_qty"]
             s2["last_price"] = r2.get("last_price")
+            if o2["oid"]:
+                s2["order_ids"].append(o2["oid"])
+
+        # wait once after submitting both
+        if o1["oid"] or o2["oid"]:
+            t_end = time.time() + STEP_WAIT
+            while time.time() < t_end:
+                all_done = True
+                for o in (o1, o2):
+                    if not o["oid"] or o["cur_filled"] >= o["cur_qty"]:
+                        continue
+                    all_done = False
+                    st = get_status(c, acct_hash, o["oid"]) or {}
+                    s = status_upper(st)
+                    fq = extract_filled_quantity(st)
+                    if s == "FILLED" and fq <= 0:
+                        fq = o["cur_qty"]
+                    if fq > o["cur_filled"]:
+                        o["cur_filled"] = fq
+                    if s in FINAL_STATUSES:
+                        o["cur_filled"] = max(o["cur_filled"], fq)
+                if all_done:
+                    break
+                time.sleep(POLL_SECS)
+
+        # cancel both after wait
+        for o in (o1, o2):
+            remaining = max(0, o["cur_qty"] - o["cur_filled"])
+            if not o["oid"] or remaining <= 0:
+                continue
+            url_del = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{o['oid']}"
+            ok = delete_with_retry(c, url_del, tag=f"CANCEL {o['oid']}", tries=CANCEL_TRIES)
+            print(f"CS_VERT_PLACE CANCEL {o['oid']} → {'OK' if ok else 'FAIL'}")
+            if ok:
+                time.sleep(CANCEL_SETTLE)
+            else:
+                s1["danger"] = s1["danger"] or (o is o1)
+                s2["danger"] = s2["danger"] or (o is o2)
+
+        s1["filled"] += int(o1["cur_filled"])
+        s2["filled"] += int(o2["cur_filled"])
 
         if s1["filled"] >= s1["qty_total"] and s2["filled"] >= s2["qty_total"]:
             break
