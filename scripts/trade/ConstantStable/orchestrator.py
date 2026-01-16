@@ -71,6 +71,7 @@ CS_TOPUP_FAIL_ACTION = (os.environ.get("CS_TOPUP_FAIL_ACTION", "SKIP_ALL") or "S
 CS_BUNDLE_4LEG = (os.environ.get("CS_BUNDLE_4LEG", "1") or "1").strip().lower() in ("1", "true", "yes", "y")
 CS_BUNDLE_REQUIRE_EQUAL_QTY = (os.environ.get("CS_BUNDLE_REQUIRE_EQUAL_QTY", "1") or "1").strip().lower() in ("1", "true", "yes", "y")
 CS_BUNDLE_FALLBACK = (os.environ.get("CS_BUNDLE_FALLBACK", "1") or "1").strip().lower() in ("1", "true", "yes", "y")
+CS_PAIR_ALTERNATE = (os.environ.get("CS_PAIR_ALTERNATE", "1") or "1").strip().lower() in ("1", "true", "yes", "y")
 
 
 # ---------- Utility helpers ----------
@@ -714,43 +715,37 @@ def main():
         })
         return e
 
-    # ----- Place bundled 4-leg order if possible -----
-    if CS_BUNDLE_4LEG and v_put_f and v_call_f:
+    # ----- Place CALL then PUT in alternating ladder (pair mode) -----
+    if CS_PAIR_ALTERNATE and v_put_f and v_call_f:
         q_put = int(v_put_f["send_qty"])
         q_call = int(v_call_f["send_qty"])
-
-        can_bundle = (q_put == q_call) if CS_BUNDLE_REQUIRE_EQUAL_QTY else True
-        if can_bundle and q_put > 0 and q_call > 0:
-            q = min(q_put, q_call) if not CS_BUNDLE_REQUIRE_EQUAL_QTY else q_put
-
+        if q_put > 0 and q_call > 0:
             print(
-                f"CS_VERT_RUN BUNDLE4: qty={q} "
-                f"PUT={v_put_f['name']}({v_put_f['short_osi']}|{v_put_f['long_osi']}) "
-                f"CALL={v_call_f['name']}({v_call_f['short_osi']}|{v_call_f['long_osi']})"
+                f"CS_VERT_RUN PAIR_ALT: "
+                f"CALL={v_call_f['name']}({v_call_f['short_osi']}|{v_call_f['long_osi']}) qty={q_call} "
+                f"PUT={v_put_f['name']}({v_put_f['short_osi']}|{v_put_f['long_osi']}) qty={q_put}"
             )
 
-            env = env_for_vertical({**v_put_f, "send_qty": q})
-            # add second vertical into env
+            env = env_for_vertical({**v_call_f, "send_qty": q_call})
             env.update({
-                "VERT_BUNDLE": "true",
-                "VERT_BUNDLE_FALLBACK": "separate" if CS_BUNDLE_FALLBACK else "false",
-                "VERT2_SIDE":       v_call_f["side"],
-                "VERT2_KIND":       v_call_f["kind"],
-                "VERT2_NAME":       v_call_f["name"],
-                "VERT2_DIRECTION":  v_call_f["direction"],
-                "VERT2_SHORT_OSI":  v_call_f["short_osi"],
-                "VERT2_LONG_OSI":   v_call_f["long_osi"],
-                "VERT2_QTY":        str(q),
-                "VERT2_GO":         "" if v_call_f.get("go") is None else str(v_call_f["go"]),
-                "VERT2_STRENGTH":   f"{float(v_call_f['strength']):.3f}",
+                "VERT_PAIR": "true",
+                "VERT2_SIDE":       v_put_f["side"],
+                "VERT2_KIND":       v_put_f["kind"],
+                "VERT2_NAME":       v_put_f["name"],
+                "VERT2_DIRECTION":  v_put_f["direction"],
+                "VERT2_SHORT_OSI":  v_put_f["short_osi"],
+                "VERT2_LONG_OSI":   v_put_f["long_osi"],
+                "VERT2_QTY":        str(q_put),
+                "VERT2_GO":         "" if v_put_f.get("go") is None else str(v_put_f["go"]),
+                "VERT2_STRENGTH":   f"{float(v_put_f['strength']):.3f}",
             })
 
             rc = subprocess.call([sys.executable, "scripts/trade/ConstantStable/place.py"], env=env)
             if rc != 0:
-                print(f"CS_VERT_RUN BUNDLE4: placer rc={rc}")
-            return 0  # done (we deliberately do not chase leftovers in asymmetric scenarios)
+                print(f"CS_VERT_RUN PAIR_ALT: placer rc={rc}")
+            return 0
 
-        print(f"CS_VERT_RUN BUNDLE4 SKIP: qty mismatch (put={q_put} call={q_call}) — placing separately")
+        print(f"CS_VERT_RUN PAIR_ALT SKIP: qty missing (put={q_put} call={q_call}) — placing separately")
 
     # ----- Fallback: place separately -----
     for v in (v_put_f, v_call_f):

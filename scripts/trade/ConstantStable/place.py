@@ -61,6 +61,24 @@ def _retry_after_seconds(resp, default_wait):
     return default_wait
 
 
+def price_from_mid(mid: float, off: float, bid: float, ask: float) -> float:
+    p = clamp_tick(mid + off)
+    p = max(p, bid)
+    p = min(p, ask)
+    return p
+
+
+def aggressive_offset_for_side(off: float, side: str) -> float:
+    return abs(off) if side.upper() == "DEBIT" else -abs(off)
+
+
+def ladder_offsets_for_side(side: str):
+    base = [-0.05, 0.00, 0.05, 0.10]
+    if side.upper() == "CREDIT":
+        return [-x for x in base]
+    return base
+
+
 # ---------- Schwab ----------
 def schwab_client():
     app_key = os.environ["SCHWAB_APP_KEY"]
@@ -397,12 +415,6 @@ def place_order_with_ladder(
         else:
             ladder_spec = [(-0.05, False), (0.00, False), (+0.05, True)]
 
-    def price_from_mid(m, off, b, a):
-        p = clamp_tick(m + off)
-        p = max(p, b)
-        p = min(p, a)
-        return p
-
     preview = []
     for off, refresh in ladder_spec[:MAX_LADDER]:
         preview.append("REFRESH" if refresh else f"{price_from_mid(mid, off, bid, ask):.2f}")
@@ -528,6 +540,349 @@ def place_order_with_ladder(
     }
 
 
+def place_order_at_price(
+    c,
+    acct_hash: str,
+    payload: dict,
+    qty: int,
+    tag_prefix: str,
+    wait_secs: float,
+):
+    order_ids = []
+    filled = 0
+    danger = False
+    placed_reason = "UNKNOWN"
+
+    POLL_SECS = float(os.environ.get("VERT_POLL_SECS", "1.5"))
+    CANCEL_SETTLE = float(os.environ.get("VERT_CANCEL_SETTLE", "1.0"))
+    CANCEL_TRIES = int(os.environ.get("VERT_CANCEL_TRIES", "4"))
+
+    url_post = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
+
+    try:
+        r = post_with_retry(c, url_post, payload, tag=f"{tag_prefix}")
+    except Exception as e:
+        print(f"CS_VERT_PLACE ERROR posting order: {e}")
+        return {
+            "filled": 0,
+            "order_ids": [],
+            "reason": "POST_FAIL",
+            "danger": False,
+        }
+
+    oid = parse_order_id(r)
+    if oid:
+        order_ids.append(oid)
+    else:
+        return {
+            "filled": 0,
+            "order_ids": [],
+            "reason": "NO_ORDER_ID",
+            "danger": False,
+        }
+
+    t_end = time.time() + wait_secs
+    while time.time() < t_end and oid:
+        st = get_status(c, acct_hash, oid) or {}
+        s = status_upper(st)
+
+        fq = extract_filled_quantity(st)
+        if s == "FILLED" and fq <= 0:
+            fq = qty
+        if fq > filled:
+            filled = fq
+
+        if s in FINAL_STATUSES:
+            break
+
+        time.sleep(POLL_SECS)
+
+    remaining = max(0, qty - filled)
+
+    if remaining > 0 and oid:
+        url_del = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
+        ok = delete_with_retry(c, url_del, tag=f"CANCEL {oid}", tries=CANCEL_TRIES)
+        print(f"CS_VERT_PLACE CANCEL {oid} → {'OK' if ok else 'FAIL'}")
+
+        if ok:
+            time.sleep(CANCEL_SETTLE)
+        else:
+            s_final = ""
+            for j in range(6):
+                st = get_status(c, acct_hash, oid) or {}
+                s_final = status_upper(st)
+
+                fq = extract_filled_quantity(st)
+                if s_final == "FILLED" and fq <= 0:
+                    fq = qty
+                if fq > filled:
+                    filled = fq
+
+                if s_final in FINAL_STATUSES:
+                    break
+
+                time.sleep(min(4.0, 0.6 * (2 ** j)) + random.uniform(0.0, 0.2))
+
+            if s_final in FINAL_STATUSES:
+                pass
+            else:
+                placed_reason = f"CANCEL_FAILED_STATUS_{s_final or 'UNKNOWN'}"
+                danger = True
+
+    if filled >= qty:
+        placed_reason = "OK"
+    elif filled > 0 and placed_reason == "UNKNOWN":
+        placed_reason = "PARTIAL_FILL"
+    elif placed_reason == "UNKNOWN":
+        placed_reason = "NO_FILL"
+
+    return {
+        "filled": int(filled),
+        "order_ids": order_ids,
+        "reason": placed_reason,
+        "danger": danger,
+    }
+
+
+def place_two_verticals_simul(
+    c,
+    acct_hash: str,
+    v1: dict,
+    v2: dict,
+    qty1: int,
+    qty2: int,
+    aggressive_off: float,
+):
+    FIRST_WAIT = float(os.environ.get("VERT_FIRST_WAIT", "20"))
+    ADJUST_WAIT = float(os.environ.get("VERT_ADJUST_WAIT", "20"))
+    POLL_SECS = float(os.environ.get("VERT_POLL_SECS", "1.5"))
+    CANCEL_SETTLE = float(os.environ.get("VERT_CANCEL_SETTLE", "1.0"))
+    CANCEL_TRIES = int(os.environ.get("VERT_CANCEL_TRIES", "4"))
+
+    def submit_one(v, price, q, tag):
+        payload = order_payload_vertical(v["side"], v["short_osi"], v["long_osi"], price, q)
+        try:
+            r = post_with_retry(c, f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders", payload, tag=tag)
+        except Exception as e:
+            print(f"CS_VERT_PLACE ERROR posting order: {e}")
+            return ""
+        return parse_order_id(r)
+
+    def poll_orders(states, wait_secs):
+        t_end = time.time() + wait_secs
+        while time.time() < t_end:
+            all_done = True
+            for st in states:
+                if not st["oid"]:
+                    continue
+                if st["cur_filled"] >= st["cur_qty"]:
+                    continue
+                all_done = False
+                res = get_status(c, acct_hash, st["oid"]) or {}
+                s = status_upper(res)
+                fq = extract_filled_quantity(res)
+                if s == "FILLED" and fq <= 0:
+                    fq = st["cur_qty"]
+                if fq > st["cur_filled"]:
+                    delta = fq - st["cur_filled"]
+                    st["cur_filled"] = fq
+                    st["total_filled"] += delta
+                if s in FINAL_STATUSES:
+                    st["done"] = True
+            if all_done:
+                break
+            time.sleep(POLL_SECS)
+
+    def cancel_if_open(st):
+        if not st["oid"]:
+            return False, ""
+        remaining = max(0, st["cur_qty"] - st["cur_filled"])
+        if remaining <= 0:
+            return True, ""
+        url_del = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{st['oid']}"
+        ok = delete_with_retry(c, url_del, tag=f"CANCEL {st['oid']}", tries=CANCEL_TRIES)
+        print(f"CS_VERT_PLACE CANCEL {st['oid']} → {'OK' if ok else 'FAIL'}")
+        if ok:
+            time.sleep(CANCEL_SETTLE)
+            return True, ""
+
+        s_final = ""
+        for j in range(6):
+            res = get_status(c, acct_hash, st["oid"]) or {}
+            s_final = status_upper(res)
+            fq = extract_filled_quantity(res)
+            if s_final == "FILLED" and fq <= 0:
+                fq = st["cur_qty"]
+            if fq > st["cur_filled"]:
+                delta = fq - st["cur_filled"]
+                st["cur_filled"] = fq
+                st["total_filled"] += delta
+            if s_final in FINAL_STATUSES:
+                break
+            time.sleep(min(4.0, 0.6 * (2 ** j)) + random.uniform(0.0, 0.2))
+        return False, s_final
+
+    # ---- first round at mid ----
+    b1, a1, m1 = vertical_nbbo(v1["side"], v1["short_osi"], v1["long_osi"], c)
+    b2, a2, m2 = vertical_nbbo(v2["side"], v2["short_osi"], v2["long_osi"], c)
+    if None in (b1, a1, m1, b2, a2, m2):
+        return (
+            {"filled": 0, "order_ids": [], "reason": "NBBO_UNAVAILABLE", "danger": False, "ladder_plan": "[mid, mid+0.10]"},
+            {"filled": 0, "order_ids": [], "reason": "NBBO_UNAVAILABLE", "danger": False, "ladder_plan": "[mid, mid+0.10]"},
+        )
+
+    p1 = price_from_mid(m1, 0.0, b1, a1)
+    p2 = price_from_mid(m2, 0.0, b2, a2)
+    print(f"CS_VERT_PLACE VERT_MID: {v1['name']}@{p1:.2f} qty={qty1} ; {v2['name']}@{p2:.2f} qty={qty2}")
+
+    s1 = {"v": v1, "qty_total": qty1, "total_filled": 0, "cur_qty": qty1, "cur_filled": 0, "oid": "", "done": False, "order_ids": []}
+    s2 = {"v": v2, "qty_total": qty2, "total_filled": 0, "cur_qty": qty2, "cur_filled": 0, "oid": "", "done": False, "order_ids": []}
+
+    s1["oid"] = submit_one(v1, p1, qty, f"{v1['name']}:MID@{p1:.2f}x{qty}")
+    if s1["oid"]:
+        s1["order_ids"].append(s1["oid"])
+    s2["oid"] = submit_one(v2, p2, qty, f"{v2['name']}:MID@{p2:.2f}x{qty}")
+    if s2["oid"]:
+        s2["order_ids"].append(s2["oid"])
+
+    poll_orders([s1, s2], FIRST_WAIT)
+
+    danger = False
+    ok1, st1 = cancel_if_open(s1)
+    ok2, st2 = cancel_if_open(s2)
+    if not ok1 and st1 not in FINAL_STATUSES:
+        danger = True
+    if not ok2 and st2 not in FINAL_STATUSES:
+        danger = True
+
+    # ---- second round (aggressive) for remaining ----
+    r1 = max(0, s1["qty_total"] - s1["total_filled"])
+    r2 = max(0, s2["qty_total"] - s2["total_filled"])
+    if r1 > 0 or r2 > 0:
+        b1, a1, m1 = vertical_nbbo(v1["side"], v1["short_osi"], v1["long_osi"], c)
+        b2, a2, m2 = vertical_nbbo(v2["side"], v2["short_osi"], v2["long_osi"], c)
+        if r1 > 0 and None not in (b1, a1, m1):
+            off1 = aggressive_offset_for_side(aggressive_off, v1["side"])
+            p1 = price_from_mid(m1, off1, b1, a1)
+            print(f"CS_VERT_PLACE VERT_ADJ: {v1['name']}@{p1:.2f} rem={r1}")
+            s1["oid"] = submit_one(v1, p1, r1, f"{v1['name']}:ADJ@{p1:.2f}x{r1}")
+            if s1["oid"]:
+                s1["order_ids"].append(s1["oid"])
+            s1["cur_qty"] = r1
+            s1["cur_filled"] = 0
+        if r2 > 0 and None not in (b2, a2, m2):
+            off2 = aggressive_offset_for_side(aggressive_off, v2["side"])
+            p2 = price_from_mid(m2, off2, b2, a2)
+            print(f"CS_VERT_PLACE VERT_ADJ: {v2['name']}@{p2:.2f} rem={r2}")
+            s2["oid"] = submit_one(v2, p2, r2, f"{v2['name']}:ADJ@{p2:.2f}x{r2}")
+            if s2["oid"]:
+                s2["order_ids"].append(s2["oid"])
+            s2["cur_qty"] = r2
+            s2["cur_filled"] = 0
+
+        poll_orders([s1, s2], ADJUST_WAIT)
+
+        ok1, st1 = cancel_if_open(s1)
+        ok2, st2 = cancel_if_open(s2)
+        if not ok1 and st1 not in FINAL_STATUSES:
+            danger = True
+        if not ok2 and st2 not in FINAL_STATUSES:
+            danger = True
+
+    def finalize(st):
+        filled = int(st["total_filled"])
+        if filled >= st["qty_total"]:
+            reason = "OK"
+        elif filled > 0:
+            reason = "PARTIAL_FILL"
+        else:
+            reason = "NO_FILL"
+        return {
+            "filled": filled,
+            "order_ids": st["order_ids"],
+            "reason": reason,
+            "danger": danger,
+            "ladder_plan": "[mid, mid+0.10]",
+        }
+
+    return finalize(s1), finalize(s2)
+
+
+def place_two_verticals_alternating(
+    c,
+    acct_hash: str,
+    v1: dict,
+    v2: dict,
+    qty1: int,
+    qty2: int,
+):
+    STEP_WAIT = float(os.environ.get("VERT_STEP_WAIT", "12"))
+
+    offs1 = ladder_offsets_for_side(v1["side"])
+    offs2 = ladder_offsets_for_side(v2["side"])
+    ladder_plan_1 = "[" + ", ".join([f"mid{off:+.2f}" if off != 0 else "mid" for off in offs1]) + "]"
+    ladder_plan_2 = "[" + ", ".join([f"mid{off:+.2f}" if off != 0 else "mid" for off in offs2]) + "]"
+
+    def run_one(v, off, remaining):
+        b, a, m = vertical_nbbo(v["side"], v["short_osi"], v["long_osi"], c)
+        if None in (b, a, m):
+            return {"filled": 0, "order_ids": [], "reason": "NBBO_UNAVAILABLE", "danger": False, "last_price": None}
+        price = price_from_mid(m, off, b, a)
+        print(f"CS_VERT_PLACE ALT rung: {v['name']} price={price:.2f} rem={remaining}")
+        payload = order_payload_vertical(v["side"], v["short_osi"], v["long_osi"], price, remaining)
+        res = place_order_at_price(
+            c=c,
+            acct_hash=acct_hash,
+            payload=payload,
+            qty=remaining,
+            tag_prefix=f"{v['name']}@{price:.2f}x{remaining}",
+            wait_secs=STEP_WAIT,
+        )
+        res["last_price"] = price
+        return res
+
+    s1 = {"qty_total": qty1, "filled": 0, "order_ids": [], "danger": False, "last_price": None}
+    s2 = {"qty_total": qty2, "filled": 0, "order_ids": [], "danger": False, "last_price": None}
+
+    for i in range(max(len(offs1), len(offs2))):
+        if s1["filled"] < s1["qty_total"] and i < len(offs1):
+            rem1 = s1["qty_total"] - s1["filled"]
+            r1 = run_one(v1, offs1[i], rem1)
+            s1["filled"] += int(r1["filled"])
+            s1["order_ids"].extend(r1["order_ids"])
+            s1["danger"] = s1["danger"] or r1.get("danger", False)
+            s1["last_price"] = r1.get("last_price")
+        if s2["filled"] < s2["qty_total"] and i < len(offs2):
+            rem2 = s2["qty_total"] - s2["filled"]
+            r2 = run_one(v2, offs2[i], rem2)
+            s2["filled"] += int(r2["filled"])
+            s2["order_ids"].extend(r2["order_ids"])
+            s2["danger"] = s2["danger"] or r2.get("danger", False)
+            s2["last_price"] = r2.get("last_price")
+
+        if s1["filled"] >= s1["qty_total"] and s2["filled"] >= s2["qty_total"]:
+            break
+
+    def finalize(st, ladder_plan):
+        filled = int(st["filled"])
+        if filled >= st["qty_total"]:
+            reason = "OK"
+        elif filled > 0:
+            reason = "PARTIAL_FILL"
+        else:
+            reason = "NO_FILL"
+        return {
+            "filled": filled,
+            "order_ids": st["order_ids"],
+            "reason": reason,
+            "danger": st["danger"],
+            "ladder_plan": ladder_plan,
+            "last_price": st["last_price"],
+        }
+
+    return finalize(s1, ladder_plan_1), finalize(s2, ladder_plan_2)
+
+
 def run_single_vertical(c, acct_hash: str, v: dict, qty: int, tag_prefix: str):
     side = v["side"]
     short_osi = v["short_osi"]
@@ -540,7 +895,10 @@ def run_single_vertical(c, acct_hash: str, v: dict, qty: int, tag_prefix: str):
     def payload_single(price: float, q: int):
         return order_payload_vertical(side, short_osi, long_osi, price, q)
 
-    ladder_spec = [(-0.05, False), (0.00, False), (+0.05, True)]
+    offs = ladder_offsets_for_side(side)
+    ladder_spec = [(o, False) for o in offs]
+    if ladder_spec:
+        ladder_spec[-1] = (ladder_spec[-1][0], True)
     return place_order_with_ladder(
         c=c,
         acct_hash=acct_hash,
@@ -558,6 +916,7 @@ def main():
     DRY_RUN = truthy(os.environ.get("VERT_DRY_RUN", "false"))
 
     bundle_mode = truthy(os.environ.get("VERT_BUNDLE", "false")) and bool((os.environ.get("VERT2_NAME") or "").strip())
+    pair_mode = truthy(os.environ.get("VERT_PAIR", "false")) and bool((os.environ.get("VERT2_NAME") or "").strip())
     bundle_fallback = (os.environ.get("VERT_BUNDLE_FALLBACK", "") or "").strip().lower()
     bundle_fallback_separate = bundle_fallback in ("1", "true", "yes", "y", "separate", "split", "verticals")
 
@@ -588,7 +947,7 @@ def main():
     vol_bucket = os.environ.get("VERT_VOL_BUCKET", "")
     vol_mult = os.environ.get("VERT_VOL_MULT", "")
 
-    if bundle_mode:
+    if bundle_mode or pair_mode:
         v2 = {
             "side": (os.environ.get("VERT2_SIDE", "") or "").upper(),
             "kind": (os.environ.get("VERT2_KIND", "") or "").upper(),
@@ -600,17 +959,21 @@ def main():
             "strength": os.environ.get("VERT2_STRENGTH", ""),
         }
         qty = v1["qty"]  # common qty
+        mode_label = "PAIR" if pair_mode else "BUNDLE4"
         print(
-            f"CS_VERT_PLACE START MODE=BUNDLE4 qty={qty} "
+            f"CS_VERT_PLACE START MODE={mode_label} qty={qty} "
             f"V1={v1['name']}({v1['short_osi']}|{v1['long_osi']}) "
             f"V2={v2['name']}({v2['short_osi']}|{v2['long_osi']}) dry_run={DRY_RUN}"
         )
-        print("CS_VERT_PLACE LADDER=BUNDLE4 [mid-0.05, mid, mid+0.10]")
+        if pair_mode:
+            print("CS_VERT_PLACE LADDER=PAIR [mid-0.05, mid, mid+0.05, mid+0.10]")
+        else:
+            print("CS_VERT_PLACE LADDER=BUNDLE4 [mid] -> VERT [mid, mid+0.10]")
     else:
         v2 = None
         qty = v1["qty"]
         print(f"CS_VERT_PLACE START MODE=VERT name={v1['name']} side={v1['side']} kind={v1['kind']} short={v1['short_osi']} long={v1['long_osi']} qty={qty} dry_run={DRY_RUN}")
-        print("CS_VERT_PLACE LADDER=VERT [mid-0.05, mid, mid+0.05]")
+        print("CS_VERT_PLACE LADDER=VERT [mid-0.05, mid, mid+0.05, mid+0.10] (credit uses opposite)")
 
     c = schwab_client()
     acct_hash = resolve_acct_hash(c)
@@ -623,7 +986,7 @@ def main():
         order_ids = ""
         nbbo_bid = nbbo_ask = nbbo_mid = ""
         last_price = ""
-        ladder_prices = "[mid-0.05, mid, mid+0.10]" if bundle_mode else "[mid-0.05, mid, mid+0.05]"
+        ladder_prices = "[mid]" if bundle_mode else "[mid-0.05, mid, mid+0.05, mid+0.10]"
 
         def write_one(v):
             row = {
@@ -644,7 +1007,7 @@ def main():
             log_row(row)
 
         write_one(v1)
-        if bundle_mode and v2:
+        if (bundle_mode or pair_mode) and v2:
             write_one(v2)
 
         goutput("placed", "0")
@@ -655,6 +1018,58 @@ def main():
         return 0
 
     # ---------- run placement ----------
+    if pair_mode and v2:
+        qty1 = max(1, int(os.environ.get("VERT_QTY", "1")))
+        qty2 = max(1, int(os.environ.get("VERT2_QTY", str(qty1))))
+
+        res_v1, res_v2 = place_two_verticals_alternating(
+            c=c,
+            acct_hash=acct_hash,
+            v1=v1,
+            v2=v2,
+            qty1=qty1,
+            qty2=qty2,
+        )
+
+        def log_pair(v, r, qty_req):
+            r_filled = int(r["filled"])
+            r_order_ids = ",".join(r["order_ids"])
+            r_last_price = r.get("last_price")
+            r_ladder = r.get("ladder_plan", "")
+            row = {
+                "ts_utc": ts_utc.isoformat(), "ts_et": ts_et.isoformat(),
+                "trade_date": trade_date, "tdate": tdate,
+                "name": v["name"], "kind": v["kind"], "side": v["side"], "direction": v["direction"],
+                "short_osi": v["short_osi"], "long_osi": v["long_osi"],
+                "go": v.get("go", ""), "strength": v.get("strength", ""),
+                "qty_rule": qty_rule,
+                "vol_field": vol_field, "vol_used": vol_used, "vol_value": vol_value,
+                "vol_bucket": vol_bucket, "vol_mult": vol_mult,
+                "unit_dollars": unit_d, "oc": oc, "units": units,
+                "qty_requested": qty_req, "qty_filled": r_filled,
+                "ladder_prices": r_ladder,
+                "last_price": f"{r_last_price:.2f}" if r_last_price is not None else "",
+                "nbbo_bid": "", "nbbo_ask": "", "nbbo_mid": "",
+                "order_ids": r_order_ids,
+                "reason": r["reason"],
+            }
+            log_row(row)
+            return r_filled, r_order_ids, r.get("danger")
+
+        f1, o1, d1 = log_pair(v1, res_v1, qty1)
+        f2, o2, d2 = log_pair(v2, res_v2, qty2)
+
+        total_filled = min(f1, qty1) + min(f2, qty2)
+        all_order_ids = ",".join([x for x in (o1, o2) if x])
+        goutput("placed", "1" if total_filled > 0 else "0")
+        goutput("reason", "PAIR_ALTERNATING")
+        goutput("qty_filled", str(total_filled))
+        goutput("order_ids", all_order_ids)
+
+        if d1 or d2:
+            return 2
+        return 0
+
     if bundle_mode and v2:
         # Determine bundle net side + NBBO
         def nbbo_fn(refresh: bool):
@@ -702,7 +1117,7 @@ def main():
             print("CS_VERT_PLACE DONE MODE=BUNDLE4 reason=NBBO_UNAVAILABLE")
             return 0
 
-        # Place bundle with ladder
+        # Place bundle at mid only, then split if needed
         def nbbo_fn2(refresh: bool):
             s, b, a, m = bundle_nbbo(
                 long_osi_1=v1["long_osi"], short_osi_1=v1["short_osi"],
@@ -718,25 +1133,26 @@ def main():
                 long_osi_2=v2["long_osi"], short_osi_2=v2["short_osi"],
             )
 
-        # For ladder we use bundle side
-        ladder_spec = [(-0.05, False), (0.00, False), (+0.10, True)]
-        res = place_order_with_ladder(
+        FIRST_WAIT = float(os.environ.get("VERT_FIRST_WAIT", "20"))
+        aggressive_off = float(os.environ.get("VERT_AGGRESSIVE_OFFSET", "0.10"))
+
+        b2, a2, m2 = bid0, ask0, mid0
+        mid_price = price_from_mid(m2, 0.0, b2, a2)
+        print(f"CS_VERT_PLACE BUNDLE_MID: price={mid_price:.2f} qty={qty} wait={FIRST_WAIT:.2f}s")
+        res = place_order_at_price(
             c=c,
             acct_hash=acct_hash,
-            side=side_pkg,
+            payload=payload_fn(mid_price, qty),
             qty=qty,
-            nbbo_fn=nbbo_fn2,
-            payload_fn=payload_fn,
-            tag_prefix=f"BUNDLE4:{v1['name']}+{v2['name']}",
-            ladder_spec=ladder_spec,
+            tag_prefix=f"BUNDLE4:{v1['name']}+{v2['name']}@MID",
+            wait_secs=FIRST_WAIT,
         )
 
         filled = int(res["filled"])
         placed_reason = res["reason"]
         order_ids = ",".join(res["order_ids"])
-        last_price = res["last_price"]
-        b2, a2, m2 = res["nbbo_bid"], res["nbbo_ask"], res["nbbo_mid"]
-        ladder_plan = res.get("ladder_plan", "")
+        last_price = mid_price
+        ladder_plan = "[mid]"
 
         # log BOTH rows (bundle attempt)
         for v in (v1, v2):
@@ -763,17 +1179,22 @@ def main():
 
         print(f"CS_VERT_PLACE DONE MODE=BUNDLE4 qty_req={qty} qty_filled={filled} last_price={last_price} reason={placed_reason}")
 
-        if bundle_fallback_separate and filled == 0 and placed_reason == "NO_FILL":
-            print("CS_VERT_PLACE FALLBACK: bundle no fill — placing verticals separately")
-            res_v1 = run_single_vertical(c, acct_hash, v1, qty, tag_prefix=f"{v1['name']}:FALLBACK")
-            res_v2 = run_single_vertical(c, acct_hash, v2, qty, tag_prefix=f"{v2['name']}:FALLBACK")
+        remaining = max(0, qty - filled)
+        if bundle_fallback_separate and remaining > 0:
+            print("CS_VERT_PLACE FALLBACK: bundle incomplete — placing verticals separately")
+            res_v1, res_v2 = place_two_verticals_simul(
+                c=c,
+                acct_hash=acct_hash,
+                v1=v1,
+                v2=v2,
+                qty=remaining,
+                aggressive_off=aggressive_off,
+            )
 
             def log_fallback(v, r):
                 r_filled = int(r["filled"])
                 r_reason = f"FALLBACK_{r['reason']}"
                 r_order_ids = ",".join(r["order_ids"])
-                r_last_price = r["last_price"]
-                r_b2, r_a2, r_m2 = r["nbbo_bid"], r["nbbo_ask"], r["nbbo_mid"]
                 r_ladder = r.get("ladder_plan", "")
                 row = {
                     "ts_utc": ts_utc.isoformat(), "ts_et": ts_et.isoformat(),
@@ -785,12 +1206,12 @@ def main():
                     "vol_field": vol_field, "vol_used": vol_used, "vol_value": vol_value,
                     "vol_bucket": vol_bucket, "vol_mult": vol_mult,
                     "unit_dollars": unit_d, "oc": oc, "units": units,
-                    "qty_requested": qty, "qty_filled": r_filled,
+                    "qty_requested": remaining, "qty_filled": r_filled,
                     "ladder_prices": r_ladder,
-                    "last_price": f"{r_last_price:.2f}" if r_last_price is not None else "",
-                    "nbbo_bid": f"{r_b2:.2f}" if r_b2 is not None else "",
-                    "nbbo_ask": f"{r_a2:.2f}" if r_a2 is not None else "",
-                    "nbbo_mid": f"{r_m2:.2f}" if r_m2 is not None else "",
+                    "last_price": "",
+                    "nbbo_bid": "",
+                    "nbbo_ask": "",
+                    "nbbo_mid": "",
                     "order_ids": r_order_ids,
                     "reason": r_reason,
                 }
@@ -800,8 +1221,8 @@ def main():
             f1, _, o1, d1 = log_fallback(v1, res_v1)
             f2, _, o2, d2 = log_fallback(v2, res_v2)
 
-            total_filled = f1 + f2
-            fallback_order_ids = ",".join([x for x in (o1, o2) if x])
+            total_filled = filled + min(f1, f2)
+            fallback_order_ids = ",".join([x for x in (order_ids, o1, o2) if x])
             goutput("placed", "1" if total_filled > 0 else "0")
             goutput("reason", "FALLBACK_SEPARATE")
             goutput("qty_filled", str(total_filled))
