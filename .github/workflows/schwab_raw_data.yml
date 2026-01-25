@@ -128,6 +128,12 @@ jobs:
             echo "Token file not found, skipping SCHWAB_TOKEN_JSON update."
           fi
 
+      - name: Test failure (email notifier)
+        if: always()
+        run: |
+          echo "Intentional failure to test email notification."
+          exit 1
+
       - name: Notify on failure (email)
         if: failure()
         env:
