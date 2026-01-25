@@ -78,3 +78,15 @@ jobs:
       - name: Edge guard (write/update daily stats)
         run: |
           python scripts/trade/ConstantStable/edge_guard.py
+
+      - name: Persist Schwab token refresh
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_SECRET_TOKEN }}
+        run: |
+          if [ -f Token/schwab_token.json ]; then
+            gh secret set SCHWAB_TOKEN_JSON --body-file Token/schwab_token.json -R "${GITHUB_REPOSITORY}"
+            echo "Updated SCHWAB_TOKEN_JSON secret."
+          else
+            echo "No token file found; skipping secret update."
+          fi
