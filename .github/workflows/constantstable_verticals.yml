@@ -90,3 +90,14 @@ jobs:
           else
             echo "No token file found; skipping secret update."
           fi
+
+      - name: Notify on failure (email)
+        if: failure()
+        env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SMTP_TO: ${{ secrets.SMTP_TO }}
+        run: |
+          python scripts/notify/smtp_notify.py \
+            "ConstantStableVerticals failed" \
+            "Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
