@@ -5,7 +5,24 @@ import os, json, base64, re, math
 from datetime import datetime, timedelta, timezone, date
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
-from schwab.auth import client_from_token_file
+import sys
+
+
+def _add_scripts_root():
+    cur = os.path.abspath(os.path.dirname(__file__))
+    while True:
+        if os.path.basename(cur) == "scripts":
+            if cur not in sys.path:
+                sys.path.append(cur)
+            return
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return
+        cur = parent
+
+
+_add_scripts_root()
+from schwab_token_keeper import schwab_client as schwab_client_base
 from google.oauth2 import service_account
 from googleapiclient.discovery import build as gbuild
 
@@ -73,19 +90,8 @@ def merge_rows(existing,new,headers):
     out=list(merged.values()); out.sort(key=ts_key, reverse=True)
     return out
 
-def _token_to_file():
-    tj=os.environ["SCHWAB_TOKEN_JSON"]
-    try:
-        dec=base64.b64decode(tj).decode("utf-8")
-        if dec.strip().startswith("{"): tj=dec
-    except Exception: pass
-    with open("schwab_token.json","w") as f: f.write(tj)
-    return "schwab_token.json"
-
 def schwab_client():
-    c=client_from_token_file(api_key=os.environ["SCHWAB_APP_KEY"],
-                             app_secret=os.environ["SCHWAB_APP_SECRET"],
-                             token_path=_token_to_file())
+    c = schwab_client_base()
     r=c.get_account_numbers(); r.raise_for_status()
     acct_hash=r.json()[0]["hashValue"]
     return c, acct_hash

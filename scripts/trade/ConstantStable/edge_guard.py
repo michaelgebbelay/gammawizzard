@@ -37,7 +37,22 @@ import os, sys, json, math
 from datetime import datetime, timedelta, timezone, date
 from zoneinfo import ZoneInfo
 
-from schwab.auth import client_from_token_file
+
+def _add_scripts_root():
+    cur = os.path.abspath(os.path.dirname(__file__))
+    while True:
+        if os.path.basename(cur) == "scripts":
+            if cur not in sys.path:
+                sys.path.append(cur)
+            return
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return
+        cur = parent
+
+
+_add_scripts_root()
+from schwab_token_keeper import schwab_client
 
 ET = ZoneInfo("America/New_York")
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -71,14 +86,6 @@ def fint(key: str, default=None):
         return default
 
 # ---------------- Schwab equity ----------------
-def schwab_client():
-    app_key = os.environ["SCHWAB_APP_KEY"]
-    app_secret = os.environ["SCHWAB_APP_SECRET"]
-    token_json = os.environ["SCHWAB_TOKEN_JSON"]
-    with open("schwab_token.json", "w") as f:
-        f.write(token_json)
-    return client_from_token_file(api_key=app_key, app_secret=app_secret, token_path="schwab_token.json")
-
 def opening_cash_for_account(c):
     """
     Returns (equity_value, source_key, acct_number) preferring liquidationValue and ignoring 0/neg.

@@ -5,7 +5,7 @@ from schwab.auth import client_from_login_flow
 APP_KEY = "wtdRgK6ENV2R2NQ0aAcBAc9Ux8Vihb4hQiTnymAlS23FDgwS"
 APP_SECRET = "Y4JhG3N18mlZTnGRXifVZFfCc7mg51k3bOZZiQj9pC3Y79wZ1EH2eOXiT1tETBIn"
 CALLBACK_URL = "https://127.0.0.1:8182"
-TOKEN_PATH  = "schwab_token.json"
+TOKEN_PATH  = os.environ.get("SCHWAB_TOKEN_PATH", "Token/schwab_token.json")
 
 def die(msg):
     print("ERROR:", msg, file=sys.stderr)

@@ -20,7 +20,7 @@ def main():
         print("Set SCHWAB_APP_KEY, SCHWAB_APP_SECRET, SCHWAB_REDIRECT_URI and re-run.", file=sys.stderr)
         sys.exit(1)
 
-    token_path = "schwab_token.json"
+    token_path = os.environ.get("SCHWAB_TOKEN_PATH", os.path.join("Token", "schwab_token.json"))
     client_from_login_flow(api_key=app_key, app_secret=app_secret, redirect_uri=redirect_uri, token_path=token_path)
 
     with open(token_path, "r") as f:
@@ -28,7 +28,7 @@ def main():
 
     print("\n=== WRITE THIS INTO YOUR GitHub secret SCHWAB_TOKEN_JSON ===\n")
     print(token_json)
-    print("\n=== END ===\nSaved to ./schwab_token.json as well.\n")
+    print(f"\n=== END ===\nSaved to {token_path} as well.\n")
 
 if __name__ == "__main__":
     main()

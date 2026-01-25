@@ -5,7 +5,21 @@
 import os, re, json, math, sys
 from datetime import date
 import requests
-from schwab.auth import client_from_token_file
+def _add_scripts_root():
+    cur = os.path.abspath(os.path.dirname(__file__))
+    while True:
+        if os.path.basename(cur) == "scripts":
+            if cur not in sys.path:
+                sys.path.append(cur)
+            return
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return
+        cur = parent
+
+
+_add_scripts_root()
+from schwab_token_keeper import schwab_client as schwab_client_base
 
 TICK = 0.05
 
@@ -86,9 +100,7 @@ def extract_trade(j):
 
 # --- Schwab quote helpers ---
 def schwab_client():
-    app_key=os.environ["SCHWAB_APP_KEY"]; app_secret=os.environ["SCHWAB_APP_SECRET"]; token_json=os.environ["SCHWAB_TOKEN_JSON"]
-    with open("schwab_token.json","w") as f: f.write(token_json)
-    return client_from_token_file(api_key=app_key, app_secret=app_secret, token_path="schwab_token.json")
+    return schwab_client_base()
 
 def fetch_bid_ask(c, osi: str):
     r=c.get_quote(osi)
