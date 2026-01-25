@@ -245,7 +245,7 @@ def main():
         print(f"CS_EDGE_GUARD ERROR: Schwab init/equity failed: {e}")
         goutput("can_trade","0")
         goutput("reason","SCHWAB_FAIL")
-        return 0
+        return 1
 
     if eq is None or eq <= 0:
         print(f"CS_EDGE_GUARD WARN: equity unavailable (eq={eq}) - allowing trade")

@@ -4,6 +4,7 @@ Schwab token keeper with single-writer locking and refresh-token overwrite.
 """
 
 import base64
+import inspect
 import json
 import os
 import time
@@ -101,9 +102,19 @@ def schwab_client():
     def token_write_func(token, *args, **kwargs):
         _write_token_locked(token_path, token)
 
-    return client_from_token_file(
-        token_path=token_path,
-        api_key=app_key,
-        app_secret=app_secret,
-        token_write_func=token_write_func,
-    )
+    kwargs = {
+        "token_path": token_path,
+        "api_key": app_key,
+        "app_secret": app_secret,
+    }
+    try:
+        sig = inspect.signature(client_from_token_file)
+    except Exception:
+        sig = None
+
+    if sig and "token_write_func" in sig.parameters:
+        kwargs["token_write_func"] = token_write_func
+    elif sig and "write_func" in sig.parameters:
+        kwargs["write_func"] = token_write_func
+
+    return client_from_token_file(**kwargs)

@@ -494,7 +494,7 @@ def main():
         acct_hash = get_account_hash(c)
     except Exception as e:
         print(f"CS_VERT_RUN SKIP: Schwab init failed: {e}")
-        return 0
+        return 1
 
     ov_raw = (os.environ.get("SIZING_DOLLARS_OVERRIDE", "") or "").strip()
     if ov_raw:
