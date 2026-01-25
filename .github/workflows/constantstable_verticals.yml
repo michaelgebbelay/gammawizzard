@@ -85,7 +85,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_SECRET_TOKEN }}
         run: |
           if [ -f Token/schwab_token.json ]; then
-            gh secret set SCHWAB_TOKEN_JSON --body-file Token/schwab_token.json -R "${GITHUB_REPOSITORY}"
+            gh secret set SCHWAB_TOKEN_JSON -b "$(cat Token/schwab_token.json)" -R "${GITHUB_REPOSITORY}"
             echo "Updated SCHWAB_TOKEN_JSON secret."
           else
             echo "No token file found; skipping secret update."
