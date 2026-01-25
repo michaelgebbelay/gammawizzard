@@ -65,10 +65,12 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run ConstantStable vertical orchestrator
+        id: cs_orchestrator
         run: |
           python scripts/trade/ConstantStable/orchestrator.py
 
       - name: Push ConstantStable trades to Google Sheets
+        id: cs_gsheet
         env:
           CS_GSHEET_TAB: "ConstantStableTrades"
           CS_LOG_PATH: "logs/constantstable_vertical_trades.csv"
@@ -76,10 +78,12 @@ jobs:
           python scripts/data/cs_trades_to_gsheet.py
 
       - name: Edge guard (write/update daily stats)
+        id: cs_edge_guard
         run: |
           python scripts/trade/ConstantStable/edge_guard.py
 
       - name: Persist Schwab token refresh
+        id: cs_token_persist
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GH_SECRET_TOKEN }}
@@ -97,7 +101,18 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           SMTP_TO: ${{ secrets.SMTP_TO }}
+          SMTP_SUBJECT: "ConstantStableVerticals failed"
+          SMTP_BODY: |
+            Repo: ${{ github.repository }}
+            Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            Ref: ${{ github.ref }}
+            Actor: ${{ github.actor }}
+            Event: ${{ github.event_name }}
+
+            Step outcomes:
+            - orchestrator: ${{ steps.cs_orchestrator.outcome }}
+            - gsheet: ${{ steps.cs_gsheet.outcome }}
+            - edge_guard: ${{ steps.cs_edge_guard.outcome }}
+            - token_persist: ${{ steps.cs_token_persist.outcome }}
         run: |
-          python scripts/notify/smtp_notify.py \
-            "ConstantStableVerticals failed" \
-            "Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          python scripts/notify/smtp_notify.py

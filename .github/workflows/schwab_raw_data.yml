@@ -34,6 +34,7 @@ jobs:
           cache-dependency-path: requirements.txt
 
       - name: Install deps
+        id: sw_install_deps
         run: |
           python -m pip install --upgrade pip setuptools wheel
           # Ensure transitive import requirement is present even if requirements.txt misses it
@@ -43,6 +44,7 @@ jobs:
           pip check
 
       - name: Import smoke test
+        id: sw_import_smoke
         run: |
           python - <<'PY'
           import googleapiclient.discovery
@@ -64,6 +66,7 @@ jobs:
           echo "DAYS_BACK=$DB" >> "$GITHUB_OUTPUT"
 
       - name: Dump Schwab → sw_txn_raw (YTD or incremental)
+        id: sw_dump_raw
         env:
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
@@ -106,6 +109,7 @@ jobs:
       #     python scripts/data/gw_settlements_to_sheet.py
 
       - name: Build Standard orig orders from sw_txn_raw (only)
+        id: sw_summary
         env:
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
@@ -117,6 +121,7 @@ jobs:
           python scripts/data/sw_3way_summary.py
 
       - name: Persist Schwab token refresh
+        id: sw_token_persist
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GH_SECRET_TOKEN }}
@@ -134,7 +139,19 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           SMTP_TO: ${{ secrets.SMTP_TO }}
+          SMTP_SUBJECT: "schwab raw data failed"
+          SMTP_BODY: |
+            Repo: ${{ github.repository }}
+            Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            Ref: ${{ github.ref }}
+            Actor: ${{ github.actor }}
+            Event: ${{ github.event_name }}
+
+            Step outcomes:
+            - install_deps: ${{ steps.sw_install_deps.outcome }}
+            - import_smoke: ${{ steps.sw_import_smoke.outcome }}
+            - dump_raw: ${{ steps.sw_dump_raw.outcome }}
+            - summary: ${{ steps.sw_summary.outcome }}
+            - token_persist: ${{ steps.sw_token_persist.outcome }}
         run: |
-          python scripts/notify/smtp_notify.py \
-            "schwab raw data failed" \
-            "Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          python scripts/notify/smtp_notify.py

@@ -6,12 +6,15 @@ from email.message import EmailMessage
 
 
 def main():
-    if len(sys.argv) < 3:
-        print("Usage: smtp_notify.py <subject> <body>")
-        return 2
-
-    subject = sys.argv[1]
-    body = sys.argv[2]
+    if len(sys.argv) >= 3:
+        subject = sys.argv[1]
+        body = sys.argv[2]
+    else:
+        subject = os.environ.get("SMTP_SUBJECT", "").strip()
+        body = os.environ.get("SMTP_BODY", "").strip()
+        if not subject or not body:
+            print("Usage: smtp_notify.py <subject> <body> (or SMTP_SUBJECT/SMTP_BODY env)")
+            return 2
 
     smtp_user = os.environ.get("SMTP_USER", "").strip()
     smtp_pass = os.environ.get("SMTP_PASS", "").strip()
