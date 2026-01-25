@@ -115,3 +115,15 @@ jobs:
           ORIG_ONLY: "1"   # ensures the hot path runs
         run: |
           python scripts/data/sw_3way_summary.py
+
+      - name: Persist Schwab token refresh
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_SECRET_TOKEN }}
+        run: |
+          if [ -f Token/schwab_token.json ]; then
+            gh secret set SCHWAB_TOKEN_JSON -b "$(cat Token/schwab_token.json)" -R "$GITHUB_REPOSITORY"
+            echo "Updated SCHWAB_TOKEN_JSON secret."
+          else
+            echo "Token file not found, skipping SCHWAB_TOKEN_JSON update."
+          fi
