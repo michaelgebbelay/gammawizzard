@@ -199,6 +199,8 @@ def main():
     idx = {h: i for i, h in enumerate(header)}
 
     def get(row, key, default=""):
+        if row is None:
+            return default
         j = idx.get(key)
         return row[j] if j is not None and j < len(row) else default
 
