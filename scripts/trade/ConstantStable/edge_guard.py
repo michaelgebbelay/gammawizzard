@@ -3,7 +3,7 @@
 ConstantStable - Equity logger + edge guard (Google Sheets + GitHub Actions outputs)
 
 Writes one row per run into a Google Sheet tab (default: ConstantStableState).
-Computes daily/run P&L based on Schwab liquidationValue (account used exclusively for this strategy).
+Computes daily/run P&L based on Schwab liquidationValue and adjusts for transfers.
 Optionally pauses trading when edge is likely gone (sequential test on returns).
 
 Required env (for Schwab):
@@ -159,6 +159,69 @@ def opening_cash_for_account(c):
             return got[0], got[1], chosen_num
     return None, "none", chosen_num
 
+def get_account_hash(c):
+    r = c.get_account_numbers()
+    r.raise_for_status()
+    arr = r.json() or []
+    info = arr[0] if arr else {}
+    return str(info.get("hashValue") or info.get("hashvalue") or "")
+
+def safe_float(x, default=None):
+    try:
+        if x is None:
+            return default
+        return float(x)
+    except Exception:
+        return default
+
+def list_transactions(c, acct_hash: str, t0: datetime, t1: datetime):
+    r = c.get_transactions(acct_hash, start_date=t0, end_date=t1)
+    if getattr(r, "status_code", None) == 204:
+        return []
+    r.raise_for_status()
+    j = r.json()
+    return j if isinstance(j, list) else []
+
+def is_transfer_txn(txn: dict) -> bool:
+    ttype = str(txn.get("type") or txn.get("transactionType") or "").upper()
+    subtype = str(txn.get("subType") or "").upper()
+    desc = str(txn.get("description") or "").upper()
+    text = " ".join([ttype, subtype, desc])
+
+    exclude = ("DIVIDEND", "INTEREST", "TRADE", "OPTION", "BUY", "SELL", "EXERCISE", "ASSIGNMENT")
+    if any(x in text for x in exclude):
+        return False
+
+    include = ("TRANSFER", "WIRE", "ACH", "EFT", "DEPOSIT", "WITHDRAW", "JOURNAL", "CONTRIBUTION", "DISTRIBUTION")
+    if any(x in text for x in include):
+        return True
+
+    if txn.get("orderId"):
+        return False
+
+    items = txn.get("transferItems") or []
+    if items:
+        for it in items:
+            ins = it.get("instrument") or {}
+            asset = str(ins.get("assetType") or "").upper()
+            if asset == "OPTION":
+                return False
+        return True
+
+    return False
+
+def net_transfers_between(c, acct_hash: str, t0: datetime, t1: datetime) -> float:
+    txns = list_transactions(c, acct_hash, t0, t1)
+    total = 0.0
+    for t in txns:
+        if not is_transfer_txn(t):
+            continue
+        amt = safe_float(t.get("netAmount"))
+        if amt is None:
+            continue
+        total += amt
+    return round(total, 2)
+
 # ---------------- Google Sheets ----------------
 def sheets_available():
     return bool((os.environ.get("GSHEET_ID") or "").strip()) and bool((os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip())
@@ -240,6 +303,7 @@ def main():
     try:
         c = schwab_client()
         eq, src, acct = opening_cash_for_account(c)
+        acct_hash = get_account_hash(c)
     except Exception as e:
         # If Schwab fails, trading probably fails too; be explicit
         print(f"CS_EDGE_GUARD ERROR: Schwab init/equity failed: {e}")
@@ -270,7 +334,7 @@ def main():
     header = [
         "ts_utc","ts_et","run_date",
         "acct","equity","equity_src",
-        "prev_equity","pnl","ret",
+        "prev_equity","transfer_net","transfer_cum","equity_adj","prev_equity_adj","pnl","ret",
         "peak_equity","dd","dd_pct",
         "winloss",
         "llr","n",
@@ -293,6 +357,8 @@ def main():
 
     prev = last_state(existing, header)
     prev_eq = ffloat_from(prev.get("equity",""), default=None)
+    prev_adj = ffloat_from(prev.get("equity_adj",""), default=None)
+    prev_trans_cum = ffloat_from(prev.get("transfer_cum",""), default=0.0) or 0.0
     prev_peak = ffloat_from(prev.get("peak_equity",""), default=None)
     prev_llr = ffloat_from(prev.get("llr",""), default=0.0) or 0.0
     prev_n   = fint_from(prev.get("n",""), default=0) or 0
@@ -312,6 +378,10 @@ def main():
                     "equity": f"{eq:.2f}",
                     "equity_src": src,
                     "prev_equity": prev.get("equity",""),
+                    "transfer_net": "",
+                    "transfer_cum": prev.get("transfer_cum",""),
+                    "equity_adj": prev.get("equity_adj",""),
+                    "prev_equity_adj": prev.get("prev_equity_adj",""),
                     "pnl": "",
                     "ret": "",
                     "peak_equity": prev.get("peak_equity",""),
@@ -331,20 +401,43 @@ def main():
         except Exception:
             pass
 
+    # transfer adjustment window: from prev run to now (fallback 1 day)
+    if prev.get("ts_utc"):
+        try:
+            t0 = datetime.fromisoformat(prev.get("ts_utc")).astimezone(timezone.utc)
+        except Exception:
+            t0 = ts_utc - timedelta(days=1)
+    else:
+        t0 = ts_utc - timedelta(days=1)
+    t1 = ts_utc
+
+    transfer_net = 0.0
+    if acct_hash:
+        try:
+            transfer_net = net_transfers_between(c, acct_hash, t0, t1)
+        except Exception as e:
+            print(f"CS_EDGE_GUARD WARN: transfer lookup failed: {str(e)[:200]}")
+
+    transfer_cum = prev_trans_cum + transfer_net
+
+    equity_adj = eq - transfer_cum
+    if prev_adj is None:
+        prev_adj = prev_eq if prev_eq is not None else None
+
     pnl = ""
     ret = ""
     winloss = ""
-    if prev_eq and prev_eq > 0:
-        pnl_v = eq - prev_eq
-        ret_v = pnl_v / prev_eq
+    if prev_adj and prev_adj > 0:
+        pnl_v = equity_adj - prev_adj
+        ret_v = pnl_v / prev_adj
         pnl = f"{pnl_v:.2f}"
         ret = f"{ret_v:.8f}"
         if pnl_v > 0: winloss = "WIN"
         elif pnl_v < 0: winloss = "LOSS"
         else: winloss = "FLAT"
 
-    peak = max(prev_peak or 0.0, eq) if (prev_peak and prev_peak > 0) else eq
-    dd = max(0.0, peak - eq)
+    peak = max(prev_peak or 0.0, equity_adj) if (prev_peak and prev_peak > 0) else equity_adj
+    dd = max(0.0, peak - equity_adj)
     dd_pct = (dd / peak) if peak > 0 else 0.0
 
     # Edge-test parameters (returns, not dollars)
@@ -364,7 +457,7 @@ def main():
     reason = "OK"
 
     # Only run test if we have params AND we have a new return datapoint
-    if (mu1 is not None) and (sigma is not None) and (prev_eq and prev_eq > 0):
+    if (mu1 is not None) and (sigma is not None) and (prev_adj and prev_adj > 0):
         x = float(ret)  # return per run
         if sigma > 0:
             new_llr = prev_llr + llr_increment_normal(x, mu0, mu1, sigma)
@@ -401,6 +494,10 @@ def main():
         "equity": f"{eq:.2f}",
         "equity_src": src,
         "prev_equity": f"{prev_eq:.2f}" if prev_eq else "",
+        "transfer_net": f"{transfer_net:.2f}",
+        "transfer_cum": f"{transfer_cum:.2f}",
+        "equity_adj": f"{equity_adj:.2f}",
+        "prev_equity_adj": f"{prev_adj:.2f}" if prev_adj else "",
         "pnl": pnl,
         "ret": ret,
         "peak_equity": f"{peak:.2f}",
