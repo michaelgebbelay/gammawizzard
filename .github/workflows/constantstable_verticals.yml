@@ -2,10 +2,6 @@ name: ConstantStableVerticals
 
 on:
   workflow_dispatch:
-  # 4:13 PM ET (two crons for DST)
-  schedule:
-    - cron: "13 20 * * 1-5"  # 20:13 UTC = 4:13 PM EDT
-    - cron: "13 21 * * 1-5"  # 21:13 UTC = 4:13 PM EST
 
 jobs:
   trade:
@@ -49,8 +45,8 @@ jobs:
       CS_EDGE_GSHEET_TAB: "ConstantStableEdge"
 
       # Placer timing knobs (keep as-is unless you want to tweak)
-      VERT_STEP_WAIT:      "18"
-      VERT_POLL_SECS:      "1.0"
+      VERT_STEP_WAIT:      "20"
+      VERT_POLL_SECS:      "2.0"
       VERT_CANCEL_SETTLE:  "1.0"
       VERT_MAX_LADDER:     "3"
       VERT_DRY_RUN:        "false"
