@@ -2,8 +2,8 @@
 # CONSTANT STABLE — placer (vertical or 4-leg bundle)
 #
 # Ladder (Option B):
-#   CREDIT: mid+0.05, mid, mid-0.05 (refresh on last rung)
-#   DEBIT : mid-0.05, mid, mid+0.05 (refresh on last rung)
+#   CREDIT: mid, mid-0.05, mid-0.10 (refresh on last rung)
+#   DEBIT : mid, mid+0.05, mid+0.10 (refresh on last rung)
 #
 # Bundle mode:
 #   If VERT_BUNDLE=true and VERT2_NAME present, places one 4-leg NET_DEBIT/NET_CREDIT "CUSTOM" order.
@@ -91,7 +91,7 @@ def aggressive_offset_for_side(off: float, side: str) -> float:
 
 
 def ladder_offsets_for_side(side: str):
-    base = [-0.05, 0.00, 0.05, 0.10]
+    base = [0.00, 0.05, 0.10]
     if side.upper() == "CREDIT":
         return [-x for x in base]
     return base
@@ -566,9 +566,9 @@ def place_order_with_ladder(
     # Ladder spec (Option B)
     if ladder_spec is None:
         if side.upper() == "CREDIT":
-            ladder_spec = [(+0.05, False), (0.00, False), (-0.05, True)]
+            ladder_spec = [(0.00, False), (-0.05, False), (-0.10, True)]
         else:
-            ladder_spec = [(-0.05, False), (0.00, False), (+0.05, True)]
+            ladder_spec = [(0.00, False), (+0.05, False), (+0.10, True)]
 
     preview = []
     for off, refresh in ladder_spec[:MAX_LADDER]:
@@ -806,7 +806,6 @@ def place_two_verticals_simul(
     v2: dict,
     qty1: int,
     qty2: int,
-    aggressive_off: float,
 ):
     FIRST_WAIT = float(os.environ.get("VERT_FIRST_WAIT", "20"))
     ADJUST_WAIT = float(os.environ.get("VERT_ADJUST_WAIT", "20"))
@@ -882,8 +881,8 @@ def place_two_verticals_simul(
     b2, a2, m2 = vertical_nbbo(v2["side"], v2["short_osi"], v2["long_osi"], c)
     if None in (b1, a1, m1, b2, a2, m2):
         return (
-            {"filled": 0, "order_ids": [], "reason": "NBBO_UNAVAILABLE", "danger": False, "ladder_plan": "[mid, mid+0.10]"},
-            {"filled": 0, "order_ids": [], "reason": "NBBO_UNAVAILABLE", "danger": False, "ladder_plan": "[mid, mid+0.10]"},
+            {"filled": 0, "order_ids": [], "reason": "NBBO_UNAVAILABLE", "danger": False, "ladder_plan": "[mid, mid+0.05, mid+0.10]"},
+            {"filled": 0, "order_ids": [], "reason": "NBBO_UNAVAILABLE", "danger": False, "ladder_plan": "[mid, mid+0.05, mid+0.10]"},
         )
 
     p1 = price_from_mid(m1, 0.0, b1, a1)
@@ -910,10 +909,16 @@ def place_two_verticals_simul(
     if not ok2 and st2 not in FINAL_STATUSES:
         danger = True
 
-    # ---- second round (aggressive) for remaining ----
-    r1 = max(0, s1["qty_total"] - s1["total_filled"])
-    r2 = max(0, s2["qty_total"] - s2["total_filled"])
-    if r1 > 0 or r2 > 0:
+    aggressive_offs = [
+        float(os.environ.get("VERT_AGGRESSIVE_OFFSET1", "0.05")),
+        float(os.environ.get("VERT_AGGRESSIVE_OFFSET2", "0.10")),
+    ]
+
+    for aggressive_off in aggressive_offs:
+        r1 = max(0, s1["qty_total"] - s1["total_filled"])
+        r2 = max(0, s2["qty_total"] - s2["total_filled"])
+        if r1 <= 0 and r2 <= 0:
+            break
         b1, a1, m1 = vertical_nbbo(v1["side"], v1["short_osi"], v1["long_osi"], c)
         b2, a2, m2 = vertical_nbbo(v2["side"], v2["short_osi"], v2["long_osi"], c)
         if r1 > 0 and None not in (b1, a1, m1):
@@ -957,7 +962,7 @@ def place_two_verticals_simul(
             "order_ids": st["order_ids"],
             "reason": reason,
             "danger": danger,
-            "ladder_plan": "[mid, mid+0.10]",
+            "ladder_plan": "[mid, mid+0.05, mid+0.10]",
         }
 
     return finalize(s1), finalize(s2)
@@ -1204,14 +1209,14 @@ def main():
             f"V2={v2['name']}({v2['short_osi']}|{v2['long_osi']}) dry_run={DRY_RUN}"
         )
         if pair_mode:
-            print("CS_VERT_PLACE LADDER=PAIR [mid-0.05, mid, mid+0.05, mid+0.10]")
+            print("CS_VERT_PLACE LADDER=PAIR [mid, mid+0.05, mid+0.10] (credit uses opposite)")
         else:
-            print("CS_VERT_PLACE LADDER=BUNDLE4 [mid] -> VERT [mid, mid+0.10]")
+            print("CS_VERT_PLACE LADDER=BUNDLE4 [mid] -> VERT [mid, mid+0.05, mid+0.10]")
     else:
         v2 = None
         qty = v1["qty"]
         print(f"CS_VERT_PLACE START MODE=VERT name={v1['name']} side={v1['side']} kind={v1['kind']} short={v1['short_osi']} long={v1['long_osi']} qty={qty} dry_run={DRY_RUN}")
-        print("CS_VERT_PLACE LADDER=VERT [mid-0.05, mid, mid+0.05, mid+0.10] (credit uses opposite)")
+        print("CS_VERT_PLACE LADDER=VERT [mid, mid+0.05, mid+0.10] (credit uses opposite)")
 
     c = schwab_client()
     acct_hash = resolve_acct_hash(c)
@@ -1224,7 +1229,7 @@ def main():
         order_ids = ""
         nbbo_bid = nbbo_ask = nbbo_mid = ""
         last_price = ""
-        ladder_prices = "[mid]" if bundle_mode else "[mid-0.05, mid, mid+0.05, mid+0.10]"
+        ladder_prices = "[mid]" if bundle_mode else "[mid, mid+0.05, mid+0.10]"
 
         def write_one(v):
             row = {
@@ -1372,8 +1377,6 @@ def main():
             )
 
         FIRST_WAIT = float(os.environ.get("VERT_FIRST_WAIT", "20"))
-        aggressive_off = float(os.environ.get("VERT_AGGRESSIVE_OFFSET", "0.10"))
-
         b2, a2, m2 = bid0, ask0, mid0
         mid_price = price_from_mid(m2, 0.0, b2, a2)
         print(f"CS_VERT_PLACE BUNDLE_MID: price={mid_price:.2f} qty={qty} wait={FIRST_WAIT:.2f}s")
@@ -1426,7 +1429,6 @@ def main():
                 v1=v1,
                 v2=v2,
                 qty=remaining,
-                aggressive_off=aggressive_off,
             )
 
             def log_fallback(v, r):
