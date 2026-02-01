@@ -1,0 +1,47 @@
+name: TT ConstantStable Edge Backfill
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: "Backfill start date (YYYY-MM-DD)"
+        required: false
+        default: "2025-12-01"
+      recompute_llr:
+        description: "Recompute llr/n/decision using adjusted returns?"
+        type: boolean
+        default: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PYTHONUNBUFFERED: "1"
+
+      SCHWAB_APP_KEY:     ${{ secrets.SCHWAB_APP_KEY }}
+      SCHWAB_APP_SECRET:  ${{ secrets.SCHWAB_APP_SECRET }}
+      SCHWAB_TOKEN_JSON:  ${{ secrets.SCHWAB_TOKEN_JSON }}
+
+      GSHEET_ID: ${{ secrets.GSHEET_ID }}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+      CS_STATE_TAB: "ConstantStableState"
+
+      BACKFILL_START_DATE: ${{ github.event.inputs.start_date }}
+      CS_EDGE_RECOMPUTE_LLR: ${{ github.event.inputs.recompute_llr }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Backfill transfer-adjusted equity (TT)
+        run: |
+          python TT/data/cs_edge_backfill_transfers.py

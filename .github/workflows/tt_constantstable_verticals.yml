@@ -1,0 +1,118 @@
+name: TT ConstantStableVerticals
+
+on:
+  workflow_dispatch:
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      PYTHONUNBUFFERED: "1"
+
+      # Schwab
+      SCHWAB_APP_KEY:     ${{ secrets.SCHWAB_APP_KEY }}
+      SCHWAB_APP_SECRET:  ${{ secrets.SCHWAB_APP_SECRET }}
+      SCHWAB_TOKEN_JSON:  ${{ secrets.SCHWAB_TOKEN_JSON }}
+
+      # GammaWizard
+      GW_EMAIL:           ${{ secrets.GW_EMAIL }}
+      GW_PASSWORD:        ${{ secrets.GW_PASSWORD }}
+      GW_BASE:            "https://gandalf.gammawizard.com"
+      GW_ENDPOINT:        "rapi/GetUltraPureConstantStable"
+
+      # --- Sizing / Vol regime defaults (VixOne 5 buckets) ---
+      # NOTE:
+      # - Breaks are for VixOne (decimal), not VIX.
+      # - 5 buckets => 4 breaks + 5 multipliers
+      CS_UNIT_DOLLARS: "7500"
+      CS_VOL_FIELD:  "VixOne"
+      CS_VIX_BREAKS: "0.1636779,0.3276571,0.3702533,0.4514141"
+      CS_VIX_MULTS:  "1,2,4,8,10"
+
+      # Logging
+      CS_LOG_PATH: "logs/constantstable_vertical_trades.csv"
+
+      # Guardrails (keep as-is)
+      CS_GUARD_NO_CLOSE: "1"
+      CS_GUARD_FAIL_ACTION: "SKIP_ALL"
+      CS_TOPUP_ENABLE: "1"
+
+      # Edge guard sheet (already in your repo flow)
+      GSHEET_ID: ${{ secrets.GSHEET_ID }}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+      CS_EDGE_GSHEET_TAB: "ConstantStableEdge"
+
+      # Placer timing knobs (keep as-is unless you want to tweak)
+      VERT_STEP_WAIT:      "20"
+      VERT_POLL_SECS:      "2.0"
+      VERT_CANCEL_SETTLE:  "1.0"
+      VERT_MAX_LADDER:     "3"
+      VERT_DRY_RUN:        "false"
+      VERT_CANCEL_TRIES:   "4"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run TT ConstantStable vertical orchestrator
+        id: cs_orchestrator
+        run: |
+          python TT/Script/ConstantStable/orchestrator.py
+
+      - name: Push TT ConstantStable trades to Google Sheets
+        id: cs_gsheet
+        env:
+          CS_GSHEET_TAB: "ConstantStableTrades"
+          CS_LOG_PATH: "logs/constantstable_vertical_trades.csv"
+        run: |
+          python TT/data/cs_trades_to_gsheet.py
+
+      - name: TT Edge guard (write/update daily stats)
+        id: cs_edge_guard
+        run: |
+          python TT/Script/ConstantStable/edge_guard.py
+
+      - name: Persist Schwab token refresh
+        id: cs_token_persist
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_SECRET_TOKEN }}
+        run: |
+          if [ -f Token/schwab_token.json ]; then
+            gh secret set SCHWAB_TOKEN_JSON -b "$(cat Token/schwab_token.json)" -R "${GITHUB_REPOSITORY}"
+            echo "Updated SCHWAB_TOKEN_JSON secret."
+          else
+            echo "No token file found; skipping secret update."
+          fi
+
+      - name: Notify on failure (email)
+        if: failure()
+        env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SMTP_TO: ${{ secrets.SMTP_TO }}
+          SMTP_SUBJECT: "ConstantStableVerticals failed"
+          SMTP_BODY: |
+            Repo: ${{ github.repository }}
+            Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            Ref: ${{ github.ref }}
+            Actor: ${{ github.actor }}
+            Event: ${{ github.event_name }}
+
+            Step outcomes:
+            - orchestrator: ${{ steps.cs_orchestrator.outcome }}
+            - gsheet: ${{ steps.cs_gsheet.outcome }}
+            - edge_guard: ${{ steps.cs_edge_guard.outcome }}
+            - token_persist: ${{ steps.cs_token_persist.outcome }}
+        run: |
+          python scripts/notify/smtp_notify.py
