@@ -87,13 +87,19 @@ def refresh_token(token: dict) -> dict:
     if not (client_id and client_secret and refresh):
         raise RuntimeError("Missing TT_CLIENT_ID/TT_CLIENT_SECRET or refresh_token")
 
+    auth_mode = (os.environ.get("TT_CLIENT_AUTH") or "body").strip().lower()
     data = {
         "grant_type": "refresh_token",
         "refresh_token": refresh,
         "client_id": client_id,
-        "client_secret": client_secret,
     }
-    r = requests.post(token_url, data=data, timeout=20)
+    req_kwargs = {"data": data, "timeout": 20}
+    if auth_mode == "basic":
+        req_kwargs["auth"] = (client_id, client_secret)
+    else:
+        data["client_secret"] = client_secret
+
+    r = requests.post(token_url, **req_kwargs)
     r.raise_for_status()
     new_token = r.json()
     save_token(new_token)
@@ -107,4 +113,3 @@ def get_access_token() -> str:
         token = refresh_token(token)
         access = token.get("access_token") or ""
     return access
-
