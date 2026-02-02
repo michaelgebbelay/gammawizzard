@@ -67,15 +67,24 @@ def main():
     if not code:
         die("Missing authorization code.")
 
+    auth_mode = (os.environ.get("TT_CLIENT_AUTH") or "body").strip().lower()
     data = {
         "grant_type": "authorization_code",
         "code": code,
         "client_id": client_id,
-        "client_secret": client_secret,
         "redirect_uri": redirect_uri,
     }
-    r = requests.post(token_url, data=data, timeout=20)
-    r.raise_for_status()
+    req_kwargs = {"data": data, "timeout": 20}
+    if auth_mode == "basic":
+        req_kwargs["auth"] = (client_id, client_secret)
+    else:
+        data["client_secret"] = client_secret
+
+    r = requests.post(token_url, **req_kwargs)
+    if r.status_code >= 400:
+        print(f"Token exchange failed: HTTP {r.status_code}")
+        print(r.text)
+        r.raise_for_status()
     token = r.json()
 
     token_path = os.environ.get("TT_TOKEN_PATH", os.path.join("TT", "Token", "tt_token.json"))
