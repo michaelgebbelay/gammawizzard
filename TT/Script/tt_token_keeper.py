@@ -100,6 +100,9 @@ def refresh_token(token: dict) -> dict:
         data["client_secret"] = client_secret
 
     r = requests.post(token_url, **req_kwargs)
+    if r.status_code >= 400:
+        print(f"TT refresh failed: HTTP {r.status_code}")
+        print(r.text)
     r.raise_for_status()
     new_token = r.json()
     save_token(new_token)
