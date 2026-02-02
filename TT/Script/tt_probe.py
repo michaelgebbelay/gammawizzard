@@ -37,11 +37,18 @@ def main():
     save_token(token_obj)
 
     out = {}
-    out["balances"] = request("GET", f"/accounts/{acct}/balances").json()
-    out["positions"] = request("GET", f"/accounts/{acct}/positions").json()
-    out["orders"] = request("GET", f"/accounts/{acct}/orders").json()
-    out["transactions"] = request("GET", f"/accounts/{acct}/transactions").json()
-    out["quotes"] = request("GET", "/market-data/quotes", params={"symbols": "SPXW"}).json()
+
+    def safe_get(label, method, path, **kwargs):
+        try:
+            out[label] = request(method, path, **kwargs).json()
+        except Exception as e:
+            out[label] = {"error": str(e)}
+
+    safe_get("balances", "GET", f"/accounts/{acct}/balances")
+    safe_get("positions", "GET", f"/accounts/{acct}/positions")
+    safe_get("orders", "GET", f"/accounts/{acct}/orders")
+    safe_get("transactions", "GET", f"/accounts/{acct}/transactions")
+    safe_get("quotes", "GET", "/market-data/quotes", params={"symbols": "SPXW"})
 
     print(json.dumps(out, indent=2))
     return 0
