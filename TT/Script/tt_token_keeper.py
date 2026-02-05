@@ -104,9 +104,13 @@ def refresh_token(token: dict) -> dict:
         print(f"TT refresh failed: HTTP {r.status_code}")
         print(r.text)
     r.raise_for_status()
-    new_token = r.json()
-    save_token(new_token)
-    return new_token
+    new_token = r.json() or {}
+    merged = dict(token or {})
+    merged.update({k: v for k, v in new_token.items() if v not in (None, "")})
+    if not merged.get("refresh_token") and token.get("refresh_token"):
+        merged["refresh_token"] = token.get("refresh_token")
+    save_token(merged)
+    return merged
 
 
 def get_access_token() -> str:

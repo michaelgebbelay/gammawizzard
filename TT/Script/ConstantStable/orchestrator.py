@@ -31,6 +31,7 @@
 # Delegates placement + logging to scripts/trade/ConstantStable/place.py via VERT_* envs.
 
 import os
+import json
 import sys
 import re
 import time
@@ -56,7 +57,7 @@ def _add_scripts_root():
 
 
 _add_scripts_root()
-from schwab_token_keeper import schwab_client
+from tt_client import request as tt_request
 
 __version__ = "2.3.0"
 
@@ -259,99 +260,47 @@ def extract_trade(j):
     return {}
 
 
-# ---------- Schwab helpers ----------
+# ---------- Tastytrade helpers ----------
 
-def opening_cash_for_account(c, prefer_number=None):
+def tt_account_number():
+    acct = (os.environ.get("TT_ACCOUNT_NUMBER") or "").strip()
+    if not acct:
+        raise RuntimeError("TT_ACCOUNT_NUMBER missing")
+    return acct
+
+
+def opening_cash_for_account(prefer_number=None):
     """
     Returns (value_or_None, source_key, acct_number).
-    Ignores 0/negative values; prefers liquidationValue first.
+    Ignores 0/negative values; prefers net-liquidating-value first.
     """
-    r = c.get_accounts()
-    r.raise_for_status()
-    data = r.json()
-    arr = data if isinstance(data, list) else [data]
-
-    if prefer_number is None:
-        try:
-            rr = c.get_account_numbers()
-            rr.raise_for_status()
-            prefer_number = str((rr.json() or [{}])[0].get("accountNumber") or "")
-        except Exception:
-            prefer_number = None
-
-    def hunt(a):
-        acct_id = None
-        init = {}
-        curr = {}
-        stack = [a]
-        while stack:
-            x = stack.pop()
-            if isinstance(x, dict):
-                if acct_id is None and x.get("accountNumber"):
-                    acct_id = str(x["accountNumber"])
-                if "initialBalances" in x and isinstance(x["initialBalances"], dict):
-                    init = x["initialBalances"]
-                if "currentBalances" in x and isinstance(x["currentBalances"], dict):
-                    curr = x["currentBalances"]
-                for v in x.values():
-                    if isinstance(v, (dict, list)):
-                        stack.append(v)
-            elif isinstance(x, list):
-                stack.extend(x)
-        return acct_id, init, curr
-
-    chosen = None
-    acct_num = ""
-    for a in arr:
-        aid, init, curr = hunt(a)
-        if prefer_number and aid == prefer_number:
-            chosen = (init, curr)
-            acct_num = aid
-            break
-        if chosen is None:
-            chosen = (init, curr)
-            acct_num = aid
-
-    if not chosen:
-        return None, "none", ""
-
-    init, curr = chosen
-
+    acct_num = prefer_number or tt_account_number()
+    j = tt_request("GET", f"/accounts/{acct_num}/balances").json()
+    data = j.get("data") if isinstance(j, dict) else {}
+    src = data or {}
     keys = [
-        "liquidationValue",
-        "cashAvailableForTrading",
-        "cashBalance",
-        "availableFundsNonMarginableTrade",
-        "buyingPowerNonMarginableTrade",
-        "optionBuyingPower",
-        "buyingPower",
+        "net-liquidating-value",
+        "cash-balance",
+        "cash-available-to-withdraw",
+        "equity-buying-power",
+        "derivative-buying-power",
     ]
 
     def pick(src):
         for k in keys:
             v = (src or {}).get(k)
-            if isinstance(v, (int, float)):
+            try:
                 fv = float(v)
                 if fv > 0:
                     return fv, k
+            except Exception:
+                continue
         return None
 
-    for src in (init, curr):
-        got = pick(src)
-        if got:
-            return got[0], got[1], acct_num
-
+    got = pick(src)
+    if got:
+        return got[0], got[1], acct_num
     return None, "none", acct_num
-
-
-def get_account_hash(c):
-    r = c.get_account_numbers()
-    r.raise_for_status()
-    arr = r.json() or []
-    if not arr:
-        return ""
-    info = arr[0]
-    return str(info.get("hashValue") or info.get("hashvalue") or "")
 
 
 # ----- Positions map (for NO-CLOSE guard + TOPUP) -----
@@ -366,72 +315,60 @@ def _sleep_for_429(resp, attempt: int) -> float:
     return min(8.0, 0.6 * (2 ** attempt)) + random.uniform(0.0, 0.25)
 
 
-def schwab_get_json(c, url: str, params=None, tries: int = 6, tag: str = ""):
+def tt_get_json(url: str, params=None, tries: int = 6, tag: str = ""):
     last = ""
     for i in range(tries):
         try:
-            r = c.session.get(url, params=(params or {}), timeout=20)
-            if r.status_code == 200:
-                return r.json()
-            if r.status_code == 429:
-                time.sleep(_sleep_for_429(r, i))
+            r = tt_request("GET", url, params=(params or {}))
+            return r.json()
+        except requests.HTTPError as e:
+            resp = e.response
+            if resp is not None and resp.status_code == 429:
+                time.sleep(_sleep_for_429(resp, i))
                 continue
-            last = f"HTTP_{r.status_code}:{(r.text or '')[:200]}"
+            last = f"HTTP_{resp.status_code}:{(resp.text or '')[:200]}" if resp is not None else "HTTP_unknown"
         except Exception as e:
             last = f"{type(e).__name__}:{str(e)}"
         time.sleep(min(6.0, 0.5 * (2 ** i)))
-    raise RuntimeError(f"SCHWAB_GET_FAIL({tag}) {last or 'unknown'}")
+    raise RuntimeError(f"TT_GET_FAIL({tag}) {last or 'unknown'}")
 
 
-def _osi_from_instrument(ins: Dict[str, Any]) -> str | None:
-    sym = (ins.get("symbol") or "").strip()
-    if sym:
-        try:
-            sym_clean = re.sub(r"\s+", "", sym)
-            return to_osi(sym_clean)
-        except Exception:
-            pass
-
-    exp = ins.get("optionExpirationDate") or ins.get("expirationDate") or ""
-    pc = (ins.get("putCall") or ins.get("type") or "").upper()
-    strike = ins.get("strikePrice") or ins.get("strike")
-
+def _osi_from_symbol(sym: str) -> str | None:
+    sym = (sym or "").strip()
+    if not sym:
+        return None
     try:
-        if exp and strike is not None and pc:
-            ymd = date.fromisoformat(str(exp)[:10]).strftime("%y%m%d")
-            cp = "C" if pc.startswith("C") else "P"
-            mills = int(round(float(strike) * 1000))
-            return f"{'SPXW':<6}{ymd}{cp}{mills:08d}"
+        return to_osi(re.sub(r"\s+", "", sym))
     except Exception:
         return None
 
-    return None
 
-
-def positions_map(c, acct_hash: str) -> Dict[Tuple[str, str, str], float]:
+def positions_map(acct_num: str) -> Dict[Tuple[str, str, str], float]:
     """
     Returns dict: canon -> net_qty (positive=long, negative=short)
     """
-    url = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}"
-    j = schwab_get_json(c, url, params={"fields": "positions"}, tag="POSITIONS")
-
-    sa = j[0]["securitiesAccount"] if isinstance(j, list) else (j.get("securitiesAccount") or j)
+    j = tt_get_json(f"/accounts/{acct_num}/positions", tag="POSITIONS")
+    data = j.get("data") if isinstance(j, dict) else {}
+    items = data.get("items") or []
     out: Dict[Tuple[str, str, str], float] = {}
 
-    for p in (sa.get("positions") or []):
-        ins = p.get("instrument", {}) or {}
-        atype = (ins.get("assetType") or ins.get("type") or "").upper()
-        if atype != "OPTION":
+    for p in items:
+        atype = (p.get("instrument-type") or p.get("instrument_type") or "").upper()
+        if "OPTION" not in atype:
             continue
 
-        osi = _osi_from_instrument(ins)
+        osi = _osi_from_symbol(p.get("symbol", ""))
         if not osi:
             continue
 
         try:
-            qty = float(p.get("longQuantity", 0)) - float(p.get("shortQuantity", 0))
+            qty = float(p.get("quantity", 0) or 0)
         except Exception:
             continue
+
+        direction = str(p.get("quantity-direction") or p.get("quantity_direction") or "").lower()
+        if direction.startswith("short"):
+            qty = -abs(qty)
 
         if abs(qty) < 1e-9:
             continue
@@ -487,13 +424,25 @@ def would_close_guard(v: Dict[str, Any], pos: Dict[Tuple[str, str, str], float])
 # ---------- main ----------
 
 def main():
-    # --- Schwab + equity (with override & fallback) ---
+    # --- Tastytrade + equity (with override & fallback) ---
     try:
-        c = schwab_client()
-        oc_val, oc_src, acct_num = opening_cash_for_account(c)
-        acct_hash = get_account_hash(c)
+        acct_num = tt_account_number()
+        # Per-account sizing override from config file if present.
+        sizing_path = os.environ.get("TT_ACCOUNT_SIZING_PATH", "TT/data/account_sizing.json")
+        try:
+            with open(sizing_path, "r") as f:
+                sizing_cfg = json.load(f) or {}
+            if isinstance(sizing_cfg, dict) and acct_num in sizing_cfg:
+                unit = sizing_cfg[acct_num].get("unit_dollars")
+                if unit:
+                    print(f"CS_VERT_RUN INFO: account sizing override unit_dollars={unit} acct={acct_num}")
+                    global CS_UNIT_DOLLARS
+                    CS_UNIT_DOLLARS = float(unit)
+        except Exception:
+            pass
+        oc_val, oc_src, acct_num = opening_cash_for_account(acct_num)
     except Exception as e:
-        print(f"CS_VERT_RUN SKIP: Schwab init failed: {e}")
+        print(f"CS_VERT_RUN SKIP: Tastytrade init failed: {e}")
         return 1
 
     ov_raw = (os.environ.get("SIZING_DOLLARS_OVERRIDE", "") or "").strip()
@@ -613,7 +562,7 @@ def main():
     pos = None
     if need_positions:
         try:
-            pos = positions_map(c, acct_hash)
+            pos = positions_map(acct_num)
             print(
                 f"CS_VERT_RUN POSITIONS: loaded count={len(pos)} "
                 f"(guard={'on' if CS_GUARD_NO_CLOSE else 'off'}, topup={'on' if CS_TOPUP else 'off'})"
@@ -709,10 +658,10 @@ def main():
             "VERT_QTY_RULE":     qty_rule,
 
             # needed by placer
-            "SCHWAB_APP_KEY":     os.environ["SCHWAB_APP_KEY"],
-            "SCHWAB_APP_SECRET":  os.environ["SCHWAB_APP_SECRET"],
-            "SCHWAB_TOKEN_JSON":  os.environ["SCHWAB_TOKEN_JSON"],
-            "SCHWAB_ACCT_HASH":   acct_hash,
+            "TT_TOKEN_JSON":      os.environ["TT_TOKEN_JSON"],
+            "TT_ACCOUNT_NUMBER":  acct_num,
+            "TT_BASE_URL":        os.environ.get("TT_BASE_URL", "https://api.tastyworks.com"),
+            "TT_CLIENT_AUTH":     os.environ.get("TT_CLIENT_AUTH", ""),
             "CS_LOG_PATH":        CS_LOG_PATH,
         })
         return e
@@ -742,7 +691,7 @@ def main():
                 "VERT2_STRENGTH":   f"{float(v_put_f['strength']):.3f}",
             })
 
-            rc = subprocess.call([sys.executable, "scripts/trade/ConstantStable/place.py"], env=env)
+            rc = subprocess.call([sys.executable, "TT/Script/ConstantStable/place.py"], env=env)
             if rc != 0:
                 print(f"CS_VERT_RUN PAIR_ALT: placer rc={rc}")
             return 0
@@ -760,7 +709,7 @@ def main():
             f"(units={units} vix_mult={vix_mult} bucket={bucket})"
         )
         env = env_for_vertical(v)
-        rc = subprocess.call([sys.executable, "scripts/trade/ConstantStable/place.py"], env=env)
+        rc = subprocess.call([sys.executable, "TT/Script/ConstantStable/place.py"], env=env)
         if rc != 0:
             print(f"CS_VERT_RUN {v['name']}: placer rc={rc}")
 

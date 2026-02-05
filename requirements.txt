@@ -1,6 +1,7 @@
 # Core
 schwab-py
 requests
+websockets
 
 # Google Sheets client
 google-api-python-client

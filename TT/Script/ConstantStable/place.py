@@ -21,7 +21,6 @@ import os, sys, time, random, csv
 import requests
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
-import sys
 
 
 def _add_scripts_root():
@@ -38,12 +37,14 @@ def _add_scripts_root():
 
 
 _add_scripts_root()
-from schwab_token_keeper import schwab_client
+from tt_client import request as tt_request
+from tt_dxlink import get_quotes_once
 
 TICK = 0.05
 ET = ZoneInfo("America/New_York")
 
 FINAL_STATUSES = {"FILLED", "CANCELED", "REJECTED", "EXPIRED"}
+_TT_SYMBOL_CACHE: dict[str, dict[str, str]] = {}
 
 
 # ---------- utils ----------
@@ -52,6 +53,22 @@ def goutput(name: str, val: str):
     if p:
         with open(p, "a") as fh:
             fh.write(f"{name}={val}\n")
+
+
+def _payload_summary(payload: dict) -> str:
+    try:
+        price = payload.get("price")
+        effect = payload.get("price_effect")
+        legs = payload.get("legs") or []
+        leg_s = []
+        for leg in legs:
+            sym = leg.get("symbol")
+            side = leg.get("side")
+            qty = leg.get("quantity")
+            leg_s.append(f"{side}:{sym}x{qty}")
+        return f"price={price} effect={effect} legs=[{', '.join(leg_s)}]"
+    except Exception:
+        return "summary_unavailable"
 
 
 def clamp_tick(x: float) -> float:
@@ -243,44 +260,210 @@ def update_vertical_strikes(v: dict, inner_put: int | None, inner_call: int | No
     return False
 
 
-# ---------- Schwab ----------
-def resolve_acct_hash(c):
-    ah = (os.environ.get("SCHWAB_ACCT_HASH") or "").strip()
-    if ah:
-        return ah
-    r = c.get_account_numbers()
-    r.raise_for_status()
-    arr = r.json() or []
-    return str((arr[0] or {}).get("hashValue") or "")
+# ---------- Tastytrade ----------
+def tt_account_number():
+    acct = (os.environ.get("TT_ACCOUNT_NUMBER") or "").strip()
+    if not acct:
+        raise RuntimeError("TT_ACCOUNT_NUMBER missing")
+    return acct
 
 
-def get_quote_json_with_retry(c, osi: str, tries: int = 4):
-    last = None
-    for i in range(tries):
-        r = c.get_quote(osi)
-        if r.status_code == 200:
-            try:
-                return r.json()
-            except Exception:
-                return None
-        if r.status_code == 429:
-            base = min(6.0, 0.5 * (2 ** i))
-            wait = _retry_after_seconds(r, base) + random.uniform(0.0, 0.25)
-            time.sleep(wait)
+def order_symbol(osi: str) -> str:
+    info = resolve_tt_option_symbols(osi)
+    if info.get("order"):
+        return info["order"]
+    return (osi or "").strip().lstrip(".")
+
+
+def _exp6_to_iso(exp6: str) -> str | None:
+    exp6 = (exp6 or "").strip()
+    if len(exp6) != 6 or not exp6.isdigit():
+        return None
+    yy = int(exp6[:2])
+    mm = int(exp6[2:4])
+    dd = int(exp6[4:6])
+    return f"20{yy:02d}-{mm:02d}-{dd:02d}"
+
+
+def _underlying_from_root(root: str) -> str:
+    r = (root or "").strip()
+    if r.endswith("W") and len(r) > 1:
+        return r[:-1]
+    return r
+
+
+def resolve_tt_option_symbols(osi: str) -> dict[str, str]:
+    if not osi:
+        return {}
+    cached = _TT_SYMBOL_CACHE.get(osi)
+    if cached:
+        return cached
+
+    parsed = parse_osi(osi.strip().lstrip("."))
+    if not parsed:
+        return {}
+    root, exp6, cp, strike8 = parsed
+    root_str = root.strip()
+    under = _underlying_from_root(root_str)
+    exp_iso = _exp6_to_iso(exp6)
+    strike_val = strike8 / 1000.0
+
+    candidates = [
+        (f"/option-chains/{under}/nested", None),
+        (f"/option-chains/{root_str}/nested", None),
+    ]
+
+    order_sym = ""
+    streamer_sym = ""
+
+    for path, params in candidates:
+        try:
+            r = tt_request("GET", path, params=params or {})
+            j = r.json()
+        except Exception:
             continue
-        last = r.status_code
-        time.sleep(min(2.0, 0.35 * (2 ** i)))
+
+        data = j.get("data") if isinstance(j, dict) else {}
+        items = data.get("items") if isinstance(data, dict) else []
+        for item in items or []:
+            exps = item.get("expirations") or []
+            for exp in exps:
+                if exp_iso and exp.get("expiration-date") != exp_iso:
+                    continue
+                strikes = exp.get("strikes") or []
+                for st in strikes:
+                    try:
+                        if float(st.get("strike-price")) != float(strike_val):
+                            continue
+                    except Exception:
+                        continue
+                    if cp.upper() == "C":
+                        order_sym = st.get("call") or ""
+                        streamer_sym = st.get("call-streamer-symbol") or ""
+                    else:
+                        order_sym = st.get("put") or ""
+                        streamer_sym = st.get("put-streamer-symbol") or ""
+                    if order_sym:
+                        info = {"order": order_sym, "streamer": streamer_sym}
+                        _TT_SYMBOL_CACHE[osi] = info
+                        print(f"CS_VERT_PLACE SYMBOL_OK: {osi} -> {order_sym}")
+                        return info
+
+    info = {"order": order_sym, "streamer": streamer_sym}
+    _TT_SYMBOL_CACHE[osi] = info
+    return info
+
+
+def tt_symbol_candidates(osi: str) -> list[str]:
+    s = (osi or "").strip().lstrip(".")
+    out: list[str] = []
+    info = resolve_tt_option_symbols(s)
+    if info.get("streamer"):
+        out.append(info["streamer"])
+        if info["streamer"].startswith("."):
+            out.append(info["streamer"].lstrip("."))
+    if info.get("order"):
+        out.append(info["order"])
+    parsed = parse_osi(s)
+    if parsed:
+        root, exp6, cp, strike8 = parsed
+        root_str = root.strip()
+        out.append(f"{root_str}{exp6}{cp}{strike8:08d}")
+        if root_str == "SPXW":
+            out.append(f"SPX{exp6}{cp}{strike8:08d}")
+        out.append(f"{root_str.ljust(6)}{exp6}{cp}{strike8:08d}")
+    if s:
+        out.append(s.replace(" ", ""))
+        out.append(s)
+    # de-dup preserve order
+    seen = set()
+    uniq = []
+    for sym in out:
+        if sym and sym not in seen:
+            uniq.append(sym)
+            seen.add(sym)
+    return uniq
+
+
+def get_quote_json_with_retry(osi: str, tries: int = 4):
+    last = None
+    candidates = tt_symbol_candidates(osi)
+    for i in range(tries):
+        try:
+            for sym in candidates:
+                r = tt_request("GET", "/market-data/by-type", params={"option": sym})
+                j = r.json()
+                items = _extract_quote_list(j)
+                if items:
+                    print(f"CS_VERT_PLACE QUOTE_OK option={sym}")
+                    return j
+                print(f"CS_VERT_PLACE QUOTE_EMPTY option={sym}")
+            return {}
+        except requests.HTTPError as e:
+            resp = e.response
+            if resp is not None and resp.status_code == 429:
+                base = min(6.0, 0.5 * (2 ** i))
+                wait = _retry_after_seconds(resp, base) + random.uniform(0.0, 0.25)
+                time.sleep(wait)
+                continue
+            if resp is not None:
+                print(f"CS_VERT_PLACE QUOTE_HTTP_{resp.status_code} body={(resp.text or '')[:200]}")
+            last = resp.status_code if resp is not None else "unknown"
+            time.sleep(min(2.0, 0.35 * (2 ** i)))
+        except requests.RequestException as e:
+            print(f"CS_VERT_PLACE QUOTE_REQUEST_ERR: {str(e)[:200]}")
+            break
     return None
 
 
+def _extract_quote_list(j):
+    if not isinstance(j, dict):
+        return []
+    for key in ("byType", "by-type", "by_type"):
+        bt = j.get(key)
+        if isinstance(bt, dict):
+            opt = bt.get("option") or bt.get("options")
+            if isinstance(opt, list):
+                return opt
+    if "data" in j and isinstance(j["data"], dict):
+        return _extract_quote_list(j["data"])
+    if "items" in j and isinstance(j["items"], list):
+        return j["items"]
+    return []
+
+
 def fetch_bid_ask(c, osi: str):
-    j = get_quote_json_with_retry(c, osi)
+    use_stream = truthy(os.environ.get("TT_STREAM_QUOTES", "1"))
+    allow_rest = truthy(os.environ.get("TT_STREAM_FALLBACK_REST", "0"))
+    allow_no_quote = truthy(os.environ.get("TT_ALLOW_NO_QUOTE", "0"))
+    stream_timeout = float(os.environ.get("TT_STREAM_TIMEOUT_SECS", "6.0"))
+    info = resolve_tt_option_symbols(osi)
+    if use_stream and info.get("streamer"):
+        sym = info["streamer"]
+        try:
+            quotes = get_quotes_once([sym], timeout_s=stream_timeout)
+            if sym in quotes:
+                return quotes[sym]
+        except Exception as e:
+            print(f"CS_VERT_PLACE STREAM_WARN: {str(e)[:160]}")
+        if not allow_rest:
+            if allow_no_quote:
+                fallback = float(os.environ.get("TT_NO_QUOTE_MID", "0.05"))
+                print(f"CS_VERT_PLACE NO_QUOTE_FALLBACK mid={fallback:.2f}")
+                return (fallback, fallback)
+            return (None, None)
+    if allow_no_quote and not use_stream:
+        fallback = float(os.environ.get("TT_NO_QUOTE_MID", "0.05"))
+        print(f"CS_VERT_PLACE NO_QUOTE_FALLBACK mid={fallback:.2f}")
+        return (fallback, fallback)
+
+    j = get_quote_json_with_retry(osi)
     if not j:
         return (None, None)
-    d = list(j.values())[0] if isinstance(j, dict) else {}
-    q = d.get("quote", d)
-    b = q.get("bidPrice") or q.get("bid") or q.get("bidPriceInDouble")
-    a = q.get("askPrice") or q.get("ask") or q.get("askPriceInDouble")
+    items = _extract_quote_list(j)
+    q = items[0] if items else {}
+    b = q.get("bid") or q.get("bid-price") or q.get("bidPrice")
+    a = q.get("ask") or q.get("ask-price") or q.get("askPrice")
     return (float(b) if b is not None else None, float(a) if a is not None else None)
 
 
@@ -358,18 +541,15 @@ def order_payload_vertical(side: str, short_osi: str, long_osi: str, price: floa
     side = side.upper()
     if side not in ("CREDIT", "DEBIT"):
         raise ValueError("VERT_SIDE must be CREDIT or DEBIT")
+    px = clamp_tick(price)
     return {
-        "orderType": "NET_CREDIT" if side == "CREDIT" else "NET_DEBIT",
-        "session": "NORMAL",
-        "price": f"{clamp_tick(price):.2f}",
-        "duration": "DAY",
-        "orderStrategyType": "SINGLE",
-        "complexOrderStrategyType": "VERTICAL",
-        "orderLegCollection": [
-            {"instruction": "BUY_TO_OPEN",  "positionEffect": "OPENING", "quantity": qty,
-             "instrument": {"symbol": long_osi,  "assetType": "OPTION"}},
-            {"instruction": "SELL_TO_OPEN", "positionEffect": "OPENING", "quantity": qty,
-             "instrument": {"symbol": short_osi, "assetType": "OPTION"}},
+        "order-type": "Limit",
+        "price": f"{px:.2f}",
+        "price-effect": "Credit" if side == "CREDIT" else "Debit",
+        "time-in-force": "Day",
+        "legs": [
+            {"symbol": order_symbol(long_osi), "instrument-type": "Equity Option", "action": "Buy to Open", "quantity": qty},
+            {"symbol": order_symbol(short_osi), "instrument-type": "Equity Option", "action": "Sell to Open", "quantity": qty},
         ],
     }
 
@@ -380,22 +560,17 @@ def order_payload_bundle(side: str, price: float, qty: int,
     side = side.upper()
     if side not in ("CREDIT", "DEBIT"):
         raise ValueError("bundle side must be CREDIT or DEBIT")
+    px = clamp_tick(price)
     return {
-        "orderType": "NET_CREDIT" if side == "CREDIT" else "NET_DEBIT",
-        "session": "NORMAL",
-        "price": f"{clamp_tick(price):.2f}",
-        "duration": "DAY",
-        "orderStrategyType": "SINGLE",
-        "complexOrderStrategyType": "CUSTOM",
-        "orderLegCollection": [
-            {"instruction": "BUY_TO_OPEN",  "positionEffect": "OPENING", "quantity": qty,
-             "instrument": {"symbol": long_osi_1,  "assetType": "OPTION"}},
-            {"instruction": "SELL_TO_OPEN", "positionEffect": "OPENING", "quantity": qty,
-             "instrument": {"symbol": short_osi_1, "assetType": "OPTION"}},
-            {"instruction": "BUY_TO_OPEN",  "positionEffect": "OPENING", "quantity": qty,
-             "instrument": {"symbol": long_osi_2,  "assetType": "OPTION"}},
-            {"instruction": "SELL_TO_OPEN", "positionEffect": "OPENING", "quantity": qty,
-             "instrument": {"symbol": short_osi_2, "assetType": "OPTION"}},
+        "order-type": "Limit",
+        "price": f"{px:.2f}",
+        "price-effect": "Credit" if side == "CREDIT" else "Debit",
+        "time-in-force": "Day",
+        "legs": [
+            {"symbol": order_symbol(long_osi_1), "instrument-type": "Equity Option", "action": "Buy to Open", "quantity": qty},
+            {"symbol": order_symbol(short_osi_1), "instrument-type": "Equity Option", "action": "Sell to Open", "quantity": qty},
+            {"symbol": order_symbol(long_osi_2), "instrument-type": "Equity Option", "action": "Buy to Open", "quantity": qty},
+            {"symbol": order_symbol(short_osi_2), "instrument-type": "Equity Option", "action": "Sell to Open", "quantity": qty},
         ],
     }
 
@@ -404,7 +579,8 @@ def parse_order_id(r):
     try:
         j = r.json()
         if isinstance(j, dict):
-            oid = j.get("orderId") or j.get("order_id")
+            data = j.get("data") if isinstance(j.get("data"), dict) else j
+            oid = data.get("id") or data.get("orderId") or data.get("order_id")
             if oid:
                 return str(oid)
     except Exception:
@@ -416,69 +592,77 @@ def parse_order_id(r):
 def post_with_retry(c, url, payload, tag="", tries=5):
     last = ""
     for i in range(tries):
-        r = c.session.post(url, json=payload, timeout=20)
-        if r.status_code in (200, 201, 202):
+        try:
+            r = tt_request("POST", url, json=payload)
             return r
-        if r.status_code == 429:
-            base = min(10.0, 0.7 * (2 ** i))
-            wait = _retry_after_seconds(r, base) + random.uniform(0.0, 0.35)
-            print(f"WARN: place failed — HTTP_429 — backoff {wait:.2f}s [{tag}]")
-            time.sleep(wait)
+        except requests.HTTPError as e:
+            resp = e.response
+            if resp is not None and resp.status_code == 429:
+                base = min(10.0, 0.7 * (2 ** i))
+                wait = _retry_after_seconds(resp, base) + random.uniform(0.0, 0.35)
+                print(f"WARN: place failed — HTTP_429 — backoff {wait:.2f}s [{tag}]")
+                time.sleep(wait)
+                continue
+            last = f"HTTP_{resp.status_code}:{(resp.text or '')[:200]}" if resp is not None else "HTTP_unknown"
+            time.sleep(min(6.0, 0.45 * (2 ** i)))
             continue
-        last = f"HTTP_{r.status_code}:{(r.text or '')[:200]}"
-        time.sleep(min(6.0, 0.45 * (2 ** i)))
     raise RuntimeError(f"POST_FAIL({tag}) {last or 'unknown'}")
 
 
+def _normalize_order(st: dict) -> dict:
+    if isinstance(st, dict) and isinstance(st.get("data"), dict):
+        return st["data"]
+    return st or {}
+
+
 def status_upper(st: dict) -> str:
-    return str(st.get("status") or st.get("orderStatus") or "").upper().strip()
+    st = _normalize_order(st)
+    return str(st.get("status") or st.get("order-status") or st.get("orderStatus") or "").upper().strip()
 
 
 def extract_filled_quantity(st: dict) -> int:
     """
-    Robust filled qty extractor for Schwab complex orders.
-    1) Try top-level filledQuantity-ish fields.
-    2) Fall back to summing executions in orderActivityCollection.
-       For multi-leg executions, legs share same execution quantity; use min across legs as combo qty.
+    Filled qty extractor for Tastytrade complex orders.
+    Prefers top-level filled/remaining fields, then leg fills.
     """
-    for k in (
-        "filledQuantity", "filled_quantity", "filledQty", "filledQtyInDouble",
-        "filledQuantityInDouble", "filledQtyInDbl"
-    ):
+    st = _normalize_order(st)
+    for k in ("filled-quantity", "filled_quantity", "filledQuantity", "filledQty"):
         if k in st:
             v = _fnum(st.get(k))
             if v is not None:
                 return int(round(v))
 
-    acts = st.get("orderActivityCollection") or st.get("orderActivities") or []
-    total = 0.0
-    for act in acts:
-        if str(act.get("activityType") or "").upper() != "EXECUTION":
-            continue
-        legs = act.get("executionLegs") or []
-        qtys = []
-        for leg in legs:
-            q = _fnum(leg.get("quantity"))
-            if q is not None:
-                qtys.append(q)
-        if qtys:
-            total += min(qtys)
+    size = _fnum(st.get("size"))
+    rem_top = _fnum(st.get("remaining-quantity") or st.get("remaining_quantity"))
+    if size is not None and rem_top is not None:
+        return int(round(max(0.0, size - rem_top)))
 
-    if total > 0:
-        return int(round(total))
+    legs = st.get("legs") or []
+    filleds = []
+    for leg in legs:
+        qty = _fnum(leg.get("quantity"))
+        rem = _fnum(leg.get("remaining-quantity") or leg.get("remaining_quantity"))
+        if qty is not None and rem is not None:
+            filleds.append(max(0.0, qty - rem))
+            continue
+        fills = leg.get("fills") or []
+        if fills:
+            filleds.append(sum(_fnum(f.get("quantity")) or 0.0 for f in fills))
+    if filleds:
+        return int(round(min(filleds)))
     return 0
 
 
 def get_status(c, acct_hash: str, oid: str, tries: int = 4):
-    url = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
     for i in range(tries):
         try:
-            r = c.session.get(url, timeout=20)
-            if r.status_code == 200:
-                return r.json() or {}
-            if r.status_code == 429:
+            r = tt_request("GET", f"/accounts/{acct_hash}/orders/{oid}")
+            return r.json() or {}
+        except requests.HTTPError as e:
+            resp = e.response
+            if resp is not None and resp.status_code == 429:
                 base = min(6.0, 0.5 * (2 ** i))
-                wait = _retry_after_seconds(r, base) + random.uniform(0.0, 0.25)
+                wait = _retry_after_seconds(resp, base) + random.uniform(0.0, 0.25)
                 time.sleep(wait)
                 continue
         except Exception:
@@ -489,15 +673,17 @@ def get_status(c, acct_hash: str, oid: str, tries: int = 4):
 
 def delete_with_retry(c, url, tag="", tries=4):
     for i in range(tries):
-        r = c.session.delete(url, timeout=20)
-        if r.status_code in (200, 201, 202, 204):
+        try:
+            tt_request("DELETE", url)
             return True
-        if r.status_code == 429:
-            base = min(6.0, 0.5 * (2 ** i))
-            wait = _retry_after_seconds(r, base) + random.uniform(0.0, 0.25)
-            print(f"WARN: cancel failed — HTTP_429 — backoff {wait:.2f}s [{tag}]")
-            time.sleep(wait)
-            continue
+        except requests.HTTPError as e:
+            resp = e.response
+            if resp is not None and resp.status_code == 429:
+                base = min(6.0, 0.5 * (2 ** i))
+                wait = _retry_after_seconds(resp, base) + random.uniform(0.0, 0.25)
+                print(f"WARN: cancel failed — HTTP_429 — backoff {wait:.2f}s [{tag}]")
+                time.sleep(wait)
+                continue
         time.sleep(min(3.0, 0.35 * (2 ** i)))
     return False
 
@@ -550,11 +736,12 @@ def place_order_with_ladder(
     MAX_LADDER = int(os.environ.get("VERT_MAX_LADDER", "3"))
     CANCEL_TRIES = int(os.environ.get("VERT_CANCEL_TRIES", "4"))
 
-    url_post = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
+    url_post = f"/accounts/{acct_hash}/orders"
 
     # Initial NBBO
     bid, ask, mid = nbbo_fn(refresh=False)
     if bid is None or ask is None or mid is None:
+        print("CS_VERT_PLACE NBBO_UNAVAILABLE: initial quote fetch failed")
         return {
             "filled": 0, "order_ids": [], "last_price": None,
             "nbbo_bid": bid, "nbbo_ask": ask, "nbbo_mid": mid,
@@ -590,6 +777,7 @@ def place_order_with_ladder(
             cur_bid, cur_ask, cur_mid = nbbo_fn(refresh=True)
             print(f"CS_VERT_PLACE REFRESH NBBO: bid={cur_bid} ask={cur_ask} mid={cur_mid}")
             if None in (cur_bid, cur_ask, cur_mid):
+                print("CS_VERT_PLACE NBBO_REFRESH_FAIL: quote fetch failed")
                 placed_reason = "NBBO_REFRESH_FAIL"
                 break
 
@@ -600,6 +788,7 @@ def place_order_with_ladder(
         payload = payload_fn(price, remaining)
 
         try:
+            print(f"CS_VERT_PLACE POST {tag_prefix}@{price:.2f}x{remaining} {_payload_summary(payload)}")
             r = post_with_retry(c, url_post, payload, tag=f"{tag_prefix}@{price:.2f}x{remaining}")
         except Exception as e:
             if "HTTP_429" in str(e):
@@ -610,6 +799,9 @@ def place_order_with_ladder(
         oid = parse_order_id(r)
         if oid:
             order_ids.append(oid)
+            print(f"CS_VERT_PLACE ORDER_ID: {oid}")
+        else:
+            print("CS_VERT_PLACE ORDER_ID: missing")
 
         this_order_filled = 0
 
@@ -638,7 +830,7 @@ def place_order_with_ladder(
 
         # Cancel before next rung
         if oid:
-            url_del = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
+            url_del = f"/accounts/{acct_hash}/orders/{oid}"
             ok = delete_with_retry(c, url_del, tag=f"CANCEL {oid}", tries=CANCEL_TRIES)
             print(f"CS_VERT_PLACE CANCEL {oid} → {'OK' if ok else 'FAIL'}")
 
@@ -712,9 +904,10 @@ def place_order_at_price(
     CANCEL_SETTLE = float(os.environ.get("VERT_CANCEL_SETTLE", "1.0"))
     CANCEL_TRIES = int(os.environ.get("VERT_CANCEL_TRIES", "4"))
 
-    url_post = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
+    url_post = f"/accounts/{acct_hash}/orders"
 
     try:
+        print(f"CS_VERT_PLACE POST {tag_prefix} {_payload_summary(payload)}")
         r = post_with_retry(c, url_post, payload, tag=f"{tag_prefix}")
     except Exception as e:
         print(f"CS_VERT_PLACE ERROR posting order: {e}")
@@ -728,6 +921,7 @@ def place_order_at_price(
     oid = parse_order_id(r)
     if oid:
         order_ids.append(oid)
+        print(f"CS_VERT_PLACE ORDER_ID: {oid}")
     else:
         return {
             "filled": 0,
@@ -755,7 +949,7 @@ def place_order_at_price(
     remaining = max(0, qty - filled)
 
     if remaining > 0 and oid:
-        url_del = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{oid}"
+        url_del = f"/accounts/{acct_hash}/orders/{oid}"
         ok = delete_with_retry(c, url_del, tag=f"CANCEL {oid}", tries=CANCEL_TRIES)
         print(f"CS_VERT_PLACE CANCEL {oid} → {'OK' if ok else 'FAIL'}")
 
@@ -816,7 +1010,8 @@ def place_two_verticals_simul(
     def submit_one(v, price, q, tag):
         payload = order_payload_vertical(v["side"], v["short_osi"], v["long_osi"], price, q)
         try:
-            r = post_with_retry(c, f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders", payload, tag=tag)
+            print(f"CS_VERT_PLACE POST {tag} {_payload_summary(payload)}")
+            r = post_with_retry(c, f"/accounts/{acct_hash}/orders", payload, tag=tag)
         except Exception as e:
             print(f"CS_VERT_PLACE ERROR posting order: {e}")
             return ""
@@ -853,7 +1048,7 @@ def place_two_verticals_simul(
         remaining = max(0, st["cur_qty"] - st["cur_filled"])
         if remaining <= 0:
             return True, ""
-        url_del = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{st['oid']}"
+        url_del = f"/accounts/{acct_hash}/orders/{st['oid']}"
         ok = delete_with_retry(c, url_del, tag=f"CANCEL {st['oid']}", tries=CANCEL_TRIES)
         print(f"CS_VERT_PLACE CANCEL {st['oid']} → {'OK' if ok else 'FAIL'}")
         if ok:
@@ -880,6 +1075,7 @@ def place_two_verticals_simul(
     b1, a1, m1 = vertical_nbbo(v1["side"], v1["short_osi"], v1["long_osi"], c)
     b2, a2, m2 = vertical_nbbo(v2["side"], v2["short_osi"], v2["long_osi"], c)
     if None in (b1, a1, m1, b2, a2, m2):
+        print("CS_VERT_PLACE NBBO_UNAVAILABLE: pair mid quotes missing")
         return (
             {"filled": 0, "order_ids": [], "reason": "NBBO_UNAVAILABLE", "danger": False, "ladder_plan": "[mid, mid+0.05, mid+0.10]"},
             {"filled": 0, "order_ids": [], "reason": "NBBO_UNAVAILABLE", "danger": False, "ladder_plan": "[mid, mid+0.05, mid+0.10]"},
@@ -992,14 +1188,16 @@ def place_two_verticals_alternating(
         print(f"CS_VERT_PLACE ALT STEP={rung_idx} SIDE={label}")
         b, a, m = vertical_nbbo(v["side"], v["short_osi"], v["long_osi"], c)
         if None in (b, a, m):
+            print(f"CS_VERT_PLACE NBBO_UNAVAILABLE: {v['name']} {v['short_osi']}|{v['long_osi']}")
             return {"oid": "", "cur_qty": 0, "reason": "NBBO_UNAVAILABLE", "last_price": None}
         price = price_from_mid(m, off, b, a)
         print(f"CS_VERT_PLACE ALT rung: {v['name']} price={price:.2f} rem={remaining}")
         payload = order_payload_vertical(v["side"], v["short_osi"], v["long_osi"], price, remaining)
         try:
+            print(f"CS_VERT_PLACE POST {v['name']}@{price:.2f}x{remaining} {_payload_summary(payload)}")
             r = post_with_retry(
                 c,
-                f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders",
+                f"/accounts/{acct_hash}/orders",
                 payload,
                 tag=f"{v['name']}@{price:.2f}x{remaining}",
             )
@@ -1065,7 +1263,7 @@ def place_two_verticals_alternating(
             remaining = max(0, o["cur_qty"] - o["cur_filled"])
             if not o["oid"] or remaining <= 0:
                 continue
-            url_del = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{o['oid']}"
+            url_del = f"/accounts/{acct_hash}/orders/{o['oid']}"
             ok = delete_with_retry(c, url_del, tag=f"CANCEL {o['oid']}", tries=CANCEL_TRIES)
             print(f"CS_VERT_PLACE CANCEL {o['oid']} → {'OK' if ok else 'FAIL'}")
             if ok:
@@ -1218,8 +1416,8 @@ def main():
         print(f"CS_VERT_PLACE START MODE=VERT name={v1['name']} side={v1['side']} kind={v1['kind']} short={v1['short_osi']} long={v1['long_osi']} qty={qty} dry_run={DRY_RUN}")
         print("CS_VERT_PLACE LADDER=VERT [mid, mid+0.05, mid+0.10] (credit uses opposite)")
 
-    c = schwab_client()
-    acct_hash = resolve_acct_hash(c)
+    c = None
+    acct_hash = tt_account_number()
 
     ts_utc = datetime.now(timezone.utc)
     ts_et = ts_utc.astimezone(ET)

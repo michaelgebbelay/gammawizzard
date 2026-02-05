@@ -92,7 +92,16 @@ def main():
     with open(token_path, "w") as f:
         json.dump(token, f)
 
+    # Also mirror to legacy path for convenience if different.
+    legacy_path = os.path.join("TT", "Token", "tt_token.json")
+    if os.path.normpath(token_path) != os.path.normpath(legacy_path):
+        os.makedirs(os.path.dirname(legacy_path), exist_ok=True)
+        with open(legacy_path, "w") as f:
+            json.dump(token, f)
+
     print(f"\nToken saved to: {token_path}")
+    if os.path.normpath(token_path) != os.path.normpath(legacy_path):
+        print(f"Token mirrored to: {legacy_path}")
     print("=== COPY THIS JSON INTO GitHub Secret: TT_TOKEN_JSON ===\n")
     print(json.dumps(token))
     print("\n=== END ===")
