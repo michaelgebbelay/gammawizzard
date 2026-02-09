@@ -57,6 +57,7 @@ ACCOUNTS = {
         "static_env": {
             "TT_ACCOUNT_NUMBER": "5WT20360",
             "TT_TOKEN_PATH": "/tmp/tt_token.json",
+            "TT_QUOTE_TOKEN_PATH": "/tmp/tt_quote_token.json",
             "SCHWAB_TOKEN_PATH": "/tmp/schwab_token.json",
             "CS_UNIT_DOLLARS": "7500",
         },
@@ -78,6 +79,7 @@ ACCOUNTS = {
         "static_env": {
             "TT_ACCOUNT_NUMBER": "5WT09219",
             "TT_TOKEN_PATH": "/tmp/tt_token.json",
+            "TT_QUOTE_TOKEN_PATH": "/tmp/tt_quote_token.json",
             "SCHWAB_TOKEN_PATH": "/tmp/schwab_token.json",
             "CS_UNIT_DOLLARS": "7500",
         },
