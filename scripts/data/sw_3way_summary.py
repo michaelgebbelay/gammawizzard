@@ -1,220 +1,3 @@
-# ===== ORIG-ONLY HOT PATH (exp_primary | side | contracts) =====
-import os, json, base64, re
-from typing import Any, List, Dict, Tuple, Optional
-from datetime import datetime, date, time, timedelta, timezone
-from zoneinfo import ZoneInfo
-from google.oauth2 import service_account
-from googleapiclient.discovery import build as gbuild
-
-if os.environ.get("ORIG_ONLY", "1").strip().lower() in {"1","true","yes","on"}:
-    ET = ZoneInfo("America/New_York")
-    RAW_TAB = "sw_txn_raw"
-    OUT_TAB = "sw_orig_orders"
-    OUT_HEADERS = ["exp_primary","side","contracts"]
-
-    def _svc_sid():
-        sid = os.environ["GSHEET_ID"]
-        sa_json = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
-        try:
-            dec = base64.b64decode(sa_json).decode("utf-8")
-            if dec.strip().startswith("{"): sa_json = dec
-        except Exception:
-            pass
-        creds = service_account.Credentials.from_service_account_info(
-            json.loads(sa_json),
-            scopes=["https://www.googleapis.com/auth/spreadsheets"]
-        )
-        return gbuild("sheets","v4",credentials=creds), sid
-
-    def ensure_tab_with_header(svc, sid: str, tab: str, headers: List[str]) -> None:
-        meta = svc.spreadsheets().get(spreadsheetId=sid).execute()
-        titles = {s["properties"]["title"] for s in meta.get("sheets",[])}
-        if tab not in titles:
-            svc.spreadsheets().batchUpdate(
-                spreadsheetId=sid,
-                body={"requests":[{"addSheet":{"properties":{"title":tab}}}]}
-            ).execute()
-        got = svc.spreadsheets().values().get(spreadsheetId=sid, range=f"{tab}!1:1").execute().get("values",[])
-        if not got or got[0] != headers:
-            svc.spreadsheets().values().update(
-                spreadsheetId=sid,
-                range=f"{tab}!A1",
-                valueInputOption="RAW",
-                body={"values":[headers]}
-            ).execute()
-
-    def overwrite_rows(svc, sid: str, tab: str, headers: List[str], rows: List[List[Any]]) -> None:
-        svc.spreadsheets().values().clear(spreadsheetId=sid, range=tab).execute()
-        svc.spreadsheets().values().update(
-            spreadsheetId=sid,
-            range=f"{tab}!A1",
-            valueInputOption="RAW",
-            body={"values":[headers] + rows}
-        ).execute()
-
-    def _idx(hdr: List[str], col: str) -> int:
-        try: return hdr.index(col)
-        except ValueError: return -1
-
-    def _fix_iso(s: str) -> str:
-        x = (s or "").strip()
-        if x.endswith("Z"): x = x[:-1] + "+00:00"
-        if re.search(r"[+-]\d{4}$", x):
-            x = x[:-5] + x[-5:-2] + ":" + x[-2:]
-        return x
-
-    def _dt_et(s: str) -> Optional[datetime]:
-        if not s: return None
-        try:
-            dt = datetime.fromisoformat(_fix_iso(s))
-            return dt.astimezone(ET)
-        except Exception:
-            return None
-
-    def _prev_bday(d: date, n: int) -> date:
-        cur, step = d, 0
-        while step < n:
-            cur = cur - timedelta(days=1)
-            if cur.weekday() < 5: step += 1
-        return cur
-
-    def _safe_f(x): 
-        try: return float(x)
-        except Exception: return None
-
-    def _build_orig_min(svc, sid):
-        # Pull raw
-        resp = svc.spreadsheets().values().get(spreadsheetId=sid, range=f"{RAW_TAB}!A1:R").execute()
-        vals = resp.get("values", [])
-        if not vals: 
-            ensure_tab_with_header(svc, sid, OUT_TAB, OUT_HEADERS)
-            overwrite_rows(svc, sid, OUT_TAB, OUT_HEADERS, [])
-            print("ORIG_ONLY: no raw.")
-            return
-
-        hdr = vals[0]
-        i_ts   = _idx(hdr,"ts")
-        i_ledger = _idx(hdr,"ledger_id")
-        i_exp  = _idx(hdr,"exp_primary")
-        i_pc   = _idx(hdr,"put_call")
-        i_strk = _idx(hdr,"strike")
-        i_qty  = _idx(hdr,"quantity")
-        i_amt  = _idx(hdr,"amount")
-        i_net  = _idx(hdr,"net_amount")
-        i_comm = _idx(hdr,"commissions")
-        i_fee  = _idx(hdr,"fees_other")
-        rows = [r + [""]*(len(hdr)-len(r)) for r in vals[1:]]
-
-        # Window config
-        T0 = os.environ.get("ORIG_ET_START","16:00")
-        T1 = os.environ.get("ORIG_ET_END","16:20")
-        def _hhmm(s):
-            try:
-                h,m = [int(x) for x in s.split(":")]
-                return time(hour=h, minute=m, tzinfo=ET)
-            except Exception:
-                return time(16,0,tzinfo=ET)
-        W0, W1 = _hhmm(T0), _hhmm(T1)
-        D_BEFORE = int(os.environ.get("ORIG_DAYS_BEFORE","1") or "1")
-
-        # Collect candidate ledgers per expiry within window
-        exps = sorted({ (r[i_exp] or "").strip() for r in rows if i_exp>=0 and r[i_exp] }, key=lambda s:s)
-        out = []
-        for e in exps:
-            try:
-                exp_d = date.fromisoformat(e[:10])
-            except Exception:
-                continue
-            orig_d = _prev_bday(exp_d, D_BEFORE)
-            win_start = datetime.combine(orig_d, W0).astimezone(ET)
-            win_end   = datetime.combine(orig_d, W1).astimezone(ET)
-
-            per_ledger: Dict[str, List[List[Any]]] = {}
-            for r in rows:
-                if (r[i_exp] or "").strip() != e: continue
-                lid = (r[i_ledger] or "").strip()
-                if not lid: continue
-                dt = _dt_et(r[i_ts]) if i_ts>=0 else None
-                if not dt or not (win_start <= dt <= win_end): continue
-                per_ledger.setdefault(lid, []).append(r)
-
-            if not per_ledger: 
-                continue
-
-            # Score ledgers, compute units and side
-            choices: List[Tuple[int,int,datetime,str,Dict[str,Any]]] = []
-            for lid, legs in per_ledger.items():
-                # classify legs
-                put_strikes = {}
-                call_strikes = {}
-                latest = None
-                amt_sum = 0.0
-                have_amt = True
-                net = None; comm=0.0; fee=0.0
-                for r in legs:
-                    pc = (r[i_pc] or "").strip().upper() if i_pc>=0 else ""
-                    s  = _safe_f(r[i_strk]) if i_strk>=0 else None
-                    q  = _safe_f(r[i_qty]) if i_qty>=0 else None
-                    a  = _safe_f(r[i_amt]) if i_amt>=0 else None
-                    if latest is None or (_dt_et(r[i_ts]) and _dt_et(r[i_ts]) > latest):
-                        latest = _dt_et(r[i_ts])
-                    if a is None: have_amt = False
-                    else: amt_sum += a
-                    if i_net>=0 and net is None and r[i_net] not in ("",None):
-                        net = _safe_f(r[i_net])
-                    if i_comm>=0 and r[i_comm] not in ("",None):
-                        comm = max(comm, _safe_f(r[i_comm]) or 0.0)
-                    if i_fee>=0 and r[i_fee] not in ("",None):
-                        fee = max(fee, _safe_f(r[i_fee]) or 0.0)
-                    if pc and s is not None and q is not None:
-                        d = put_strikes if pc=="PUT" else call_strikes if pc=="CALL" else None
-                        if d is not None:
-                            d[s] = d.get(s, 0.0) + q
-
-                if len(put_strikes) < 2 or len(call_strikes) < 2:
-                    continue
-
-                # units = min abs qty across top 2 strikes per side
-                def top2_units(dmap):
-                    pairs = sorted(((abs(q), s) for s,q in dmap.items()), reverse=True)
-                    if not pairs: return []
-                    top = pairs[:2] if len(pairs)>=2 else pairs*2
-                    return [abs(dmap[top[0][1]]), abs(dmap[top[1][1]])]
-                q_puts  = top2_units(put_strikes)
-                q_calls = top2_units(call_strikes)
-                if not q_puts or not q_calls:
-                    continue
-                units = int(round(min(q_puts + q_calls)))
-                if units <= 0: 
-                    continue
-
-                # side: prefer sign of (sum amounts); fallback to net_amount; else assume short
-                if have_amt:
-                    side = "short" if (amt_sum < 0) else "long"
-                elif net is not None:
-                    side = "short" if (net > 0) else "long"  # net>0 means cash received → credit (short)
-                else:
-                    side = "short"
-
-                score = 1  # valid condor
-                choices.append((score, units, latest or datetime.min.replace(tzinfo=ET), lid, {"e":e,"side":side,"units":units}))
-
-            if not choices:
-                continue
-            choices.sort(key=lambda x: (x[0], x[1], x[2]))
-            best = choices[-1][4]
-            out.append([best["e"], best["side"], str(int(best["units"]))])
-
-        out.sort(key=lambda r: r[0])
-        ensure_tab_with_header(svc, sid, OUT_TAB, OUT_HEADERS)
-        overwrite_rows(svc, sid, OUT_TAB, OUT_HEADERS, out)
-        print(f"ORIG_ONLY: wrote {len(out)} rows to {OUT_TAB} (exp_primary|side|contracts).")
-
-    # run and exit BEFORE legacy code below
-    _svc, _sid = _svc_sid()
-    _build_orig_min(_svc, _sid)
-    raise SystemExit(0)
-# ===== END ORIG-ONLY HOT PATH =====
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -232,14 +15,28 @@ Env:
   GSHEET_ID, GOOGLE_SERVICE_ACCOUNT_JSON
   UNIT_RISK (default 4500)   # dollars; used to normalize P&L
 """
-import base64, json, os, math, re
+import os, sys, math, re
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, date, timedelta, timezone
-from zoneinfo import ZoneInfo
-from google.oauth2 import service_account
-from googleapiclient.discovery import build as gbuild
 
-ET = ZoneInfo("America/New_York")
+# -- path setup --
+def _add_scripts_root():
+    cur = os.path.abspath(os.path.dirname(__file__))
+    while True:
+        if os.path.basename(cur) == "scripts":
+            if cur not in sys.path:
+                sys.path.append(cur)
+            return
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return
+        cur = parent
+
+_add_scripts_root()
+
+from lib.sheets import sheets_client, get_values, ensure_tab, overwrite_rows
+from lib.parsing import ET, safe_float, parse_sheet_datetime, parse_sheet_date, contract_multiplier
+
 UNIT_RISK = float(os.environ.get("UNIT_RISK", "4500"))
 
 RAW_TAB = "sw_txn_raw"
@@ -264,90 +61,6 @@ ORIG_DAYS_BEFORE = int(os.environ.get("ORIG_DAYS_BEFORE", "1"))
 # Allocate multi-expiry ledger net across expiries by gross leg flow (avoid dropping roll P&L)
 ALLOCATE_MULTI_EXP = os.environ.get("ALLOCATE_MULTI_EXP", "1").strip() in {"1","true","yes","on","y"}
 
-def sheets_client():
-    sid = os.environ["GSHEET_ID"]
-    sa_json = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
-    try:
-        dec = base64.b64decode(sa_json).decode("utf-8")
-        if dec.strip().startswith("{"):
-            sa_json = dec
-    except Exception:
-        pass
-    creds = service_account.Credentials.from_service_account_info(
-        json.loads(sa_json),
-        scopes=["https://www.googleapis.com/auth/spreadsheets"],
-    )
-    return gbuild("sheets","v4",credentials=creds), sid
-
-def get_values(svc, sid, rng: str) -> List[List[Any]]:
-    return svc.spreadsheets().values().get(spreadsheetId=sid, range=rng).execute().get("values", [])
-
-def ensure_tab(svc, sid: str, tab: str, headers: List[str]):
-    meta = svc.spreadsheets().get(spreadsheetId=sid).execute()
-    titles = {s["properties"]["title"] for s in meta.get("sheets", [])}
-    if tab not in titles:
-        svc.spreadsheets().batchUpdate(spreadsheetId=sid, body={"requests":[{"addSheet":{"properties":{"title":tab}}}]}).execute()
-    got = svc.spreadsheets().values().get(spreadsheetId=sid, range=f"{tab}!1:1").execute().get("values", [])
-    if not got or got[0] != headers:
-        svc.spreadsheets().values().update(spreadsheetId=sid, range=f"{tab}!A1",
-            valueInputOption="RAW", body={"values":[headers]}).execute()
-
-def write_rows(svc, sid, tab: str, headers: List[str], rows: List[List[Any]]):
-    svc.spreadsheets().values().clear(spreadsheetId=sid, range=tab).execute()
-    svc.spreadsheets().values().update(spreadsheetId=sid, range=f"{tab}!A1",
-        valueInputOption="RAW", body={"values":[headers]+rows}).execute()
-
-def parse_date(x) -> Optional[date]:
-    if x is None: return None
-    s = str(x).strip()
-    if not s: return None
-    try:
-        return date.fromisoformat(s[:10])
-    except Exception:
-        try:
-            z = s.replace("Z","+00:00")
-            return datetime.fromisoformat(z).astimezone(ET).date()
-        except Exception:
-            return None
-
-def _f(x) -> Optional[float]:
-    try:
-        if x is None or str(x).strip()=="":
-            return None
-        return float(x)
-    except Exception:
-        return None
-
-def parse_sheet_datetime(x) -> Optional[datetime]:
-    if isinstance(x, datetime):
-        if x.tzinfo:
-            return x
-        return x.replace(tzinfo=timezone.utc)
-    if isinstance(x, date):
-        return datetime(x.year, x.month, x.day, tzinfo=timezone.utc)
-    if x is None:
-        return None
-    s = str(x).strip()
-    if not s:
-        return None
-    try:
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
-    except Exception:
-        return None
-
-def parse_sheet_date(x) -> Optional[date]:
-    if isinstance(x, date) and not isinstance(x, datetime):
-        return x
-    dt = parse_sheet_datetime(x)
-    if isinstance(dt, datetime):
-        return dt.astimezone(ET).date()
-    return parse_date(x)
-
 def _to_minutes(hhmm: str) -> int:
     try:
         hh, mm = [int(x) for x in hhmm.split(":")]
@@ -365,22 +78,6 @@ def _et_minutes(dt: Optional[datetime]) -> Optional[int]:
     d = dt.astimezone(ET) if dt.tzinfo else dt.replace(tzinfo=ET)
     return d.hour*60 + d.minute
 
-def _safe_float(x) -> Optional[float]:
-    try:
-        if x is None or str(x).strip()=="":
-            return None
-        return float(x)
-    except Exception:
-        return None
-
-def _multiplier(underlying: str, symbol: str) -> int:
-    u = (underlying or "").upper()
-    s = (symbol or "").upper()
-    # OCC-coded options & index options → 100; else 1
-    if re.search(r"\d{6}[CP]\d{8}$", s): return 100
-    if u in {"SPX","SPXW","NDX","RUT","VIX","XSP"}: return 100
-    return 1
-
 def _is_ic_open(legs: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Classify a 4-leg iron condor OPEN (2P/2C, one +qty & one -qty per wing). Return dict or None."""
     puts  = [L for L in legs if (L.get("put_call")=="PUT")]
@@ -388,30 +85,29 @@ def _is_ic_open(legs: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if len(puts)!=2 or len(calls)!=2:
         return None
     def split_sign(arr):
-        pos=[L for L in arr if (_safe_float(L.get("quantity")) or 0)>0]
-        neg=[L for L in arr if (_safe_float(L.get("quantity")) or 0)<0]
+        pos=[L for L in arr if (safe_float(L.get("quantity")) or 0)>0]
+        neg=[L for L in arr if (safe_float(L.get("quantity")) or 0)<0]
         return pos, neg
     p_pos, p_neg = split_sign(puts)
     c_pos, c_neg = split_sign(calls)
     if len(p_pos)!=1 or len(p_neg)!=1 or len(c_pos)!=1 or len(c_neg)!=1:
         return None
-    sp = _safe_float(p_neg[0].get("strike"));  lp = _safe_float(p_pos[0].get("strike"))
-    sc = _safe_float(c_neg[0].get("strike"));  lc = _safe_float(c_pos[0].get("strike"))
+    sp = safe_float(p_neg[0].get("strike"));  lp = safe_float(p_pos[0].get("strike"))
+    sc = safe_float(c_neg[0].get("strike"));  lc = safe_float(c_pos[0].get("strike"))
     if None in (sp,lp,sc,lc): return None
-    contracts = int(round(min(abs(_safe_float(p_neg[0].get("quantity")) or 0.0),
-                               abs(_safe_float(c_neg[0].get("quantity")) or 0.0))))
+    contracts = int(round(min(abs(safe_float(p_neg[0].get("quantity")) or 0.0),
+                               abs(safe_float(c_neg[0].get("quantity")) or 0.0))))
     if contracts < 1:
         return None
     wp = abs(sp-lp); wc = abs(lc-sc)
     width = max(wp, wc)
-    # Attach signs orientation
     return {
         "short_put": sp, "long_put": lp, "short_call": sc, "long_call": lc,
         "width": width, "contracts": contracts
     }
 
 def derive_standard_from_raw(raw: List[List[Any]], alerts: List[List[Any]]) -> Dict[date, Dict[str, Any]]:
-    """Return per-expiry STANDARD from sw_txn_raw using 16:00–16:20 ET on expiry-1.
+    """Return per-expiry STANDARD from sw_txn_raw using 16:00-16:20 ET on expiry-1.
        Returns {exp: {side, width, price, contracts, risk_total, tickets:[{side,sp,lp,sc,lc,price,contracts}]}}"""
     if not raw or raw[0] != RAW_HEADERS:
         return {}
@@ -436,16 +132,16 @@ def derive_standard_from_raw(raw: List[List[Any]], alerts: List[List[Any]]) -> D
         dt = parse_sheet_datetime(r[i_ts])
         exp = parse_sheet_date(r[i_exp])
         pc  = (r[i_pc] or "").strip().upper() if r[i_pc] else ""
-        strike = _safe_float(r[i_strk])
-        qty    = _safe_float(r[i_qty]) or 0.0
+        strike = safe_float(r[i_strk])
+        qty    = safe_float(r[i_qty]) or 0.0
         sym    = (r[i_sym] or "").strip()
-        amt    = _safe_float(r[i_amt])
+        amt    = safe_float(r[i_amt])
         if amt is None:
             # back-compute if missing
-            price = _safe_float(r[raw[0].index("price")]) if "price" in head else None
-            mult = _multiplier(und, sym)
+            price = safe_float(r[raw[0].index("price")]) if "price" in head else None
+            mult = contract_multiplier(sym, und)
             amt = (qty * price * mult) if (price is not None) else 0.0
-        net = _safe_float(r[i_net])
+        net = safe_float(r[i_net])
         bucket = led.get(ledger)
         if not bucket:
             bucket = {"ts": dt, "exp_set": set(), "legs": [], "net": 0.0, "net_seen": False}
@@ -459,7 +155,7 @@ def derive_standard_from_raw(raw: List[List[Any]], alerts: List[List[Any]]) -> D
         if (net is not None) and (not bucket["net_seen"]):
             bucket["net"] += float(net); bucket["net_seen"] = True
 
-    # candidates → aggregate by expiry in window
+    # candidates -> aggregate by expiry in window
     start_min = _to_minutes(ORIG_ET_START); end_min = _to_minutes(ORIG_ET_END)
     std: Dict[date, Dict[str, Any]] = {}  # exp -> aggregate
 
@@ -481,14 +177,12 @@ def derive_standard_from_raw(raw: List[List[Any]], alerts: List[List[Any]]) -> D
 
     for lg, b in led.items():
         if len(b["exp_set"]) != 1:
-            # not a single-expiry open; leave for adjusted allocation
             continue
         exp = next(iter(b["exp_set"]))
         tsd = _et_date(b["ts"])
         mins = _et_minutes(b["ts"])
         if not isinstance(tsd, date) or mins is None:
             continue
-        # window check: ts date == exp - ORIG_DAYS_BEFORE and time in [start,end]
         if tsd != (exp - timedelta(days=ORIG_DAYS_BEFORE)) or not (start_min <= mins <= end_min):
             continue
         cls = _is_ic_open(b["legs"])
@@ -518,7 +212,6 @@ def derive_standard_from_raw(raw: List[List[Any]], alerts: List[List[Any]]) -> D
     for exp, arr in fallback_candidates.items():
         arr.sort(key=lambda x: x[0])  # earliest first
         for _, side, width, contracts, net in arr:
-            # No per-ledger strikes in fallback path; leave strikes=None. P&L will still be approx via width/price if needed.
             add_component(exp, side, width, contracts, net, strikes=None)
         alerts.append(["std","used_fallback_no_time_window", exp.isoformat(), f"{len(arr)} ticket(s)"])
 
@@ -605,7 +298,7 @@ def build_three_way(svc, sid):
         i_exp = h.index("exp_primary"); i_set = h.index("settle")
         for r in settle[1:]:
             if i_exp>=len(r) or i_set>=len(r): continue
-            d = parse_date(r[i_exp]); s = _f(r[i_set])
+            d = parse_sheet_date(r[i_exp]); s = safe_float(r[i_set])
             if d and s is not None: st_map[d]=s
 
     # Leo ideas
@@ -614,24 +307,24 @@ def build_three_way(svc, sid):
         h=[c.strip() for c in leo[0]]
         ix={k:i for i,k in enumerate(h)}
         for need in ["exp_primary","side","short_put","long_put","short_call","long_call","price"]:
-            if need not in ix: 
+            if need not in ix:
                 alerts.append(["config","leo_orders_missing_col",need,""])
                 ix[need]=None
         for r in leo[1:]:
-            d = parse_date(r[ix["exp_primary"]]) if ix["exp_primary"] is not None else None
+            d = parse_sheet_date(r[ix["exp_primary"]]) if ix["exp_primary"] is not None else None
             if not d: continue
             if d in leo_map:
                 alerts.append(["config","leo_duplicate_expiry",d.isoformat(),""])
             leo_map[d]={
                 "side": (r[ix["side"]] if ix["side"] is not None else "short"),
-                "sp": _f(r[ix["short_put"]]) if ix["short_put"] is not None else None,
-                "lp": _f(r[ix["long_put"]]) if ix["long_put"] is not None else None,
-                "sc": _f(r[ix["short_call"]]) if ix["short_call"] is not None else None,
-                "lc": _f(r[ix["long_call"]]) if ix["long_call"] is not None else None,
-                "price": _f(r[ix["price"]]) if ix["price"] is not None else None,
+                "sp": safe_float(r[ix["short_put"]]) if ix["short_put"] is not None else None,
+                "lp": safe_float(r[ix["long_put"]]) if ix["long_put"] is not None else None,
+                "sc": safe_float(r[ix["short_call"]]) if ix["short_call"] is not None else None,
+                "lc": safe_float(r[ix["long_call"]]) if ix["long_call"] is not None else None,
+                "price": safe_float(r[ix["price"]]) if ix["price"] is not None else None,
             }
 
-    # STANDARD: derive directly from sw_txn_raw using 16:00–16:20 ET on expiry-1
+    # STANDARD: derive directly from sw_txn_raw using 16:00-16:20 ET on expiry-1
     std_map: Dict[date, Dict[str, Any]] = derive_standard_from_raw(raw, alerts)
 
     # Realized adjusted from sw_txn_raw (per-ledger net, per-expiry), with roll detection
@@ -654,63 +347,60 @@ def build_three_way(svc, sid):
             need = max(i_exp, i_net, i_ledger, i_ts)+1
             if len(r) < need:
                 continue
-            led = str(r[i_ledger]).strip()
-            if not led:
+            led_id = str(r[i_ledger]).strip()
+            if not led_id:
                 continue
-            expd = parse_date(r[i_exp])
-            if led not in lg_exps: lg_exps[led]=set()
-            if expd: lg_exps[led].add(expd)
-            # timestamp for ordering (unused here but might be useful later)
-            if led not in lg_ts:
+            expd = parse_sheet_date(r[i_exp])
+            if led_id not in lg_exps: lg_exps[led_id]=set()
+            if expd: lg_exps[led_id].add(expd)
+            if led_id not in lg_ts:
                 try:
                     z=str(r[i_ts]).replace("Z","+00:00")
-                    lg_ts[led] = datetime.fromisoformat(z).astimezone(ET).date()
+                    lg_ts[led_id] = datetime.fromisoformat(z).astimezone(ET).date()
                 except Exception:
-                    lg_ts[led] = None
-            net = _f(r[i_net])
+                    lg_ts[led_id] = None
+            net = safe_float(r[i_net])
             if net is not None:
-                lg_nets[led] = lg_nets.get(led, 0.0) + float(net)
-                lg_net_rows[led] = lg_net_rows.get(led, 0)+1
+                lg_nets[led_id] = lg_nets.get(led_id, 0.0) + float(net)
+                lg_net_rows[led_id] = lg_net_rows.get(led_id, 0)+1
             # gross leg flow by expiry (for allocation)
-            amt = _f(r[i_amt])
+            amt = safe_float(r[i_amt])
             if amt is None:
-                # try recompute from price*qty*mult (rarely needed)
                 try:
-                    price = _f(r[head.index("price")])
-                    qty = _f(r[head.index("quantity")]) or 0.0
+                    price = safe_float(r[head.index("price")])
+                    qty = safe_float(r[head.index("quantity")]) or 0.0
                     mult = 100.0  # SPX options; safe default here
                     amt = qty*price*mult if (price is not None) else 0.0
                 except Exception:
                     amt = 0.0
             if isinstance(expd, date):
-                lg_abs_by_exp.setdefault(led, {})
-                lg_abs_by_exp[led][expd] = round(lg_abs_by_exp[led].get(expd, 0.0) + abs(float(amt)), 2)
+                lg_abs_by_exp.setdefault(led_id, {})
+                lg_abs_by_exp[led_id][expd] = round(lg_abs_by_exp[led_id].get(expd, 0.0) + abs(float(amt)), 2)
 
-        for led, net_total in lg_nets.items():
-            exps = [e for e in (lg_exps.get(led) or []) if isinstance(e, date)]
+        for led_id, net_total in lg_nets.items():
+            exps = [e for e in (lg_exps.get(led_id) or []) if isinstance(e, date)]
             if not exps:
-                alerts.append(["raw","ledger_missing_exp",led, net_total])
+                alerts.append(["raw","ledger_missing_exp",led_id, net_total])
                 continue
             if len(exps) == 1 or not ALLOCATE_MULTI_EXP:
                 d = exps[0]
                 if d > cutoff:
                     continue
-                if lg_net_rows.get(led,0) > 1:
-                    alerts.append(["raw","ledger_multiple_net_rows", led, lg_net_rows[led]])
+                if lg_net_rows.get(led_id,0) > 1:
+                    alerts.append(["raw","ledger_multiple_net_rows", led_id, lg_net_rows[led_id]])
                 adj_by_exp[d] = round(adj_by_exp.get(d, 0.0) + net_total, 2)
             else:
-                # allocate net_total by gross leg flow weight per expiry
-                weights = lg_abs_by_exp.get(led, {})
+                weights = lg_abs_by_exp.get(led_id, {})
                 tot = sum(weights.values())
                 if tot <= 0:
-                    alerts.append(["raw","ledger_multi_expiry_no_weights", led, "skip"])
+                    alerts.append(["raw","ledger_multi_expiry_no_weights", led_id, "skip"])
                     continue
                 for d, w in weights.items():
                     if d > cutoff:
                         continue
                     share = (w / tot)
                     adj_by_exp[d] = round(adj_by_exp.get(d, 0.0) + net_total*share, 2)
-                alerts.append(["raw","ledger_multi_expiry_allocated", led,
+                alerts.append(["raw","ledger_multi_expiry_allocated", led_id,
                                "; ".join(f"{dd.isoformat()}:{weights[dd]:.2f}" for dd in sorted(weights.keys()))])
 
     # Build per-expiry rows
@@ -726,7 +416,7 @@ def build_three_way(svc, sid):
             continue
         settle_px = st_map.get(d)
 
-        # Standard (from raw) — compute P&L when settle exists
+        # Standard (from raw) -- compute P&L when settle exists
         std_pnl_norm=None; std_w=None; std_price=None; std_contracts=None; std_risk_total=None
         if d in std_map:
             S = std_map[d]
@@ -736,16 +426,13 @@ def build_three_way(svc, sid):
                 pnl_sum = 0.0
                 tickets = S.get("tickets") or []
                 if tickets:
-                    # precise per-ticket payoff
                     for t in tickets:
                         sp,lp,sc,lc = t["sp"],t["lp"],t["sc"],t["lc"]
                         per = pnl_iron_condor(t["side"], sp, lp, sc, lc, t["price"], settle_px)
                         pnl_sum += per * (t["contracts"] or 1)
                 else:
-                    # approximate using width/price if strikes are missing
                     w = std_w; px = std_price; side = S.get("side","short")
                     if w is not None and px is not None:
-                        # Build proxy symmetric wings around settle (ok for PM 0DTE stats)
                         sp = settle_px - w/2.0; lp = sp - w
                         sc = settle_px + w/2.0; lc = sc + w
                         per = pnl_iron_condor(side, sp, lp, sc, lc, px, settle_px)
@@ -784,27 +471,22 @@ def build_three_way(svc, sid):
             val = adj_norm - std_pnl_norm
             series_val.append((d, round(val,2)))
 
-        # Alert: missing settle for a date we’re trying to evaluate Leo/Standard
         if settle_px is None and (d in leo_map or d in std_map):
             alerts.append(["config","missing_settle", d.isoformat(), ""])
 
         rows.append([
-            d.isoformat(),                             # exp_primary
-            settle_px if settle_px is not None else "",# settle
-            # Leo
+            d.isoformat(),
+            settle_px if settle_px is not None else "",
             leo_w if leo_w is not None else "",
             leo_price if leo_price is not None else "",
             round(leo_pnl_norm,2) if leo_pnl_norm is not None else "",
-            # Standard
             std_w if std_w is not None else "",
             std_price if std_price is not None else "",
             std_contracts if std_contracts is not None else "",
             round(std_risk_total,2) if std_risk_total is not None else "",
             round(std_pnl_norm,2) if std_pnl_norm is not None else "",
-            # Adjusted
             round(adj_nom,2) if adj_nom is not None else "",
             round(adj_norm,2) if adj_norm is not None else "",
-            # Value add
             round(val,2) if val is not None else "",
         ])
 
@@ -817,7 +499,7 @@ def build_three_way(svc, sid):
         "value_add_vs_std"
     ]
     ensure_tab(svc, sid, OUT_TAB, by_headers)
-    write_rows(svc, sid, OUT_TAB, by_headers, rows)
+    overwrite_rows(svc, sid, OUT_TAB, by_headers, rows)
 
     # Build perf (Last-10/20 expiry dates) for each stream
     def lastN(series: List[Tuple[date,float]], n: int) -> List[float]:
@@ -848,11 +530,11 @@ def build_three_way(svc, sid):
             ["","","",""],
         ]
     ensure_tab(svc, sid, PERF_TAB, ["Category","Metric","Last10","Last20"])
-    write_rows(svc, sid, PERF_TAB, ["Category","Metric","Last10","Last20"], perf_rows[1:])
+    overwrite_rows(svc, sid, PERF_TAB, ["Category","Metric","Last10","Last20"], perf_rows[1:])
 
     # Alerts
     ensure_tab(svc, sid, ALERTS_TAB, ["scope","issue","key","detail"])
-    write_rows(svc, sid, ALERTS_TAB, ["scope","issue","key","detail"], alerts)
+    overwrite_rows(svc, sid, ALERTS_TAB, ["scope","issue","key","detail"], alerts)
 
 def main() -> int:
     svc, sid = sheets_client()

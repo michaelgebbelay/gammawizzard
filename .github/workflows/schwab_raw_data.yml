@@ -108,7 +108,7 @@ jobs:
       #   run: |
       #     python scripts/data/gw_settlements_to_sheet.py
 
-      - name: Build Standard orig orders from sw_txn_raw (only)
+      - name: Build Standard orig orders from sw_txn_raw
         id: sw_summary
         env:
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
@@ -116,9 +116,8 @@ jobs:
           ORIG_ET_START: "16:00"
           ORIG_ET_END:   "16:20"
           ORIG_DAYS_BEFORE: "1"
-          ORIG_ONLY: "1"   # ensures the hot path runs
         run: |
-          python scripts/data/sw_3way_summary.py
+          python scripts/data/sw_orig_orders.py
 
       - name: Persist Schwab token refresh
         id: sw_token_persist

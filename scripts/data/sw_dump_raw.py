@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-# Dump Schwab account ledger → Sheets: sw_txn_raw (per-leg, per-fill, de-duped), no summary here.
+# Dump Schwab account ledger -> Sheets: sw_txn_raw (per-leg, per-fill, de-duped), no summary here.
 
-import os, json, base64, re, math
-from datetime import datetime, timedelta, timezone, date
+import os, re, sys
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
-from zoneinfo import ZoneInfo
-import sys
 
 
 def _add_scripts_root():
@@ -23,10 +21,9 @@ def _add_scripts_root():
 
 _add_scripts_root()
 from schwab_token_keeper import schwab_client as schwab_client_base
-from google.oauth2 import service_account
-from googleapiclient.discovery import build as gbuild
+from lib.sheets import sheets_client, ensure_tab, read_existing, overwrite_rows
+from lib.parsing import ET, safe_float, iso_fix, fmt_ts_et, contract_multiplier
 
-ET = ZoneInfo("America/New_York")
 RAW_TAB = "sw_txn_raw"
 RAW_HEADERS = [
     "ts","txn_id","type","sub_type","description",
@@ -35,43 +32,7 @@ RAW_HEADERS = [
     "source","ledger_id"
 ]
 
-def _sa():
-    sj=os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
-    try:
-        dec=base64.b64decode(sj).decode("utf-8")
-        if dec.strip().startswith("{"): sj=dec
-    except Exception: pass
-    creds=service_account.Credentials.from_service_account_info(json.loads(sj),
-        scopes=["https://www.googleapis.com/auth/spreadsheets"])
-    svc=gbuild("sheets","v4",credentials=creds)
-    sid=os.environ["GSHEET_ID"]
-    return svc, sid
-
-def ensure_tab_with_header(svc,sid,tab,headers):
-    meta=svc.spreadsheets().get(spreadsheetId=sid).execute()
-    names={s["properties"]["title"] for s in meta.get("sheets",[])}
-    if tab not in names:
-        svc.spreadsheets().batchUpdate(spreadsheetId=sid, body={"requests":[{"addSheet":{"properties":{"title":tab}}}]}).execute()
-    got=svc.spreadsheets().values().get(spreadsheetId=sid, range=f"{tab}!1:1").execute().get("values",[])
-    if not got or got[0]!=headers:
-        svc.spreadsheets().values().update(spreadsheetId=sid, range=f"{tab}!A1",
-            valueInputOption="RAW", body={"values":[headers]}).execute()
-
-def read_existing(svc,sid,tab,headers):
-    last_col=chr(ord("A")+len(headers)-1)
-    vals=svc.spreadsheets().values().get(spreadsheetId=sid, range=f"{tab}!A2:{last_col}").execute().get("values",[])
-    out=[]
-    for r in vals:
-        row=list(r)+[""]*(len(headers)-len(r))
-        out.append(row[:len(headers)])
-    return out
-
-def overwrite_rows(svc,sid,tab,headers,rows):
-    svc.spreadsheets().values().clear(spreadsheetId=sid, range=tab).execute()
-    svc.spreadsheets().values().update(spreadsheetId=sid, range=f"{tab}!A1",
-        valueInputOption="RAW", body={"values":[headers]+rows}).execute()
-
-def merge_rows(existing,new,headers):
+def merge_rows(existing, new, headers):
     def idx(c): return headers.index(c) if c in headers else -1
     i_ledger=idx("ledger_id"); i_symbol=idx("symbol"); i_qty=idx("quantity"); i_price=idx("price"); i_amt=idx("amount"); i_ts=idx("ts")
     def key(r):
@@ -95,25 +56,6 @@ def schwab_client():
     r=c.get_account_numbers(); r.raise_for_status()
     acct_hash=r.json()[0]["hashValue"]
     return c, acct_hash
-
-def _iso_fix(s: str) -> str:
-    x=str(s).strip()
-    if x.endswith("Z"): return x[:-1]+"+00:00"
-    m=re.search(r"[+-]\d{4}$", x)
-    if m: return x[:-5]+x[-5:-2]+":"+x[-2:]
-    return x
-
-def fmt_ts_et(s: str) -> str:
-    try:
-        dt=datetime.fromisoformat(_iso_fix(s))
-    except Exception:
-        return s
-    dt=dt.astimezone(ET)
-    z=dt.strftime("%Y-%m-%dT%H:%M:%S%z"); return f"{z[:-2]}:{z[-2:]}"
-
-def safe_float(x):
-    try: return float(x)
-    except Exception: return None
 
 def parse_exp(sym: str) -> Optional[str]:
     if not sym: return None
@@ -139,18 +81,12 @@ def parse_strike(sym: str) -> Optional[float]:
     except Exception: return None
 
 def to_underlying(sym: str, hint: str="") -> str:
-    u=(hint or "").upper(); 
+    u=(hint or "").upper()
     if u: return "SPX" if u.startswith("SPX") else u
-    s=(sym or "").strip().upper(); 
+    s=(sym or "").strip().upper()
     if not s: return ""
     p0=s.split()[0]
     return "SPX" if p0.startswith("SPX") else p0
-
-def contract_multiplier(symbol: str, underlying: str) -> int:
-    s=(symbol or "").upper(); u=(underlying or "").upper()
-    if re.search(r"\d{6}[CP]\d{8}$", s): return 100
-    if u in {"SPX","SPXW","NDX","RUT","VIX","XSP"}: return 100
-    return 1
 
 def amount_from(qty: Optional[float], price: Optional[float], symbol: str, underlying: str):
     if qty is None or price is None: return None
@@ -184,7 +120,7 @@ def rows_from_ledger(txn: Dict[str,Any]) -> List[List[Any]]:
     out=[]; seen=set()
     for it in (txn.get("transferItems") or []):
         ins=it.get("instrument") or {}
-        if (str(ins.get("assetType") or "").upper()!="OPTION"): 
+        if (str(ins.get("assetType") or "").upper()!="OPTION"):
             continue
         symbol=str(ins.get("symbol") or "")
         underlying=to_underlying(symbol, ins.get("underlyingSymbol") or "")
@@ -204,7 +140,7 @@ def rows_from_ledger(txn: Dict[str,Any]) -> List[List[Any]]:
         amt=amount_from(qty, price, symbol, underlying)
 
         leg_key=(symbol, exp_primary, pc, strike, round(qty or 0.0,6), round(price or 0.0,6))
-        if leg_key in seen: 
+        if leg_key in seen:
             continue
         seen.add(leg_key)
         out.append([
@@ -217,8 +153,8 @@ def rows_from_ledger(txn: Dict[str,Any]) -> List[List[Any]]:
     return out
 
 def main():
-    svc,sid=_sa()
-    ensure_tab_with_header(svc,sid,RAW_TAB,RAW_HEADERS)
+    svc,sid=sheets_client()
+    ensure_tab(svc,sid,RAW_TAB,RAW_HEADERS)
 
     c, acct_hash = schwab_client()
 

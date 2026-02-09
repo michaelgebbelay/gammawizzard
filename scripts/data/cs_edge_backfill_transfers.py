@@ -18,10 +18,8 @@ Optional:
 
 import os
 import sys
-import json
 import math
 from datetime import datetime, timedelta, timezone, date
-from zoneinfo import ZoneInfo
 
 
 def _add_scripts_root():
@@ -39,22 +37,12 @@ def _add_scripts_root():
 
 _add_scripts_root()
 from schwab_token_keeper import schwab_client
-
-ET = ZoneInfo("America/New_York")
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+from lib.sheets import sheets_client, get_values
+from lib.parsing import ET, safe_float
 
 
 def truthy(s: str) -> bool:
     return str(s or "").strip().lower() in ("1", "true", "yes", "y", "on")
-
-
-def safe_float(x, default=None):
-    try:
-        if x is None:
-            return default
-        return float(x)
-    except Exception:
-        return default
 
 
 def ffloat_from(v, default=None):
@@ -87,23 +75,6 @@ def parse_iso_dt(s: str) -> datetime | None:
         return datetime.fromisoformat(raw)
     except Exception:
         return None
-
-
-def creds_from_env():
-    from google.oauth2 import service_account
-    raw = (os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip()
-    info = json.loads(raw)
-    return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
-
-
-def build_svc():
-    from googleapiclient.discovery import build
-    return build("sheets", "v4", credentials=creds_from_env(), cache_discovery=False)
-
-
-def read_all(svc, sid: str, title: str):
-    r = svc.spreadsheets().values().get(spreadsheetId=sid, range=f"{title}!A1:ZZ").execute()
-    return r.get("values") or []
 
 
 def write_all(svc, sid: str, title: str, values: list[list[str]]):
@@ -176,14 +147,13 @@ def llr_increment_normal(x: float, mu0: float, mu1: float, sigma: float) -> floa
 
 
 def main():
-    sid = (os.environ.get("GSHEET_ID") or "").strip()
     tab = (os.environ.get("CS_STATE_TAB") or "ConstantStableState").strip()
     start_raw = (os.environ.get("BACKFILL_START_DATE") or "2025-12-01").strip()
     start_date = date.fromisoformat(start_raw[:10])
     recompute_llr = truthy(os.environ.get("CS_EDGE_RECOMPUTE_LLR", "false"))
 
-    svc = build_svc()
-    data = read_all(svc, sid, tab)
+    svc, sid = sheets_client()
+    data = get_values(svc, sid, f"{tab}!A1:ZZ")
     if not data or len(data) < 2:
         print("No data to backfill.")
         return 0
