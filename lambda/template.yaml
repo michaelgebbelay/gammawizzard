@@ -51,6 +51,22 @@ Resources:
       DockerContext: ..
       DockerTag: latest
 
+  # ---------- Warm-up Schedule (3 min before trade) ----------
+  WarmupSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: gamma-cs-warmup
+      Description: "Warm up Lambda container 3 min before trading"
+      State: !Ref ScheduleState
+      ScheduleExpression: "cron(10 16 ? * MON-FRI *)"
+      ScheduleExpressionTimezone: "America/New_York"
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt TradingFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"account": "warmup"}'
+
   # ---------- EventBridge Schedules ----------
   SchwabSchedule:
     Type: AWS::Scheduler::Schedule

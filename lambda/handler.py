@@ -223,6 +223,11 @@ def lambda_handler(event, context):
     account = event.get("account", "")
     dry_run = event.get("dry_run", False)
 
+    # Warm-up ping — just loads the container, no work done
+    if account == "warmup":
+        print("WARMUP ping — container is warm")
+        return {"status": "ok", "account": "warmup", "duration_s": 0}
+
     if account not in ACCOUNTS:
         msg = f"Unknown account: {account!r}. Expected one of {list(ACCOUNTS)}"
         print(msg)
