@@ -39,6 +39,7 @@ jobs:
         run: |
           cd lambda && sam deploy \
             --stack-name gamma-trading \
+            --resolve-s3 \
             --resolve-image-repos \
             --capabilities CAPABILITY_IAM \
             --no-confirm-changeset \
