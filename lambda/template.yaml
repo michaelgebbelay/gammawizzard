@@ -47,7 +47,7 @@ Resources:
               Action: ssm:PutParameter
               Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/gamma/*/token_json"
     Metadata:
-      Dockerfile: Dockerfile
+      Dockerfile: lambda/Dockerfile
       DockerContext: ..
       DockerTag: latest
 
