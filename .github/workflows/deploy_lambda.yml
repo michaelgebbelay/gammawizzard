@@ -1,0 +1,48 @@
+name: Deploy Trading Lambda
+
+on:
+  workflow_dispatch:
+    inputs:
+      schedule_state:
+        description: "Enable or disable schedules"
+        type: choice
+        options: [ENABLED, DISABLED]
+        default: DISABLED
+      dry_run:
+        description: "Dry run (no real orders)"
+        type: choice
+        options: ["true", "false"]
+        default: "true"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: SAM build
+        run: cd lambda && sam build
+
+      - name: SAM deploy
+        run: |
+          cd lambda && sam deploy \
+            --stack-name gamma-trading \
+            --resolve-image-repos \
+            --capabilities CAPABILITY_IAM \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              ScheduleState=${{ github.event.inputs.schedule_state }} \
+              DryRun=${{ github.event.inputs.dry_run }}

@@ -1,0 +1,129 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  ConstantStableVerticals trading Lambda.
+  Three EventBridge schedules invoke one container-image Lambda
+  with different payloads (schwab, tt-ira, tt-individual).
+
+Parameters:
+  ScheduleState:
+    Type: String
+    Default: ENABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: Toggle schedules on/off without deleting them.
+  ScheduleTime:
+    Type: String
+    Default: "cron(13 16 ? * MON-FRI *)"
+    Description: Cron expression for trade trigger (ET).
+  DryRun:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Pass dry_run=true to handler (no real orders).
+
+Globals:
+  Function:
+    Timeout: 120
+    MemorySize: 1024
+
+Resources:
+
+  # ---------- Lambda Function ----------
+  TradingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      PackageType: Image
+      Architectures: [x86_64]
+      Environment:
+        Variables:
+          DRY_RUN: !Ref DryRun
+      Policies:
+        # Read all /gamma/* params
+        - SSMParameterReadPolicy:
+            ParameterName: "gamma/*"
+        # Write tokens back after refresh
+        - Statement:
+            - Effect: Allow
+              Action: ssm:PutParameter
+              Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/gamma/*/token_json"
+    Metadata:
+      Dockerfile: Dockerfile
+      DockerContext: ..
+      DockerTag: latest
+
+  # ---------- EventBridge Schedules ----------
+  SchwabSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: gamma-cs-schwab
+      Description: "ConstantStable Schwab account"
+      State: !Ref ScheduleState
+      ScheduleExpression: !Ref ScheduleTime
+      ScheduleExpressionTimezone: "America/New_York"
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt TradingFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"account": "schwab"}'
+
+  TtIraSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: gamma-cs-tt-ira
+      Description: "ConstantStable TT IRA (5WT20360)"
+      State: !Ref ScheduleState
+      ScheduleExpression: !Ref ScheduleTime
+      ScheduleExpressionTimezone: "America/New_York"
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt TradingFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"account": "tt-ira"}'
+
+  TtIndividualSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: gamma-cs-tt-individual
+      Description: "ConstantStable TT Individual (5WT09219)"
+      State: !Ref ScheduleState
+      ScheduleExpression: !Ref ScheduleTime
+      ScheduleExpressionTimezone: "America/New_York"
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt TradingFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"account": "tt-individual"}'
+
+  # ---------- IAM Role for EventBridge Scheduler ----------
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: InvokeTradingLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt TradingFunction.Arn
+
+Outputs:
+  FunctionArn:
+    Description: "Trading Lambda ARN"
+    Value: !GetAtt TradingFunction.Arn
+  FunctionName:
+    Description: "Trading Lambda name (for manual invoke)"
+    Value: !Ref TradingFunction
