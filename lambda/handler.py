@@ -59,7 +59,7 @@ ACCOUNTS = {
             "TT_TOKEN_PATH": "/tmp/tt_token.json",
             "TT_QUOTE_TOKEN_PATH": "/tmp/tt_quote_token.json",
             "SCHWAB_TOKEN_PATH": "/tmp/schwab_token.json",
-            "CS_UNIT_DOLLARS": "7500",
+            "CS_UNIT_DOLLARS": "10000",
         },
     },
     "tt-individual": {
@@ -81,7 +81,7 @@ ACCOUNTS = {
             "TT_TOKEN_PATH": "/tmp/tt_token.json",
             "TT_QUOTE_TOKEN_PATH": "/tmp/tt_quote_token.json",
             "SCHWAB_TOKEN_PATH": "/tmp/schwab_token.json",
-            "CS_UNIT_DOLLARS": "7500",
+            "CS_UNIT_DOLLARS": "10000",
         },
     },
 }
