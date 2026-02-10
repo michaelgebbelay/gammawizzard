@@ -557,6 +557,17 @@ def main():
         print("CS_VERT_RUN SKIP: no verticals to trade (LeftGo/RightGo zero or vix_mult=0).")
         return 0
 
+    # RR credit reduction: when mult >= 5 and sides differ (one DEBIT, one CREDIT),
+    # reduce the credit side to ~60% of full target.
+    CS_RR_CREDIT_RATIO = float(os.environ.get("CS_RR_CREDIT_RATIO", "0.6"))
+    if v_put and v_call and int(vix_mult) >= 5 and v_put["side"] != v_call["side"]:
+        full_target = max(1, units * int(vix_mult))
+        credit_target = max(1, round(full_target * CS_RR_CREDIT_RATIO))
+        for v in (v_put, v_call):
+            if v["side"] == "CREDIT":
+                print(f"CS_VERT_RUN RR_CREDIT_REDUCE: {v['name']} target {full_target} → {credit_target} (ratio={CS_RR_CREDIT_RATIO} mult={vix_mult})")
+                v["target_qty"] = credit_target
+
     # Load positions once if needed (guard and/or topup)
     need_positions = CS_GUARD_NO_CLOSE or CS_TOPUP
     pos = None

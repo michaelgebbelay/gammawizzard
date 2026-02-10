@@ -93,7 +93,7 @@ COMMON_ENV = {
     "GW_ENDPOINT": "rapi/GetUltraPureConstantStable",
     "CS_VOL_FIELD": "VixOne",
     "CS_VIX_BREAKS": "0.1636779,0.3276571,0.3702533,0.4514141",
-    "CS_VIX_MULTS": "1,2,4,8,10",
+    "CS_VIX_MULTS": "2,3,5,8,10",
     "CS_LOG_PATH": "/tmp/cs_trades.csv",
     "CS_GUARD_NO_CLOSE": "1",
     "CS_GUARD_FAIL_ACTION": "SKIP_ALL",
