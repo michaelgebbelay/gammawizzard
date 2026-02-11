@@ -24,8 +24,10 @@ ACCOUNTS = {
     "schwab": {
         "orchestrator": "scripts/trade/ConstantStable/orchestrator.py",
         "post_steps": [
+            "scripts/data/cs_gw_signal_to_gsheet.py",
             "scripts/data/cs_trades_to_gsheet.py",
             "scripts/data/cs_tracking_to_gsheet.py",
+            "scripts/data/cs_backfill_20260211.py",
             "scripts/data/cs_summary_to_gsheet.py",
             "scripts/trade/ConstantStable/edge_guard.py",
         ],
@@ -45,6 +47,7 @@ ACCOUNTS = {
     "tt-ira": {
         "orchestrator": "TT/Script/ConstantStable/orchestrator.py",
         "post_steps": [
+            "scripts/data/cs_gw_signal_to_gsheet.py",
             "TT/data/cs_trades_to_gsheet.py",
             "scripts/data/cs_tracking_to_gsheet.py",
             "scripts/data/cs_backfill_20260211.py",
@@ -75,6 +78,7 @@ ACCOUNTS = {
     "tt-individual": {
         "orchestrator": "TT/Script/ConstantStable/orchestrator.py",
         "post_steps": [
+            "scripts/data/cs_gw_signal_to_gsheet.py",
             "TT/data/cs_trades_to_gsheet.py",
             "scripts/data/cs_tracking_to_gsheet.py",
             "scripts/data/cs_summary_to_gsheet.py",
@@ -113,6 +117,7 @@ COMMON_ENV = {
     "CS_GUARD_NO_CLOSE": "1",
     "CS_GUARD_FAIL_ACTION": "SKIP_ALL",
     "CS_TOPUP_ENABLE": "1",
+    "CS_GW_SIGNAL_TAB": "GW_Signal",
     "CS_EDGE_GSHEET_TAB": "ConstantStableEdge",
     "CS_TRACKING_TAB": "CS_Tracking",
     "CS_SUMMARY_TAB": "CS_Summary",

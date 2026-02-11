@@ -704,7 +704,7 @@ def log_row(row: dict):
         "ts_utc","ts_et","trade_date","tdate",
         "name","kind","side","direction",
         "short_osi","long_osi",
-        "go","strength",
+        "go","strength","gw_price",
         "qty_rule","vol_field","vol_used","vol_value","vol_bucket","vol_mult",
         "unit_dollars","oc","units",
         "qty_requested","qty_filled",
@@ -1399,6 +1399,7 @@ def main():
         "qty": max(1, int(os.environ.get("VERT_QTY", "1"))),
         "go": os.environ.get("VERT_GO", ""),
         "strength": os.environ.get("VERT_STRENGTH", ""),
+        "gw_price": os.environ.get("VERT_GW_PRICE", ""),
     }
 
     # passthrough for logging (shared)
@@ -1425,6 +1426,7 @@ def main():
             "long_osi": os.environ.get("VERT2_LONG_OSI", ""),
             "go": os.environ.get("VERT2_GO", ""),
             "strength": os.environ.get("VERT2_STRENGTH", ""),
+            "gw_price": os.environ.get("VERT2_GW_PRICE", ""),
         }
         qty = v1["qty"]  # common qty
         mode_label = "PAIR" if pair_mode else "BUNDLE4"
@@ -1462,7 +1464,7 @@ def main():
                 "trade_date": trade_date, "tdate": tdate,
                 "name": v["name"], "kind": v["kind"], "side": v["side"], "direction": v["direction"],
                 "short_osi": v["short_osi"], "long_osi": v["long_osi"],
-                "go": v.get("go", ""), "strength": v.get("strength", ""),
+                "go": v.get("go", ""), "strength": v.get("strength", ""), "gw_price": v.get("gw_price", ""),
                 "qty_rule": qty_rule,
                 "vol_field": vol_field, "vol_used": vol_used, "vol_value": vol_value,
                 "vol_bucket": vol_bucket, "vol_mult": vol_mult,
@@ -1516,7 +1518,7 @@ def main():
                 "trade_date": trade_date, "tdate": tdate,
                 "name": v["name"], "kind": v["kind"], "side": v["side"], "direction": v["direction"],
                 "short_osi": v["short_osi"], "long_osi": v["long_osi"],
-                "go": v.get("go", ""), "strength": v.get("strength", ""),
+                "go": v.get("go", ""), "strength": v.get("strength", ""), "gw_price": v.get("gw_price", ""),
                 "qty_rule": qty_rule,
                 "vol_field": vol_field, "vol_used": vol_used, "vol_value": vol_value,
                 "vol_bucket": vol_bucket, "vol_mult": vol_mult,
@@ -1636,7 +1638,7 @@ def main():
                 "trade_date": trade_date, "tdate": tdate,
                 "name": v["name"], "kind": v["kind"], "side": v["side"], "direction": v["direction"],
                 "short_osi": v["short_osi"], "long_osi": v["long_osi"],
-                "go": v.get("go", ""), "strength": v.get("strength", ""),
+                "go": v.get("go", ""), "strength": v.get("strength", ""), "gw_price": v.get("gw_price", ""),
                 "qty_rule": qty_rule,
                 "vol_field": vol_field, "vol_used": vol_used, "vol_value": vol_value,
                 "vol_bucket": vol_bucket, "vol_mult": vol_mult,

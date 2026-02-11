@@ -559,6 +559,10 @@ def main():
     put_strength = left_imp if left_imp is not None else (abs(left_go) if left_go is not None else 0.0)
     call_strength = right_imp if right_imp is not None else (abs(right_go) if right_go is not None else 0.0)
 
+    # GW recommended spread prices (for fill quality comparison)
+    gw_put_price = fnum(tr.get("Put"))
+    gw_call_price = fnum(tr.get("Call"))
+
     # Vol bucket sizing
     field_used, vol_val = pick_vol_value(tr, CS_VOL_FIELD)
     bucket, vix_mult = vix_bucket_and_mult(vol_val, CS_VIX_BREAKS, CS_VIX_MULTS)
@@ -692,6 +696,8 @@ def main():
 
     def env_for_vertical(v: Dict[str, Any]) -> Dict[str, str]:
         strength_s = f"{float(v['strength']):.3f}"
+        # GW price for this vertical's kind
+        gw_px = gw_put_price if v["kind"] == "PUT" else gw_call_price
         e = dict(os.environ)
         e.update({
             "VERT_SIDE":         v["side"],
@@ -705,6 +711,7 @@ def main():
             "VERT_STRENGTH":     strength_s,
             "VERT_TRADE_DATE":   trade_date,
             "VERT_TDATE":        tdate_iso,
+            "VERT_GW_PRICE":     "" if gw_px is None else str(gw_px),
 
             # sizing context
             "VERT_UNIT_DOLLARS": str(CS_UNIT_DOLLARS),
@@ -751,6 +758,7 @@ def main():
                 "VERT2_QTY":        str(q_put),
                 "VERT2_GO":         "" if v_put_f.get("go") is None else str(v_put_f["go"]),
                 "VERT2_STRENGTH":   f"{float(v_put_f['strength']):.3f}",
+                "VERT2_GW_PRICE":   "" if gw_put_price is None else str(gw_put_price),
             })
 
             rc = subprocess.call([sys.executable, "scripts/trade/ConstantStable/place.py"], env=env)

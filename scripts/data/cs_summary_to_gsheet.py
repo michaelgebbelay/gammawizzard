@@ -183,7 +183,11 @@ def compute_daily_detail(rows: list[dict]) -> list[list[str]]:
     result = []
     for dt in sorted(by_date.keys(), reverse=True):
         accts = by_date[dt]
-        row_out = [dt]
+        # GW price is same for all accounts; grab from first available
+        any_row = next(iter(accts.values()), {})
+        gw_put = any_row.get("gw_put_price", "")
+        gw_call = any_row.get("gw_call_price", "")
+        row_out = [dt, gw_put, gw_call]
         for acct in ACCOUNT_ORDER:
             r = accts.get(acct)
             if r:
@@ -211,7 +215,7 @@ SUMMARY_HEADER = [
 ]
 
 DAILY_HEADER = [
-    "date",
+    "date", "gw_put", "gw_call",
     "schw_put", "schw_call", "schw_put_px", "schw_call_px", "schw_put_imp", "schw_call_imp", "schw_cost",
     "ira_put", "ira_call", "ira_put_px", "ira_call_px", "ira_put_imp", "ira_call_imp", "ira_cost",
     "ind_put", "ind_call", "ind_put_px", "ind_call_px", "ind_put_imp", "ind_call_imp", "ind_cost",

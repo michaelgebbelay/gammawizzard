@@ -39,6 +39,7 @@ SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 TRACKING_HEADER = [
     "date", "expiry", "account",
     "put_go", "call_go", "put_strikes", "call_strikes",
+    "gw_put_price", "gw_call_price",
     "put_spread_price", "call_spread_price",
     "vix_value", "vol_bucket", "vix_mult", "units",
     "put_side", "put_target", "call_side", "call_target",
@@ -285,6 +286,8 @@ def aggregate_rows(csv_rows, account_label: str, cost_per_contract: float):
             "call_go": val(cr, "go"),
             "put_strikes": strikes_str(pr),
             "call_strikes": strikes_str(cr),
+            "gw_put_price": val(pr, "gw_price"),
+            "gw_call_price": val(cr, "gw_price"),
             "put_spread_price": spread_price(pr) if pr else "",
             "call_spread_price": spread_price(cr) if cr else "",
             "vix_value": val(ref, "vol_value"),
