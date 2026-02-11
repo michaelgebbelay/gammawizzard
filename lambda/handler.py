@@ -25,6 +25,7 @@ ACCOUNTS = {
         "orchestrator": "scripts/trade/ConstantStable/orchestrator.py",
         "post_steps": [
             "scripts/data/cs_trades_to_gsheet.py",
+            "scripts/data/cs_tracking_to_gsheet.py",
             "scripts/trade/ConstantStable/edge_guard.py",
         ],
         "token_ssm_path": "/gamma/schwab/token_json",
@@ -36,12 +37,15 @@ ACCOUNTS = {
         "static_env": {
             "SCHWAB_TOKEN_PATH": "/tmp/schwab_token.json",
             "CS_UNIT_DOLLARS": "10000",
+            "CS_ACCOUNT_LABEL": "schwab",
+            "CS_COST_PER_CONTRACT": "0.65",
         },
     },
     "tt-ira": {
         "orchestrator": "TT/Script/ConstantStable/orchestrator.py",
         "post_steps": [
             "TT/data/cs_trades_to_gsheet.py",
+            "scripts/data/cs_tracking_to_gsheet.py",
             "TT/Script/ConstantStable/edge_guard.py",
         ],
         "token_ssm_path": "/gamma/tt/token_json",
@@ -60,12 +64,15 @@ ACCOUNTS = {
             "TT_QUOTE_TOKEN_PATH": "/tmp/tt_quote_token.json",
             "SCHWAB_TOKEN_PATH": "/tmp/schwab_token.json",
             "CS_UNIT_DOLLARS": "10000",
+            "CS_ACCOUNT_LABEL": "tt-ira",
+            "CS_COST_PER_CONTRACT": "1.00",
         },
     },
     "tt-individual": {
         "orchestrator": "TT/Script/ConstantStable/orchestrator.py",
         "post_steps": [
             "TT/data/cs_trades_to_gsheet.py",
+            "scripts/data/cs_tracking_to_gsheet.py",
             "TT/Script/ConstantStable/edge_guard.py",
         ],
         "token_ssm_path": "/gamma/tt/token_json",
@@ -82,6 +89,8 @@ ACCOUNTS = {
             "TT_QUOTE_TOKEN_PATH": "/tmp/tt_quote_token.json",
             "SCHWAB_TOKEN_PATH": "/tmp/schwab_token.json",
             "CS_UNIT_DOLLARS": "10000",
+            "CS_ACCOUNT_LABEL": "tt-individual",
+            "CS_COST_PER_CONTRACT": "1.00",
         },
     },
 }
@@ -99,6 +108,7 @@ COMMON_ENV = {
     "CS_GUARD_FAIL_ACTION": "SKIP_ALL",
     "CS_TOPUP_ENABLE": "1",
     "CS_EDGE_GSHEET_TAB": "ConstantStableEdge",
+    "CS_TRACKING_TAB": "CS_Tracking",
     "VERT_STEP_WAIT": "20",
     "VERT_POLL_SECS": "2.0",
     "VERT_CANCEL_SETTLE": "1.0",
