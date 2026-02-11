@@ -26,6 +26,7 @@ ACCOUNTS = {
         "post_steps": [
             "scripts/data/cs_trades_to_gsheet.py",
             "scripts/data/cs_tracking_to_gsheet.py",
+            "scripts/data/cs_summary_to_gsheet.py",
             "scripts/trade/ConstantStable/edge_guard.py",
         ],
         "token_ssm_path": "/gamma/schwab/token_json",
@@ -46,6 +47,8 @@ ACCOUNTS = {
         "post_steps": [
             "TT/data/cs_trades_to_gsheet.py",
             "scripts/data/cs_tracking_to_gsheet.py",
+            "scripts/data/cs_backfill_20260211.py",
+            "scripts/data/cs_summary_to_gsheet.py",
             "TT/Script/ConstantStable/edge_guard.py",
         ],
         "token_ssm_path": "/gamma/tt/token_json",
@@ -74,6 +77,7 @@ ACCOUNTS = {
         "post_steps": [
             "TT/data/cs_trades_to_gsheet.py",
             "scripts/data/cs_tracking_to_gsheet.py",
+            "scripts/data/cs_summary_to_gsheet.py",
             "TT/Script/ConstantStable/edge_guard.py",
         ],
         "token_ssm_path": "/gamma/tt/token_json",
@@ -111,6 +115,7 @@ COMMON_ENV = {
     "CS_TOPUP_ENABLE": "1",
     "CS_EDGE_GSHEET_TAB": "ConstantStableEdge",
     "CS_TRACKING_TAB": "CS_Tracking",
+    "CS_SUMMARY_TAB": "CS_Summary",
     "VERT_STEP_WAIT": "20",
     "VERT_POLL_SECS": "2.0",
     "VERT_CANCEL_SETTLE": "1.0",
