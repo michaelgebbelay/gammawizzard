@@ -1007,10 +1007,13 @@ def place_two_verticals_alternating(
             print(f"CS_VERT_PLACE ERROR posting order: {e}")
             return {"oid": "", "cur_qty": 0, "reason": "POST_FAIL", "last_price": price}
         oid = parse_order_id(r)
-        return {"oid": oid, "cur_qty": remaining, "reason": "PLACED", "last_price": price}
+        return {"oid": oid, "cur_qty": remaining, "reason": "PLACED", "last_price": price,
+                "nbbo_bid": b, "nbbo_ask": a, "nbbo_mid": m}
 
-    s1 = {"qty_total": qty1, "filled": 0, "order_ids": [], "danger": False, "last_price": None}
-    s2 = {"qty_total": qty2, "filled": 0, "order_ids": [], "danger": False, "last_price": None}
+    s1 = {"qty_total": qty1, "filled": 0, "order_ids": [], "danger": False, "last_price": None,
+          "nbbo_bid": None, "nbbo_ask": None, "nbbo_mid": None}
+    s2 = {"qty_total": qty2, "filled": 0, "order_ids": [], "danger": False, "last_price": None,
+          "nbbo_bid": None, "nbbo_ask": None, "nbbo_mid": None}
     strikes_changed = False
     exp_put, exp_call = expected_inner_strikes(v2 if v2["kind"] == "PUT" else v1, v1 if v1["kind"] == "CALL" else v2)
 
@@ -1027,6 +1030,10 @@ def place_two_verticals_alternating(
             o1["oid"] = r1["oid"]
             o1["cur_qty"] = r1["cur_qty"]
             s1["last_price"] = r1.get("last_price")
+            if s1["nbbo_mid"] is None:
+                s1["nbbo_bid"] = r1.get("nbbo_bid")
+                s1["nbbo_ask"] = r1.get("nbbo_ask")
+                s1["nbbo_mid"] = r1.get("nbbo_mid")
             if o1["oid"]:
                 s1["order_ids"].append(o1["oid"])
         if s2["filled"] < s2["qty_total"] and i < len(offs2):
@@ -1035,6 +1042,10 @@ def place_two_verticals_alternating(
             o2["oid"] = r2["oid"]
             o2["cur_qty"] = r2["cur_qty"]
             s2["last_price"] = r2.get("last_price")
+            if s2["nbbo_mid"] is None:
+                s2["nbbo_bid"] = r2.get("nbbo_bid")
+                s2["nbbo_ask"] = r2.get("nbbo_ask")
+                s2["nbbo_mid"] = r2.get("nbbo_mid")
             if o2["oid"]:
                 s2["order_ids"].append(o2["oid"])
 
@@ -1121,6 +1132,9 @@ def place_two_verticals_alternating(
             "danger": st["danger"],
             "ladder_plan": ladder_plan,
             "last_price": st["last_price"],
+            "nbbo_bid": st["nbbo_bid"],
+            "nbbo_ask": st["nbbo_ask"],
+            "nbbo_mid": st["nbbo_mid"],
         }
 
     return finalize(s1, ladder_plan_1), finalize(s2, ladder_plan_2)
@@ -1292,7 +1306,9 @@ def main():
                 "qty_requested": qty_req, "qty_filled": r_filled,
                 "ladder_prices": r_ladder,
                 "last_price": f"{r_last_price:.2f}" if r_last_price is not None else "",
-                "nbbo_bid": "", "nbbo_ask": "", "nbbo_mid": "",
+                "nbbo_bid": f"{r['nbbo_bid']:.2f}" if r.get("nbbo_bid") is not None else "",
+                "nbbo_ask": f"{r['nbbo_ask']:.2f}" if r.get("nbbo_ask") is not None else "",
+                "nbbo_mid": f"{r['nbbo_mid']:.2f}" if r.get("nbbo_mid") is not None else "",
                 "order_ids": r_order_ids,
                 "reason": r["reason"],
             }

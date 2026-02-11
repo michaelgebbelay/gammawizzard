@@ -44,6 +44,7 @@ TRACKING_HEADER = [
     "put_side", "put_target", "call_side", "call_target",
     "put_filled", "put_fill_price", "put_status",
     "call_filled", "call_fill_price", "call_status",
+    "put_improvement", "call_improvement",
     "cost_per_contract", "put_cost", "call_cost", "total_cost",
 ]
 
@@ -235,6 +236,27 @@ def aggregate_rows(csv_rows, account_label: str, cost_per_contract: float):
                 return f"{lo}/{hi}"
             return ""
 
+        # Fill quality: improvement vs NBBO mid (positive = favorable)
+        # CREDIT: got more credit than mid -> fill_price - mid
+        # DEBIT:  paid less than mid -> mid - fill_price
+        def calc_improvement(row, side_str: str) -> str:
+            if not row:
+                return ""
+            fill_s = (row.get("last_price") or "").strip()
+            mid_s = (row.get("nbbo_mid") or "").strip()
+            if not fill_s or not mid_s:
+                return ""
+            try:
+                fill = float(fill_s)
+                mid = float(mid_s)
+                side = (side_str or "").upper()
+                if side == "CREDIT":
+                    return f"{fill - mid:.2f}"
+                else:
+                    return f"{mid - fill:.2f}"
+            except (ValueError, TypeError):
+                return ""
+
         # Cost: cost_per_contract * filled * 2 legs
         def calc_cost(filled_str: str) -> str:
             try:
@@ -279,6 +301,8 @@ def aggregate_rows(csv_rows, account_label: str, cost_per_contract: float):
             "call_filled": call_filled,
             "call_fill_price": val(cr, "last_price"),
             "call_status": val(cr, "reason"),
+            "put_improvement": calc_improvement(pr, val(pr, "side")),
+            "call_improvement": calc_improvement(cr, val(cr, "side")),
             "cost_per_contract": f"{cost_per_contract:.2f}",
             "put_cost": put_cost,
             "call_cost": call_cost,
