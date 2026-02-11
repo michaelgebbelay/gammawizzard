@@ -580,11 +580,17 @@ def parse_order_id(r):
         j = r.json()
         if isinstance(j, dict):
             data = j.get("data") if isinstance(j.get("data"), dict) else j
+            # TT nests order ID under data.order.id on success
+            if isinstance(data.get("order"), dict):
+                oid = data["order"].get("id")
+                if oid:
+                    return str(oid)
             oid = data.get("id") or data.get("orderId") or data.get("order_id")
             if oid:
                 return str(oid)
-    except Exception:
-        pass
+        print(f"CS_VERT_PLACE WARN: parse_order_id empty — response: {(r.text or '')[:300]}")
+    except Exception as e:
+        print(f"CS_VERT_PLACE WARN: parse_order_id failed: {e} — response: {(r.text or '')[:200]}")
     loc = r.headers.get("Location", "")
     return loc.rstrip("/").split("/")[-1] if loc else ""
 
