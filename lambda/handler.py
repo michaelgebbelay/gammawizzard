@@ -66,6 +66,7 @@ ACCOUNTS = {
             "CS_UNIT_DOLLARS": "10000",
             "CS_ACCOUNT_LABEL": "tt-ira",
             "CS_COST_PER_CONTRACT": "1.00",
+            "VERT_MAX_QTY_PER_SIDE": "5",
         },
     },
     "tt-individual": {
@@ -91,6 +92,7 @@ ACCOUNTS = {
             "CS_UNIT_DOLLARS": "10000",
             "CS_ACCOUNT_LABEL": "tt-individual",
             "CS_COST_PER_CONTRACT": "1.00",
+            "VERT_MAX_QTY_PER_SIDE": "5",
         },
     },
 }

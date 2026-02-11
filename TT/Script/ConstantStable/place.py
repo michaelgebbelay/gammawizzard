@@ -1305,6 +1305,13 @@ def place_two_verticals_alternating(
 
         if s1["filled"] >= s1["qty_total"] and s2["filled"] >= s2["qty_total"]:
             break
+
+        # Cumulative safety: abort if fills already hit the hard cap
+        max_cap = int(os.environ.get("VERT_MAX_QTY_PER_SIDE", "0"))
+        if max_cap > 0 and (s1["filled"] >= max_cap or s2["filled"] >= max_cap):
+            print(f"CS_VERT_PLACE SAFETY_ABORT: filled s1={s1['filled']} s2={s2['filled']} cap={max_cap}")
+            break
+
         repeat_count = 0
         i += 1
 
@@ -1464,10 +1471,17 @@ def main():
         print("CS_VERT_PLACE DONE (DRY_RUN)")
         return 0
 
+    # ---------- per-side safety cap ----------
+    max_per_side = int(os.environ.get("VERT_MAX_QTY_PER_SIDE", "0"))
+    if max_per_side > 0 and qty > max_per_side:
+        print(f"CS_VERT_PLACE SAFETY_CAP: qty {qty} -> {max_per_side} (VERT_MAX_QTY_PER_SIDE)")
+        qty = max_per_side
+        v1["qty"] = qty
+
     # ---------- run placement ----------
     if pair_mode and v2:
-        qty1 = max(1, int(os.environ.get("VERT_QTY", "1")))
-        qty2 = max(1, int(os.environ.get("VERT2_QTY", str(qty1))))
+        qty1 = max(1, min(int(os.environ.get("VERT_QTY", "1")), max_per_side or 999))
+        qty2 = max(1, min(int(os.environ.get("VERT2_QTY", str(qty1))), max_per_side or 999))
 
         res_v1, res_v2 = place_two_verticals_alternating(
             c=c,
