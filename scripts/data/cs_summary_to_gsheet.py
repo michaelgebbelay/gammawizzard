@@ -20,6 +20,7 @@ Env:
   GSHEET_ID                    - spreadsheet ID
   GOOGLE_SERVICE_ACCOUNT_JSON  - full JSON string for service account
   CS_TRACKING_TAB              - source tab (default "CS_Tracking")
+  CS_GW_SIGNAL_TAB             - GW signal tab (default "GW_Signal")
   CS_SUMMARY_TAB               - target tab (default "CS_Summary")
   CS_GSHEET_STRICT             - "1" to fail hard on errors
 """
@@ -127,7 +128,33 @@ def signed_price(price_str: str, side_str: str) -> str:
 # Daily detail computation
 # ---------------------------------------------------------------------------
 
-def compute_daily_detail(rows: list[dict]) -> list[tuple]:
+def read_gw_signal(svc, spreadsheet_id: str, tab: str) -> dict:
+    """Read GW_Signal tab and return {date: {put_price, call_price}}."""
+    try:
+        resp = svc.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id, range=f"{tab}!A1:ZZ"
+        ).execute()
+        all_rows = resp.get("values") or []
+        if len(all_rows) < 2:
+            return {}
+        header = all_rows[0]
+        result = {}
+        for vals in all_rows[1:]:
+            d = {header[i]: (vals[i] if i < len(vals) else "") for i in range(len(header))}
+            dt = (d.get("date") or "").strip()
+            if dt:
+                result[dt] = {
+                    "put_price": (d.get("put_price") or "").strip(),
+                    "call_price": (d.get("call_price") or "").strip(),
+                }
+        log(f"read {len(result)} GW signal rows")
+        return result
+    except Exception as e:
+        log(f"WARN — could not read GW_Signal: {e}")
+        return {}
+
+
+def compute_daily_detail(rows: list[dict], gw_signal: dict) -> list[tuple]:
     """Build daily pivot: one row per date with GW + 3 accounts side by side.
 
     Returns list of (date, gw_group, [schwab_group, ira_group, ind_group])
@@ -143,12 +170,14 @@ def compute_daily_detail(rows: list[dict]) -> list[tuple]:
     result = []
     for dt in sorted(by_date.keys(), reverse=True):
         accts = by_date[dt]
-        # GW prices and sides: same across all accounts, grab from first available
         any_row = next(iter(accts.values()), {})
         put_side = (any_row.get("put_side") or "").strip()
         call_side = (any_row.get("call_side") or "").strip()
-        gw_put = signed_price(any_row.get("gw_put_price", ""), put_side)
-        gw_call = signed_price(any_row.get("gw_call_price", ""), call_side)
+
+        # GW prices from GW_Signal tab (authoritative source)
+        gw = gw_signal.get(dt, {})
+        gw_put = signed_price(gw.get("put_price", ""), put_side)
+        gw_call = signed_price(gw.get("call_price", ""), call_side)
         gw_group = ["1", gw_put, gw_call]
 
         account_groups = []
@@ -191,6 +220,7 @@ def main() -> int:
         return fail("SA creds missing", 2) if strict else skip("SA creds missing")
 
     tracking_tab = (os.environ.get("CS_TRACKING_TAB") or "CS_Tracking").strip()
+    gw_signal_tab = (os.environ.get("CS_GW_SIGNAL_TAB") or "GW_Signal").strip()
     summary_tab = (os.environ.get("CS_SUMMARY_TAB") or "CS_Summary").strip()
 
     try:
@@ -215,8 +245,11 @@ def main() -> int:
 
         log(f"read {len(rows)} tracking rows")
 
+        # Read GW signal prices (authoritative source for GW put_price/call_price)
+        gw_signal = read_gw_signal(svc, spreadsheet_id, gw_signal_tab)
+
         # Compute daily detail
-        daily_rows = compute_daily_detail(rows)
+        daily_rows = compute_daily_detail(rows, gw_signal)
         if not daily_rows:
             return skip("no daily data")
 
