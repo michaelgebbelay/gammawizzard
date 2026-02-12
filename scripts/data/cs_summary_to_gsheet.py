@@ -264,15 +264,12 @@ def main() -> int:
              "values": [COLUMN_HEADER]},
         ]
 
-        # Clear old data in data columns only (preserve formula columns E, I, M, Q)
+        # Clear old data + formulas in all columns A:Q
         clear_to = DATA_START_ROW + len(daily_rows) + 100
         svc.spreadsheets().values().batchClear(
             spreadsheetId=spreadsheet_id,
             body={"ranges": [
-                f"{summary_tab}!A{DATA_START_ROW}:D{clear_to}",
-                f"{summary_tab}!F{DATA_START_ROW}:H{clear_to}",
-                f"{summary_tab}!J{DATA_START_ROW}:L{clear_to}",
-                f"{summary_tab}!N{DATA_START_ROW}:P{clear_to}",
+                f"{summary_tab}!A{DATA_START_ROW}:Q{clear_to}",
             ]},
         ).execute()
 
@@ -301,11 +298,36 @@ def main() -> int:
                 "values": [account_groups[2]],
             })
 
-        # Write headers + data in one batch
+        # Write headers + data in one batch (RAW so dates stay as strings)
         all_updates = header_updates + data_updates
         svc.spreadsheets().values().batchUpdate(
             spreadsheetId=spreadsheet_id,
             body={"valueInputOption": "RAW", "data": all_updates},
+        ).execute()
+
+        # Write "Total with comm" formulas in E/I/M/Q (USER_ENTERED for formulas)
+        formula_updates = []
+        for i in range(len(daily_rows)):
+            r = DATA_START_ROW + i
+            formula_updates.append({
+                "range": f"{summary_tab}!E{r}",
+                "values": [[f"=B{r}*(C{r}+D{r})"]],
+            })
+            formula_updates.append({
+                "range": f"{summary_tab}!I{r}",
+                "values": [[f"=(F{r}*(G{r}+H{r}))+0.97*F{r}*4"]],
+            })
+            formula_updates.append({
+                "range": f"{summary_tab}!M{r}",
+                "values": [[f"=(J{r}*(K{r}+L{r}))+1.72*J{r}*4"]],
+            })
+            formula_updates.append({
+                "range": f"{summary_tab}!Q{r}",
+                "values": [[f"=(N{r}*(O{r}+P{r}))+1.72*N{r}*4"]],
+            })
+        svc.spreadsheets().values().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"valueInputOption": "USER_ENTERED", "data": formula_updates},
         ).execute()
 
         log(f"wrote {len(daily_rows)} daily rows to {summary_tab}")
