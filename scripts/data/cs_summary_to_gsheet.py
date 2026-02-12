@@ -109,6 +109,71 @@ def ensure_sheet_tab(svc, sid: str, title: str) -> int:
     return int(r["replies"][0]["addSheet"]["properties"]["sheetId"])
 
 
+# --- Account group colors (RGB 0-1 scale) ---
+COLOR_GW   = {"red": 0.851, "green": 0.918, "blue": 0.827}  # light green
+COLOR_SCHW = {"red": 0.788, "green": 0.855, "blue": 0.973}  # light blue
+COLOR_IRA  = {"red": 0.851, "green": 0.918, "blue": 0.827}  # light green
+COLOR_IND  = {"red": 1.0,   "green": 0.949, "blue": 0.800}  # light yellow
+
+
+def apply_formatting(svc, spreadsheet_id: str, sheet_id: int, num_data_rows: int):
+    """Apply background colors and currency format to the summary tab."""
+    last_row = DATA_START_ROW + num_data_rows  # exclusive (0-indexed end)
+    top = SECTION_HEADER_ROW - 1               # 0-indexed start for colors
+
+    requests = []
+
+    # Background colors for each account group (section header through data)
+    for start_col, end_col, color in [
+        (1, 5, COLOR_GW),    # B:E
+        (5, 9, COLOR_SCHW),  # F:I
+        (9, 13, COLOR_IRA),  # J:M
+        (13, 17, COLOR_IND), # N:Q
+    ]:
+        requests.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": top,
+                    "endRowIndex": last_row,
+                    "startColumnIndex": start_col,
+                    "endColumnIndex": end_col,
+                },
+                "cell": {"userEnteredFormat": {"backgroundColor": color}},
+                "fields": "userEnteredFormat.backgroundColor",
+            }
+        })
+
+    # Currency format ($#,##0.00) for price/total columns in data rows
+    data_top = COLUMN_HEADER_ROW  # 0-indexed row 10 = data starts at row 11
+    for start_col, end_col in [
+        (2, 5),   # C:E  (GW price put, price call, total)
+        (6, 9),   # G:I  (Schwab price put, price call, total)
+        (10, 13), # K:M  (TT IRA price put, price call, total)
+        (14, 17), # O:Q  (TT IND price put, price call, total)
+    ]:
+        requests.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": data_top,
+                    "endRowIndex": last_row,
+                    "startColumnIndex": start_col,
+                    "endColumnIndex": end_col,
+                },
+                "cell": {"userEnteredFormat": {
+                    "numberFormat": {"type": "CURRENCY", "pattern": "$#,##0.00"}
+                }},
+                "fields": "userEnteredFormat.numberFormat",
+            }
+        })
+
+    svc.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={"requests": requests},
+    ).execute()
+
+
 def signed_price(price_str: str, side_str: str) -> str:
     """Apply sign based on trade side: CREDIT = positive, DEBIT = negative."""
     if not price_str:
@@ -254,7 +319,7 @@ def main() -> int:
             return skip("no daily data")
 
         # Write to summary tab
-        ensure_sheet_tab(svc, spreadsheet_id, summary_tab)
+        sheet_id = ensure_sheet_tab(svc, spreadsheet_id, summary_tab)
 
         # Write section + column headers (rows 9-10)
         header_updates = [
@@ -329,6 +394,9 @@ def main() -> int:
             spreadsheetId=spreadsheet_id,
             body={"valueInputOption": "USER_ENTERED", "data": formula_updates},
         ).execute()
+
+        # Apply formatting (colors + currency)
+        apply_formatting(svc, spreadsheet_id, sheet_id, len(daily_rows))
 
         log(f"wrote {len(daily_rows)} daily rows to {summary_tab}")
         return 0
