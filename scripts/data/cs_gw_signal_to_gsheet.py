@@ -44,7 +44,11 @@ SIGNAL_HEADER = [
     "fp",
     "rv", "rv5", "rv10", "rv20",
     "r", "ar", "ar2", "ar3",
+    "tx",  # user-managed formula column — script never overwrites this
 ]
+
+# Data columns = everything except user-managed columns at the end
+DATA_COLS = SIGNAL_HEADER[:-1]  # write data up to but not including "tx"
 
 UPSERT_KEY = "date"
 
@@ -228,13 +232,14 @@ def main() -> int:
         ).execute()
         existing = resp.get("values") or []
 
-        last_col = col_letter(len(SIGNAL_HEADER) - 1)
+        header_col = col_letter(len(SIGNAL_HEADER) - 1)  # full header range (includes tx)
+        data_col = col_letter(len(DATA_COLS) - 1)        # data range (excludes tx)
 
-        # Ensure header
-        if not existing or existing[0] != SIGNAL_HEADER:
+        # Ensure header (write full header including tx)
+        if not existing or existing[0][:len(SIGNAL_HEADER)] != SIGNAL_HEADER:
             svc.spreadsheets().values().update(
                 spreadsheetId=spreadsheet_id,
-                range=f"{tab}!A1:{last_col}1",
+                range=f"{tab}!A1:{header_col}1",
                 valueInputOption="RAW",
                 body={"values": [SIGNAL_HEADER]},
             ).execute()
@@ -251,15 +256,15 @@ def main() -> int:
             if dt:
                 existing_dates[dt] = rnum
 
-        # Upsert rows
+        # Upsert rows (write data columns only — preserve user tx formulas)
         updates = []
         appends = []
         for d in rows:
-            values = [str(d.get(h, "")) for h in SIGNAL_HEADER]
+            values = [str(d.get(h, "")) for h in DATA_COLS]
             dt = d.get("date", "")
             if dt in existing_dates:
                 rnum = existing_dates[dt]
-                rng = f"{tab}!A{rnum}:{last_col}{rnum}"
+                rng = f"{tab}!A{rnum}:{data_col}{rnum}"
                 updates.append({"range": rng, "values": [values]})
             else:
                 appends.append(values)

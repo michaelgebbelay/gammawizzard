@@ -1,166 +1,200 @@
-Here’s the full picture—what this system is, what it does, and how it does it. No fluff.
+# GammaWizzard Trading System
 
-⸻
+Automated options trading across Schwab and TastyTrade accounts, triggered daily via AWS Lambda + EventBridge.
 
-1) Objective
+---
 
-Automate your daily SPXW LeoCross iron‑condor trade so you don’t have to be at the screen:
-	•	Input: LeoCross signal (strikes + expiry + “credit vs debit”).
-	•	Action: Place a single complex IRON_CONDOR order at Schwab with a price‑ladder that tries to fill within a few minutes.
-	•	Safety: Never place an order that would close any existing leg, and never place when there’s partial overlap (1–3 legs already on). Only allow top‑ups to target when all 4 legs already exist.
-	•	Sizing: Fixed count (default 4 contracts). No OBP checks.
-	•	Observability: Log every guard decision and every placement attempt to Google Sheets.
+## Architecture
 
-⸻
+```
+EventBridge Scheduler (America/New_York)
+  4:10 PM  -->  Lambda warmup ping
+  4:13 PM  -->  Lambda x3 (schwab, tt-ira, tt-individual) in parallel
+                  |
+                  +-- Read secrets from SSM Parameter Store
+                  +-- Seed token files to /tmp
+                  +-- Run orchestrator.py via subprocess
+                  +-- Post-trade: push to Google Sheets, edge guard
+                  +-- Persist refreshed tokens back to SSM
+```
 
-2) Components
+All trading scripts run unmodified inside a container-image Lambda. EventBridge handles DST natively via `ScheduleExpressionTimezone`.
 
-A. Orchestrator (guard + runner) — scripts/leocross_orchestrator.py
-	•	Fetches latest LeoCross trade payload from GammaWizard.
-	•	Derives the four SPXW legs (.SPXW yymmdd P/C strikes), correctly oriented:
-	•	Short IC (credit): BUY outer wings, SELL inner strikes.
-	•	Long IC (debit): SELL outer wings, BUY inner strikes (inverted orientation).
-	•	Checks Schwab for:
-	1.	Would‑close guard: It refuses to place if BUY_TO_OPEN would hit a short already in the account, or SELL_TO_OPEN would hit a long already in the account (i.e., the new order would functionally close anything).
-	2.	Partial‑overlap guard: If any (1–3) of the intended legs already exist in the same direction, it skips. If all 4 exist and are aligned, it tops up to the target.
-	3.	Duplicate working orders: Skips if an identical 4‑leg working order is already open.
-	•	Computes remaining quantity to trade:
-	•	rem_qty = QTY_TARGET - units_open (units_open = min of aligned leg counts).
-	•	If allowed and rem_qty > 0, it runs the placer and injects QTY_OVERRIDE=rem_qty into the environment.
-	•	Logs every decision to your Google Sheet in a tab named guard.
-	•	Hardenings:
-	•	Backoff/retry on Schwab HTTP calls.
-	•	Per‑run lock (based on GITHUB_RUN_ID) + duplicate‑main sentinel so it can’t run twice inside a single job even if the file is ever pasted twice by mistake.
+---
 
-B. Placer (ladder) — scripts/trade/leocross_place_simple.py
-	•	Takes the four legs from LeoCross.
-	•	Quantity: uses QTY_OVERRIDE if present; otherwise a hard‑coded constant at the top of the file (set to 4 as you asked). No OBP sizing. No balance checks.
-	•	Cancel/replace ladder (one cycle):
-	•	Credit IC:
-	•	Start 2.10 → wait ~30s.
-	•	If not filled, use mid once, then refresh mid again → wait each time.
-	•	If still not filled, try prev mid − 0.05 (bounded by floor 1.90).
-	•	Final bound: 1.90, then cancel.
-	•	Debit IC mirrors the above (start 1.90, step toward 2.10 ceiling).
-	•	Before each placement, cancels any matching open order (same 4 legs).
-	•	Tracks partial fills and cancellations; if partially filled, it continues the ladder for the remaining size only.
-	•	Logs to Google Sheet tab schwab:
-	•	Timestamp, source, signal date, side (short/long IC), size, order type (net credit/debit), limit used, four OCC symbols, Schwab order id, and a ladder trace (e.g., STEPS 2.10@4→1.95@4 | FILLED 3/4 | CANCELED 1).
+## Strategies
 
-C. Workflow — .github/workflows/leocross.yml
-	•	Triggered manually (workflow_dispatch inputs.mode) and/or by schedule or external scheduler.
-	•	Single step runs the orchestrator; the orchestrator decides whether to run the placer.
-	•	Uses concurrency (group: leocross-min) with cancel-in-progress: true so only one job runs at a time.
+### ConstantStable Verticals (primary)
+- Iron condor strategy driven by GammaWizard signal
+- Sizing based on VIX regime buckets (VixOne field)
+- Per-account sizing overrides via `TT/data/account_sizing.json`
+- Ladder pricing with configurable step/poll/cancel timing
 
-D. External scheduler (optional)
-	•	You can trigger via cron-job.com with a single POST to GitHub’s workflow‑dispatch at 16:12 ET (Mon–Fri).
-	•	Expected 204 response; no retries; one job only.
+---
 
-⸻
+## Accounts
 
-3) Data flow & decisions
-	1.	Trigger fires (GitHub manual, scheduled, or cron‑job.com -> workflow_dispatch).
-	2.	Orchestrator:
-	•	Get LeoCross JSON → extract last/active trade.
-	•	Build legs (expiry, inner strikes, width=5), determine credit/debit using Cat1/Cat2 when present.
-	•	Orient legs so BUY are wings for credit; inverted for debit.
-	•	Positions snapshot (Schwab “positions?fields=positions”).
-	•	Guards:
-	•	Would‑close? If BUY leg already short, or SELL leg already long → SKIP.
-	•	Partial overlap? If 1–3 legs present → SKIP.
-	•	All four aligned? Top‑up only → compute rem_qty.
-	•	No legs present? Set rem_qty = QTY_TARGET.
-	•	Working order duplicate? SKIP.
-	•	Log decision to Sheet tab guard.
-	•	If allowed and rem_qty > 0, run placer with QTY_OVERRIDE=rem_qty.
-	3.	Placer:
-	•	Cancels matching working orders for those legs.
-	•	Ladder submissions (wait ~30s per rung); poll status; handle partial fills.
-	•	Final cleanup: cancel lingering working orders if not filled.
-	•	Log to Sheet tab schwab with full ladder trace and fill/cancel counts.
-	4.	Done.
+| Account | Broker | ID | Unit Dollars |
+|---------|--------|----|-------------|
+| Schwab | Charles Schwab | (primary) | $10,000 |
+| TT IRA | TastyTrade | 5WT20360 | $6,000 |
+| TT Individual | TastyTrade | 5WT09219 | $7,500 |
 
-⸻
+---
 
-4) Configuration (what you set once)
+## Repository Structure
 
-Secrets (GitHub → Settings → Secrets and variables → Actions):
-	•	SCHWAB_APP_KEY, SCHWAB_APP_SECRET
-	•	SCHWAB_TOKEN_JSON (valid refresh token JSON; rotate when you see refresh_token_authentication_error / unsupported_token_type)
-	•	GSHEET_ID (the target spreadsheet)
-	•	GOOGLE_SERVICE_ACCOUNT_JSON (service account JSON with edit rights on that sheet)
-	•	GammaWizard: GW_TOKEN (optional), GW_EMAIL, GW_PASSWORD (fallback auth)
+```
+scripts/
+  trade/ConstantStable/    # Schwab orchestrator + place.py
+  trade/leocross/          # LeoCross orchestrator + placer
+  data/                    # Data scripts (dump, summarize, backfill)
+  lib/                     # Shared modules (sheets.py, parsing.py)
+  notify/                  # Email notifications
+  schwab_token_keeper.py   # Schwab OAuth token management
 
-Placer constants (top of scripts/trade/leocross_place_simple.py):
-	•	QTY_FIXED = 4 (your hard‑coded quantity when QTY_OVERRIDE not set)
-	•	Ladder tuning:
-	•	STEP_WAIT = 30 (seconds between checks)
-	•	CREDIT_START = 2.10, CREDIT_FLOOR = 1.90
-	•	DEBIT_START = 1.90, DEBIT_CEIL = 2.10
-	•	TICK = 0.05, WIDTH = 5
+TT/
+  Script/ConstantStable/   # TT orchestrator + place.py + DXLink quotes
+  Script/tt_token_keeper.py
+  Script/tt_client.py      # TT REST wrapper
+  Script/tt_dxlink.py      # TT WebSocket streaming
+  data/                    # TT data scripts (mirror of scripts/data/)
 
-Orchestrator constant:
-	•	QTY_TARGET = 4
+lambda/
+  handler.py               # Lambda entry point (wraps orchestrators)
+  template.yaml            # SAM template (Lambda + EventBridge + IAM)
+  Dockerfile               # Container image definition
+  requirements-lambda.txt  # Python dependencies
+  seed_ssm.sh              # One-time SSM parameter seeding
+  test_event_*.json        # Dry-run test payloads
 
-Optional env for dry‑run:
-	•	GUARD_ONLY=1 → runs guard + logs, does not call placer.
+.github/workflows/
+  deploy_lambda.yml                    # SAM build + deploy (manual)
+  constantstable_verticals.yml         # Schwab CS (DISABLED - replaced by Lambda)
+  tt_constantstable_verticals.yml      # TT CS (DISABLED - replaced by Lambda)
+  schwab_raw_data.yml                  # Schwab transaction data to Sheets
+  tt_raw_data.yml                      # TT transaction data to Sheets
+  constantstable_edge_backfill.yml     # Edge/transfer backfill
+  tt_constantstable_edge_backfill.yml  # TT edge backfill
+  gw_fetch.yml                         # GammaWizard data fetch
+  tt_probe.yml                         # TT connectivity test
+  tt_token_keepalive.yml               # TT token refresh
+```
 
-⸻
+### Shared Library (`scripts/lib/`)
 
-5) Triggers you can use
-	•	Manual: Actions → “Place LeoCross” → Run workflow → mode=NOW.
-	•	GitHub schedule (commented/uncommented in YAML): two crons around 16:10–16:12 ET; the placer itself enforces a narrow window if you use the scheduled path.
-	•	cron-job.com external: Single POST to
-https://api.github.com/repos/<owner>/<repo>/actions/workflows/leocross.yml/dispatches
-with body {"ref":"main","inputs":{"mode":"NOW"}}, headers Authorization: Bearer <PAT>, Accept: application/vnd.github+json, X-GitHub-Api-Version: 2022-11-28, Content-Type: application/json.
-Schedule: Mon–Fri 16:12:00 ET; no retries; treat 204 as success.
+Consolidated utilities used by all data scripts:
+- **sheets.py**: `sheets_client()`, `ensure_tab()`, `overwrite_rows()`, `read_existing()`, `get_values()`
+- **parsing.py**: `safe_float()`, `iso_fix()`, `fmt_ts_et()`, `parse_sheet_datetime()`, `parse_sheet_date()`, `contract_multiplier()`, `ET` timezone
 
-(Tip: while using cron‑job.com, comment out the schedule: block in YAML to avoid two trigger sources. If you keep both, add a “debounce” step to skip if another run started within ~90s.)
+---
 
-⸻
+## Infrastructure
 
-6) What we explicitly do not do
-	•	No OBP / balance checks. You asked to remove them; quantity is fixed or override via orchestrator.
-	•	No strike hunting or price discovery beyond the ladder. We follow the exact strikes from LeoCross and ladder prices to fill quickly.
-	•	No multi‑cycle re‑laddering beyond the single 3–5 minute cycle; after the final bound the order is canceled.
+### AWS Lambda + EventBridge (production trading)
+- **Lambda**: Container image (Python 3.12), 1024 MB, 120s timeout
+- **Schedules**: 4:10 PM warmup + 4:13 PM x3 accounts (Mon-Fri ET)
+- **Secrets**: SSM Parameter Store SecureStrings under `/gamma/`
+- **Token persistence**: Tokens auto-refresh during execution; handler detects changes via SHA-256 and writes back to SSM
+- **Cost**: < $1/month (free tier)
 
-⸻
+### GitHub Actions (deployment + data workflows)
+- **deploy_lambda.yml**: Manual dispatch to build + deploy SAM stack
+- **schwab_raw_data.yml**: Schwab transaction data to Google Sheets
+- **tt_raw_data.yml**: TT transaction data to Google Sheets
+- Trading workflows are **disabled** -- replaced by Lambda
 
-7) Reliability & safety rails
-	•	Hardened HTTP (GET/POST/DELETE) with backoff/retries for Schwab.
-	•	Must‑include time window for listing open orders (Schwab requires fromEnteredTime/toEnteredTime).
-	•	Per‑run lock (/tmp/leocross-orch-run-<RUN_ID>) to prevent duplicate execution inside one GitHub run.
-	•	Duplicate‑main sentinel so even if someone pastes the orchestrator file twice, only the first main() executes.
-	•	Actions concurrency group to prevent two jobs from running at once.
-	•	Optional debounce in YAML to ignore a second dispatch within 90 seconds.
+---
 
-⸻
+## Deployment
 
-8) Observability
-	•	Console: clear prints for guard snapshot, decision, and ladder steps.
-	•	Google Sheets:
-	•	guard tab: every run’s decision (ALLOW/TOP_UP/SKIP reason/ABORT) + planned legs + account leg quantities + open_units/rem_qty.
-	•	schwab tab: placement steps, price(s) used, fill/cancel counts, final order id and status.
+Deploy or update the Lambda stack via GitHub Actions:
 
-⸻
+```bash
+# Deploy with schedules enabled
+gh workflow run "Deploy Trading Lambda" \
+  -f schedule_state=ENABLED -f dry_run=false
 
-9) Runbook (what to do when X breaks)
-	•	Schwab OAuth error (refresh_token_authentication_error / unsupported_token_type):
-refresh and replace SCHWAB_TOKEN_JSON Secret.
-	•	Working orders list returns 400 “fromEnteredTime missing”:
-we call with fromEnteredTime/toEnteredTime already; if Schwab glitches, placer continues with warn and still tries to place.
-	•	GammaWizard 401/403: falls back to email/password to fetch a fresh token.
-	•	cron‑job.com double‑fires: ensure only one job, disable retries; treat 204 as success. Add YAML debounce if needed.
+# Deploy with dry run (no real orders)
+gh workflow run "Deploy Trading Lambda" \
+  -f schedule_state=ENABLED -f dry_run=true
 
-⸻
+# Disable schedules without deleting
+gh workflow run "Deploy Trading Lambda" \
+  -f schedule_state=DISABLED -f dry_run=false
+```
 
-10) Acceptance criteria
-	•	At 16:12 ET (or on manual trigger):
-	•	Guard logs a row in guard with ALLOW (or SKIP with clear reason).
-	•	If ALLOW and rem_qty>0, placer runs once, posts 1 order, ladders prices for ≤ ~3–5 minutes, and either fills or cancels.
-	•	schwab tab shows one row per placement with ladder trace and final status (FILLED X/Y, CANCELED N).
-	•	No order ever posts that would close an existing leg; no partial‑overlap placements.
+### First-time setup
 
-⸻
+1. Create AWS account, install AWS CLI: `brew install awscli`
+2. Create IAM user `gamma-deploy` with AdministratorAccess
+3. `aws configure` with the access key
+4. Run `./lambda/seed_ssm.sh` to populate SSM secrets
+5. Set `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` as GitHub repo secrets
+6. Trigger the deploy workflow
 
-That’s the system. If anything in this description doesn’t match the current behavior you’re seeing in logs, call it out and we’ll lock it down.
+---
+
+## Secrets
+
+### SSM Parameter Store (Lambda)
+```
+/gamma/schwab/app_key
+/gamma/schwab/app_secret
+/gamma/schwab/token_json
+/gamma/tt/client_id
+/gamma/tt/client_secret
+/gamma/tt/token_json
+/gamma/shared/gsheet_id
+/gamma/shared/google_sa_json
+/gamma/shared/gw_email
+/gamma/shared/gw_password
+/gamma/shared/smtp_user       # optional
+/gamma/shared/smtp_pass       # optional
+/gamma/shared/smtp_to         # optional
+```
+
+### GitHub Secrets (Actions workflows)
+SCHWAB_APP_KEY, SCHWAB_APP_SECRET, SCHWAB_TOKEN_JSON, GSHEET_ID, GOOGLE_SERVICE_ACCOUNT_JSON, GW_EMAIL, GW_PASSWORD, TT_CLIENT_ID, TT_CLIENT_SECRET, TT_TOKEN_JSON, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+
+---
+
+## Monitoring
+
+```bash
+# Tail Lambda logs (real-time)
+aws logs tail /aws/lambda/gamma-trading-TradingFunction-O0rzFPNn3umX \
+  --follow --region us-east-1
+
+# Last hour of logs
+aws logs tail /aws/lambda/gamma-trading-TradingFunction-O0rzFPNn3umX \
+  --since 1h --region us-east-1
+
+# Manual invoke (dry run)
+aws lambda invoke --function-name gamma-trading-TradingFunction-O0rzFPNn3umX \
+  --payload "$(echo '{"account":"schwab","dry_run":true}' | base64)" \
+  --region us-east-1 /dev/stdout
+
+# Check schedule status
+aws scheduler list-schedules --region us-east-1 \
+  --query 'Schedules[].{Name:Name,State:State}'
+```
+
+### Google Sheets tabs
+- **sw_txn_raw**: Raw Schwab transactions
+- **sw_orig_orders**: Classified iron condor orders
+- **ConstantStableEdge**: Edge guard daily stats
+- **ConstantStableTrades**: Trade execution log
+
+---
+
+## Runbook
+
+| Issue | Fix |
+|-------|-----|
+| Schwab token expired | Re-run `Token/schwab_token_bootstrap.py`, then update SSM: `aws ssm put-parameter --name /gamma/schwab/token_json --value file://Token/schwab_token.json --type SecureString --overwrite --region us-east-1` |
+| TT token expired | Refresh via `TT/Script/tt_token_refresh.py`, then update SSM similarly |
+| Lambda timeout | Check CloudWatch logs; increase timeout in template.yaml if needed |
+| Need to disable trading | `gh workflow run "Deploy Trading Lambda" -f schedule_state=DISABLED -f dry_run=false` |
+| Need to update code | Push to main, then run deploy workflow |
+| GammaWizard auth failure | Falls back to email/password automatically |

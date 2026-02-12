@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
 """
-Compute aggregate summary from CS_Tracking tab and write to CS_Summary tab.
+Write daily trading summary to CS_Summary tab.
 
-Reads all rows from CS_Tracking, computes per-account stats, and writes
-a clean summary to CS_Summary. Runs as a post-step after cs_tracking_to_gsheet.py.
+Reads all rows from CS_Tracking, builds a daily pivot with GW signal prices +
+per-account fills side by side, and writes to CS_Summary.
+
+Layout:
+  Rows 1-8:   User-managed summary formulas (Trade Total, Edge, etc.) — never touched
+  Row 9:      Section headers (GW, schwab, TT IRA, TT IND)
+  Row 10:     Column headers (Date, QTY, price put, price call, Total with comm, ...)
+  Row 11+:    Daily data (one row per date, newest first)
+
+"Total with comm" columns (E, I, M, Q) are user-managed formulas — script never
+writes to them.
 
 NON-BLOCKING BY DEFAULT (same pattern as other gsheet scripts).
 
@@ -19,8 +28,6 @@ import os
 import sys
 import json
 from collections import defaultdict
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
 
 # --- optional imports (skip if missing) ---
 _IMPORT_ERR = None
@@ -35,7 +42,29 @@ except Exception as e:
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 TAG = "CS_SUMMARY"
-ET = ZoneInfo("America/New_York")
+
+# --- Layout constants ---
+SECTION_HEADER_ROW = 9   # "GW", "schwab", etc.
+COLUMN_HEADER_ROW = 10   # "Date", "QTY", "price put", etc.
+DATA_START_ROW = 11      # First data row
+
+SECTION_HEADER = [
+    "",
+    "GW", "", "", "",
+    "schwab", "", "", "",
+    "TT IRA", "", "", "",
+    "TT IND", "", "", "",
+]
+
+COLUMN_HEADER = [
+    "Date",
+    "QTY", "price put", "price call", "Total with comm",
+    "QTY", "price put", "price call", "Total with comm",
+    "QTY", "price put", "price call", "Total with comm",
+    "QTY", "price put", "price call", "Total with comm",
+]
+
+ACCOUNT_ORDER = ["schwab", "tt-ira", "tt-individual"]
 
 
 # ---------------------------------------------------------------------------
@@ -68,15 +97,6 @@ def creds_from_env():
     return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
 
 
-def col_letter(idx: int) -> str:
-    n = idx + 1
-    s = ""
-    while n:
-        n, r = divmod(n - 1, 26)
-        s = chr(65 + r) + s
-    return s
-
-
 def ensure_sheet_tab(svc, sid: str, title: str) -> int:
     meta = svc.spreadsheets().get(spreadsheetId=sid, fields="sheets.properties").execute()
     for s in (meta.get("sheets") or []):
@@ -88,90 +108,31 @@ def ensure_sheet_tab(svc, sid: str, title: str) -> int:
     return int(r["replies"][0]["addSheet"]["properties"]["sheetId"])
 
 
-def safe_int(s, default=0):
+def signed_price(price_str: str, side_str: str) -> str:
+    """Apply sign based on trade side: CREDIT = positive, DEBIT = negative."""
+    if not price_str:
+        return ""
     try:
-        return int(s)
+        price = float(price_str)
+        if not price:
+            return "0"
+        if (side_str or "").strip().upper() == "DEBIT":
+            price = -price
+        return str(price)
     except (ValueError, TypeError):
-        return default
-
-
-def safe_float(s, default=None):
-    try:
-        return float(s)
-    except (ValueError, TypeError):
-        return default
+        return price_str
 
 
 # ---------------------------------------------------------------------------
-# Summary computation
+# Daily detail computation
 # ---------------------------------------------------------------------------
 
-def compute_summary(rows: list[dict]) -> list[list[str]]:
-    """Compute per-account summary stats from tracking rows."""
+def compute_daily_detail(rows: list[dict]) -> list[tuple]:
+    """Build daily pivot: one row per date with GW + 3 accounts side by side.
 
-    # Accumulate per account
-    accounts = defaultdict(lambda: {
-        "days": set(),
-        "put_target": 0, "put_filled": 0,
-        "call_target": 0, "call_filled": 0,
-        "put_improvements": [], "call_improvements": [],
-        "total_cost": 0.0,
-    })
-
-    for row in rows:
-        acct = (row.get("account") or "").strip()
-        if not acct:
-            continue
-        a = accounts[acct]
-        a["days"].add(row.get("date", ""))
-        a["put_target"] += safe_int(row.get("put_target"))
-        a["put_filled"] += safe_int(row.get("put_filled"))
-        a["call_target"] += safe_int(row.get("call_target"))
-        a["call_filled"] += safe_int(row.get("call_filled"))
-
-        pi = safe_float(row.get("put_improvement"))
-        if pi is not None:
-            a["put_improvements"].append(pi)
-        ci = safe_float(row.get("call_improvement"))
-        if ci is not None:
-            a["call_improvements"].append(ci)
-
-        tc = safe_float(row.get("total_cost"))
-        if tc is not None:
-            a["total_cost"] += tc
-
-    # Build summary rows
-    ACCOUNT_ORDER = ["schwab", "tt-ira", "tt-individual"]
-    sorted_accounts = sorted(accounts.keys(), key=lambda x: ACCOUNT_ORDER.index(x) if x in ACCOUNT_ORDER else 99)
-
-    result = []
-    for acct in sorted_accounts:
-        a = accounts[acct]
-        days = len(a["days"])
-        pt, pf = a["put_target"], a["put_filled"]
-        ct, cf = a["call_target"], a["call_filled"]
-        put_rate = f"{pf / pt * 100:.0f}%" if pt > 0 else "—"
-        call_rate = f"{cf / ct * 100:.0f}%" if ct > 0 else "—"
-        avg_pi = f"{sum(a['put_improvements']) / len(a['put_improvements']):.3f}" if a["put_improvements"] else "—"
-        avg_ci = f"{sum(a['call_improvements']) / len(a['call_improvements']):.3f}" if a["call_improvements"] else "—"
-        total_spreads = pf + cf
-        cost_per_spread = f"{a['total_cost'] / total_spreads:.2f}" if total_spreads > 0 else "—"
-
-        result.append([
-            acct, str(days),
-            str(pt), str(pf), put_rate,
-            str(ct), str(cf), call_rate,
-            avg_pi, avg_ci,
-            f"{a['total_cost']:.2f}", cost_per_spread,
-        ])
-
-    return result
-
-
-def compute_daily_detail(rows: list[dict]) -> list[list[str]]:
-    """Build a daily pivot: one row per date with accounts side by side."""
-
-    # Group by date
+    Returns list of (date, gw_group, [schwab_group, ira_group, ind_group])
+    where each group is [qty, price_put, price_call].
+    """
     by_date = defaultdict(dict)
     for row in rows:
         dt = (row.get("date") or "").strip()
@@ -179,47 +140,35 @@ def compute_daily_detail(rows: list[dict]) -> list[list[str]]:
         if dt and acct:
             by_date[dt][acct] = row
 
-    ACCOUNT_ORDER = ["schwab", "tt-ira", "tt-individual"]
     result = []
     for dt in sorted(by_date.keys(), reverse=True):
         accts = by_date[dt]
-        # GW price is same for all accounts; grab from first available
+        # GW prices and sides: same across all accounts, grab from first available
         any_row = next(iter(accts.values()), {})
-        gw_put = any_row.get("gw_put_price", "")
-        gw_call = any_row.get("gw_call_price", "")
-        row_out = [dt, gw_put, gw_call]
-        for acct in ACCOUNT_ORDER:
-            r = accts.get(acct)
+        put_side = (any_row.get("put_side") or "").strip()
+        call_side = (any_row.get("call_side") or "").strip()
+        gw_put = signed_price(any_row.get("gw_put_price", ""), put_side)
+        gw_call = signed_price(any_row.get("gw_call_price", ""), call_side)
+        gw_group = ["1", gw_put, gw_call]
+
+        account_groups = []
+        for acct_name in ACCOUNT_ORDER:
+            r = accts.get(acct_name)
             if r:
-                pf = r.get("put_filled", "0")
-                cf = r.get("call_filled", "0")
-                fp = r.get("put_fill_price", "")
-                fc = r.get("call_fill_price", "")
-                pi = r.get("put_improvement", "")
-                ci = r.get("call_improvement", "")
-                tc = r.get("total_cost", "")
-                row_out.extend([pf, cf, fp, fc, pi, ci, tc])
+                qty = r.get("put_filled", "0")
+                p_side = (r.get("put_side") or "").strip()
+                c_side = (r.get("call_side") or "").strip()
+                price_put = signed_price(r.get("put_fill_price", ""), p_side)
+                price_call = signed_price(r.get("call_fill_price", ""), c_side)
             else:
-                row_out.extend(["", "", "", "", "", "", ""])
-        result.append(row_out)
+                qty = "0"
+                price_put = ""
+                price_call = ""
+            account_groups.append([qty, price_put, price_call])
+
+        result.append((dt, gw_group, account_groups))
 
     return result
-
-
-SUMMARY_HEADER = [
-    "account", "trading_days",
-    "put_target", "put_filled", "put_fill_rate",
-    "call_target", "call_filled", "call_fill_rate",
-    "avg_put_improve", "avg_call_improve",
-    "total_cost", "cost_per_spread",
-]
-
-DAILY_HEADER = [
-    "date", "gw_put", "gw_call",
-    "schw_put", "schw_call", "schw_put_px", "schw_call_px", "schw_put_imp", "schw_call_imp", "schw_cost",
-    "ira_put", "ira_call", "ira_put_px", "ira_call_px", "ira_put_imp", "ira_call_imp", "ira_cost",
-    "ind_put", "ind_call", "ind_put_px", "ind_call_px", "ind_put_imp", "ind_call_imp", "ind_cost",
-]
 
 
 # ---------------------------------------------------------------------------
@@ -266,45 +215,67 @@ def main() -> int:
 
         log(f"read {len(rows)} tracking rows")
 
-        # Compute summaries
-        summary_rows = compute_summary(rows)
+        # Compute daily detail
         daily_rows = compute_daily_detail(rows)
+        if not daily_rows:
+            return skip("no daily data")
 
         # Write to summary tab
         ensure_sheet_tab(svc, spreadsheet_id, summary_tab)
 
-        now_et = datetime.now(timezone.utc).astimezone(ET)
-        timestamp = now_et.strftime("%Y-%m-%d %I:%M %p ET")
+        # Write section + column headers (rows 9-10)
+        header_updates = [
+            {"range": f"{summary_tab}!A{SECTION_HEADER_ROW}:Q{SECTION_HEADER_ROW}",
+             "values": [SECTION_HEADER]},
+            {"range": f"{summary_tab}!A{COLUMN_HEADER_ROW}:Q{COLUMN_HEADER_ROW}",
+             "values": [COLUMN_HEADER]},
+        ]
 
-        # Build output: title + summary + gap + daily detail
-        output = []
-        output.append(["Account Performance Summary", "", "", "", "", "", "", "", "", "", "", f"Updated: {timestamp}"])
-        output.append([])  # blank row
-        output.append(SUMMARY_HEADER)
-        output.extend(summary_rows)
-        output.append([])  # blank row
-        output.append([])  # blank row
-        output.append(["Daily Detail (newest first)"])
-        output.append(DAILY_HEADER)
-        output.extend(daily_rows)
-
-        last_col = col_letter(max(len(SUMMARY_HEADER), len(DAILY_HEADER)) - 1)
-        last_row = len(output)
-
-        # Clear and write
-        svc.spreadsheets().values().clear(
+        # Clear old data in data columns only (preserve formula columns E, I, M, Q)
+        clear_to = DATA_START_ROW + len(daily_rows) + 100
+        svc.spreadsheets().values().batchClear(
             spreadsheetId=spreadsheet_id,
-            range=f"{summary_tab}!A1:ZZ",
+            body={"ranges": [
+                f"{summary_tab}!A{DATA_START_ROW}:D{clear_to}",
+                f"{summary_tab}!F{DATA_START_ROW}:H{clear_to}",
+                f"{summary_tab}!J{DATA_START_ROW}:L{clear_to}",
+                f"{summary_tab}!N{DATA_START_ROW}:P{clear_to}",
+            ]},
         ).execute()
 
-        svc.spreadsheets().values().update(
+        # Build data updates (4 ranges per row, skipping formula columns E/I/M/Q)
+        data_updates = []
+        for i, (dt, gw_group, account_groups) in enumerate(daily_rows):
+            rnum = DATA_START_ROW + i
+            # A:D = date + GW (qty, price put, price call)
+            data_updates.append({
+                "range": f"{summary_tab}!A{rnum}:D{rnum}",
+                "values": [[dt] + gw_group],
+            })
+            # F:H = Schwab (qty, price put, price call)
+            data_updates.append({
+                "range": f"{summary_tab}!F{rnum}:H{rnum}",
+                "values": [account_groups[0]],
+            })
+            # J:L = TT IRA
+            data_updates.append({
+                "range": f"{summary_tab}!J{rnum}:L{rnum}",
+                "values": [account_groups[1]],
+            })
+            # N:P = TT IND
+            data_updates.append({
+                "range": f"{summary_tab}!N{rnum}:P{rnum}",
+                "values": [account_groups[2]],
+            })
+
+        # Write headers + data in one batch
+        all_updates = header_updates + data_updates
+        svc.spreadsheets().values().batchUpdate(
             spreadsheetId=spreadsheet_id,
-            range=f"{summary_tab}!A1:{last_col}{last_row}",
-            valueInputOption="RAW",
-            body={"values": output},
+            body={"valueInputOption": "RAW", "data": all_updates},
         ).execute()
 
-        log(f"wrote summary ({len(summary_rows)} accounts, {len(daily_rows)} daily rows) to {summary_tab}")
+        log(f"wrote {len(daily_rows)} daily rows to {summary_tab}")
         return 0
 
     except Exception as e:
