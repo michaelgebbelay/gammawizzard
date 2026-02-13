@@ -8,17 +8,21 @@ to compute dynamic close prices.
 
 Runs as a post-step for TT Individual only (IRA is the control).
 
-Formula:
-  entry_net  = sum of credits received - sum of debits paid (per share)
-  max_profit = num_debit_spreads × $5.00  +  entry_net
-  close_net  = max_profit × profit_pct  -  entry_net
-  → positive close_net = Credit order; negative = Debit order
+Max profit (only ONE side of an IC/RR can pay off — SPX goes one direction):
+  Credit IC/vert:  max_profit = total credit received
+  Debit IC/vert:   max_profit = $5.00 - total debit paid
+  RR:              max_profit = $5.00 (spread width, always)
+
+Close order price:
+  close_net = max_profit × profit_pct  -  entry_net
+  → positive = Credit order; negative = Debit order
   → rounded to nearest $0.05
 
 Examples (at 50%):
-  Credit IC  ($2 credit):  close = 2×0.50 - 2  = -1.00  → Debit  $1.00
-  Debit IC   ($4 debit):   close = 6×0.50 -(-4) =  7.00  → Credit $7.00
-  RR (net $1.20 debit):    close = 3.80×0.50-(-1.20) = 3.10 → Credit $3.10
+  Credit IC  ($2 credit):    close = 2×0.50 - 2      = -1.00  → Debit  $1.00
+  Debit IC   ($2 debit):     close = 3×0.50 -(-2)    =  3.50  → Credit $3.50
+  RR (net $1.20 debit):      close = 5×0.50 -(-1.20) =  3.70  → Credit $3.70
+  RR (net $0.50 credit):     close = 5×0.50 -(+0.50) =  2.00  → Credit $2.00
 
 Env:
   CS_CLOSE_ORDERS_ENABLE  - "1" to enable (default "0")
@@ -334,11 +338,16 @@ def compute_close_price(fills):
     fills: {"PUT": {"side": "CREDIT"|"DEBIT", "price": float},
             "CALL": {"side": "CREDIT"|"DEBIT", "price": float}}
 
-    Returns (price, price_effect) or (None, None) if can't compute.
+    Max profit rules (only ONE side can pay off — SPX goes one direction):
+      Credit IC/vert:  max_profit = total credit received
+      Debit IC/vert:   max_profit = $5 - total debit paid
+      RR (mixed):      max_profit = $5 (spread width, always)
+
+    Returns (price, price_effect, max_profit) or (None, None, None).
     Price is already clamped to $0.05 ticks.
     """
     entry_net = 0.0   # positive = net credit, negative = net debit
-    num_debit_verts = 0
+    sides = []
 
     for kind in ("PUT", "CALL"):
         f = fills.get(kind)
@@ -346,13 +355,27 @@ def compute_close_price(fills):
             continue
         if f["side"] == "CREDIT":
             entry_net += f["price"]
+            sides.append("CREDIT")
         else:
             entry_net -= f["price"]
-            num_debit_verts += 1
+            sides.append("DEBIT")
 
-    max_profit = num_debit_verts * SPREAD_WIDTH_DOLLARS + entry_net
+    if not sides:
+        return None, None, None
+
+    # Determine max_profit based on structure
+    if len(sides) == 2 and sides[0] != sides[1]:
+        # RR (one credit, one debit): max_profit = spread width
+        max_profit = SPREAD_WIDTH_DOLLARS
+    elif all(s == "CREDIT" for s in sides):
+        # Credit IC or single credit: max_profit = credit received
+        max_profit = entry_net
+    else:
+        # Debit IC or single debit: max_profit = spread width - debit
+        max_profit = SPREAD_WIDTH_DOLLARS + entry_net  # entry_net is negative
+
     if max_profit <= 0.01:
-        return None, None
+        return None, None, None
 
     # close_net > 0 → we receive credit; close_net < 0 → we pay debit
     close_net = max_profit * PROFIT_PCT - entry_net
@@ -361,9 +384,9 @@ def compute_close_price(fills):
     effect = "Credit" if close_net > 0 else "Debit"
 
     if price < 0.01:
-        return None, None
+        return None, None, None
 
-    return price, effect
+    return price, effect, max_profit
 
 
 # ---------------------------------------------------------------------------
@@ -556,7 +579,7 @@ def main():
                 continue
 
             # 7. Compute close price
-            close_price, price_effect = compute_close_price(fills_for_price)
+            close_price, price_effect, max_profit = compute_close_price(fills_for_price)
             if close_price is None:
                 print(f"{TAG}: SKIP — could not compute close price (max_profit <= 0)")
                 continue
@@ -566,8 +589,6 @@ def main():
                 f["price"] if f["side"] == "CREDIT" else -f["price"]
                 for f in fills_for_price.values()
             )
-            n_debit = sum(1 for f in fills_for_price.values() if f["side"] == "DEBIT")
-            max_profit = n_debit * SPREAD_WIDTH_DOLLARS + entry_net
             target_profit = max_profit * PROFIT_PCT
 
             print(f"{TAG}: entry_net=${entry_net:+.2f} max_profit=${max_profit:.2f} "
