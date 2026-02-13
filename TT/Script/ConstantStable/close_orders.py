@@ -2,30 +2,39 @@
 """
 ConstantStable — Automated Profit-Taking Close Orders (A/B test)
 
-Places GTC limit close orders on existing vertical spread positions.
+Places a single GTC limit close order at 50% of max profit for the entire
+position (all legs together). Reads actual fill prices from the trade CSV
+to compute dynamic close prices.
+
 Runs as a post-step for TT Individual only (IRA is the control).
 
-Rules:
-  Long IC  → 2 separate vertical close orders at $3.50 credit each
-  Short IC → 1 four-leg IC close order at $1.00 debit
-  RR       → short vert close at $0.50 debit, long vert close at $2.00 credit
+Formula:
+  entry_net  = sum of credits received - sum of debits paid (per share)
+  max_profit = num_debit_spreads × $5.00  +  entry_net
+  close_net  = max_profit × profit_pct  -  entry_net
+  → positive close_net = Credit order; negative = Debit order
+  → rounded to nearest $0.05
+
+Examples (at 50%):
+  Credit IC  ($2 credit):  close = 2×0.50 - 2  = -1.00  → Debit  $1.00
+  Debit IC   ($4 debit):   close = 6×0.50 -(-4) =  7.00  → Credit $7.00
+  RR (net $1.20 debit):    close = 3.80×0.50-(-1.20) = 3.10 → Credit $3.10
 
 Env:
   CS_CLOSE_ORDERS_ENABLE  - "1" to enable (default "0")
   CS_CLOSE_DRY_RUN        - "1" to log but not place orders
-  CS_CLOSE_LONG_IC_PRICE  - credit per vertical for Long IC (default "3.50")
-  CS_CLOSE_SHORT_IC_PRICE - debit for 4-leg Short IC (default "1.00")
-  CS_CLOSE_RR_SHORT_PRICE - debit for RR short vert (default "0.50")
-  CS_CLOSE_RR_LONG_PRICE  - credit for RR long vert (default "2.00")
+  CS_CLOSE_PROFIT_PCT     - profit target as decimal (default "0.50" = 50%)
+  CS_LOG_PATH             - path to trade CSV
   TT_ACCOUNT_NUMBER       - TastyTrade account number
 """
 
 import os
 import sys
 import re
+import csv
 import time
 import random
-from datetime import datetime, timedelta
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 
@@ -48,7 +57,8 @@ from tt_client import request as tt_request
 ET = ZoneInfo("America/New_York")
 TAG = "CS_CLOSE"
 TICK = 0.05
-SPREAD_WIDTH = 5000  # $5 = 5000 in 8-digit strike format
+SPREAD_WIDTH = 5000        # $5 in 8-digit strike format
+SPREAD_WIDTH_DOLLARS = 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -59,20 +69,9 @@ def truthy(s):
     return str(s or "").strip().lower() in ("1", "true", "yes", "y", "on")
 
 
-def env_float(key, default):
-    try:
-        return float(os.environ.get(key, default))
-    except (ValueError, TypeError):
-        return float(default)
-
-
 ENABLED = truthy(os.environ.get("CS_CLOSE_ORDERS_ENABLE", "0"))
 DRY_RUN = truthy(os.environ.get("CS_CLOSE_DRY_RUN", "") or os.environ.get("VERT_DRY_RUN", "false"))
-
-LONG_IC_PRICE = env_float("CS_CLOSE_LONG_IC_PRICE", "3.50")
-SHORT_IC_PRICE = env_float("CS_CLOSE_SHORT_IC_PRICE", "1.00")
-RR_SHORT_PRICE = env_float("CS_CLOSE_RR_SHORT_PRICE", "0.50")
-RR_LONG_PRICE = env_float("CS_CLOSE_RR_LONG_PRICE", "2.00")
+PROFIT_PCT = float(os.environ.get("CS_CLOSE_PROFIT_PCT", "0.50") or "0.50")
 
 
 # ---------------------------------------------------------------------------
@@ -180,14 +179,60 @@ def parse_order_id(r):
 
 
 # ---------------------------------------------------------------------------
+# Trade CSV reading
+# ---------------------------------------------------------------------------
+
+def read_csv_fills():
+    """Read trade CSV and return fill prices grouped by expiry.
+
+    Returns: {expiry_yymmdd: {"PUT": {"side": str, "price": float},
+                               "CALL": {"side": str, "price": float}}}
+    """
+    path = (os.environ.get("CS_LOG_PATH") or "logs/constantstable_vertical_trades.csv").strip()
+    if not os.path.exists(path):
+        print(f"{TAG}: trade CSV not found at {path}")
+        return {}
+
+    fills = {}
+    with open(path, "r", newline="") as f:
+        for row in csv.DictReader(f):
+            tdate_str = (row.get("tdate") or "").strip()
+            kind = (row.get("kind") or "").strip().upper()
+            side = (row.get("side") or "").strip().upper()
+            price_str = (row.get("last_price") or "").strip()
+            qty_str = (row.get("qty_filled") or "0").strip()
+
+            if not tdate_str or kind not in ("PUT", "CALL"):
+                continue
+            try:
+                price = float(price_str)
+                qty = int(qty_str)
+            except (ValueError, TypeError):
+                continue
+            if qty <= 0 or price <= 0:
+                continue
+
+            # Convert tdate (ISO) to yymmdd
+            try:
+                dt = date.fromisoformat(tdate_str)
+                yymmdd = dt.strftime("%y%m%d")
+            except ValueError:
+                continue
+
+            if yymmdd not in fills:
+                fills[yymmdd] = {}
+            # Keep last occurrence per kind (handles re-runs)
+            fills[yymmdd][kind] = {"side": side, "price": price}
+
+    return fills
+
+
+# ---------------------------------------------------------------------------
 # Position fetching
 # ---------------------------------------------------------------------------
 
 def fetch_positions(acct_num):
-    """
-    Returns list of dicts: {symbol, osi, canon, qty}
-    where qty is positive for long, negative for short.
-    """
+    """Returns list of dicts: {symbol, osi, canon, qty}."""
     j = tt_get_json(f"/accounts/{acct_num}/positions", tag="POSITIONS")
     data = j.get("data") if isinstance(j, dict) else {}
     items = data.get("items") or []
@@ -229,16 +274,11 @@ def fetch_positions(acct_num):
 
 
 # ---------------------------------------------------------------------------
-# Vertical pairing and structure classification
+# Vertical pairing
 # ---------------------------------------------------------------------------
 
 def pair_verticals(legs):
-    """
-    Pair option legs into $5-wide vertical spreads.
-
-    legs: list of {symbol, osi, canon, qty} all same expiry and type (P or C)
-    Returns list of vertical dicts.
-    """
+    """Pair option legs into $5-wide vertical spreads."""
     sorted_legs = sorted(legs, key=lambda l: int(l["canon"][2]))
     used = set()
     verticals = []
@@ -254,7 +294,6 @@ def pair_verticals(legs):
             s2 = int(l2["canon"][2])
             if abs(s2 - s1) != SPREAD_WIDTH:
                 continue
-            # One must be long, one short
             if not ((l1["qty"] > 0 and l2["qty"] < 0) or (l1["qty"] < 0 and l2["qty"] > 0)):
                 continue
 
@@ -262,16 +301,13 @@ def pair_verticals(legs):
             short_leg = l1 if l1["qty"] < 0 else l2
             spread_qty = int(min(abs(l1["qty"]), abs(l2["qty"])))
 
-            # Determine credit vs debit:
-            # PUT credit spread: short the HIGHER strike, long the LOWER
-            # CALL credit spread: short the LOWER strike, long the HIGHER
             cp = l1["canon"][1]
             short_strike = int(short_leg["canon"][2])
             long_strike = int(long_leg["canon"][2])
 
             if cp == "P":
                 is_credit = short_strike > long_strike
-            else:  # C
+            else:
                 is_credit = short_strike < long_strike
 
             verticals.append({
@@ -288,25 +324,46 @@ def pair_verticals(legs):
     return verticals
 
 
-def classify_structure(put_verts, call_verts):
-    """Classify as LONG_IC, SHORT_IC, RR, or SINGLE_*."""
-    has_put = len(put_verts) > 0
-    has_call = len(call_verts) > 0
+# ---------------------------------------------------------------------------
+# Close price computation
+# ---------------------------------------------------------------------------
 
-    if has_put and has_call:
-        pv = put_verts[0]
-        cv = call_verts[0]
-        if pv["is_credit"] and cv["is_credit"]:
-            return "SHORT_IC"
-        elif not pv["is_credit"] and not cv["is_credit"]:
-            return "LONG_IC"
+def compute_close_price(fills):
+    """Compute close order price for 50% (or PROFIT_PCT) of max profit.
+
+    fills: {"PUT": {"side": "CREDIT"|"DEBIT", "price": float},
+            "CALL": {"side": "CREDIT"|"DEBIT", "price": float}}
+
+    Returns (price, price_effect) or (None, None) if can't compute.
+    Price is already clamped to $0.05 ticks.
+    """
+    entry_net = 0.0   # positive = net credit, negative = net debit
+    num_debit_verts = 0
+
+    for kind in ("PUT", "CALL"):
+        f = fills.get(kind)
+        if not f:
+            continue
+        if f["side"] == "CREDIT":
+            entry_net += f["price"]
         else:
-            return "RR"
-    elif has_put:
-        return "SINGLE_PUT"
-    elif has_call:
-        return "SINGLE_CALL"
-    return "NONE"
+            entry_net -= f["price"]
+            num_debit_verts += 1
+
+    max_profit = num_debit_verts * SPREAD_WIDTH_DOLLARS + entry_net
+    if max_profit <= 0.01:
+        return None, None
+
+    # close_net > 0 → we receive credit; close_net < 0 → we pay debit
+    close_net = max_profit * PROFIT_PCT - entry_net
+
+    price = clamp_tick(abs(close_net))
+    effect = "Credit" if close_net > 0 else "Debit"
+
+    if price < 0.01:
+        return None, None
+
+    return price, effect
 
 
 # ---------------------------------------------------------------------------
@@ -314,10 +371,7 @@ def classify_structure(put_verts, call_verts):
 # ---------------------------------------------------------------------------
 
 def fetch_close_signatures(acct_num):
-    """
-    Fetch live orders and return a set of frozensets (leg canonical keys)
-    for all working close orders. Used to prevent placing duplicate orders.
-    """
+    """Return set of frozensets (leg canonical keys) for working close orders."""
     try:
         j = tt_get_json(f"/accounts/{acct_num}/orders/live", tag="LIVE_ORDERS")
     except Exception as e:
@@ -355,12 +409,9 @@ def fetch_close_signatures(acct_num):
 
 def close_payload_vertical(long_leg, short_leg, price, price_effect, qty):
     """Build a 2-leg close order for a single vertical spread."""
-    # To close: reverse the original actions
-    # Original long leg (Buy to Open) → Sell to Close
-    # Original short leg (Sell to Open) → Buy to Close
     return {
         "order-type": "Limit",
-        "price": f"{clamp_tick(price):.2f}",
+        "price": f"{price:.2f}",
         "price-effect": price_effect,
         "time-in-force": "GTC",
         "legs": [
@@ -380,11 +431,11 @@ def close_payload_vertical(long_leg, short_leg, price, price_effect, qty):
     }
 
 
-def close_payload_4leg_ic(put_vert, call_vert, price, price_effect, qty):
-    """Build a 4-leg close order for an entire Iron Condor."""
+def close_payload_4leg(put_vert, call_vert, price, price_effect, qty):
+    """Build a 4-leg close order for the entire position (IC or RR)."""
     return {
         "order-type": "Limit",
-        "price": f"{clamp_tick(price):.2f}",
+        "price": f"{price:.2f}",
         "price-effect": price_effect,
         "time-in-force": "GTC",
         "legs": [
@@ -443,7 +494,15 @@ def main():
         return 0
 
     try:
-        # 1. Fetch positions
+        # 1. Read trade CSV for fill prices (keyed by expiry yymmdd)
+        csv_fills = read_csv_fills()
+        if not csv_fills:
+            print(f"{TAG}: SKIP — no fills in trade CSV")
+            return 0
+
+        print(f"{TAG}: fill data for expiries: {list(csv_fills.keys())}")
+
+        # 2. Fetch positions
         positions = fetch_positions(acct_num)
         if not positions:
             print(f"{TAG}: SKIP — no option positions")
@@ -451,149 +510,113 @@ def main():
 
         print(f"{TAG}: found {len(positions)} option leg(s)")
 
-        # 2. Filter to tomorrow's expiry only (1DTE positions opened today)
-        now_et = datetime.now(ET)
-        tomorrow = now_et.date() + timedelta(days=1)
-        tomorrow_6 = tomorrow.strftime("%y%m%d")
-
-        tomorrow_pos = [p for p in positions if p["canon"][0] == tomorrow_6]
-        if not tomorrow_pos:
-            print(f"{TAG}: SKIP — no positions expiring {tomorrow} (checked {tomorrow_6})")
-            return 0
-
-        print(f"{TAG}: {len(tomorrow_pos)} leg(s) expiring {tomorrow}")
-
-        # 3. Separate into puts and calls
-        puts = [p for p in tomorrow_pos if p["canon"][1] == "P"]
-        calls = [p for p in tomorrow_pos if p["canon"][1] == "C"]
-
-        # 4. Pair into verticals
-        put_verts = pair_verticals(puts)
-        call_verts = pair_verticals(calls)
-
-        if not put_verts and not call_verts:
-            print(f"{TAG}: SKIP — no vertical spreads found (puts={len(puts)} calls={len(calls)})")
-            return 0
-
-        for v in put_verts:
-            side = "CREDIT" if v["is_credit"] else "DEBIT"
-            print(f"{TAG}: PUT vert {side} qty={v['qty']} "
-                  f"short={v['short_leg']['canon'][2]} long={v['long_leg']['canon'][2]}")
-        for v in call_verts:
-            side = "CREDIT" if v["is_credit"] else "DEBIT"
-            print(f"{TAG}: CALL vert {side} qty={v['qty']} "
-                  f"short={v['short_leg']['canon'][2]} long={v['long_leg']['canon'][2]}")
-
-        # 5. Classify structure
-        structure = classify_structure(put_verts, call_verts)
-        print(f"{TAG}: structure={structure}")
-
-        if structure == "NONE":
-            print(f"{TAG}: SKIP — no classifiable structure")
-            return 0
-
-        # 6. Fetch existing close orders for duplicate check
+        # 3. Fetch existing close orders (once) for duplicate check
         existing_sigs = fetch_close_signatures(acct_num)
-        print(f"{TAG}: {len(existing_sigs)} existing close order(s) found")
+        print(f"{TAG}: {len(existing_sigs)} existing close order(s)")
 
-        # 7. Build close order payloads
-        orders_to_place = []
+        # 4. For each expiry with fill data, match to positions and place close order
+        placed_total = 0
 
-        if structure == "LONG_IC":
-            # Close each vertical separately at $3.50 credit
-            for v in put_verts + call_verts:
-                qty = v["qty"]
-                payload = close_payload_vertical(
-                    v["long_leg"], v["short_leg"],
-                    price=LONG_IC_PRICE, price_effect="Credit", qty=qty,
-                )
-                orders_to_place.append((f"LONG_IC_{v['cp']}", payload))
+        for expiry_ymd, fills in csv_fills.items():
+            exp_pos = [p for p in positions if p["canon"][0] == expiry_ymd]
+            if not exp_pos:
+                print(f"{TAG}: no positions for expiry {expiry_ymd} — skipping")
+                continue
 
-        elif structure == "SHORT_IC":
-            # Close entire IC as single 4-leg order at $1.00 debit
-            pv = put_verts[0]
-            cv = call_verts[0]
-            qty = min(pv["qty"], cv["qty"])
-            payload = close_payload_4leg_ic(
-                pv, cv,
-                price=SHORT_IC_PRICE, price_effect="Debit", qty=qty,
+            print(f"{TAG}: {len(exp_pos)} leg(s) for expiry {expiry_ymd}")
+
+            # 5. Separate puts/calls and pair into verticals
+            puts = [p for p in exp_pos if p["canon"][1] == "P"]
+            calls = [p for p in exp_pos if p["canon"][1] == "C"]
+            put_verts = pair_verticals(puts)
+            call_verts = pair_verticals(calls)
+
+            if not put_verts and not call_verts:
+                print(f"{TAG}: SKIP — no verticals for {expiry_ymd}")
+                continue
+
+            for v in put_verts:
+                sd = "CREDIT" if v["is_credit"] else "DEBIT"
+                print(f"{TAG}: PUT vert {sd} qty={v['qty']} "
+                      f"short={v['short_leg']['canon'][2]} long={v['long_leg']['canon'][2]}")
+            for v in call_verts:
+                sd = "CREDIT" if v["is_credit"] else "DEBIT"
+                print(f"{TAG}: CALL vert {sd} qty={v['qty']} "
+                      f"short={v['short_leg']['canon'][2]} long={v['long_leg']['canon'][2]}")
+
+            # 6. Build fills dict for only the sides we have positions for
+            fills_for_price = {}
+            if put_verts and "PUT" in fills:
+                fills_for_price["PUT"] = fills["PUT"]
+            if call_verts and "CALL" in fills:
+                fills_for_price["CALL"] = fills["CALL"]
+
+            if not fills_for_price:
+                print(f"{TAG}: SKIP — no matching fill data for {expiry_ymd}")
+                continue
+
+            # 7. Compute close price
+            close_price, price_effect = compute_close_price(fills_for_price)
+            if close_price is None:
+                print(f"{TAG}: SKIP — could not compute close price (max_profit <= 0)")
+                continue
+
+            # Log the math
+            entry_net = sum(
+                f["price"] if f["side"] == "CREDIT" else -f["price"]
+                for f in fills_for_price.values()
             )
-            orders_to_place.append(("SHORT_IC_4LEG", payload))
+            n_debit = sum(1 for f in fills_for_price.values() if f["side"] == "DEBIT")
+            max_profit = n_debit * SPREAD_WIDTH_DOLLARS + entry_net
+            target_profit = max_profit * PROFIT_PCT
 
-        elif structure == "RR":
-            # Each vertical closed separately
-            for v in put_verts + call_verts:
-                if v["is_credit"]:
-                    price = RR_SHORT_PRICE
-                    effect = "Debit"
-                    label = f"RR_SHORT_{v['cp']}"
-                else:
-                    price = RR_LONG_PRICE
-                    effect = "Credit"
-                    label = f"RR_LONG_{v['cp']}"
+            print(f"{TAG}: entry_net=${entry_net:+.2f} max_profit=${max_profit:.2f} "
+                  f"target({PROFIT_PCT:.0%})=${target_profit:.2f}")
+            print(f"{TAG}: close_price=${close_price:.2f} {price_effect} GTC")
+
+            # 8. Build close order payload
+            all_verts = put_verts + call_verts
+            qty = min(v["qty"] for v in all_verts)
+
+            if put_verts and call_verts:
+                payload = close_payload_4leg(
+                    put_verts[0], call_verts[0], close_price, price_effect, qty)
+                label = "4LEG"
+            else:
+                v = all_verts[0]
                 payload = close_payload_vertical(
-                    v["long_leg"], v["short_leg"],
-                    price=price, price_effect=effect, qty=v["qty"],
-                )
-                orders_to_place.append((label, payload))
+                    v["long_leg"], v["short_leg"], close_price, price_effect, qty)
+                label = f"2LEG_{v['cp']}"
 
-        elif structure in ("SINGLE_PUT", "SINGLE_CALL"):
-            # Treat like RR — use short/long pricing based on direction
-            verts = put_verts if structure == "SINGLE_PUT" else call_verts
-            for v in verts:
-                if v["is_credit"]:
-                    price = RR_SHORT_PRICE
-                    effect = "Debit"
-                    label = f"SINGLE_SHORT_{v['cp']}"
-                else:
-                    price = RR_LONG_PRICE
-                    effect = "Credit"
-                    label = f"SINGLE_LONG_{v['cp']}"
-                payload = close_payload_vertical(
-                    v["long_leg"], v["short_leg"],
-                    price=price, price_effect=effect, qty=v["qty"],
-                )
-                orders_to_place.append((label, payload))
-
-        if not orders_to_place:
-            print(f"{TAG}: SKIP — no close orders to place")
-            return 0
-
-        # 8. Place orders (skip duplicates)
-        url = f"/accounts/{acct_num}/orders"
-        placed = 0
-        skipped = 0
-
-        for label, payload in orders_to_place:
+            # 9. Check duplicate
             sig = leg_signature(payload)
             if sig in existing_sigs:
-                print(f"{TAG}: SKIP {label} — close order already exists")
-                skipped += 1
+                print(f"{TAG}: SKIP {label} — close order already exists for {expiry_ymd}")
                 continue
 
             legs_desc = ", ".join(
                 f"{l['action']} {l['symbol']} x{l['quantity']}"
                 for l in payload.get("legs", [])
             )
-            print(f"{TAG}: {label} price={payload['price']} {payload['price-effect']} "
-                  f"TIF={payload['time-in-force']} legs=[{legs_desc}]")
+            print(f"{TAG}: {label} qty={qty} legs=[{legs_desc}]")
 
+            # 10. Place order
             if DRY_RUN:
                 print(f"{TAG}: DRY_RUN — would place {label}")
-                placed += 1
+                placed_total += 1
                 continue
 
             try:
-                r = tt_post_json(url, payload, tag=label)
+                r = tt_post_json(f"/accounts/{acct_num}/orders", payload, tag=label)
                 oid = parse_order_id(r)
                 print(f"{TAG}: PLACED {label} order_id={oid}")
-                placed += 1
+                placed_total += 1
                 existing_sigs.add(sig)
             except Exception as e:
                 print(f"{TAG}: WARN — failed to place {label}: {e}")
 
         dry_tag = " (DRY_RUN)" if DRY_RUN else ""
-        print(f"{TAG}: done — placed={placed} skipped={skipped}{dry_tag}")
+        print(f"{TAG}: done — placed={placed_total}{dry_tag}")
         return 0
 
     except Exception as e:
