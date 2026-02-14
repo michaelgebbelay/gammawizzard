@@ -6,9 +6,18 @@ Reads daily P&L from CS_Summary, aggregates into monthly dollar P&L and
 rolling trade statistics (last 10/20 trades) for all 4 accounts:
   Leo (GW Signal), Schwab, TT IRA, TT Individual.
 
-Layout: stacked vertical sections, one per account.  Each section has a
-monthly P&L table (years as columns, months as rows) followed by rolling
-stats (Total P&L, Edge, Max Drawdown, Factor, Win Rate).
+Layout:
+  Row 1:    "CS Performance"
+  Row 2:    (blank)
+  Row 3:    "", year1, year2, ...  (year sub-header, merged concept)
+  Row 4:    "CS Performance", "Leo (GW Signal)", "Schwab", "TT IRA", "TT Individual", "Total"
+  Row 5-16: Jan-Dec monthly P&L (all accounts side by side + Total)
+  Row 17:   (blank)
+  Row 18:   Leo stats header + Schwab stats header (side by side)
+  Row 19-23: Stats rows (Leo cols A-C, blank D, Schwab cols E-G)
+  Row 24-25: (blank)
+  Row 26:   TT IRA stats header + TT Individual stats header
+  Row 27-31: Stats rows (TT IRA cols A-C, blank D, TT Individual cols E-G)
 
 NON-BLOCKING BY DEFAULT (same pattern as other gsheet scripts).
 
@@ -55,8 +64,6 @@ TAG = "CS_PERFORMANCE"
 SUMMARY_DATA_START_ROW = 11  # CS_Summary row 11 = first data row
 
 # Account definitions: name + P&L column index (0-based) in CS_Summary
-# CS_Summary: A=Date, B-E=GW, F-I=Schwab, J-M=TT IRA, N-Q=TT IND
-# P&L is the 4th column in each group: E=4, I=8, M=12, Q=16
 ACCOUNTS = [
     {"name": "Leo (GW Signal)", "pnl_col": 4},
     {"name": "Schwab",          "pnl_col": 8},
@@ -69,14 +76,22 @@ SPX_MULTIPLIER = 100  # 1 SPX point = $100
 MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
-SECTION_ROWS = 22  # rows per account section
-
 # Colors matching CS_Summary (RGB 0-1 scale)
 COLOR_GW   = {"red": 0.851, "green": 0.918, "blue": 0.827}
 COLOR_SCHW = {"red": 0.788, "green": 0.855, "blue": 0.973}
 COLOR_IRA  = {"red": 0.851, "green": 0.918, "blue": 0.827}
 COLOR_IND  = {"red": 1.0,   "green": 0.949, "blue": 0.800}
 ACCOUNT_COLORS = [COLOR_GW, COLOR_SCHW, COLOR_IRA, COLOR_IND]
+
+# Layout row offsets (0-indexed)
+YEAR_ROW = 2       # Row 3: year sub-header
+HEADER_ROW = 3     # Row 4: column headers
+DATA_START = 4     # Row 5: first month (Jan)
+DATA_END = 16      # Row 16: last month (Dec) — DATA_START + 12
+STATS1_HEADER = 17 # Row 18: Leo + Schwab stats header
+STATS1_DATA = 18   # Row 19-22: stats data
+STATS2_HEADER = 25 # Row 26: TT IRA + TT Individual stats header
+STATS2_DATA = 26   # Row 27-30: stats data
 
 
 # ---------------------------------------------------------------------------
@@ -201,21 +216,53 @@ def compute_rolling_stats(data: list, acct_idx: int, n: int) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Stats block helper
+# ---------------------------------------------------------------------------
+
+def _stats_block(name_left, stats_left_10, stats_left_20,
+                 name_right, stats_right_10, stats_right_20) -> list:
+    """Build a paired stats block (2 accounts side by side).
+
+    Returns list of 7 rows:
+      header: [name_left, "Last 10", "Last 20", "", name_right, "Last 10", "Last 20"]
+      5 stat rows: [label, val, val, "", label, val, val]
+      blank separator row
+    """
+    rows = []
+    rows.append([name_left, "Last 10", "Last 20", "", name_right, "Last 10", "Last 20"])
+
+    stat_defs = [
+        ("Total P&L", "total_pnl"),
+        ("Edge", "edge"),
+        ("Max Drawdown", "max_dd"),
+        ("Factor", "factor"),
+        ("Win Rate", "win_rate"),
+    ]
+    for label, key in stat_defs:
+        lv10 = stats_left_10[key] if stats_left_10 else ""
+        lv20 = stats_left_20[key] if stats_left_20 else ""
+        rv10 = stats_right_10[key] if stats_right_10 else ""
+        rv20 = stats_right_20[key] if stats_right_20 else ""
+        if key == "win_rate":
+            lv10 = f"{lv10:.0%}" if isinstance(lv10, float) else ""
+            lv20 = f"{lv20:.0%}" if isinstance(lv20, float) else ""
+            rv10 = f"{rv10:.0%}" if isinstance(rv10, float) else ""
+            rv20 = f"{rv20:.0%}" if isinstance(rv20, float) else ""
+        rows.append([label, lv10, lv20, "", label, rv10, rv20])
+
+    rows.append([])  # blank separator
+    return rows
+
+
+# ---------------------------------------------------------------------------
 # Grid builder
 # ---------------------------------------------------------------------------
 
 def build_performance_grid(data: list) -> tuple:
     """Build the complete cell grid for CS_Performance tab.
 
-    Returns (grid, years) where grid is list[list] of cell values
-    and years is the sorted list of years found in the data.
+    Returns (grid, years) where grid is list[list] of cell values.
     """
-    grid = []
-
-    # Title
-    grid.append(["CS Performance"])
-    grid.append([])
-
     # Determine year range
     years = set()
     for row in data:
@@ -225,49 +272,78 @@ def build_performance_grid(data: list) -> tuple:
             pass
     years = sorted(years) if years else [2026]
 
-    for acct_idx, acct in enumerate(ACCOUNTS):
-        monthly = aggregate_monthly(data, acct_idx)
-        stats_10 = compute_rolling_stats(data, acct_idx, 10)
-        stats_20 = compute_rolling_stats(data, acct_idx, 20)
+    # Aggregate monthly for all accounts
+    monthlies = [aggregate_monthly(data, i) for i in range(len(ACCOUNTS))]
 
-        # +0: Account name
-        grid.append([acct["name"]])
+    # Compute rolling stats for all accounts
+    all_stats = []
+    for i in range(len(ACCOUNTS)):
+        all_stats.append((
+            compute_rolling_stats(data, i, 10),
+            compute_rolling_stats(data, i, 20),
+        ))
 
-        # +1: Year headers
-        grid.append([""] + [str(y) for y in years])
+    grid = []
 
-        # +2 to +13: Monthly data (Jan-Dec)
-        for m_idx, m_name in enumerate(MONTH_NAMES):
-            row = [m_name]
-            for y in years:
-                val = monthly.get((y, m_idx + 1))
-                row.append(round(val, 0) if val is not None else "")
-            grid.append(row)
+    # Row 1: Title
+    grid.append(["CS Performance"])
+    # Row 2: blank
+    grid.append([])
 
-        # +14: blank
-        grid.append([])
+    # Row 3: Year sub-header (one row per year block)
+    # For each year, span across account columns
+    year_row = [""]
+    for y in years:
+        year_row.append(str(y))
+    grid.append(year_row)
 
-        # +15: Stats header
-        grid.append(["", "Last 10", "Last 20"])
+    # Row 4: Column headers
+    # "CS Performance", account names..., "Total"
+    header = ["CS Performance"]
+    for acct in ACCOUNTS:
+        header.append(acct["name"])
+    header.append("Total")
+    grid.append(header)
 
-        # +16 to +20: Stats rows
-        stat_rows = [
-            ("Total P&L", "total_pnl"),
-            ("Edge", "edge"),
-            ("Max Drawdown", "max_dd"),
-            ("Factor", "factor"),
-            ("Win Rate", "win_rate"),
-        ]
-        for label, key in stat_rows:
-            val_10 = stats_10[key] if stats_10 else ""
-            val_20 = stats_20[key] if stats_20 else ""
-            if key == "win_rate":
-                val_10 = f"{val_10:.0%}" if isinstance(val_10, float) else ""
-                val_20 = f"{val_20:.0%}" if isinstance(val_20, float) else ""
-            grid.append([label, val_10, val_20])
+    # Rows 5-16: Monthly data (Jan-Dec)
+    for m_idx, m_name in enumerate(MONTH_NAMES):
+        row = [m_name]
+        month_total = 0.0
+        has_any = False
+        for acct_idx in range(len(ACCOUNTS)):
+            val = monthlies[acct_idx].get((years[0] if len(years) == 1 else None, m_idx + 1))
+            # For multi-year: sum across years for this month
+            if len(years) == 1:
+                val = monthlies[acct_idx].get((years[0], m_idx + 1))
+            else:
+                val = sum(monthlies[acct_idx].get((y, m_idx + 1), 0)
+                          for y in years) or None
+            if val is not None:
+                row.append(round(val, 0))
+                month_total += val
+                has_any = True
+            else:
+                row.append("")
+        row.append(round(month_total, 0) if has_any else "")
+        grid.append(row)
 
-        # +21: blank separator
-        grid.append([])
+    # Row 17: blank
+    grid.append([])
+
+    # Rows 18-23: Leo + Schwab stats (side by side)
+    grid.extend(_stats_block(
+        ACCOUNTS[0]["name"], all_stats[0][0], all_stats[0][1],
+        ACCOUNTS[1]["name"], all_stats[1][0], all_stats[1][1],
+    ))
+
+    # Row 24-25: blank (the _stats_block already ends with a blank row)
+    grid.append([])
+
+    # Rows 26-31: TT IRA + TT Individual stats (side by side)
+    grid.extend(_stats_block(
+        ACCOUNTS[2]["name"], all_stats[2][0], all_stats[2][1],
+        ACCOUNTS[3]["name"], all_stats[3][0], all_stats[3][1],
+    ))
 
     return grid, years
 
@@ -276,12 +352,11 @@ def build_performance_grid(data: list) -> tuple:
 # Formatting
 # ---------------------------------------------------------------------------
 
-def apply_formatting(svc, spreadsheet_id: str, sheet_id: int,
-                     years: list, num_accounts: int = 4):
+def apply_formatting(svc, spreadsheet_id: str, sheet_id: int, years: list):
     """Apply background colors, bold text, and currency formats."""
     requests = []
-    num_years = len(years)
-    max_col = max(num_years + 1, 3)
+    num_accts = len(ACCOUNTS)
+    total_col = num_accts + 2  # A + 4 accounts + Total = 6 cols (0..5), end=6
 
     # Title: bold 12pt
     requests.append({
@@ -298,89 +373,103 @@ def apply_formatting(svc, spreadsheet_id: str, sheet_id: int,
         }
     })
 
-    for acct_idx in range(num_accounts):
-        color = ACCOUNT_COLORS[acct_idx]
-        base = 2 + acct_idx * SECTION_ROWS  # 0-indexed start of section
+    # Header row (row 4, 0-indexed=3): bold
+    requests.append({
+        "repeatCell": {
+            "range": {
+                "sheetId": sheet_id,
+                "startRowIndex": HEADER_ROW, "endRowIndex": HEADER_ROW + 1,
+                "startColumnIndex": 0, "endColumnIndex": total_col,
+            },
+            "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}},
+            "fields": "userEnteredFormat.textFormat",
+        }
+    })
 
-        # Account name: bold + background color
+    # Account column colors in monthly table (rows 4-16, 0-indexed 3-16)
+    for acct_idx, color in enumerate(ACCOUNT_COLORS):
+        col = acct_idx + 1  # col B=1, C=2, D=3, E=4
         requests.append({
             "repeatCell": {
                 "range": {
                     "sheetId": sheet_id,
-                    "startRowIndex": base, "endRowIndex": base + 1,
-                    "startColumnIndex": 0, "endColumnIndex": max_col,
+                    "startRowIndex": HEADER_ROW, "endRowIndex": DATA_END,
+                    "startColumnIndex": col, "endColumnIndex": col + 1,
                 },
-                "cell": {"userEnteredFormat": {
-                    "backgroundColor": color,
-                    "textFormat": {"bold": True},
-                }},
-                "fields": "userEnteredFormat.backgroundColor,userEnteredFormat.textFormat",
+                "cell": {"userEnteredFormat": {"backgroundColor": color}},
+                "fields": "userEnteredFormat.backgroundColor",
             }
         })
 
-        # Year header row: background color + bold
-        requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": sheet_id,
-                    "startRowIndex": base + 1, "endRowIndex": base + 2,
-                    "startColumnIndex": 0, "endColumnIndex": max_col,
-                },
-                "cell": {"userEnteredFormat": {
-                    "backgroundColor": color,
-                    "textFormat": {"bold": True},
-                }},
-                "fields": "userEnteredFormat.backgroundColor,userEnteredFormat.textFormat",
-            }
-        })
+    # Currency format for monthly P&L data (rows 5-16, cols B-F)
+    requests.append({
+        "repeatCell": {
+            "range": {
+                "sheetId": sheet_id,
+                "startRowIndex": DATA_START, "endRowIndex": DATA_END,
+                "startColumnIndex": 1, "endColumnIndex": total_col,
+            },
+            "cell": {"userEnteredFormat": {
+                "numberFormat": {"type": "CURRENCY", "pattern": "$#,##0"}
+            }},
+            "fields": "userEnteredFormat.numberFormat",
+        }
+    })
 
-        # Monthly P&L cells: currency format (rows +2 to +13, cols 1..num_years)
+    # Stats formatting (two pairs)
+    for header_row, color_left, color_right in [
+        (STATS1_HEADER, COLOR_GW, COLOR_SCHW),
+        (STATS2_HEADER, COLOR_IRA, COLOR_IND),
+    ]:
+        # Left stats header: bold + color (cols A-C)
         requests.append({
             "repeatCell": {
                 "range": {
                     "sheetId": sheet_id,
-                    "startRowIndex": base + 2, "endRowIndex": base + 14,
-                    "startColumnIndex": 1, "endColumnIndex": num_years + 1,
-                },
-                "cell": {"userEnteredFormat": {
-                    "numberFormat": {"type": "CURRENCY", "pattern": "$#,##0"}
-                }},
-                "fields": "userEnteredFormat.numberFormat",
-            }
-        })
-
-        # Stats header row: bold + background color
-        requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": sheet_id,
-                    "startRowIndex": base + 15, "endRowIndex": base + 16,
+                    "startRowIndex": header_row, "endRowIndex": header_row + 1,
                     "startColumnIndex": 0, "endColumnIndex": 3,
                 },
                 "cell": {"userEnteredFormat": {
-                    "backgroundColor": color,
+                    "backgroundColor": color_left,
+                    "textFormat": {"bold": True},
+                }},
+                "fields": "userEnteredFormat.backgroundColor,userEnteredFormat.textFormat",
+            }
+        })
+        # Right stats header: bold + color (cols E-G)
+        requests.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": header_row, "endRowIndex": header_row + 1,
+                    "startColumnIndex": 4, "endColumnIndex": 7,
+                },
+                "cell": {"userEnteredFormat": {
+                    "backgroundColor": color_right,
                     "textFormat": {"bold": True},
                 }},
                 "fields": "userEnteredFormat.backgroundColor,userEnteredFormat.textFormat",
             }
         })
 
-        # Currency format for Total P&L and Max Drawdown stats
-        for offset in [16, 18]:  # Total P&L = +16, Max Drawdown = +18
-            requests.append({
-                "repeatCell": {
-                    "range": {
-                        "sheetId": sheet_id,
-                        "startRowIndex": base + offset,
-                        "endRowIndex": base + offset + 1,
-                        "startColumnIndex": 1, "endColumnIndex": 3,
-                    },
-                    "cell": {"userEnteredFormat": {
-                        "numberFormat": {"type": "CURRENCY", "pattern": "$#,##0"}
-                    }},
-                    "fields": "userEnteredFormat.numberFormat",
-                }
-            })
+        # Currency format for Total P&L and Max Drawdown (offsets +1 and +3)
+        data_row = header_row + 1
+        for offset in [0, 2]:  # Total P&L = +0, Max Drawdown = +2
+            for start_c, end_c in [(1, 3), (5, 7)]:  # left B-C, right F-G
+                requests.append({
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": data_row + offset,
+                            "endRowIndex": data_row + offset + 1,
+                            "startColumnIndex": start_c, "endColumnIndex": end_c,
+                        },
+                        "cell": {"userEnteredFormat": {
+                            "numberFormat": {"type": "CURRENCY", "pattern": "$#,##0"}
+                        }},
+                        "fields": "userEnteredFormat.numberFormat",
+                    }
+                })
 
     if requests:
         svc.spreadsheets().batchUpdate(
