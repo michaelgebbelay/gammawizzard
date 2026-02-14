@@ -26,20 +26,30 @@ UPSERT KEYS:
 
 import os
 import sys
-import json
 import csv
 
-# --- optional imports (skip if missing) ---
+# --- path setup ---
+def _add_scripts_root():
+    cur = os.path.abspath(os.path.dirname(__file__))
+    while True:
+        if os.path.basename(cur) == "scripts":
+            if cur not in sys.path:
+                sys.path.append(cur)
+            return
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return
+        cur = parent
+
 _IMPORT_ERR = None
 try:
-    from googleapiclient.discovery import build
-    from google.oauth2 import service_account
+    _add_scripts_root()
+    from lib.sheets import sheets_client, col_letter, ensure_sheet_tab, get_values
 except Exception as e:
-    build = None
-    service_account = None
+    sheets_client = None
     _IMPORT_ERR = e
 
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+TAG = "CS_TRADES_TO_GSHEET"
 
 
 def strict_enabled() -> bool:
@@ -47,58 +57,17 @@ def strict_enabled() -> bool:
 
 
 def log(msg: str):
-    print(msg)
-
-
-def warn(msg: str):
-    print(msg, file=sys.stderr)
+    print(f"{TAG}: {msg}")
 
 
 def skip(msg: str) -> int:
-    log(f"CS_TRADES_TO_GSHEET: SKIP — {msg}")
+    log(f"SKIP — {msg}")
     return 0
 
 
 def fail(msg: str, code: int = 2) -> int:
-    warn(f"CS_TRADES_TO_GSHEET: ERROR — {msg}")
+    print(f"{TAG}: ERROR — {msg}", file=sys.stderr)
     return code
-
-
-def creds_from_env():
-    raw = (os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip()
-    if not raw:
-        return None
-    try:
-        info = json.loads(raw)
-    except Exception as e:
-        raise RuntimeError(f"Invalid GOOGLE_SERVICE_ACCOUNT_JSON (json parse failed): {e}")
-    return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
-
-
-def col_letter(idx_zero_based: int) -> str:
-    n = idx_zero_based + 1
-    s = ""
-    while n:
-        n, r = divmod(n - 1, 26)
-        s = chr(65 + r) + s
-    return s
-
-
-def ensure_sheet_tab(svc, spreadsheet_id: str, title: str) -> int:
-    meta = svc.spreadsheets().get(spreadsheetId=spreadsheet_id, fields="sheets.properties").execute()
-    for s in (meta.get("sheets") or []):
-        p = s.get("properties") or {}
-        if (p.get("title") or "") == title:
-            return int(p.get("sheetId"))
-    req = {"requests": [{"addSheet": {"properties": {"title": title}}}]}
-    r = svc.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=req).execute()
-    sid = r["replies"][0]["addSheet"]["properties"]["sheetId"]
-    return int(sid)
-
-
-def read_sheet_all(svc, spreadsheet_id: str, title: str):
-    r = svc.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=f"{title}!A1:ZZ").execute()
-    return r.get("values") or []
 
 
 def parse_upsert_keys(header: list[str]) -> list[str]:
@@ -114,7 +83,7 @@ def parse_upsert_keys(header: list[str]) -> list[str]:
 
 
 def upsert_rows(svc, spreadsheet_id: str, title: str, rows: list[dict], header: list[str]):
-    existing = read_sheet_all(svc, spreadsheet_id, title)
+    existing = get_values(svc, spreadsheet_id, f"{title}!A1:ZZ")
 
     # Ensure header row
     if not existing:
@@ -188,18 +157,17 @@ def upsert_rows(svc, spreadsheet_id: str, title: str, rows: list[dict], header: 
 def main() -> int:
     strict = strict_enabled()
 
-    # If google libs missing, skip (unless strict)
-    if build is None or service_account is None:
+    if sheets_client is None:
         msg = f"google sheets libs not installed ({_IMPORT_ERR})"
         return fail(msg, 2) if strict else skip(msg)
 
     spreadsheet_id = (os.environ.get("GSHEET_ID") or "").strip()
     if not spreadsheet_id:
-        return fail("GSHEET_ID env is required", 2) if strict else skip("GSHEET_ID missing")
+        return fail("GSHEET_ID missing", 2) if strict else skip("GSHEET_ID missing")
 
     raw_sa = (os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip()
     if not raw_sa:
-        return fail("GOOGLE_SERVICE_ACCOUNT_JSON env is required", 2) if strict else skip("GOOGLE_SERVICE_ACCOUNT_JSON missing")
+        return fail("SA creds missing", 2) if strict else skip("SA creds missing")
 
     tab = (os.environ.get("CS_GSHEET_TAB") or "ConstantStableTrades").strip()
     path = (os.environ.get("CS_LOG_PATH") or "logs/constantstable_vertical_trades.csv").strip()
@@ -215,29 +183,21 @@ def main() -> int:
     if not header:
         return skip(f"{path} has no header — nothing to do")
 
-    # Helpful debug
-    log(f"CS_TRADES_TO_GSHEET: loaded_csv_rows={len(rows)} cols={len(header)} tab={tab}")
-    if rows:
-        log("CS_TRADES_TO_GSHEET: first_row_keys_sample: " + str({k: rows[0].get(k, "") for k in header[:8]}))
+    log(f"loaded_csv_rows={len(rows)} cols={len(header)} tab={tab}")
 
     try:
-        creds = creds_from_env()
-        if creds is None:
-            return fail("GOOGLE_SERVICE_ACCOUNT_JSON missing/empty after parsing", 2) if strict else skip("GOOGLE_SERVICE_ACCOUNT_JSON missing/empty")
-        svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
-
-        ensure_sheet_tab(svc, spreadsheet_id, tab)
-        res = upsert_rows(svc, spreadsheet_id, tab, rows, header)
+        svc, sid = sheets_client()
+        ensure_sheet_tab(svc, sid, tab)
+        res = upsert_rows(svc, sid, tab, rows, header)
 
         log(
-            f"CS_TRADES_TO_GSHEET: {path} → {tab} "
+            f"{path} → {tab} "
             f"appended={res['appended']} updated={res['updated']} "
             f"upsert_keys={','.join(res['keys'])} dedup_rows={res['dedup_rows']}"
         )
         return 0
 
     except Exception as e:
-        # Soft-fail unless strict
         msg = f"Sheets push failed: {type(e).__name__}: {e}"
         return fail(msg, 2) if strict else skip(msg)
 

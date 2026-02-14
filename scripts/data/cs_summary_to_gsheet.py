@@ -3,16 +3,18 @@
 Write daily trading summary to CS_Summary tab.
 
 Reads all rows from CS_Tracking, builds a daily pivot with GW signal prices +
-per-account fills side by side, and writes to CS_Summary.
+per-account fills side by side, computes P&L from settlement data, and writes
+to CS_Summary.
 
 Layout:
   Rows 1-8:   User-managed summary formulas (Trade Total, Edge, etc.) — never touched
   Row 9:      Section headers (GW, schwab, TT IRA, TT IND)
-  Row 10:     Column headers (Date, QTY, price put, price call, Total with comm, ...)
+  Row 10:     Column headers (Date, QTY, price put, price call, P&L, ...)
   Row 11+:    Daily data (one row per date, newest first)
 
-"Total with comm" columns (E, I, M, Q) are user-managed formulas — script never
-writes to them.
+P&L columns (E, I, M, Q):
+  - After settlement available: actual P&L in SPX points × qty
+  - Before settlement: cost-adjusted net credit (SPX points × qty)
 
 NON-BLOCKING BY DEFAULT (same pattern as other gsheet scripts).
 
@@ -22,25 +24,36 @@ Env:
   CS_TRACKING_TAB              - source tab (default "CS_Tracking")
   CS_GW_SIGNAL_TAB             - GW signal tab (default "GW_Signal")
   CS_SUMMARY_TAB               - target tab (default "CS_Summary")
+  CS_SETTLE_TAB                - settlements tab (default "sw_settlements")
+  CS_TT_CLOSE_TAB              - TT close status tab (default "CS_TT_Close")
   CS_GSHEET_STRICT             - "1" to fail hard on errors
 """
 
 import os
 import sys
-import json
 from collections import defaultdict
 
-# --- optional imports (skip if missing) ---
+# --- path setup ---
+def _add_scripts_root():
+    cur = os.path.abspath(os.path.dirname(__file__))
+    while True:
+        if os.path.basename(cur) == "scripts":
+            if cur not in sys.path:
+                sys.path.append(cur)
+            return
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return
+        cur = parent
+
 _IMPORT_ERR = None
 try:
-    from googleapiclient.discovery import build
-    from google.oauth2 import service_account
+    _add_scripts_root()
+    from lib.sheets import sheets_client, ensure_sheet_tab, get_values
+    from lib.parsing import safe_float
 except Exception as e:
-    build = None
-    service_account = None
+    sheets_client = None
     _IMPORT_ERR = e
-
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 TAG = "CS_SUMMARY"
 
@@ -59,13 +72,21 @@ SECTION_HEADER = [
 
 COLUMN_HEADER = [
     "Date",
-    "QTY", "price put", "price call", "Total with comm",
-    "QTY", "price put", "price call", "Total with comm",
-    "QTY", "price put", "price call", "Total with comm",
-    "QTY", "price put", "price call", "Total with comm",
+    "QTY", "price put", "price call", "P&L",
+    "QTY", "price put", "price call", "P&L",
+    "QTY", "price put", "price call", "P&L",
+    "QTY", "price put", "price call", "P&L",
 ]
 
 ACCOUNT_ORDER = ["schwab", "tt-ira", "tt-individual"]
+
+# Cost per 1 iron condor in SPX points: cost_per_contract × 4_legs / 100
+COST_POINTS = {
+    "gw": 0.0,
+    "schwab": 0.0388,        # $0.97 × 4 / 100
+    "tt-ira": 0.0688,        # $1.72 × 4 / 100
+    "tt-individual": 0.0688,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -88,25 +109,6 @@ def skip(msg: str) -> int:
 def fail(msg: str, code: int = 2) -> int:
     print(f"{TAG}: ERROR — {msg}", file=sys.stderr)
     return code
-
-
-def creds_from_env():
-    raw = (os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip()
-    if not raw:
-        return None
-    info = json.loads(raw)
-    return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
-
-
-def ensure_sheet_tab(svc, sid: str, title: str) -> int:
-    meta = svc.spreadsheets().get(spreadsheetId=sid, fields="sheets.properties").execute()
-    for s in (meta.get("sheets") or []):
-        p = s.get("properties") or {}
-        if (p.get("title") or "") == title:
-            return int(p.get("sheetId"))
-    req = {"requests": [{"addSheet": {"properties": {"title": title}}}]}
-    r = svc.spreadsheets().batchUpdate(spreadsheetId=sid, body=req).execute()
-    return int(r["replies"][0]["addSheet"]["properties"]["sheetId"])
 
 
 # --- Account group colors (RGB 0-1 scale) ---
@@ -144,13 +146,13 @@ def apply_formatting(svc, spreadsheet_id: str, sheet_id: int, num_data_rows: int
             }
         })
 
-    # Currency format ($#,##0.00) for price/total columns in data rows
+    # Currency format ($#,##0.00) for price/P&L columns in data rows
     data_top = COLUMN_HEADER_ROW  # 0-indexed row 10 = data starts at row 11
     for start_col, end_col in [
-        (2, 5),   # C:E  (GW price put, price call, total)
-        (6, 9),   # G:I  (Schwab price put, price call, total)
-        (10, 13), # K:M  (TT IRA price put, price call, total)
-        (14, 17), # O:Q  (TT IND price put, price call, total)
+        (2, 5),   # C:E  (GW price put, price call, P&L)
+        (6, 9),   # G:I  (Schwab price put, price call, P&L)
+        (10, 13), # K:M  (TT IRA price put, price call, P&L)
+        (14, 17), # O:Q  (TT IND price put, price call, P&L)
     ]:
         requests.append({
             "repeatCell": {
@@ -190,16 +192,108 @@ def signed_price(price_str: str, side_str: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Daily detail computation
+# P&L computation
 # ---------------------------------------------------------------------------
+
+def parse_strikes(strike_str: str):
+    """Parse 'low/high' strike string. Returns (low, high) or (None, None)."""
+    parts = (strike_str or "").split("/")
+    if len(parts) == 2:
+        try:
+            return (float(parts[0]), float(parts[1]))
+        except (ValueError, TypeError):
+            pass
+    return (None, None)
+
+
+def compute_pnl_for_group(signed_put_f, signed_call_f, put_side, call_side,
+                          put_strikes_str, call_strikes_str,
+                          settlement, cost_points, qty):
+    """Compute P&L for one account-day.
+
+    All values in SPX points. Result = SPX points × qty.
+
+    Before settlement: cost-adjusted net credit = qty × (put + call - cost)
+    After settlement:  actual P&L using intrinsic at settlement.
+
+    For CREDIT legs: P&L = fill_credit - spread_value_at_expiry
+    For DEBIT legs:  P&L = -fill_debit + spread_value_at_expiry
+
+    Returns P&L as string, or "" if no fills.
+    """
+    if qty == 0:
+        return ""
+
+    if signed_put_f is None and signed_call_f is None:
+        return ""
+
+    sp = signed_put_f if signed_put_f is not None else 0.0
+    sc = signed_call_f if signed_call_f is not None else 0.0
+
+    if settlement is not None:
+        # Post-settlement: actual P&L
+        put_lo, put_hi = parse_strikes(put_strikes_str)
+        call_lo, call_hi = parse_strikes(call_strikes_str)
+
+        # Put spread value at settlement: max(0, min(width, high - settle))
+        put_intrinsic = 0.0
+        if put_lo is not None and put_hi is not None:
+            width = put_hi - put_lo
+            put_intrinsic = max(0.0, min(width, put_hi - settlement))
+
+        # Call spread value at settlement: max(0, min(width, settle - low))
+        call_intrinsic = 0.0
+        if call_lo is not None and call_hi is not None:
+            width = call_hi - call_lo
+            call_intrinsic = max(0.0, min(width, settlement - call_lo))
+
+        # Per-leg P&L depends on whether we sold (CREDIT) or bought (DEBIT)
+        if (put_side or "").strip().upper() == "DEBIT":
+            put_pnl = sp + put_intrinsic   # paid debit, receive intrinsic
+        else:
+            put_pnl = sp - put_intrinsic   # received credit, owe intrinsic
+
+        if (call_side or "").strip().upper() == "DEBIT":
+            call_pnl = sc + call_intrinsic
+        else:
+            call_pnl = sc - call_intrinsic
+
+        total = (put_pnl + call_pnl - cost_points) * qty
+    else:
+        # Pre-settlement: cost-adjusted net credit
+        total = (sp + sc - cost_points) * qty
+
+    return str(round(total, 2))
+
+
+# ---------------------------------------------------------------------------
+# Data readers
+# ---------------------------------------------------------------------------
+
+def read_settlements(svc, spreadsheet_id: str, tab: str) -> dict:
+    """Read sw_settlements tab and return {exp_primary: settle_price}."""
+    try:
+        all_rows = get_values(svc, spreadsheet_id, f"{tab}!A1:B")
+        if len(all_rows) < 2:
+            return {}
+        result = {}
+        for row in all_rows[1:]:
+            if len(row) >= 2:
+                dt = (row[0] or "").strip()
+                settle = safe_float(row[1])
+                if dt and settle is not None:
+                    result[dt] = settle
+        log(f"read {len(result)} settlement rows")
+        return result
+    except Exception as e:
+        log(f"WARN — could not read {tab}: {e}")
+        return {}
+
 
 def read_gw_signal(svc, spreadsheet_id: str, tab: str) -> dict:
     """Read GW_Signal tab and return {date: {put_price, call_price}}."""
     try:
-        resp = svc.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id, range=f"{tab}!A1:ZZ"
-        ).execute()
-        all_rows = resp.get("values") or []
+        all_rows = get_values(svc, spreadsheet_id, f"{tab}!A1:ZZ")
         if len(all_rows) < 2:
             return {}
         header = all_rows[0]
@@ -219,11 +313,42 @@ def read_gw_signal(svc, spreadsheet_id: str, tab: str) -> dict:
         return {}
 
 
-def compute_daily_detail(rows: list[dict], gw_signal: dict) -> list[tuple]:
+def read_tt_close_status(svc, spreadsheet_id: str, tab: str) -> dict:
+    """Read CS_TT_Close tab. Returns {expiry: close_net} for filled close orders."""
+    try:
+        all_rows = get_values(svc, spreadsheet_id, f"{tab}!A1:C")
+        if len(all_rows) < 2:
+            return {}
+        result = {}
+        for row in all_rows[1:]:
+            if len(row) >= 3:
+                expiry = (row[0] or "").strip()
+                status = (row[1] or "").strip()
+                close_net = safe_float(row[2])
+                if expiry and status == "closed" and close_net is not None:
+                    result[expiry] = close_net
+        if result:
+            log(f"read {len(result)} TT close entries")
+        return result
+    except Exception as e:
+        log(f"WARN — could not read {tab}: {e}")
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# Daily detail computation
+# ---------------------------------------------------------------------------
+
+def compute_daily_detail(rows: list[dict], gw_signal: dict,
+                         settlements: dict, tt_close: dict = None) -> list[tuple]:
     """Build daily pivot: one row per date with GW + 3 accounts side by side.
 
     Returns list of (date, gw_group, [schwab_group, ira_group, ind_group])
-    where each group is [qty, price_put, price_call].
+    where each group is [qty_str, price_put, price_call, pnl].
+
+    tt_close: {expiry: close_net} from CS_TT_Close tab for TT Individual
+              early-close P&L. When an expiry is present, uses close-based P&L
+              instead of settlement-based P&L.
     """
     by_date = defaultdict(dict)
     for row in rows:
@@ -238,27 +363,70 @@ def compute_daily_detail(rows: list[dict], gw_signal: dict) -> list[tuple]:
         any_row = next(iter(accts.values()), {})
         put_side = (any_row.get("put_side") or "").strip()
         call_side = (any_row.get("call_side") or "").strip()
+        expiry = (any_row.get("expiry") or "").strip()
+
+        # Look up settlement by expiry date
+        settlement = settlements.get(expiry)
 
         # GW prices from GW_Signal tab (authoritative source)
         gw = gw_signal.get(dt, {})
         gw_put = signed_price(gw.get("put_price", ""), put_side)
         gw_call = signed_price(gw.get("call_price", ""), call_side)
-        gw_group = ["1", gw_put, gw_call]
+
+        # GW P&L: use strikes from any available account (all share the same signal)
+        gw_put_strikes = (any_row.get("put_strikes") or "").strip()
+        gw_call_strikes = (any_row.get("call_strikes") or "").strip()
+        gw_pnl = compute_pnl_for_group(
+            safe_float(gw_put), safe_float(gw_call),
+            put_side, call_side,
+            gw_put_strikes, gw_call_strikes,
+            settlement, COST_POINTS["gw"], 1,
+        )
+        gw_group = ["1", gw_put, gw_call, gw_pnl]
 
         account_groups = []
         for acct_name in ACCOUNT_ORDER:
             r = accts.get(acct_name)
             if r:
-                qty = r.get("put_filled", "0")
+                put_filled_f = safe_float(r.get("put_filled"), 0)
+                call_filled_f = safe_float(r.get("call_filled"), 0)
+                qty = int(put_filled_f) if put_filled_f else 0
+
+                # QTY mismatch detection
+                qty_str = str(qty)
+                call_qty = int(call_filled_f) if call_filled_f else 0
+                if qty > 0 and call_qty > 0 and qty != call_qty:
+                    qty_str += "*"
+
                 p_side = (r.get("put_side") or "").strip()
                 c_side = (r.get("call_side") or "").strip()
                 price_put = signed_price(r.get("put_fill_price", ""), p_side)
                 price_call = signed_price(r.get("call_fill_price", ""), c_side)
+
+                cost = COST_POINTS.get(acct_name, 0.0)
+
+                # TT Individual: use close-based P&L if order filled early
+                if (acct_name == "tt-individual" and tt_close
+                        and expiry in tt_close and qty > 0):
+                    close_net = tt_close[expiry]
+                    sp = safe_float(price_put) or 0.0
+                    sc = safe_float(price_call) or 0.0
+                    # 2× cost: commissions on both open + close trades
+                    pnl = str(round((sp + sc + close_net - 2 * cost) * qty, 2))
+                else:
+                    pnl = compute_pnl_for_group(
+                        safe_float(price_put), safe_float(price_call),
+                        p_side, c_side,
+                        (r.get("put_strikes") or "").strip(),
+                        (r.get("call_strikes") or "").strip(),
+                        settlement, cost, qty,
+                    )
             else:
-                qty = "0"
+                qty_str = "0"
                 price_put = ""
                 price_call = ""
-            account_groups.append([qty, price_put, price_call])
+                pnl = ""
+            account_groups.append([qty_str, price_put, price_call, pnl])
 
         result.append((dt, gw_group, account_groups))
 
@@ -272,33 +440,27 @@ def compute_daily_detail(rows: list[dict], gw_signal: dict) -> list[tuple]:
 def main() -> int:
     strict = strict_enabled()
 
-    if build is None or service_account is None:
+    if sheets_client is None:
         msg = f"google sheets libs not installed ({_IMPORT_ERR})"
         return fail(msg, 2) if strict else skip(msg)
 
-    spreadsheet_id = (os.environ.get("GSHEET_ID") or "").strip()
-    if not spreadsheet_id:
+    if not (os.environ.get("GSHEET_ID") or "").strip():
         return fail("GSHEET_ID missing", 2) if strict else skip("GSHEET_ID missing")
 
-    raw_sa = (os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip()
-    if not raw_sa:
+    if not (os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip():
         return fail("SA creds missing", 2) if strict else skip("SA creds missing")
 
     tracking_tab = (os.environ.get("CS_TRACKING_TAB") or "CS_Tracking").strip()
     gw_signal_tab = (os.environ.get("CS_GW_SIGNAL_TAB") or "GW_Signal").strip()
     summary_tab = (os.environ.get("CS_SUMMARY_TAB") or "CS_Summary").strip()
+    settle_tab = (os.environ.get("CS_SETTLE_TAB") or "sw_settlements").strip()
+    tt_close_tab = (os.environ.get("CS_TT_CLOSE_TAB") or "CS_TT_Close").strip()
 
     try:
-        creds = creds_from_env()
-        if creds is None:
-            return fail("SA creds empty", 2) if strict else skip("SA creds empty")
-        svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
+        svc, spreadsheet_id = sheets_client()
 
         # Read tracking data
-        resp = svc.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id, range=f"{tracking_tab}!A1:ZZ"
-        ).execute()
-        all_rows = resp.get("values") or []
+        all_rows = get_values(svc, spreadsheet_id, f"{tracking_tab}!A1:ZZ")
         if len(all_rows) < 2:
             return skip("no tracking data yet")
 
@@ -313,8 +475,14 @@ def main() -> int:
         # Read GW signal prices (authoritative source for GW put_price/call_price)
         gw_signal = read_gw_signal(svc, spreadsheet_id, gw_signal_tab)
 
-        # Compute daily detail
-        daily_rows = compute_daily_detail(rows, gw_signal)
+        # Read settlement prices (for P&L calculation)
+        settlements = read_settlements(svc, spreadsheet_id, settle_tab)
+
+        # Read TT Individual close status (for early-close P&L)
+        tt_close = read_tt_close_status(svc, spreadsheet_id, tt_close_tab)
+
+        # Compute daily detail with P&L
+        daily_rows = compute_daily_detail(rows, gw_signal, settlements, tt_close)
         if not daily_rows:
             return skip("no daily data")
 
@@ -329,8 +497,8 @@ def main() -> int:
              "values": [COLUMN_HEADER]},
         ]
 
-        # Clear old data + formulas in all columns A:Q
-        clear_to = DATA_START_ROW + len(daily_rows) + 100
+        # Clear old data (generous buffer to remove stale rows)
+        clear_to = max(DATA_START_ROW + len(daily_rows) + 100, 5000)
         svc.spreadsheets().values().batchClear(
             spreadsheetId=spreadsheet_id,
             body={"ranges": [
@@ -338,28 +506,28 @@ def main() -> int:
             ]},
         ).execute()
 
-        # Build data updates (4 ranges per row, skipping formula columns E/I/M/Q)
+        # Build data updates — each group now includes P&L (no separate formula pass)
         data_updates = []
         for i, (dt, gw_group, account_groups) in enumerate(daily_rows):
             rnum = DATA_START_ROW + i
-            # A:D = date + GW (qty, price put, price call)
+            # A:E = date + GW (qty, price put, price call, P&L)
             data_updates.append({
-                "range": f"{summary_tab}!A{rnum}:D{rnum}",
+                "range": f"{summary_tab}!A{rnum}:E{rnum}",
                 "values": [[dt] + gw_group],
             })
-            # F:H = Schwab (qty, price put, price call)
+            # F:I = Schwab (qty, price put, price call, P&L)
             data_updates.append({
-                "range": f"{summary_tab}!F{rnum}:H{rnum}",
+                "range": f"{summary_tab}!F{rnum}:I{rnum}",
                 "values": [account_groups[0]],
             })
-            # J:L = TT IRA
+            # J:M = TT IRA
             data_updates.append({
-                "range": f"{summary_tab}!J{rnum}:L{rnum}",
+                "range": f"{summary_tab}!J{rnum}:M{rnum}",
                 "values": [account_groups[1]],
             })
-            # N:P = TT IND
+            # N:Q = TT IND
             data_updates.append({
-                "range": f"{summary_tab}!N{rnum}:P{rnum}",
+                "range": f"{summary_tab}!N{rnum}:Q{rnum}",
                 "values": [account_groups[2]],
             })
 
@@ -370,35 +538,20 @@ def main() -> int:
             body={"valueInputOption": "RAW", "data": all_updates},
         ).execute()
 
-        # Write "Total with comm" formulas in E/I/M/Q (USER_ENTERED for formulas)
-        formula_updates = []
-        for i in range(len(daily_rows)):
-            r = DATA_START_ROW + i
-            formula_updates.append({
-                "range": f"{summary_tab}!E{r}",
-                "values": [[f"=B{r}*(C{r}+D{r})"]],
-            })
-            formula_updates.append({
-                "range": f"{summary_tab}!I{r}",
-                "values": [[f"=(F{r}*(G{r}+H{r}))+0.97*F{r}*4"]],
-            })
-            formula_updates.append({
-                "range": f"{summary_tab}!M{r}",
-                "values": [[f"=(J{r}*(K{r}+L{r}))+1.72*J{r}*4"]],
-            })
-            formula_updates.append({
-                "range": f"{summary_tab}!Q{r}",
-                "values": [[f"=(N{r}*(O{r}+P{r}))+1.72*N{r}*4"]],
-            })
-        svc.spreadsheets().values().batchUpdate(
-            spreadsheetId=spreadsheet_id,
-            body={"valueInputOption": "USER_ENTERED", "data": formula_updates},
-        ).execute()
-
         # Apply formatting (colors + currency)
         apply_formatting(svc, spreadsheet_id, sheet_id, len(daily_rows))
 
-        log(f"wrote {len(daily_rows)} daily rows to {summary_tab}")
+        # Count dates with settlement-based P&L
+        date_to_expiry = {}
+        for r in rows:
+            dt2 = (r.get("date") or "").strip()
+            exp = (r.get("expiry") or "").strip()
+            if dt2 and exp:
+                date_to_expiry[dt2] = exp
+        settled = sum(1 for dt, _, _ in daily_rows
+                      if settlements.get(date_to_expiry.get(dt, "")))
+        log(f"wrote {len(daily_rows)} daily rows to {summary_tab} "
+            f"({settled} with settlement P&L)")
         return 0
 
     except Exception as e:

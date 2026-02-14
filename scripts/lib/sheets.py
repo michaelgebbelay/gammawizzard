@@ -95,3 +95,29 @@ def get_values(svc, sid: str, range_str: str) -> List[List[Any]]:
         .execute()
         .get("values", [])
     )
+
+
+def col_letter(idx: int) -> str:
+    """Zero-based column index to spreadsheet letter (0='A', 25='Z', 26='AA')."""
+    n = idx + 1
+    s = ""
+    while n:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def ensure_sheet_tab(svc, sid: str, title: str) -> int:
+    """Create sheet tab if missing. Returns the sheetId (int)."""
+    meta = (
+        svc.spreadsheets()
+        .get(spreadsheetId=sid, fields="sheets.properties")
+        .execute()
+    )
+    for s in meta.get("sheets") or []:
+        p = s.get("properties") or {}
+        if (p.get("title") or "") == title:
+            return int(p.get("sheetId"))
+    req = {"requests": [{"addSheet": {"properties": {"title": title}}}]}
+    r = svc.spreadsheets().batchUpdate(spreadsheetId=sid, body=req).execute()
+    return int(r["replies"][0]["addSheet"]["properties"]["sheetId"])

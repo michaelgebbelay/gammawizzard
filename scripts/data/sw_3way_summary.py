@@ -153,7 +153,7 @@ def derive_standard_from_raw(raw: List[List[Any]], alerts: List[List[Any]]) -> D
                 bucket["ts"] = dt
         bucket["legs"].append({"put_call": pc, "strike": strike, "quantity": qty})
         if (net is not None) and (not bucket["net_seen"]):
-            bucket["net"] += float(net); bucket["net_seen"] = True
+            bucket["net"] = float(net); bucket["net_seen"] = True
 
     # candidates -> aggregate by expiry in window
     start_min = _to_minutes(ORIG_ET_START); end_min = _to_minutes(ORIG_ET_END)
@@ -459,11 +459,13 @@ def build_three_way(svc, sid):
         # Adjusted: realized dollars (from Schwab) and normalized (using std risk)
         adj_nom = adj_by_exp.get(d)
         adj_norm = None
-        if adj_nom is not None and std_risk_total and std_risk_total>0:
-            adj_norm = adj_nom * (UNIT_RISK/std_risk_total)
-            series_adjN.append((d, round(adj_norm,2)))
-        if adj_nom is not None and (std_risk_total is None or std_risk_total<=0):
-            alerts.append(["calc","no_std_risk_for_norm", d.isoformat(), adj_nom])
+        if adj_nom is not None:
+            if std_risk_total and std_risk_total > 0:
+                adj_norm = adj_nom * (UNIT_RISK / std_risk_total)
+            else:
+                adj_norm = adj_nom  # fallback: assume risk ≈ UNIT_RISK
+                alerts.append(["calc", "norm_fallback_unit_risk", d.isoformat(), adj_nom])
+            series_adjN.append((d, round(adj_norm, 2)))
 
         # Value-add vs Standard (normalized)
         val = None

@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """
-Write daily GammaWizard signal data to a GW_Signal sheet tab.
+Fetch SPX settlement prices from GammaWizard API and upsert to sw_settlements tab.
 
-Fetches the latest ConstantStable payload from GW API and upserts
-one row per trading day with the full signal data.
+NON-BLOCKING BY DEFAULT (same pattern as other CS gsheet scripts).
 
-NON-BLOCKING BY DEFAULT (same pattern as other gsheet scripts).
+The sw_settlements tab is also consumed by sw_3way_summary.py for Schwab
+performance analysis.
 
 Env:
-  GW_BASE                      - GW API base URL
-  GW_EMAIL / GW_PASSWORD       - GW credentials
   GSHEET_ID                    - spreadsheet ID
   GOOGLE_SERVICE_ACCOUNT_JSON  - full JSON string for service account
-  CS_GW_SIGNAL_TAB             - tab name (default "GW_Signal")
+  GW_BASE                      - GW API base URL (default https://gandalf.gammawizard.com)
+  GW_EMAIL / GW_PASSWORD       - GW credentials
+  GW_TOKEN                     - bearer token (optional, falls back to email/password)
+  GW_SETTLE_ENDPOINT           - API endpoint for settlements (default rapi/GetSettlements)
+  SETTLE_BACKFILL_DAYS         - days of history to keep (default 90)
+  CS_GSHEET_STRICT             - "1" to fail hard on errors
 """
 
 import os
@@ -41,26 +44,9 @@ except Exception as e:
     sheets_client = None
     _IMPORT_ERR = e
 
-TAG = "GW_SIGNAL"
-
-SIGNAL_HEADER = [
-    "date", "expiry", "spx", "forward",
-    "vix", "vix_one",
-    "put_strike", "call_strike",
-    "put_price", "call_price",
-    "left_go", "right_go",
-    "l_imp", "r_imp",
-    "l_return", "r_return",
-    "fp",
-    "rv", "rv5", "rv10", "rv20",
-    "r", "ar", "ar2", "ar3",
-    "tx",  # user-managed formula column — script never overwrites this
-]
-
-# Data columns = everything except user-managed columns at the end
-DATA_COLS = SIGNAL_HEADER[:-1]  # write data up to but not including "tx"
-
-UPSERT_KEY = "date"
+TAG = "CS_SETTLEMENTS"
+SETTLE_TAB = "sw_settlements"
+SETTLE_HEADERS = ["exp_primary", "settle"]
 
 
 # ---------------------------------------------------------------------------
@@ -94,9 +80,9 @@ def _sanitize_token(t: str) -> str:
     return t.split(None, 1)[1] if t.lower().startswith("bearer ") else t
 
 
-def gw_fetch():
+def gw_fetch_settlements():
     base = (os.environ.get("GW_BASE", "https://gandalf.gammawizard.com") or "").rstrip("/")
-    endpoint = (os.environ.get("GW_ENDPOINT", "rapi/GetUltraPureConstantStable") or "").lstrip("/")
+    endpoint = (os.environ.get("GW_SETTLE_ENDPOINT", "rapi/GetSettlements") or "").lstrip("/")
     url = f"{base}/{endpoint}"
 
     def hit(tok):
@@ -126,55 +112,45 @@ def gw_fetch():
     return r.json()
 
 
-def extract_predictions(j) -> list[dict]:
-    """Extract the Predictions array (or Trade if no Predictions)."""
-    if isinstance(j, dict):
-        preds = j.get("Predictions") or j.get("Trade")
-        if isinstance(preds, list):
-            return preds
-        if isinstance(preds, dict):
-            return [preds]
-        for v in j.values():
-            if isinstance(v, (dict, list)):
-                result = extract_predictions(v)
-                if result:
-                    return result
-    return []
+def extract_settlements(j) -> list[dict]:
+    """Extract settlement rows from GW API response.
 
+    Expected format: list of {Date: "2026-02-11", Settlement: 6032.58, ...}
+    or nested inside a dict key.
+    """
+    items = []
+    if isinstance(j, list):
+        items = j
+    elif isinstance(j, dict):
+        # Try common keys
+        for key in ("Settlements", "Settlement", "Data", "Trade", "data"):
+            v = j.get(key)
+            if isinstance(v, list):
+                items = v
+                break
+        if not items:
+            # Single dict with Date key
+            if "Date" in j:
+                items = [j]
 
-def signal_row(tr: dict) -> dict:
-    """Map a GW trade dict to our signal row."""
-    def s(key):
-        v = tr.get(key)
-        return "" if v is None else str(v)
+    result = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        # Try various field names for date and settlement price
+        dt = item.get("Date") or item.get("date") or item.get("TDate") or ""
+        settle = (
+            item.get("Settlement") or item.get("settlement")
+            or item.get("Settle") or item.get("settle")
+            or item.get("SPXSettle") or item.get("Close") or item.get("close")
+        )
+        if dt and settle is not None:
+            try:
+                result.append({"exp_primary": str(dt).strip(), "settle": float(settle)})
+            except (ValueError, TypeError):
+                pass
 
-    return {
-        "date": s("Date"),
-        "expiry": s("TDate"),
-        "spx": s("SPX"),
-        "forward": s("Forward"),
-        "vix": s("VIX"),
-        "vix_one": s("VixOne"),
-        "put_strike": s("Limit"),
-        "call_strike": s("CLimit"),
-        "put_price": s("Put"),
-        "call_price": s("Call"),
-        "left_go": s("LeftGo"),
-        "right_go": s("RightGo"),
-        "l_imp": s("LImp"),
-        "r_imp": s("RImp"),
-        "l_return": s("LReturn"),
-        "r_return": s("RReturn"),
-        "fp": s("FP"),
-        "rv": s("RV"),
-        "rv5": s("RV5"),
-        "rv10": s("RV10"),
-        "rv20": s("RV20"),
-        "r": s("R"),
-        "ar": s("AR"),
-        "ar2": s("AR2"),
-        "ar3": s("AR3"),
-    }
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -194,63 +170,56 @@ def main() -> int:
     if not (os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip():
         return fail("SA creds missing", 2) if strict else skip("SA creds missing")
 
-    tab = (os.environ.get("CS_GW_SIGNAL_TAB") or "GW_Signal").strip()
-
     try:
-        # Fetch GW data
-        api = gw_fetch()
-        predictions = extract_predictions(api)
-        if not predictions:
-            return skip("no predictions from GW")
-
-        rows = [signal_row(tr) for tr in predictions if tr.get("Date")]
+        # Fetch settlement data from GW
+        api = gw_fetch_settlements()
+        rows = extract_settlements(api)
         if not rows:
-            return skip("no valid signal rows")
+            return skip("no settlement data from GW")
 
-        log(f"fetched {len(rows)} signal row(s) from GW")
+        log(f"fetched {len(rows)} settlement row(s) from GW")
 
         # Connect to Sheets
         svc, sid = sheets_client()
-
-        ensure_sheet_tab(svc, sid, tab)
+        ensure_sheet_tab(svc, sid, SETTLE_TAB)
 
         # Read existing data
-        existing = get_values(svc, sid, f"{tab}!A1:ZZ")
+        existing = get_values(svc, sid, f"{SETTLE_TAB}!A1:ZZ")
 
-        header_col = col_letter(len(SIGNAL_HEADER) - 1)  # full header range (includes tx)
-        data_col = col_letter(len(DATA_COLS) - 1)        # data range (excludes tx)
+        last_col = col_letter(len(SETTLE_HEADERS) - 1)
 
-        # Ensure header (write full header including tx)
-        if not existing or existing[0][:len(SIGNAL_HEADER)] != SIGNAL_HEADER:
+        # Ensure header
+        if not existing or existing[0] != SETTLE_HEADERS:
             svc.spreadsheets().values().update(
                 spreadsheetId=sid,
-                range=f"{tab}!A1:{header_col}1",
+                range=f"{SETTLE_TAB}!A1:{last_col}1",
                 valueInputOption="RAW",
-                body={"values": [SIGNAL_HEADER]},
+                body={"values": [SETTLE_HEADERS]},
             ).execute()
             if existing:
-                existing = [SIGNAL_HEADER] + existing[1:]
+                existing = [SETTLE_HEADERS] + existing[1:]
             else:
-                existing = [SIGNAL_HEADER]
+                existing = [SETTLE_HEADERS]
 
         # Build existing date map
-        date_idx = 0  # "date" is first column
         existing_dates = {}
         for rnum, row in enumerate(existing[1:], start=2):
-            dt = row[date_idx] if date_idx < len(row) else ""
+            dt = row[0] if len(row) > 0 else ""
             if dt:
-                existing_dates[dt] = rnum
+                existing_dates[dt.strip()] = rnum
 
-        # Upsert rows (write data columns only — preserve user tx formulas)
+        # Upsert rows
         updates = []
         appends = []
         for d in rows:
-            values = [str(d.get(h, "")) for h in DATA_COLS]
-            dt = d.get("date", "")
-            if dt in existing_dates:
-                rnum = existing_dates[dt]
-                rng = f"{tab}!A{rnum}:{data_col}{rnum}"
-                updates.append({"range": rng, "values": [values]})
+            exp = d["exp_primary"]
+            values = [exp, str(d["settle"])]
+            if exp in existing_dates:
+                rnum = existing_dates[exp]
+                updates.append({
+                    "range": f"{SETTLE_TAB}!A{rnum}:{last_col}{rnum}",
+                    "values": [values],
+                })
             else:
                 appends.append(values)
 
@@ -263,17 +232,17 @@ def main() -> int:
         if appends:
             svc.spreadsheets().values().append(
                 spreadsheetId=sid,
-                range=f"{tab}!A1",
+                range=f"{SETTLE_TAB}!A1",
                 valueInputOption="RAW",
                 insertDataOption="INSERT_ROWS",
                 body={"values": appends},
             ).execute()
 
-        log(f"updated={len(updates)} appended={len(appends)} to {tab}")
+        log(f"updated={len(updates)} appended={len(appends)} to {SETTLE_TAB}")
         return 0
 
     except Exception as e:
-        msg = f"GW Signal failed: {type(e).__name__}: {e}"
+        msg = f"Settlements failed: {type(e).__name__}: {e}"
         return fail(msg, 2) if strict else skip(msg)
 
 

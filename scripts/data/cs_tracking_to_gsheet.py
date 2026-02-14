@@ -20,21 +20,29 @@ Env:
 
 import os
 import sys
-import json
 import csv
 from collections import defaultdict
 
-# --- optional imports (skip if missing) ---
+# --- path setup ---
+def _add_scripts_root():
+    cur = os.path.abspath(os.path.dirname(__file__))
+    while True:
+        if os.path.basename(cur) == "scripts":
+            if cur not in sys.path:
+                sys.path.append(cur)
+            return
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return
+        cur = parent
+
 _IMPORT_ERR = None
 try:
-    from googleapiclient.discovery import build
-    from google.oauth2 import service_account
+    _add_scripts_root()
+    from lib.sheets import sheets_client, col_letter, ensure_sheet_tab, get_values
 except Exception as e:
-    build = None
-    service_account = None
+    sheets_client = None
     _IMPORT_ERR = e
-
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 TRACKING_HEADER = [
     "date", "expiry", "account",
@@ -55,7 +63,7 @@ TAG = "CS_TRACKING"
 
 
 # ---------------------------------------------------------------------------
-# Helpers (same patterns as cs_trades_to_gsheet.py)
+# Helpers
 # ---------------------------------------------------------------------------
 
 def strict_enabled() -> bool:
@@ -76,41 +84,8 @@ def fail(msg: str, code: int = 2) -> int:
     return code
 
 
-def creds_from_env():
-    raw = (os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip()
-    if not raw:
-        return None
-    info = json.loads(raw)
-    return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
-
-
-def col_letter(idx: int) -> str:
-    n = idx + 1
-    s = ""
-    while n:
-        n, r = divmod(n - 1, 26)
-        s = chr(65 + r) + s
-    return s
-
-
-def ensure_sheet_tab(svc, sid: str, title: str) -> int:
-    meta = svc.spreadsheets().get(spreadsheetId=sid, fields="sheets.properties").execute()
-    for s in (meta.get("sheets") or []):
-        p = s.get("properties") or {}
-        if (p.get("title") or "") == title:
-            return int(p.get("sheetId"))
-    req = {"requests": [{"addSheet": {"properties": {"title": title}}}]}
-    r = svc.spreadsheets().batchUpdate(spreadsheetId=sid, body=req).execute()
-    return int(r["replies"][0]["addSheet"]["properties"]["sheetId"])
-
-
-def read_sheet_all(svc, sid: str, title: str):
-    r = svc.spreadsheets().values().get(spreadsheetId=sid, range=f"{title}!A1:ZZ").execute()
-    return r.get("values") or []
-
-
 def upsert_rows(svc, sid: str, title: str, rows, header):
-    existing = read_sheet_all(svc, sid, title)
+    existing = get_values(svc, sid, f"{title}!A1:ZZ")
 
     last_col = col_letter(len(header) - 1)
     if not existing:
@@ -322,16 +297,14 @@ def aggregate_rows(csv_rows, account_label: str, cost_per_contract: float):
 def main() -> int:
     strict = strict_enabled()
 
-    if build is None or service_account is None:
+    if sheets_client is None:
         msg = f"google sheets libs not installed ({_IMPORT_ERR})"
         return fail(msg, 2) if strict else skip(msg)
 
-    spreadsheet_id = (os.environ.get("GSHEET_ID") or "").strip()
-    if not spreadsheet_id:
+    if not (os.environ.get("GSHEET_ID") or "").strip():
         return fail("GSHEET_ID missing", 2) if strict else skip("GSHEET_ID missing")
 
-    raw_sa = (os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip()
-    if not raw_sa:
+    if not (os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip():
         return fail("SA creds missing", 2) if strict else skip("SA creds missing")
 
     tab = (os.environ.get("CS_TRACKING_TAB") or "CS_Tracking").strip()
@@ -359,13 +332,10 @@ def main() -> int:
     log(f"{len(tracking_rows)} row(s) for account={account_label}")
 
     try:
-        creds = creds_from_env()
-        if creds is None:
-            return fail("SA creds empty", 2) if strict else skip("SA creds empty")
-        svc = build("sheets", "v4", credentials=creds, cache_discovery=False)
+        svc, sid = sheets_client()
 
-        ensure_sheet_tab(svc, spreadsheet_id, tab)
-        res = upsert_rows(svc, spreadsheet_id, tab, tracking_rows, TRACKING_HEADER)
+        ensure_sheet_tab(svc, sid, tab)
+        res = upsert_rows(svc, sid, tab, tracking_rows, TRACKING_HEADER)
 
         log(f"{path} -> {tab}  appended={res['appended']} updated={res['updated']}")
         return 0
