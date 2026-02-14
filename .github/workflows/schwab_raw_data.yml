@@ -79,26 +79,10 @@ jobs:
         run: |
           python scripts/data/sw_dump_raw.py
 
-      - name: Ingest Leo → sw_leo_orders (5-wide)
-        if: always()
-        env:
-          GSHEET_ID: ${{ secrets.GSHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          GW_EMAIL: ${{ secrets.GW_EMAIL }}
-          GW_PASSWORD: ${{ secrets.GW_PASSWORD }}
-        run: |
-          python scripts/data/cs_leo_to_gsheet.py
-
-      - name: SPX settlements from GammaWizard
-        if: always()
-        env:
-          GSHEET_ID: ${{ secrets.GSHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          GW_EMAIL: ${{ secrets.GW_EMAIL }}
-          GW_PASSWORD: ${{ secrets.GW_PASSWORD }}
-          GW_SETTLE_ENDPOINT: ${{ secrets.GW_SETTLE_ENDPOINT }}
-        run: |
-          python scripts/data/cs_settlements_to_gsheet.py
+      # Leo and Settlement steps disabled — GetLeoCross endpoint returns 404,
+      # and settlements are now derived from GW_Signal SPX column.
+      # - name: Ingest Leo → sw_leo_orders (5-wide)
+      # - name: SPX settlements from GammaWizard
 
       - name: Build Standard orig orders from sw_txn_raw
         id: sw_summary

@@ -25,7 +25,6 @@ ACCOUNTS = {
         "orchestrator": "scripts/trade/ConstantStable/orchestrator.py",
         "post_steps": [
             "scripts/data/cs_gw_signal_to_gsheet.py",
-            "scripts/data/cs_settlements_to_gsheet.py",
             "scripts/data/cs_trades_to_gsheet.py",
             "scripts/data/cs_tracking_to_gsheet.py",
             "scripts/data/cs_backfill_20260211.py",

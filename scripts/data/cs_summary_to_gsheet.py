@@ -24,7 +24,6 @@ Env:
   CS_TRACKING_TAB              - source tab (default "CS_Tracking")
   CS_GW_SIGNAL_TAB             - GW signal tab (default "GW_Signal")
   CS_SUMMARY_TAB               - target tab (default "CS_Summary")
-  CS_SETTLE_TAB                - settlements tab (default "sw_settlements")
   CS_TT_CLOSE_TAB              - TT close status tab (default "CS_TT_Close")
   CS_GSHEET_STRICT             - "1" to fail hard on errors
 """
@@ -270,28 +269,24 @@ def compute_pnl_for_group(signed_put_f, signed_call_f, put_side, call_side,
 # Data readers
 # ---------------------------------------------------------------------------
 
-def read_settlements(svc, spreadsheet_id: str, tab: str) -> dict:
-    """Read sw_settlements tab and return {exp_primary: settle_price}."""
-    try:
-        all_rows = get_values(svc, spreadsheet_id, f"{tab}!A1:B")
-        if len(all_rows) < 2:
-            return {}
-        result = {}
-        for row in all_rows[1:]:
-            if len(row) >= 2:
-                dt = (row[0] or "").strip()
-                settle = safe_float(row[1])
-                if dt and settle is not None:
-                    result[dt] = settle
-        log(f"read {len(result)} settlement rows")
-        return result
-    except Exception as e:
-        log(f"WARN — could not read {tab}: {e}")
-        return {}
+def derive_settlements(gw_signal: dict) -> dict:
+    """Derive settlement prices from GW_Signal SPX data.
+
+    Settlement for expiry E = SPX price from GW_Signal where date == E.
+    (GW runs at ~4:13 PM ET; SPX at that time ≈ closing/settlement price.)
+    """
+    result = {}
+    for dt, data in gw_signal.items():
+        spx = safe_float(data.get("spx"))
+        if spx is not None and spx > 0:
+            result[dt] = spx
+    if result:
+        log(f"derived {len(result)} settlement prices from GW_Signal")
+    return result
 
 
 def read_gw_signal(svc, spreadsheet_id: str, tab: str) -> dict:
-    """Read GW_Signal tab and return {date: {put_price, call_price}}."""
+    """Read GW_Signal tab and return {date: {put_price, call_price, spx}}."""
     try:
         all_rows = get_values(svc, spreadsheet_id, f"{tab}!A1:ZZ")
         if len(all_rows) < 2:
@@ -305,6 +300,7 @@ def read_gw_signal(svc, spreadsheet_id: str, tab: str) -> dict:
                 result[dt] = {
                     "put_price": (d.get("put_price") or "").strip(),
                     "call_price": (d.get("call_price") or "").strip(),
+                    "spx": (d.get("spx") or "").strip(),
                 }
         log(f"read {len(result)} GW signal rows")
         return result
@@ -453,7 +449,6 @@ def main() -> int:
     tracking_tab = (os.environ.get("CS_TRACKING_TAB") or "CS_Tracking").strip()
     gw_signal_tab = (os.environ.get("CS_GW_SIGNAL_TAB") or "GW_Signal").strip()
     summary_tab = (os.environ.get("CS_SUMMARY_TAB") or "CS_Summary").strip()
-    settle_tab = (os.environ.get("CS_SETTLE_TAB") or "sw_settlements").strip()
     tt_close_tab = (os.environ.get("CS_TT_CLOSE_TAB") or "CS_TT_Close").strip()
 
     try:
@@ -475,8 +470,8 @@ def main() -> int:
         # Read GW signal prices (authoritative source for GW put_price/call_price)
         gw_signal = read_gw_signal(svc, spreadsheet_id, gw_signal_tab)
 
-        # Read settlement prices (for P&L calculation)
-        settlements = read_settlements(svc, spreadsheet_id, settle_tab)
+        # Derive settlement prices from GW_Signal SPX column
+        settlements = derive_settlements(gw_signal)
 
         # Read TT Individual close status (for early-close P&L)
         tt_close = read_tt_close_status(svc, spreadsheet_id, tt_close_tab)

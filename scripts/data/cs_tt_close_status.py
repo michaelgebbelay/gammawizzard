@@ -141,7 +141,7 @@ def fetch_filled_close_orders(acct_num: str, days_back: int = 7) -> dict:
     start = (date.today() - timedelta(days=days_back)).isoformat()
     j = _tt_get_json(
         f"/accounts/{acct_num}/orders",
-        params={"start-date": start, "per-page": "250"},
+        params={"start-date": start, "per-page": "100"},
         tag="ORDERS",
     )
     data = j.get("data") if isinstance(j, dict) else {}
