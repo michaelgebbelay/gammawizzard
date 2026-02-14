@@ -72,7 +72,6 @@ ACCOUNTS = {
             "CS_UNIT_DOLLARS": "10000",
             "CS_ACCOUNT_LABEL": "tt-ira",
             "CS_COST_PER_CONTRACT": "1.72",
-            "VERT_MAX_QTY_PER_SIDE": "5",
         },
     },
     "tt-individual": {
@@ -103,7 +102,6 @@ ACCOUNTS = {
             "CS_ACCOUNT_LABEL": "tt-individual",
             "CS_COST_PER_CONTRACT": "1.72",
             "CS_CLOSE_ORDERS_ENABLE": "1",
-            "VERT_MAX_QTY_PER_SIDE": "5",
         },
     },
 }
@@ -116,6 +114,9 @@ COMMON_ENV = {
     "CS_VOL_FIELD": "VixOne",
     "CS_VIX_BREAKS": "0.1636779,0.3276571,0.3702533,0.4514141",
     "CS_VIX_MULTS": "2,3,5,8,10",
+    "CS_RR_CREDIT_RATIOS": "0.50,0.50,0.50,1.50,1.25",
+    "CS_IC_SHORT_MULTS": "2,6,5,8,10",
+    "CS_IC_LONG_MULTS": "3,3,5,8,10",
     "CS_LOG_PATH": "/tmp/cs_trades.csv",
     "CS_GUARD_NO_CLOSE": "1",
     "CS_GUARD_FAIL_ACTION": "SKIP_ALL",

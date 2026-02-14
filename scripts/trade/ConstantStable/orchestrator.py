@@ -70,6 +70,9 @@ CS_LOG_PATH = os.environ.get("CS_LOG_PATH", "logs/constantstable_vertical_trades
 CS_VOL_FIELD = (os.environ.get("CS_VOL_FIELD", "VixOne") or "VixOne").strip()  # default changed to VixOne
 CS_VIX_BREAKS = os.environ.get("CS_VIX_BREAKS", "0.089,0.111,0.131,0.158,0.192,0.253")
 CS_VIX_MULTS = os.environ.get("CS_VIX_MULTS", "1,1,1,2,3,4,6")
+CS_RR_CREDIT_RATIOS = os.environ.get("CS_RR_CREDIT_RATIOS", "")
+CS_IC_SHORT_MULTS = os.environ.get("CS_IC_SHORT_MULTS", "")
+CS_IC_LONG_MULTS = os.environ.get("CS_IC_LONG_MULTS", "")
 
 # --- NO-CLOSE guard config ---
 CS_GUARD_NO_CLOSE = (os.environ.get("CS_GUARD_NO_CLOSE", "1") or "1").strip().lower() in ("1", "true", "yes", "y")
@@ -567,7 +570,7 @@ def main():
     field_used, vol_val = pick_vol_value(tr, CS_VOL_FIELD)
     bucket, vix_mult = vix_bucket_and_mult(vol_val, CS_VIX_BREAKS, CS_VIX_MULTS)
     print(f"CS_VERT_RUN VOL: field={CS_VOL_FIELD} used={field_used} value={vol_val} bucket={bucket} mult={vix_mult}")
-    print(f"CS_VERT_RUN VIX_BREAKS={CS_VIX_BREAKS} VIX_MULTS={CS_VIX_MULTS}")
+    print(f"CS_VERT_RUN VIX_BREAKS={CS_VIX_BREAKS} VIX_MULTS={CS_VIX_MULTS} RR_CREDIT_RATIOS={CS_RR_CREDIT_RATIOS}")
 
     print(f"CS_VERT_RUN TRADE: Date={trade_date} TDate={tdate_iso}")
     print(f"  PUT strikes : {p_low} / {p_high}  OSI=({put_low_osi},{put_high_osi})  LeftGo={left_go} LImp={left_imp}")
@@ -612,16 +615,34 @@ def main():
         print("CS_VERT_RUN SKIP: no verticals to trade (LeftGo/RightGo zero or vix_mult=0).")
         return 0
 
-    # RR credit reduction: when mult >= 5 and sides differ (one DEBIT, one CREDIT),
-    # reduce the credit side to ~60% of full target.
-    CS_RR_CREDIT_RATIO = float(os.environ.get("CS_RR_CREDIT_RATIO", "0.6"))
-    if v_put and v_call and int(vix_mult) >= 5 and v_put["side"] != v_call["side"]:
-        full_target = max(1, units * int(vix_mult))
-        credit_target = max(1, round(full_target * CS_RR_CREDIT_RATIO))
-        for v in (v_put, v_call):
-            if v["side"] == "CREDIT":
-                print(f"CS_VERT_RUN RR_CREDIT_REDUCE: {v['name']} target {full_target} → {credit_target} (ratio={CS_RR_CREDIT_RATIO} mult={vix_mult})")
-                v["target_qty"] = credit_target
+    # Structure-based sizing adjustments
+    if v_put and v_call:
+        base_mults = parse_csv_floats(CS_VIX_MULTS)
+
+        if v_put["side"] != v_call["side"] and CS_RR_CREDIT_RATIOS:
+            # RR: per-bucket credit ratio for the credit side
+            ratios = parse_csv_floats(CS_RR_CREDIT_RATIOS)
+            if len(ratios) == len(base_mults):
+                ratio = ratios[bucket - 1]
+                full_target = max(1, units * int(vix_mult))
+                credit_target = max(1, round(full_target * ratio))
+                for v in (v_put, v_call):
+                    if v["side"] == "CREDIT":
+                        print(f"CS_VERT_RUN RR_CREDIT_ADJ: {v['name']} target {full_target} → {credit_target} (ratio={ratio} bucket={bucket} mult={vix_mult})")
+                        v["target_qty"] = credit_target
+
+        elif v_put["side"] == v_call["side"]:
+            # IC: separate multiplier arrays for Short IC vs Long IC
+            ic_mults_csv = CS_IC_SHORT_MULTS if v_put["side"] == "CREDIT" else CS_IC_LONG_MULTS
+            ic_label = "IC_SHORT" if v_put["side"] == "CREDIT" else "IC_LONG"
+            if ic_mults_csv:
+                ic_mults = parse_csv_floats(ic_mults_csv)
+                if len(ic_mults) == len(base_mults):
+                    ic_mult = int(ic_mults[bucket - 1])
+                    ic_target = max(1, units * ic_mult)
+                    for v in (v_put, v_call):
+                        print(f"CS_VERT_RUN {ic_label}_SIZE: {v['name']} target {v['target_qty']} → {ic_target} (ic_mult={ic_mult} bucket={bucket})")
+                        v["target_qty"] = ic_target
 
     # Load positions once if needed (guard and/or topup)
     need_positions = CS_GUARD_NO_CLOSE or CS_TOPUP
