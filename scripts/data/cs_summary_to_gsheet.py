@@ -31,6 +31,7 @@ Env:
 import os
 import sys
 from collections import defaultdict
+from datetime import date
 
 # --- path setup ---
 def _add_scripts_root():
@@ -229,39 +230,38 @@ def compute_pnl_for_group(signed_put_f, signed_call_f, put_side, call_side,
     sp = signed_put_f if signed_put_f is not None else 0.0
     sc = signed_call_f if signed_call_f is not None else 0.0
 
-    if settlement is not None:
-        # Post-settlement: actual P&L
-        put_lo, put_hi = parse_strikes(put_strikes_str)
-        call_lo, call_hi = parse_strikes(call_strikes_str)
+    if settlement is None:
+        # No settlement yet — leave P&L blank for open trades
+        return ""
 
-        # Put spread value at settlement: max(0, min(width, high - settle))
-        put_intrinsic = 0.0
-        if put_lo is not None and put_hi is not None:
-            width = put_hi - put_lo
-            put_intrinsic = max(0.0, min(width, put_hi - settlement))
+    # Post-settlement: actual P&L
+    put_lo, put_hi = parse_strikes(put_strikes_str)
+    call_lo, call_hi = parse_strikes(call_strikes_str)
 
-        # Call spread value at settlement: max(0, min(width, settle - low))
-        call_intrinsic = 0.0
-        if call_lo is not None and call_hi is not None:
-            width = call_hi - call_lo
-            call_intrinsic = max(0.0, min(width, settlement - call_lo))
+    # Put spread value at settlement: max(0, min(width, high - settle))
+    put_intrinsic = 0.0
+    if put_lo is not None and put_hi is not None:
+        width = put_hi - put_lo
+        put_intrinsic = max(0.0, min(width, put_hi - settlement))
 
-        # Per-leg P&L depends on whether we sold (CREDIT) or bought (DEBIT)
-        if (put_side or "").strip().upper() == "DEBIT":
-            put_pnl = sp + put_intrinsic   # paid debit, receive intrinsic
-        else:
-            put_pnl = sp - put_intrinsic   # received credit, owe intrinsic
+    # Call spread value at settlement: max(0, min(width, settle - low))
+    call_intrinsic = 0.0
+    if call_lo is not None and call_hi is not None:
+        width = call_hi - call_lo
+        call_intrinsic = max(0.0, min(width, settlement - call_lo))
 
-        if (call_side or "").strip().upper() == "DEBIT":
-            call_pnl = sc + call_intrinsic
-        else:
-            call_pnl = sc - call_intrinsic
-
-        total = (put_pnl + call_pnl - cost_points) * qty
+    # Per-leg P&L depends on whether we sold (CREDIT) or bought (DEBIT)
+    if (put_side or "").strip().upper() == "DEBIT":
+        put_pnl = sp + put_intrinsic   # paid debit, receive intrinsic
     else:
-        # Pre-settlement: cost-adjusted net credit
-        total = (sp + sc - cost_points) * qty
+        put_pnl = sp - put_intrinsic   # received credit, owe intrinsic
 
+    if (call_side or "").strip().upper() == "DEBIT":
+        call_pnl = sc + call_intrinsic
+    else:
+        call_pnl = sc - call_intrinsic
+
+    total = (put_pnl + call_pnl - cost_points) * qty
     return str(round(total, 2))
 
 
@@ -273,10 +273,14 @@ def derive_settlements(gw_signal: dict) -> dict:
     """Derive settlement prices from GW_Signal SPX data.
 
     Settlement for expiry E = SPX price from GW_Signal where date == E.
-    (GW runs at ~4:13 PM ET; SPX at that time ≈ closing/settlement price.)
+    Includes today (by the time reporting runs, the market has closed and
+    GW_Signal has the SPX close for today's expiry).  Excludes future dates.
     """
+    today = date.today().isoformat()
     result = {}
     for dt, data in gw_signal.items():
+        if dt > today:
+            continue
         spx = safe_float(data.get("spx"))
         if spx is not None and spx > 0:
             result[dt] = spx
