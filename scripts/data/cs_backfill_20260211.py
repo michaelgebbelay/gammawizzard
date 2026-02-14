@@ -2,7 +2,12 @@
 """
 One-time backfill for CS_Tracking sheet:
 
-1. TT-IRA 2026-02-11: fix qty_filled (parse_order_id bug logged 0, real was 6+6)
+1. Fix 2026-02-11 column misalignment — rows were written with an older
+   27-column header (missing gw_put_price, gw_call_price, put_improvement,
+   call_improvement), so every value from column 7 onward is shifted by 2.
+   This caused put_side/call_side to be wrong (DEBIT↔CREDIT swapped), fills
+   to be garbage for Schwab, etc.  Decoded the real values from the shifted
+   data and set them explicitly.
 2. Schwab rows: fix cost_per_contract 0.65 → 0.97 and recalculate costs
 3. All rows: add gw_put_price/gw_call_price from GW historical data
 
@@ -41,6 +46,46 @@ GW_PRICES = {
     "2026-02-02": ("1.05", "0.93"),
     "2026-01-30": ("1.0", "1.05"),
     "2026-01-29": ("1.0", "0.95"),
+}
+
+# --- Corrected 2026-02-11 column values (decoded from the 2-position shift) ---
+# Original orchestrator wrote 27 cols; current header has 31 cols.
+# Columns 7-8 (gw_put/gw_call_price) and 25-26 (put/call_improvement) were
+# inserted later, shifting all subsequent values.  These are the REAL values.
+FIX_20260211 = {
+    "tt-ira": {
+        "put_spread_price": "0.95", "call_spread_price": "0.95",
+        "vix_value": "0.1424", "vol_bucket": "1", "vix_mult": "2",
+        "units": "1", "put_side": "CREDIT", "put_target": "2",
+        "call_side": "DEBIT", "call_target": "2",
+        "put_filled": "6", "put_fill_price": "0.97", "put_status": "OK",
+        "call_filled": "6", "call_fill_price": "0.97", "call_status": "OK",
+        "put_improvement": "0", "call_improvement": "0",
+        "cost_per_contract": "1.72",
+        "put_cost": "20.64", "call_cost": "20.64", "total_cost": "41.28",
+    },
+    "schwab": {
+        "put_spread_price": "0.95", "call_spread_price": "0.95",
+        "vix_value": "0.1424", "vol_bucket": "1", "vix_mult": "2",
+        "units": "2", "put_side": "CREDIT", "put_target": "4",
+        "call_side": "DEBIT", "call_target": "4",
+        "put_filled": "4", "put_fill_price": "0.95", "put_status": "OK",
+        "call_filled": "4", "call_fill_price": "0.95", "call_status": "OK",
+        "put_improvement": "0", "call_improvement": "0",
+        "cost_per_contract": "0.97",
+        "put_cost": "7.76", "call_cost": "7.76", "total_cost": "15.52",
+    },
+    "tt-individual": {
+        "put_spread_price": "0.95", "call_spread_price": "0.95",
+        "vix_value": "0.1424", "vol_bucket": "1", "vix_mult": "2",
+        "units": "1", "put_side": "CREDIT", "put_target": "2",
+        "call_side": "DEBIT", "call_target": "2",
+        "put_filled": "0", "put_fill_price": "0", "put_status": "NO_FILL",
+        "call_filled": "0", "call_fill_price": "0", "call_status": "NO_FILL",
+        "put_improvement": "0", "call_improvement": "0",
+        "cost_per_contract": "1.72",
+        "put_cost": "0", "call_cost": "0", "total_cost": "0",
+    },
 }
 
 
@@ -101,24 +146,23 @@ def main() -> int:
             acct = get_cell(vals, "account")
             dt = get_cell(vals, "date")
 
-            # --- Fix 1: TT-IRA 2026-02-11 fills ---
-            if (acct == "tt-ira" and dt == "2026-02-11"
+            # --- Fix 1: 2026-02-11 column misalignment ---
+            # Rows were written with 27-col header; current has 31 cols.
+            # Detect: put_side should be CREDIT for this date but shows DEBIT
+            # (shifted from old call_side position).
+            if (dt == "2026-02-11"
                     and get_cell(vals, "expiry") == "2026-02-12"
-                    and get_cell(vals, "put_filled") != "6"):
-                for col, val in [
-                    ("put_filled", "6"), ("put_fill_price", "0.97"), ("put_status", "OK"),
-                    ("call_filled", "6"), ("call_fill_price", "0.97"), ("call_status", "OK"),
-                    ("cost_per_contract", "1.72"),
-                    ("put_cost", "20.64"), ("call_cost", "20.64"), ("total_cost", "41.28"),
-                ]:
+                    and acct in FIX_20260211
+                    and get_cell(row_vals, "put_side") != FIX_20260211[acct]["put_side"]):
+                fix = FIX_20260211[acct]
+                for col, val in fix.items():
                     set_cell(row_vals, col, val)
                 changed = True
-                print(f"{TAG}: FIX tt-ira fills row {rnum}")
+                print(f"{TAG}: FIX column alignment row {rnum} (acct={acct})")
 
             # --- Fix 2: Schwab cost 0.65 → 0.97 ---
             if acct == "schwab" and get_cell(vals, "cost_per_contract") == "0.65":
                 set_cell(row_vals, "cost_per_contract", "0.97")
-                # Recalculate costs: cost_per_contract * filled * 2 legs
                 for side, filled_col, cost_col in [
                     ("put", "put_filled", "put_cost"),
                     ("call", "call_filled", "call_cost"),
@@ -129,7 +173,6 @@ def main() -> int:
                         set_cell(row_vals, cost_col, f"{new_cost:.2f}")
                     except (ValueError, TypeError):
                         pass
-                # Total cost
                 try:
                     pc = float(get_cell(row_vals, "put_cost") or "0")
                     cc = float(get_cell(row_vals, "call_cost") or "0")
@@ -149,7 +192,6 @@ def main() -> int:
                     print(f"{TAG}: ADD gw_prices row {rnum} (date={dt}, acct={acct})")
 
             if changed:
-                # Column letter helper
                 n = len(header)
                 if n <= 26:
                     last_col = chr(64 + n)
