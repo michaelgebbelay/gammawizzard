@@ -19,10 +19,9 @@ Close order price:
   → rounded to nearest $0.05
 
 Examples (at 50%):
-  Credit IC  ($2 credit):    close = 2×0.50 - 2      = -1.00  → Debit  $1.00
-  Debit IC   ($2 debit):     close = 3×0.50 -(-2)    =  3.50  → Credit $3.50
-  RR (net $1.20 debit):      close = 5×0.50 -(-1.20) =  3.70  → Credit $3.70
-  RR (net $0.50 credit):     close = 5×0.50 -(+0.50) =  2.00  → Credit $2.00
+  Credit IC  ($2 credit):    close = 2×0.50 - 2   = -1.00  → Debit  $1.00
+  Debit IC   ($2 debit):     close = 3×0.50 -(-2) =  3.50  → Credit $3.50
+  RR (any entry):            close = 5×0.50        =  2.50  → Credit $2.50 (fixed)
 
 Env:
   CS_CLOSE_ORDERS_ENABLE  - "1" to enable (default "0")
@@ -341,7 +340,7 @@ def compute_close_price(fills):
     Max profit rules (only ONE side can pay off — SPX goes one direction):
       Credit IC/vert:  max_profit = total credit received
       Debit IC/vert:   max_profit = $5 - total debit paid
-      RR (mixed):      max_profit = $5 (spread width, always)
+      RR (mixed):      fixed $2.50 Credit (50% of $5, entry variance ~±$0.10)
 
     Returns (price, price_effect, max_profit) or (None, None, None).
     Price is already clamped to $0.05 ticks.
@@ -363,22 +362,23 @@ def compute_close_price(fills):
     if not sides:
         return None, None, None
 
-    # Determine max_profit based on structure
+    # Determine max_profit and close price based on structure
     if len(sides) == 2 and sides[0] != sides[1]:
-        # RR (one credit, one debit): max_profit = spread width
+        # RR (one credit, one debit): fixed $2.50 credit (50% of $5 spread)
+        # Entry variance is ±$0.10, so fixed price is simpler and accurate enough
         max_profit = SPREAD_WIDTH_DOLLARS
+        close_net = SPREAD_WIDTH_DOLLARS * PROFIT_PCT  # always positive → Credit
     elif all(s == "CREDIT" for s in sides):
         # Credit IC or single credit: max_profit = credit received
         max_profit = entry_net
+        close_net = max_profit * PROFIT_PCT - entry_net
     else:
         # Debit IC or single debit: max_profit = spread width - debit
         max_profit = SPREAD_WIDTH_DOLLARS + entry_net  # entry_net is negative
+        close_net = max_profit * PROFIT_PCT - entry_net
 
     if max_profit <= 0.01:
         return None, None, None
-
-    # close_net > 0 → we receive credit; close_net < 0 → we pay debit
-    close_net = max_profit * PROFIT_PCT - entry_net
 
     price = clamp_tick(abs(close_net))
     effect = "Credit" if close_net > 0 else "Debit"
