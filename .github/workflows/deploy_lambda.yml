@@ -3,11 +3,6 @@ name: Deploy Trading Lambda
 on:
   workflow_dispatch:
     inputs:
-      schedule_state:
-        description: "Enable or disable schedules"
-        type: choice
-        options: [ENABLED, DISABLED]
-        default: DISABLED
       dry_run:
         description: "Dry run (no real orders)"
         type: choice
@@ -45,5 +40,4 @@ jobs:
             --no-confirm-changeset \
             --no-fail-on-empty-changeset \
             --parameter-overrides \
-              ScheduleState=${{ github.event.inputs.schedule_state }} \
               DryRun=${{ github.event.inputs.dry_run }}
