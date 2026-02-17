@@ -268,6 +268,29 @@ def tt_account_number():
     return acct
 
 
+def cancel_all_working_orders(acct: str):
+    """Pre-flight: cancel all live orders to prevent stacking from concurrent invocations."""
+    try:
+        r = tt_request("GET", f"/accounts/{acct}/orders/live")
+        data = r.json() or {}
+        items = data.get("data", {}).get("items", [])
+        if not items:
+            return
+        cancelled = 0
+        for order in items:
+            oid = str(order.get("id", ""))
+            if not oid:
+                continue
+            url_del = f"/accounts/{acct}/orders/{oid}"
+            ok = delete_with_retry(None, url_del, tag=f"PREFLIGHT {oid}", tries=3)
+            print(f"CS_VERT_PLACE PREFLIGHT_CANCEL {oid} → {'OK' if ok else 'FAIL'}")
+            if ok:
+                cancelled += 1
+        print(f"CS_VERT_PLACE PREFLIGHT: cancelled {cancelled}/{len(items)} live orders")
+    except Exception as e:
+        print(f"CS_VERT_PLACE PREFLIGHT_WARN: {str(e)[:200]}")
+
+
 def order_symbol(osi: str) -> str:
     info = resolve_tt_option_symbols(osi)
     if info.get("order"):
@@ -1447,6 +1470,9 @@ def main():
 
     c = None
     acct_hash = tt_account_number()
+
+    if not DRY_RUN:
+        cancel_all_working_orders(acct_hash)
 
     ts_utc = datetime.now(timezone.utc)
     ts_et = ts_utc.astimezone(ET)

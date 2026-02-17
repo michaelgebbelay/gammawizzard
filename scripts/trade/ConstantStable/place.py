@@ -254,6 +254,33 @@ def resolve_acct_hash(c):
     return str((arr[0] or {}).get("hashValue") or "")
 
 
+def cancel_all_working_orders(c, acct_hash: str):
+    """Pre-flight: cancel all WORKING orders to prevent stacking from concurrent invocations."""
+    url = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
+    try:
+        r = c.session.get(url, timeout=20)
+        if r.status_code != 200:
+            print(f"CS_VERT_PLACE PREFLIGHT: failed to fetch orders (HTTP {r.status_code})")
+            return
+        orders = r.json() or []
+        working = [o for o in orders if status_upper(o) in ("WORKING", "QUEUED", "PENDING_ACTIVATION")]
+        if not working:
+            return
+        cancelled = 0
+        for order in working:
+            oid = str(order.get("orderId", ""))
+            if not oid:
+                continue
+            url_del = f"{url}/{oid}"
+            ok = delete_with_retry(c, url_del, tag=f"PREFLIGHT {oid}", tries=3)
+            print(f"CS_VERT_PLACE PREFLIGHT_CANCEL {oid} → {'OK' if ok else 'FAIL'}")
+            if ok:
+                cancelled += 1
+        print(f"CS_VERT_PLACE PREFLIGHT: cancelled {cancelled}/{len(working)} working orders")
+    except Exception as e:
+        print(f"CS_VERT_PLACE PREFLIGHT_WARN: {str(e)[:200]}")
+
+
 def get_quote_json_with_retry(c, osi: str, tries: int = 4):
     last = None
     for i in range(tries):
@@ -1236,6 +1263,9 @@ def main():
 
     c = schwab_client()
     acct_hash = resolve_acct_hash(c)
+
+    if not DRY_RUN:
+        cancel_all_working_orders(c, acct_hash)
 
     ts_utc = datetime.now(timezone.utc)
     ts_et = ts_utc.astimezone(ET)
