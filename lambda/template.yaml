@@ -8,7 +8,7 @@ Description: >
 Parameters:
   ScheduleTime:
     Type: String
-    Default: "cron(12 16 ? * MON-FRI *)"
+    Default: "cron(13 16 ? * MON-FRI *)"
     Description: Cron expression for trade trigger (ET).
   DryRun:
     Type: String
@@ -53,7 +53,7 @@ Resources:
       Name: gamma-cs-warmup
       Description: "Warm up Lambda container 3 min before trading"
       State: ENABLED
-      ScheduleExpression: "cron(9 16 ? * MON-FRI *)"
+      ScheduleExpression: "cron(10 16 ? * MON-FRI *)"
       ScheduleExpressionTimezone: "America/New_York"
       FlexibleTimeWindow:
         Mode: "OFF"
