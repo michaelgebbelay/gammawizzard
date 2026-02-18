@@ -355,7 +355,14 @@ def lambda_handler(event, context):
     # Ensure /tmp writability for logs
     os.makedirs("/tmp/logs", exist_ok=True)
 
-    # -- 4. Run orchestrator (critical path) --
+    # -- 4. Wait for signal to stabilize (scheduled accounts only) --
+    if account in ("schwab", "tt-ira", "tt-individual"):
+        delay = int(os.environ.get("CS_TRADE_DELAY_SECS", "30"))
+        if delay > 0:
+            print(f"Signal delay: sleeping {delay}s")
+            time.sleep(delay)
+
+    # -- 4b. Run orchestrator (critical path) --
     orch_timeout = 330 if account == "manual" else 100
     orch_rc = run_script(cfg["orchestrator"], env, timeout_s=orch_timeout, label="orchestrator")
 
