@@ -258,7 +258,13 @@ def cancel_all_working_orders(c, acct_hash: str):
     """Pre-flight: cancel all WORKING orders to prevent stacking from concurrent invocations."""
     url = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
     try:
-        r = c.session.get(url, timeout=20)
+        from datetime import timedelta
+        now = datetime.now(timezone.utc)
+        params = {
+            "fromEnteredTime": (now - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "toEnteredTime": now.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+        }
+        r = c.session.get(url, params=params, timeout=20)
         if r.status_code != 200:
             print(f"CS_VERT_PLACE PREFLIGHT: failed to fetch orders (HTTP {r.status_code})")
             return
