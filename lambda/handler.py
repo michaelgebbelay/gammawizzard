@@ -356,7 +356,7 @@ def lambda_handler(event, context):
     os.makedirs("/tmp/logs", exist_ok=True)
 
     # -- 4. Run orchestrator (critical path) --
-    orch_timeout = 100
+    orch_timeout = 330 if account == "manual" else 100
     orch_rc = run_script(cfg["orchestrator"], env, timeout_s=orch_timeout, label="orchestrator")
 
     # -- 5. Post-trade steps (best-effort, time-permitting) --
