@@ -107,6 +107,27 @@ ACCOUNTS = {
             "CS_CLOSE_ORDERS_ENABLE": "1",
         },
     },
+    "manual": {
+        "orchestrator": "scripts/trade/manual_trades.py",
+        "post_steps": [],
+        "token_ssm_path": "/gamma/schwab/token_json",
+        "token_file": "/tmp/schwab_token.json",
+        "env_from_ssm": {
+            "SCHWAB_APP_KEY": "/gamma/schwab/app_key",
+            "SCHWAB_APP_SECRET": "/gamma/schwab/app_secret",
+            "TT_CLIENT_ID": "/gamma/tt/client_id",
+            "TT_CLIENT_SECRET": "/gamma/tt/client_secret",
+        },
+        "static_env": {
+            "SCHWAB_TOKEN_PATH": "/tmp/schwab_token.json",
+            "TT_TOKEN_PATH": "/tmp/tt_token.json",
+            "TT_QUOTE_TOKEN_PATH": "/tmp/tt_quote_token.json",
+            "CS_UNIT_DOLLARS": "10000",
+            "CS_ACCOUNT_LABEL": "manual",
+            "CS_COST_PER_CONTRACT": "0.97",
+            "CS_MANUAL_TAB": "Manual_Trades",
+        },
+    },
 }
 
 # Env vars shared across all accounts (match current workflow defaults)
@@ -278,6 +299,10 @@ def lambda_handler(event, context):
     if account.startswith("tt-"):
         ssm_names["_schwab_token"] = "/gamma/schwab/token_json"
 
+    # Manual account needs both Schwab (primary) + TT token
+    if account == "manual":
+        ssm_names["_tt_token"] = "/gamma/tt/token_json"
+
     all_ssm_paths = list(set(ssm_names.values()))
     params = get_ssm_params(all_ssm_paths)
     print(f"Fetched {len(params)}/{len(all_ssm_paths)} SSM params")
@@ -307,6 +332,13 @@ def lambda_handler(event, context):
     # Schwab token keeper reads SCHWAB_TOKEN_JSON env var to auto-seed
     if account == "schwab":
         env["SCHWAB_TOKEN_JSON"] = token_content
+    elif account == "manual":
+        # Manual needs both Schwab + TT tokens
+        env["SCHWAB_TOKEN_JSON"] = token_content
+        tt_token = params.get("/gamma/tt/token_json", "")
+        if tt_token:
+            seed_file("/tmp/tt_token.json", tt_token)
+            env["TT_TOKEN_JSON"] = tt_token
     else:
         # TT: set token content as env var (orchestrator passes to placer)
         env["TT_TOKEN_JSON"] = token_content
@@ -317,6 +349,7 @@ def lambda_handler(event, context):
             env["SCHWAB_TOKEN_JSON"] = sw_token
 
     token_hash = file_hash(cfg["token_file"])
+    tt_token_hash = file_hash("/tmp/tt_token.json") if account == "manual" else None
     schwab_hash = file_hash("/tmp/schwab_token.json") if account.startswith("tt-") else None
 
     # Ensure /tmp writability for logs
@@ -351,6 +384,14 @@ def lambda_handler(event, context):
             )
         except Exception as e:
             print(f"ERROR persisting schwab token: {e}")
+
+    if account == "manual" and tt_token_hash:
+        try:
+            persist_token_if_changed(
+                "/gamma/tt/token_json", "/tmp/tt_token.json", tt_token_hash
+            )
+        except Exception as e:
+            print(f"ERROR persisting tt token: {e}")
 
     # -- 7. Return result --
     duration = round(time.time() - t0, 1)

@@ -1,12 +1,21 @@
 #!/usr/bin/env bash
-# Manual invoke: triggers the trading Lambda for all 3 accounts.
-# Usage: ./scripts/manual_invoke.sh
+# Manual invoke: triggers the trading Lambda.
+# Usage:
+#   ./scripts/manual_invoke.sh              # all 3 automated accounts
+#   ./scripts/manual_invoke.sh manual       # manual trades from Google Sheet
+#   ./scripts/manual_invoke.sh schwab       # single account
 set -euo pipefail
 
 FUNC="gamma-trading-TradingFunction-O0rzFPNn3umX"
 REGION="us-east-1"
 
-for acct in schwab tt-ira tt-individual; do
+if [ $# -ge 1 ]; then
+  ACCOUNTS=("$@")
+else
+  ACCOUNTS=(schwab tt-ira tt-individual)
+fi
+
+for acct in "${ACCOUNTS[@]}"; do
   echo ">>> Invoking $acct ..."
   aws lambda invoke \
     --function-name "$FUNC" \
@@ -20,4 +29,4 @@ for acct in schwab tt-ira tt-individual; do
   echo
 done
 
-echo "Done. All 3 accounts invoked."
+echo "Done. ${#ACCOUNTS[@]} account(s) invoked."

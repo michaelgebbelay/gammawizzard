@@ -523,13 +523,19 @@ def main():
 
     print(f"CS_VERT_RUN UNITS: {units} (CS_UNIT_DOLLARS={CS_UNIT_DOLLARS}, oc_val={oc_val})")
 
-    # --- ConstantStable payload from GammaWizard ---
-    try:
-        api = gw_fetch()
-        tr = extract_trade(api)
-    except Exception as e:
-        print(f"CS_VERT_RUN SKIP: GW fetch failed: {e}")
-        return 0
+    # --- ConstantStable payload from GammaWizard (or manual override) ---
+    signal_override = os.environ.get("CS_SIGNAL_JSON", "").strip()
+    if signal_override:
+        import json as _json
+        tr = _json.loads(signal_override)
+        print("CS_VERT_RUN SIGNAL_SOURCE: MANUAL (CS_SIGNAL_JSON)")
+    else:
+        try:
+            api = gw_fetch()
+            tr = extract_trade(api)
+        except Exception as e:
+            print(f"CS_VERT_RUN SKIP: GW fetch failed: {e}")
+            return 0
 
     if not tr:
         print("CS_VERT_RUN SKIP: NO_TRADE_PAYLOAD")
