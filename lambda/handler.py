@@ -150,7 +150,7 @@ COMMON_ENV = {
     "CS_TRACKING_TAB": "CS_Tracking",
     "CS_SUMMARY_TAB": "CS_Summary",
     "CS_PERFORMANCE_TAB": "CS_Performance",
-    "VERT_STEP_WAIT": "20",
+    "VERT_STEP_WAIT": "15",
     "VERT_POLL_SECS": "2.0",
     "VERT_CANCEL_SETTLE": "1.0",
     "VERT_MAX_LADDER": "3",
