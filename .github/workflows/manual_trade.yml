@@ -1,0 +1,28 @@
+name: Manual Trade
+
+on:
+  workflow_dispatch:
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Invoke manual trade
+        run: |
+          aws lambda invoke \
+            --function-name gamma-trading-TradingFunction-O0rzFPNn3umX \
+            --region us-east-1 \
+            --payload '{"account": "manual"}' \
+            --cli-binary-format raw-in-base64-out \
+            --cli-read-timeout 300 \
+            /tmp/result.json
+          echo "Response:"
+          cat /tmp/result.json
