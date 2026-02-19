@@ -71,7 +71,7 @@ SECTION_HEADER = [
 ]
 
 COLUMN_HEADER = [
-    "Date",
+    "Expiry",
     "QTY", "price put", "price call", "P&L",
     "QTY", "price put", "price call", "P&L",
     "QTY", "price put", "price call", "P&L",
@@ -314,21 +314,41 @@ def read_gw_signal(svc, spreadsheet_id: str, tab: str) -> dict:
 
 
 def read_tt_close_status(svc, spreadsheet_id: str, tab: str) -> dict:
-    """Read CS_TT_Close tab. Returns {expiry: close_net} for filled close orders."""
+    """Read CS_TT_Close tab. Returns {(expiry, account): close_net}.
+
+    Supports both old 3-column format (assumed tt-individual) and
+    new 4-column format with account column.
+    """
     try:
-        all_rows = get_values(svc, spreadsheet_id, f"{tab}!A1:C")
+        all_rows = get_values(svc, spreadsheet_id, f"{tab}!A1:D")
         if len(all_rows) < 2:
             return {}
+        header = all_rows[0]
         result = {}
+
+        # Detect format: new has "account" as second header
+        has_account = len(header) >= 4 and header[1] == "account"
+
         for row in all_rows[1:]:
-            if len(row) >= 3:
-                expiry = (row[0] or "").strip()
-                status = (row[1] or "").strip()
-                close_net = safe_float(row[2])
-                if expiry and status == "closed" and close_net is not None:
-                    result[expiry] = close_net
+            if has_account:
+                if len(row) >= 4:
+                    expiry = (row[0] or "").strip()
+                    account = (row[1] or "").strip()
+                    status = (row[2] or "").strip()
+                    close_net = safe_float(row[3])
+                    if expiry and status == "closed" and close_net is not None:
+                        result[(expiry, account)] = close_net
+            else:
+                # Legacy 3-column format (assumed tt-individual)
+                if len(row) >= 3:
+                    expiry = (row[0] or "").strip()
+                    status = (row[1] or "").strip()
+                    close_net = safe_float(row[2])
+                    if expiry and status == "closed" and close_net is not None:
+                        result[(expiry, "tt-individual")] = close_net
+
         if result:
-            log(f"read {len(result)} TT close entries")
+            log(f"read {len(result)} close entries")
         return result
     except Exception as e:
         log(f"WARN — could not read {tab}: {e}")
@@ -341,35 +361,43 @@ def read_tt_close_status(svc, spreadsheet_id: str, tab: str) -> dict:
 
 def compute_daily_detail(rows: list[dict], gw_signal: dict,
                          settlements: dict, tt_close: dict = None) -> list[tuple]:
-    """Build daily pivot: one row per date with GW + 3 accounts side by side.
+    """Build pivot: one row per expiry with GW + 3 accounts side by side.
 
-    Returns list of (date, gw_group, [schwab_group, ira_group, ind_group])
+    Returns list of (expiry, gw_group, [schwab_group, ira_group, ind_group])
     where each group is [qty_str, price_put, price_call, pnl].
 
-    tt_close: {expiry: close_net} from CS_TT_Close tab for TT Individual
-              early-close P&L. When an expiry is present, uses close-based P&L
+    tt_close: {(expiry, account): close_net} from CS_TT_Close tab.
+              When an expiry is present, uses close-based P&L
               instead of settlement-based P&L.
     """
-    by_date = defaultdict(dict)
+    by_expiry = defaultdict(dict)
     for row in rows:
-        dt = (row.get("date") or "").strip()
+        expiry = (row.get("expiry") or "").strip()
         acct = (row.get("account") or "").strip()
-        if dt and acct:
-            by_date[dt][acct] = row
+        if expiry and acct:
+            by_expiry[expiry][acct] = row
 
     result = []
-    for dt in sorted(by_date.keys(), reverse=True):
-        accts = by_date[dt]
+    for expiry in sorted(by_expiry.keys(), reverse=True):
+        accts = by_expiry[expiry]
         any_row = next(iter(accts.values()), {})
         put_side = (any_row.get("put_side") or "").strip()
         call_side = (any_row.get("call_side") or "").strip()
-        expiry = (any_row.get("expiry") or "").strip()
 
         # Look up settlement by expiry date
         settlement = settlements.get(expiry)
 
         # GW prices from GW_Signal tab (authoritative source)
-        gw = gw_signal.get(dt, {})
+        # Signal for expiry E is stored under date E-1 in GW_Signal
+        gw = gw_signal.get(expiry, {})
+        if not gw:
+            from datetime import timedelta as _td
+            try:
+                from datetime import date as _date
+                exp_d = _date.fromisoformat(expiry)
+                gw = gw_signal.get((exp_d - _td(days=1)).isoformat(), {})
+            except Exception:
+                pass
         gw_put = signed_price(gw.get("put_price", ""), put_side)
         gw_call = signed_price(gw.get("call_price", ""), call_side)
 
@@ -405,10 +433,10 @@ def compute_daily_detail(rows: list[dict], gw_signal: dict,
 
                 cost = COST_POINTS.get(acct_name, 0.0)
 
-                # TT Individual: use close-based P&L if order filled early
-                if (acct_name == "tt-individual" and tt_close
-                        and expiry in tt_close and qty > 0):
-                    close_net = tt_close[expiry]
+                # Use close-based P&L if order filled early (any account)
+                if (tt_close and (expiry, acct_name) in tt_close
+                        and qty > 0):
+                    close_net = tt_close[(expiry, acct_name)]
                     sp = safe_float(price_put) or 0.0
                     sc = safe_float(price_call) or 0.0
                     # 2× cost: commissions on both open + close trades
@@ -428,7 +456,7 @@ def compute_daily_detail(rows: list[dict], gw_signal: dict,
                 pnl = ""
             account_groups.append([qty_str, price_put, price_call, pnl])
 
-        result.append((dt, gw_group, account_groups))
+        result.append((expiry, gw_group, account_groups))
 
     return result
 
@@ -507,12 +535,12 @@ def main() -> int:
 
         # Build data updates — each group now includes P&L (no separate formula pass)
         data_updates = []
-        for i, (dt, gw_group, account_groups) in enumerate(daily_rows):
+        for i, (expiry, gw_group, account_groups) in enumerate(daily_rows):
             rnum = DATA_START_ROW + i
-            # A:E = date + GW (qty, price put, price call, P&L)
+            # A:E = expiry + GW (qty, price put, price call, P&L)
             data_updates.append({
                 "range": f"{summary_tab}!A{rnum}:E{rnum}",
-                "values": [[dt] + gw_group],
+                "values": [[expiry] + gw_group],
             })
             # F:I = Schwab (qty, price put, price call, P&L)
             data_updates.append({
@@ -540,16 +568,10 @@ def main() -> int:
         # Apply formatting (colors + currency)
         apply_formatting(svc, spreadsheet_id, sheet_id, len(daily_rows))
 
-        # Count dates with settlement-based P&L
-        date_to_expiry = {}
-        for r in rows:
-            dt2 = (r.get("date") or "").strip()
-            exp = (r.get("expiry") or "").strip()
-            if dt2 and exp:
-                date_to_expiry[dt2] = exp
-        settled = sum(1 for dt, _, _ in daily_rows
-                      if settlements.get(date_to_expiry.get(dt, "")))
-        log(f"wrote {len(daily_rows)} daily rows to {summary_tab} "
+        # Count expiries with settlement-based P&L
+        settled = sum(1 for expiry, _, _ in daily_rows
+                      if settlements.get(expiry))
+        log(f"wrote {len(daily_rows)} rows to {summary_tab} "
             f"({settled} with settlement P&L)")
         return 0
 

@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 """
-Check TT Individual close order status and write to CS_TT_Close tab.
+Check close order status across all accounts and write to CS_TT_Close tab.
 
-For TT Individual positions with profit-taking close orders, this script
-checks which orders have filled and records the close prices. This data
-is consumed by cs_summary_to_gsheet.py for accurate P&L calculation.
+For positions with profit-taking close orders, this script checks which
+orders have filled and records the close prices. This data is consumed by
+cs_summary_to_gsheet.py for accurate P&L calculation.
 
 For positions that closed early: P&L uses the close price
 For positions that expired at settlement: P&L uses settlement price (default)
 
-Runs as a Lambda post-step for tt-individual only.
+Supports TT IRA, TT Individual, and Schwab accounts.
 
 Env:
   GSHEET_ID                    - spreadsheet ID
   GOOGLE_SERVICE_ACCOUNT_JSON  - SA creds
-  TT_ACCOUNT_NUMBER            - TT account number
+  TT_ACCOUNT_NUMBERS           - "acct:label,..." (e.g. "5WT09219:tt-individual,5WT20360:tt-ira")
+  TT_ACCOUNT_NUMBER            - fallback: single TT account number
   CS_TT_CLOSE_TAB              - tab name (default "CS_TT_Close")
   CS_GSHEET_STRICT             - "1" to fail hard
 """
@@ -24,7 +25,7 @@ import re
 import sys
 import time
 import random
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime, timezone
 
 
 # --- path setup ---
@@ -51,8 +52,10 @@ _TT_ERR = None
 try:
     _add_paths()
     from lib.sheets import sheets_client, col_letter, ensure_sheet_tab, get_values
+    from lib.parsing import safe_float
 except Exception as e:
     sheets_client = None
+    safe_float = None
     _IMPORT_ERR = e
 
 try:
@@ -61,10 +64,52 @@ except Exception as e:
     tt_request = None
     _TT_ERR = e
 
+_SW_ERR = None
+try:
+    # schwab_token_keeper lives in scripts/ (already on sys.path)
+    from schwab_token_keeper import schwab_client as _schwab_client_fn
+except Exception as e:
+    _schwab_client_fn = None
+    _SW_ERR = e
+
 
 TAG = "CS_TT_CLOSE"
 CLOSE_TAB = "CS_TT_Close"
-CLOSE_HEADERS = ["expiry", "status", "close_net"]
+CLOSE_HEADERS = ["expiry", "account", "status", "close_net"]
+
+TT_ACCOUNT_LABELS = {
+    "5WT09219": "tt-individual",
+    "5WT20360": "tt-ira",
+}
+
+
+def _derive_label(acct_num: str) -> str:
+    return TT_ACCOUNT_LABELS.get(acct_num, f"tt-{acct_num}")
+
+
+def _parse_tt_accounts() -> list:
+    """Parse TT_ACCOUNT_NUMBERS or fall back to TT_ACCOUNT_NUMBER.
+
+    Returns list of (acct_num, label) tuples.
+    """
+    raw = (os.environ.get("TT_ACCOUNT_NUMBERS") or "").strip()
+    if not raw:
+        single = (os.environ.get("TT_ACCOUNT_NUMBER") or "").strip()
+        if not single:
+            return []
+        return [(single, _derive_label(single))]
+
+    entries = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" in part:
+            num, label = part.split(":", 1)
+            entries.append((num.strip(), label.strip()))
+        else:
+            entries.append((part, _derive_label(part)))
+    return entries
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +231,114 @@ def fetch_filled_close_orders(acct_num: str, days_back: int = 7) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Schwab close detection
+# ---------------------------------------------------------------------------
+
+def fetch_schwab_close_fills(days_back: int = 7) -> dict:
+    """Fetch filled close orders from Schwab. Returns {expiry_iso: close_net}."""
+    if _schwab_client_fn is None:
+        return {}
+
+    c = _schwab_client_fn()
+    r = c.get_account_numbers()
+    r.raise_for_status()
+    acct_hash = r.json()[0]["hashValue"]
+
+    now = datetime.now(timezone.utc)
+    from_time = now - timedelta(days=days_back)
+
+    url = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
+    params = {
+        "fromEnteredTime": from_time.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+        "toEnteredTime": now.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+    }
+
+    resp = c.session.get(url, params=params, timeout=20)
+    if resp.status_code != 200:
+        log(f"WARN — schwab orders HTTP {resp.status_code}")
+        return {}
+
+    orders = resp.json() or []
+    result = {}
+
+    for order in orders:
+        status = str(order.get("status") or "").upper()
+        if status != "FILLED":
+            continue
+
+        legs = order.get("orderLegCollection") or []
+        is_close = any(
+            str(leg.get("instruction") or "").upper() in
+            ("SELL_TO_CLOSE", "BUY_TO_CLOSE")
+            for leg in legs
+        )
+        if not is_close:
+            continue
+
+        price = safe_float(str(order.get("price") or "0")) if safe_float else None
+        if price is None:
+            continue
+
+        # Net credit/debit from order strategy type
+        strategy = str(order.get("orderStrategyType") or "").upper()
+        order_type = str(order.get("orderType") or "").upper()
+        price_str = str(order.get("price") or "0")
+        # Schwab: for complex orders, check complexOrderStrategyType
+        complex_type = str(order.get("complexOrderStrategyType") or "").upper()
+
+        # Determine sign: check if this is a credit or debit order
+        # For vertical spreads, NET_CREDIT means we received credit
+        if "CREDIT" in order_type or "CREDIT" in complex_type:
+            close_net = price
+        else:
+            close_net = -price
+
+        # Extract expiry from leg symbols
+        expiry_iso = None
+        for leg in legs:
+            sym = (leg.get("instrument", {}).get("symbol") or "").strip()
+            if sym:
+                exp = _osi_expiry_iso(sym)
+                if exp:
+                    expiry_iso = exp
+                    break
+
+        if expiry_iso and expiry_iso not in result:
+            result[expiry_iso] = close_net
+            log(f"schwab closed {expiry_iso}: net={close_net:+.2f}")
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Migration
+# ---------------------------------------------------------------------------
+
+OLD_HEADERS = ["expiry", "status", "close_net"]
+
+
+def _migrate_old_format(svc, sid, close_tab, existing):
+    """Migrate 3-column format to 4-column format with account column."""
+    log("migrating CS_TT_Close: adding account column")
+    last_col = col_letter(len(CLOSE_HEADERS) - 1)
+    migrated = [CLOSE_HEADERS]
+    for row in existing[1:]:
+        if len(row) >= 3:
+            migrated.append([row[0], "tt-individual", row[1], row[2]])
+
+    svc.spreadsheets().values().clear(
+        spreadsheetId=sid, range=close_tab
+    ).execute()
+    svc.spreadsheets().values().update(
+        spreadsheetId=sid,
+        range=f"{close_tab}!A1:{last_col}{len(migrated)}",
+        valueInputOption="RAW",
+        body={"values": migrated},
+    ).execute()
+    return migrated
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -196,34 +349,61 @@ def main() -> int:
         msg = f"google sheets libs not installed ({_IMPORT_ERR})"
         return fail(msg, 2) if strict else skip(msg)
 
-    if tt_request is None:
-        msg = f"TT client not available ({_TT_ERR})"
-        return fail(msg, 2) if strict else skip(msg)
-
     if not (os.environ.get("GSHEET_ID") or "").strip():
         return fail("GSHEET_ID missing", 2) if strict else skip("GSHEET_ID missing")
 
     if not (os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip():
         return fail("SA creds missing", 2) if strict else skip("SA creds missing")
 
-    acct_num = (os.environ.get("TT_ACCOUNT_NUMBER") or "").strip()
-    if not acct_num:
-        return skip("TT_ACCOUNT_NUMBER missing")
+    tt_accounts = _parse_tt_accounts()
+    has_tt = tt_request is not None and len(tt_accounts) > 0
+    has_schwab = _schwab_client_fn is not None
+
+    if not has_tt and not has_schwab:
+        return skip("no TT accounts and no Schwab client available")
 
     close_tab = (os.environ.get("CS_TT_CLOSE_TAB") or CLOSE_TAB).strip()
 
     try:
-        filled = fetch_filled_close_orders(acct_num)
-        log(f"found {len(filled)} filled close order(s)")
+        # --- Fetch close fills from all accounts ---
+        all_filled = {}  # {(expiry, account): close_net}
 
-        if not filled:
-            return skip("no filled close orders")
+        # TT accounts
+        if has_tt:
+            for acct_num, label in tt_accounts:
+                try:
+                    filled = fetch_filled_close_orders(acct_num)
+                    for expiry, close_net in filled.items():
+                        all_filled[(expiry, label)] = close_net
+                    log(f"{label} ({acct_num}): {len(filled)} close(s)")
+                except Exception as e:
+                    log(f"WARN — {label} close fetch: {e}")
 
+        # Schwab
+        if has_schwab:
+            try:
+                sw_filled = fetch_schwab_close_fills()
+                for expiry, close_net in sw_filled.items():
+                    all_filled[(expiry, "schwab")] = close_net
+                log(f"schwab: {len(sw_filled)} close(s)")
+            except Exception as e:
+                log(f"WARN — schwab close fetch: {e}")
+
+        log(f"total: {len(all_filled)} filled close order(s) across all accounts")
+
+        if not all_filled:
+            return skip("no filled close orders across any account")
+
+        # --- Write to sheet ---
         svc, sid = sheets_client()
         ensure_sheet_tab(svc, sid, close_tab)
 
-        existing = get_values(svc, sid, f"{close_tab}!A1:C")
+        existing = get_values(svc, sid, f"{close_tab}!A1:D")
         last_col = col_letter(len(CLOSE_HEADERS) - 1)
+
+        # Migrate old 3-column format if needed
+        if existing and existing[0] == OLD_HEADERS:
+            existing = _migrate_old_format(svc, sid, close_tab, existing)
 
         # Ensure header
         if not existing or existing[0] != CLOSE_HEADERS:
@@ -235,19 +415,21 @@ def main() -> int:
             ).execute()
             existing = [CLOSE_HEADERS] + (existing[1:] if existing else [])
 
-        # Build existing map
-        existing_expiries = {}
+        # Build existing map keyed by (expiry, account)
+        existing_keys = {}
         for rnum, row in enumerate(existing[1:], start=2):
-            if len(row) > 0 and row[0]:
-                existing_expiries[row[0].strip()] = rnum
+            if len(row) >= 2:
+                key = (row[0].strip(), row[1].strip())
+                existing_keys[key] = rnum
 
         # Upsert rows
         updates = []
         appends = []
-        for expiry, close_net in filled.items():
-            values = [expiry, "closed", str(round(close_net, 4))]
-            if expiry in existing_expiries:
-                rnum = existing_expiries[expiry]
+        for (expiry, account), close_net in all_filled.items():
+            values = [expiry, account, "closed", str(round(close_net, 4))]
+            key = (expiry, account)
+            if key in existing_keys:
+                rnum = existing_keys[key]
                 updates.append({
                     "range": f"{close_tab}!A{rnum}:{last_col}{rnum}",
                     "values": [values],

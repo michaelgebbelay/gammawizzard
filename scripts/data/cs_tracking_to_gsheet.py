@@ -45,7 +45,7 @@ except Exception as e:
     _IMPORT_ERR = e
 
 TRACKING_HEADER = [
-    "date", "expiry", "account",
+    "expiry", "account",
     "put_go", "call_go", "put_strikes", "call_strikes",
     "gw_put_price", "gw_call_price",
     "put_spread_price", "call_spread_price",
@@ -57,7 +57,7 @@ TRACKING_HEADER = [
     "cost_per_contract", "put_cost", "call_cost", "total_cost",
 ]
 
-UPSERT_KEYS = ["date", "expiry", "account"]
+UPSERT_KEYS = ["expiry", "account"]
 
 TAG = "CS_TRACKING"
 
@@ -185,16 +185,14 @@ def aggregate_rows(csv_rows, account_label: str, cost_per_contract: float):
 
     for row in csv_rows:
         kind = (row.get("kind") or "").strip().upper()
-        trade_date = (row.get("trade_date") or "").strip()
         tdate = (row.get("tdate") or "").strip()
         if kind not in ("PUT", "CALL"):
             continue
-        key = (trade_date, tdate)
         # Keep last occurrence per kind (handles bundle fallback)
-        groups[key][kind.lower()] = row
+        groups[tdate][kind.lower()] = row
 
     result = []
-    for (trade_date, tdate), sides in sorted(groups.items()):
+    for tdate, sides in sorted(groups.items()):
         pr = sides["put"]
         cr = sides["call"]
 
@@ -254,7 +252,6 @@ def aggregate_rows(csv_rows, account_label: str, cost_per_contract: float):
 
         ref = pr or cr
         result.append({
-            "date": trade_date,
             "expiry": tdate,
             "account": account_label,
             "put_go": val(pr, "go"),
