@@ -247,6 +247,12 @@ def fetch_tt_open_fills(acct_num: str, label: str, days_back: int) -> list:
         if not is_open:
             continue
 
+        # Only SPXW options
+        is_spxw = any("SPXW" in str(leg.get("symbol") or "").upper()
+                       for leg in legs)
+        if not is_spxw:
+            continue
+
         # Order-level price and effect
         price = safe_float(str(order.get("price") or "0"))
         price_effect = str(order.get("price-effect") or "").strip().lower()

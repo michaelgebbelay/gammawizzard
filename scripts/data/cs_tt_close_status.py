@@ -203,6 +203,12 @@ def fetch_filled_close_orders(acct_num: str, days_back: int = 7) -> dict:
         if not is_close:
             continue
 
+        # Only SPXW options
+        is_spxw = any("SPXW" in str(leg.get("symbol") or "").upper()
+                       for leg in legs)
+        if not is_spxw:
+            continue
+
         price_str = str(order.get("price") or "0")
         price_effect = str(order.get("price-effect") or "").strip().lower()
         try:
@@ -273,6 +279,14 @@ def fetch_schwab_close_fills(days_back: int = 7) -> dict:
             for leg in legs
         )
         if not is_close:
+            continue
+
+        # Only SPXW options
+        is_spxw = any(
+            "SPXW" in str(leg.get("instrument", {}).get("symbol") or "").upper()
+            for leg in legs
+        )
+        if not is_spxw:
             continue
 
         price = safe_float(str(order.get("price") or "0")) if safe_float else None
