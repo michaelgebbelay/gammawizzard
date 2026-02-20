@@ -129,6 +129,23 @@ ACCOUNTS = {
             "CS_MANUAL_TAB": "Manual_Trades",
         },
     },
+    "morning-check": {
+        "orchestrator": "scripts/trade/ConstantStable/morning_check.py",
+        "post_steps": [],
+        "token_ssm_path": "/gamma/schwab/token_json",
+        "token_file": "/tmp/schwab_token.json",
+        "env_from_ssm": {
+            "SCHWAB_APP_KEY": "/gamma/schwab/app_key",
+            "SCHWAB_APP_SECRET": "/gamma/schwab/app_secret",
+            "SMTP_USER": "/gamma/shared/smtp_user",
+            "SMTP_PASS": "/gamma/shared/smtp_pass",
+        },
+        "static_env": {
+            "SCHWAB_TOKEN_PATH": "/tmp/schwab_token.json",
+            "CS_ACCOUNT_LABEL": "morning-check",
+            "CS_MORNING_DD_ALERT_PCT": "0.20",
+        },
+    },
 }
 
 # Env vars shared across all accounts (match current workflow defaults)
@@ -332,7 +349,7 @@ def lambda_handler(event, context):
         print(f"WARNING: no token content from {cfg['token_ssm_path']}")
 
     # Schwab token keeper reads SCHWAB_TOKEN_JSON env var to auto-seed
-    if account == "schwab":
+    if account in ("schwab", "morning-check"):
         env["SCHWAB_TOKEN_JSON"] = token_content
     elif account == "manual":
         # Manual needs both Schwab + TT tokens

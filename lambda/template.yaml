@@ -108,6 +108,22 @@ Resources:
         RoleArn: !GetAtt SchedulerRole.Arn
         Input: '{"account": "tt-individual"}'
 
+  # ---------- Morning Check Schedule ----------
+  MorningCheckSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: gamma-cs-morning-check
+      Description: "Morning equity/drawdown check with email alert"
+      State: ENABLED
+      ScheduleExpression: "cron(35 9 ? * MON-FRI *)"
+      ScheduleExpressionTimezone: "America/New_York"
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt TradingFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"account": "morning-check"}'
+
   # ---------- IAM Role for EventBridge Scheduler ----------
   SchedulerRole:
     Type: AWS::IAM::Role
