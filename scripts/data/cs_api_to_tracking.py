@@ -287,14 +287,27 @@ def fetch_tt_open_fills(acct_num: str, label: str, days_back: int) -> list:
                 entry["call_filled"] = max(entry.get("call_filled", 0), leg_qty or filled_qty)
                 entry["call_side"] = side
 
-        # For single-order iron condors, assign the net price
-        if len(legs) >= 2:
-            for leg in legs:
-                sym = (leg.get("symbol") or "").strip()
-                expiry = _osi_expiry_iso(sym)
-                if expiry and expiry in by_expiry:
-                    by_expiry[expiry]["order_price"] = price
-                    break
+        # Assign order-level fill price to the correct leg (PUT or CALL)
+        # TT typically places each vertical spread as a separate order,
+        # but manual IC orders may combine all 4 legs in one order.
+        has_put = any(_osi_put_call(leg.get("symbol", "")) == "P"
+                      for leg in legs if "Open" in str(leg.get("action", "")))
+        has_call = any(_osi_put_call(leg.get("symbol", "")) == "C"
+                       for leg in legs if "Open" in str(leg.get("action", "")))
+        for leg in legs:
+            sym = (leg.get("symbol") or "").strip()
+            expiry = _osi_expiry_iso(sym)
+            if expiry and expiry in by_expiry and price is not None:
+                if has_put and not has_call:
+                    by_expiry[expiry]["put_fill_price"] = str(price)
+                elif has_call and not has_put:
+                    by_expiry[expiry]["call_fill_price"] = str(price)
+                elif has_put and has_call:
+                    # 4-leg IC order: split price evenly between sides
+                    half = round(price / 2, 2)
+                    by_expiry[expiry].setdefault("put_fill_price", str(half))
+                    by_expiry[expiry].setdefault("call_fill_price", str(half))
+                break
 
     # Build tracking rows
     cost = COST_PER_CONTRACT.get(label, 1.72)
@@ -325,10 +338,10 @@ def fetch_tt_open_fills(acct_num: str, label: str, days_back: int) -> list:
             "put_side": entry.get("put_side", ""),
             "call_side": entry.get("call_side", ""),
             "put_filled": str(put_filled) if put_filled else "",
-            "put_fill_price": "",  # TT doesn't give per-leg fill price on order level
+            "put_fill_price": entry.get("put_fill_price", ""),
             "put_status": "filled" if put_filled else "",
             "call_filled": str(call_filled) if call_filled else "",
-            "call_fill_price": "",
+            "call_fill_price": entry.get("call_fill_price", ""),
             "call_status": "filled" if call_filled else "",
             "cost_per_contract": f"{cost:.2f}",
             "put_cost": put_cost,
@@ -431,12 +444,23 @@ def fetch_schwab_open_fills(days_back: int) -> list:
                 entry["call_filled"] = max(entry.get("call_filled", 0), leg_qty or filled_qty)
                 entry["call_side"] = side
 
-        # Assign fill price to the entry
+        # Assign order-level fill price to the correct leg (PUT or CALL)
+        has_put = any(_osi_put_call(leg.get("instrument", {}).get("symbol", "")) == "P"
+                      for leg in legs if "OPEN" in str(leg.get("instruction", "")).upper())
+        has_call = any(_osi_put_call(leg.get("instrument", {}).get("symbol", "")) == "C"
+                       for leg in legs if "OPEN" in str(leg.get("instruction", "")).upper())
         for leg in legs:
             sym = (leg.get("instrument", {}).get("symbol") or "").strip()
             expiry = _osi_expiry_iso(sym)
-            if expiry and expiry in by_expiry:
-                by_expiry[expiry]["order_price"] = price
+            if expiry and expiry in by_expiry and price is not None:
+                if has_put and not has_call:
+                    by_expiry[expiry]["put_fill_price"] = str(price)
+                elif has_call and not has_put:
+                    by_expiry[expiry]["call_fill_price"] = str(price)
+                elif has_put and has_call:
+                    half = round(price / 2, 2)
+                    by_expiry[expiry].setdefault("put_fill_price", str(half))
+                    by_expiry[expiry].setdefault("call_fill_price", str(half))
                 break
 
     # Build tracking rows
@@ -467,10 +491,10 @@ def fetch_schwab_open_fills(days_back: int) -> list:
             "put_side": entry.get("put_side", ""),
             "call_side": entry.get("call_side", ""),
             "put_filled": str(put_filled) if put_filled else "",
-            "put_fill_price": "",
+            "put_fill_price": entry.get("put_fill_price", ""),
             "put_status": "filled" if put_filled else "",
             "call_filled": str(call_filled) if call_filled else "",
-            "call_fill_price": "",
+            "call_fill_price": entry.get("call_fill_price", ""),
             "call_status": "filled" if call_filled else "",
             "cost_per_contract": f"{cost:.2f}",
             "put_cost": put_cost,
@@ -604,6 +628,102 @@ def enrich_from_gw_signal(rows: list, gw_signal: dict) -> list:
 # Upsert (reuse pattern from cs_tracking_to_gsheet.py)
 # ---------------------------------------------------------------------------
 
+_DATE_PAT = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_ACCT_NAMES = {"schwab", "tt-ira", "tt-individual"}
+
+
+def _is_old_format_row(row):
+    """Check if a data row has the old format (date, expiry, account, ...).
+
+    Old format: col A = trade date, col B = expiry date, col C = account name
+    New format: col A = expiry date, col B = account name
+    """
+    if len(row) < 3:
+        return False
+    a, b, c = (row[0] or "").strip(), (row[1] or "").strip(), (row[2] or "").strip()
+    return (_DATE_PAT.match(a) and _DATE_PAT.match(b)
+            and c.lower() in _ACCT_NAMES)
+
+
+def _migrate_tracking_data(svc, sid, tab, header):
+    """Detect and migrate old-format CS_Tracking data (strip date column).
+
+    Old format:  date | expiry | account | put_go | ...
+    New format:  expiry | account | put_go | ...
+
+    Returns migrated rows (including header) or None if no migration needed.
+    """
+    existing = get_values(svc, sid, f"{tab}!A1:ZZ")
+    if len(existing) < 2:
+        return None
+
+    old_header = existing[0]
+
+    # Detect old format: header starts with "date"
+    needs_migration = (old_header[0] == "date" and len(old_header) > 1
+                       and old_header[1] == "expiry")
+
+    # Or: header was already updated but data rows still have old format
+    if not needs_migration:
+        for row in existing[1:]:
+            if _is_old_format_row(row):
+                needs_migration = True
+                break
+
+    if not needs_migration:
+        return None
+
+    log("migrating CS_Tracking: stripping old 'date' column")
+    last_col = col_letter(len(header) - 1)
+
+    # Build migrated data: header + data rows with date column removed
+    migrated = [header]
+    seen_keys = {}  # (expiry, account) -> row index for dedup
+    for row in existing[1:]:
+        if _is_old_format_row(row):
+            new_row = row[1:]  # strip old date column
+        else:
+            new_row = row
+
+        # Pad or trim to match header length
+        new_row = list(new_row[:len(header)])
+        while len(new_row) < len(header):
+            new_row.append("")
+
+        key = (new_row[0].strip(), new_row[1].strip())
+        if key in seen_keys:
+            # Keep the row with more non-empty fields (better data wins)
+            old_idx = seen_keys[key]
+            old_row = migrated[old_idx]
+            old_filled = sum(1 for v in old_row if (v or "").strip()
+                             and (v or "").strip() != "0")
+            new_filled = sum(1 for v in new_row if (v or "").strip()
+                             and (v or "").strip() != "0")
+            if new_filled > old_filled:
+                migrated[old_idx] = new_row
+        else:
+            seen_keys[key] = len(migrated)
+            migrated.append(new_row)
+
+    # Clear entire sheet and rewrite
+    old_last_col = col_letter(max(len(header), len(old_header)) + 1)
+    svc.spreadsheets().values().clear(
+        spreadsheetId=sid,
+        range=f"{tab}!A1:{old_last_col}5000",
+    ).execute()
+
+    # Write migrated data
+    svc.spreadsheets().values().update(
+        spreadsheetId=sid,
+        range=f"{tab}!A1:{last_col}{len(migrated)}",
+        valueInputOption="RAW",
+        body={"values": migrated},
+    ).execute()
+
+    log(f"migration complete: {len(migrated) - 1} rows (deduped from {len(existing) - 1})")
+    return migrated
+
+
 def upsert_rows(svc, sid, tab, rows, header):
     existing = get_values(svc, sid, f"{tab}!A1:ZZ")
     last_col = col_letter(len(header) - 1)
@@ -689,7 +809,7 @@ def main() -> int:
 
     tracking_tab = (os.environ.get("CS_TRACKING_TAB") or "CS_Tracking").strip()
     gw_signal_tab = (os.environ.get("CS_GW_SIGNAL_TAB") or "GW_Signal").strip()
-    days_back = int(os.environ.get("CS_API_DAYS_BACK", "7"))
+    days_back = int(os.environ.get("CS_API_DAYS_BACK", "14"))
 
     tt_accounts = _parse_tt_accounts()
     has_tt = tt_request is not None and len(tt_accounts) > 0
@@ -700,6 +820,10 @@ def main() -> int:
 
     try:
         svc, sid = sheets_client()
+        ensure_sheet_tab(svc, sid, tracking_tab)
+
+        # Migrate old-format data (one-time: strips date column, dedupes)
+        _migrate_tracking_data(svc, sid, tracking_tab, TRACKING_HEADER)
 
         # Read existing tracking to find gaps
         filled_keys = read_existing_keys(svc, sid, tracking_tab)

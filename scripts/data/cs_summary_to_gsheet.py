@@ -492,9 +492,34 @@ def main() -> int:
             return skip("no tracking data yet")
 
         header = all_rows[0]
+
+        # Detect old-format header (starts with "date") or misaligned data
+        # where header was updated but data still has old date column
+        import re as _re
+        _date_pat = _re.compile(r"^\d{4}-\d{2}-\d{2}$")
+        _acct_names = {"schwab", "tt-ira", "tt-individual"}
+
+        old_format_header = (header[0] == "date" and len(header) > 1
+                             and header[1] == "expiry")
+        if old_format_header:
+            header = header[1:]  # strip "date" from header
+
+        def _is_old_row(vals):
+            """Row has old format: col A=date, col B=date, col C=account."""
+            if len(vals) < 3:
+                return False
+            a = (vals[0] or "").strip()
+            b = (vals[1] or "").strip()
+            c = (vals[2] or "").strip()
+            return _date_pat.match(a) and _date_pat.match(b) and c.lower() in _acct_names
+
         rows = []
         for vals in all_rows[1:]:
-            d = {header[i]: (vals[i] if i < len(vals) else "") for i in range(len(header))}
+            data = list(vals)
+            if old_format_header or _is_old_row(data):
+                data = data[1:]  # strip date column
+
+            d = {header[i]: (data[i] if i < len(data) else "") for i in range(len(header))}
             rows.append(d)
 
         log(f"read {len(rows)} tracking rows")

@@ -19,6 +19,7 @@ Env:
 """
 
 import os
+import re
 import sys
 import csv
 from collections import defaultdict
@@ -109,9 +110,22 @@ def upsert_rows(svc, sid: str, title: str, rows, header):
     def key_from_dict(d):
         return tuple(str(d.get(k, "")) for k in UPSERT_KEYS)
 
+    _date_pat = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+    _acct_names = {"schwab", "tt-ira", "tt-individual"}
+
+    def _row_to_dict(row):
+        """Map row values to header, stripping old date column if present."""
+        data = list(row)
+        if (len(data) >= 3
+                and _date_pat.match((data[0] or "").strip())
+                and _date_pat.match((data[1] or "").strip())
+                and (data[2] or "").strip().lower() in _acct_names):
+            data = data[1:]  # strip old date column
+        return {header[i]: (data[i] if i < len(data) else "") for i in range(len(header))}
+
     existing_map = {}
     for rnum, row in enumerate(existing[1:], start=2):
-        d = {header[i]: (row[i] if i < len(row) else "") for i in range(len(header))}
+        d = _row_to_dict(row)
         existing_map[key_from_dict(d)] = rnum
 
     # De-dupe by key (keep last)
