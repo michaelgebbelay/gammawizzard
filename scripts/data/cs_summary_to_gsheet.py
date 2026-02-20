@@ -208,7 +208,7 @@ def parse_strikes(strike_str: str):
 
 def compute_pnl_for_group(signed_put_f, signed_call_f, put_side, call_side,
                           put_strikes_str, call_strikes_str,
-                          settlement, cost_points, qty):
+                          settlement, cost_points, qty, call_qty=None):
     """Compute P&L for one account-day.
 
     All values in SPX points. Result = SPX points × qty.
@@ -219,9 +219,15 @@ def compute_pnl_for_group(signed_put_f, signed_call_f, put_side, call_side,
     For CREDIT legs: P&L = fill_credit - spread_value_at_expiry
     For DEBIT legs:  P&L = -fill_debit + spread_value_at_expiry
 
+    qty: put side quantity (also used for call if call_qty is None)
+    call_qty: call side quantity (for uneven fills like 2 puts / 4 calls)
+
     Returns P&L as string, or "" if no fills.
     """
-    if qty == 0:
+    if call_qty is None:
+        call_qty = qty
+
+    if qty == 0 and call_qty == 0:
         return ""
 
     if signed_put_f is None and signed_call_f is None:
@@ -261,7 +267,9 @@ def compute_pnl_for_group(signed_put_f, signed_call_f, put_side, call_side,
     else:
         call_pnl = sc - call_intrinsic
 
-    total = (put_pnl + call_pnl - cost_points) * qty
+    # Half the IC cost applies to each spread side
+    half_cost = cost_points / 2.0
+    total = put_pnl * qty + call_pnl * call_qty - half_cost * (qty + call_qty)
     return str(round(total, 2))
 
 
@@ -418,13 +426,13 @@ def compute_daily_detail(rows: list[dict], gw_signal: dict,
             if r:
                 put_filled_f = safe_float(r.get("put_filled"), 0)
                 call_filled_f = safe_float(r.get("call_filled"), 0)
-                qty = int(put_filled_f) if put_filled_f else 0
-
-                # QTY mismatch detection
-                qty_str = str(qty)
+                put_qty = int(put_filled_f) if put_filled_f else 0
                 call_qty = int(call_filled_f) if call_filled_f else 0
-                if qty > 0 and call_qty > 0 and qty != call_qty:
-                    qty_str += "*"
+
+                # Display qty: show put qty, mark with * if uneven
+                qty_str = str(put_qty or call_qty)
+                if put_qty > 0 and call_qty > 0 and put_qty != call_qty:
+                    qty_str = f"{put_qty}/{call_qty}"
 
                 p_side = (r.get("put_side") or "").strip()
                 c_side = (r.get("call_side") or "").strip()
@@ -435,19 +443,20 @@ def compute_daily_detail(rows: list[dict], gw_signal: dict,
 
                 # Use close-based P&L if order filled early (any account)
                 if (tt_close and (expiry, acct_name) in tt_close
-                        and qty > 0):
+                        and (put_qty > 0 or call_qty > 0)):
                     close_net = tt_close[(expiry, acct_name)]
                     sp = safe_float(price_put) or 0.0
                     sc = safe_float(price_call) or 0.0
                     # 2× cost: commissions on both open + close trades
-                    pnl = str(round((sp + sc + close_net - 2 * cost) * qty, 2))
+                    max_qty = max(put_qty, call_qty)
+                    pnl = str(round((sp + sc + close_net - 2 * cost) * max_qty, 2))
                 else:
                     pnl = compute_pnl_for_group(
                         safe_float(price_put), safe_float(price_call),
                         p_side, c_side,
                         (r.get("put_strikes") or "").strip(),
                         (r.get("call_strikes") or "").strip(),
-                        settlement, cost, qty,
+                        settlement, cost, put_qty, call_qty,
                     )
             else:
                 qty_str = "0"

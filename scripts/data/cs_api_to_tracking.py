@@ -580,7 +580,11 @@ def read_gw_signal(svc, spreadsheet_id: str, tab: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def read_existing_keys(svc, sid, tab) -> set:
-    """Read CS_Tracking and return set of (expiry, account) keys with fill data."""
+    """Read CS_Tracking and return set of (expiry, account) keys with COMPLETE fill data.
+
+    A row is "complete" only if it has fill qty AND fill price for at least one side.
+    Rows with fills but no prices are treated as gaps so the API can re-fetch them.
+    """
     existing = get_values(svc, sid, f"{tab}!A1:ZZ")
     if len(existing) < 2:
         return set()
@@ -592,7 +596,12 @@ def read_existing_keys(svc, sid, tab) -> set:
         account = (d.get("account") or "").strip()
         put_filled = (d.get("put_filled") or "").strip()
         call_filled = (d.get("call_filled") or "").strip()
-        if expiry and account and (put_filled or call_filled):
+        put_price = (d.get("put_fill_price") or "").strip()
+        call_price = (d.get("call_fill_price") or "").strip()
+        # Complete = has fill qty AND fill price for at least one side
+        has_put = put_filled and put_price
+        has_call = call_filled and call_price
+        if expiry and account and (has_put or has_call):
             keys.add((expiry, account))
     return keys
 
@@ -754,10 +763,13 @@ def upsert_rows(svc, sid, tab, rows, header):
     def key_from_dict(d):
         return tuple(str(d.get(k, "")) for k in UPSERT_KEYS)
 
-    existing_map = {}
+    existing_map = {}    # key -> row number
+    existing_data = {}   # key -> existing row values list
     for rnum, row in enumerate(existing[1:], start=2):
         d = {header[i]: (row[i] if i < len(row) else "") for i in range(len(header))}
-        existing_map[key_from_dict(d)] = rnum
+        k = key_from_dict(d)
+        existing_map[k] = rnum
+        existing_data[k] = row
 
     # De-dupe by key (keep last)
     last_by_key = {}
@@ -773,7 +785,15 @@ def upsert_rows(svc, sid, tab, rows, header):
         if key in existing_map:
             rnum = existing_map[key]
             rng = f"{tab}!A{rnum}:{last_col}{rnum}"
-            updates.append((rng, values))
+            # Merge: keep existing non-empty values, fill in blanks from API
+            old_row = existing_data[key]
+            merged = []
+            for i, h in enumerate(header):
+                new_val = values[i]
+                old_val = (old_row[i] if i < len(old_row) else "").strip()
+                # Keep old value if it's non-empty; use new if old is empty
+                merged.append(old_val if old_val else new_val)
+            updates.append((rng, merged))
         else:
             appends.append(values)
 
