@@ -286,6 +286,137 @@ def run_script(script, env, timeout_s=100, label=""):
 
 
 # ---------------------------------------------------------------------------
+# Sim chain collection (S3-backed)
+# ---------------------------------------------------------------------------
+
+
+def _handle_sim_collect(event):
+    """Collect SPX chain data and persist to S3 for the trading simulation.
+
+    Event payload: {"account": "sim-collect", "phase": "open|mid|close|close5"}
+    """
+    t0 = time.time()
+    phase = event.get("phase", "")
+    valid_phases = ("open", "mid", "close", "close5")
+
+    if phase not in valid_phases:
+        msg = f"Invalid phase: {phase!r}. Must be one of {valid_phases}"
+        print(msg)
+        return {"status": "error", "message": msg}
+
+    print(f"=== sim-collect | phase={phase} ===")
+
+    # 1. Seed TT token from SSM (needed for TT API calls)
+    ssm_paths = {
+        "/gamma/tt/token_json": None,
+        "/gamma/tt/client_id": None,
+        "/gamma/tt/client_secret": None,
+        "/gamma/shared/gw_email": None,
+        "/gamma/shared/gw_password": None,
+    }
+    params = get_ssm_params(list(ssm_paths.keys()))
+    print(f"Fetched {len(params)} SSM params")
+
+    # Seed TT token file
+    tt_token = params.get("/gamma/tt/token_json", "")
+    if tt_token:
+        seed_file("/tmp/tt_token.json", tt_token)
+    else:
+        print("WARNING: no TT token from SSM")
+
+    token_hash = file_hash("/tmp/tt_token.json")
+
+    # Set env vars for TT API + GW API
+    os.environ["TT_TOKEN_PATH"] = "/tmp/tt_token.json"
+    os.environ["TT_CLIENT_ID"] = params.get("/gamma/tt/client_id", "")
+    os.environ["TT_CLIENT_SECRET"] = params.get("/gamma/tt/client_secret", "")
+    os.environ["GW_EMAIL"] = params.get("/gamma/shared/gw_email", "")
+    os.environ["GW_PASSWORD"] = params.get("/gamma/shared/gw_password", "")
+    os.environ.setdefault("GW_BASE", "https://gandalf.gammawizard.com")
+    os.environ.setdefault("GW_ENDPOINT", "rapi/GetUltraPureConstantStable")
+
+    # 2. Run chain collection
+    from datetime import date as date_type
+    from sim.data.tt_market_data import fetch_tt_spx_chain
+    from sim.data.chain_snapshot import parse_tt_chain
+    from sim.data.features import enrich, FeaturePack
+    from sim.data.gw_client import fetch_gw_data
+    from sim.data.s3_cache import s3_put_json
+
+    today = date_type.today()
+    today_str = today.isoformat()
+    print(f"Collecting: date={today_str}, phase={phase}")
+
+    try:
+        raw = fetch_tt_spx_chain(phase=phase)
+        if raw is None:
+            return {"status": "error", "message": "TT chain fetch returned None",
+                    "duration_s": round(time.time() - t0, 1)}
+
+        # Validate
+        snapshot = parse_tt_chain(raw)
+        if not snapshot.contracts:
+            return {"status": "error", "message": "No contracts in chain",
+                    "duration_s": round(time.time() - t0, 1)}
+
+        print(f"Chain: {len(snapshot.contracts)} contracts, "
+              f"SPX={snapshot.underlying_price:.0f}, VIX={snapshot.vix:.1f}")
+
+        # 3. Save chain to S3
+        s3_put_json(today_str, f"{phase}.json", {
+            "trading_date": today_str,
+            "phase": phase,
+            "vix": raw.get("_vix", 0.0),
+            "fetched_at": raw.get("_timestamp", ""),
+            "chain": raw,
+        })
+
+        # 4. Fetch + save GW data (non-fatal)
+        gw_data = None
+        try:
+            gw_data = fetch_gw_data(today_str)
+            if gw_data:
+                s3_put_json(today_str, f"gw_{phase}.json", gw_data)
+                print(f"GW: VIX1D={gw_data.get('vix_1d')}, RV={gw_data.get('rv')}")
+            else:
+                print("GW data unavailable (non-fatal)")
+        except Exception as e:
+            print(f"GW fetch failed (non-fatal): {e}")
+
+        # 5. Save FeaturePack to S3
+        prev_close = raw.get("spx_prev_close", 0.0)
+        fp = enrich(snapshot, prev_close=prev_close, gw_data=gw_data)
+        s3_put_json(today_str, f"features_{phase}.json", fp.to_dict())
+
+        print(f"FeaturePack: EM={fp.atm_straddle_mid:.1f}, IV={fp.iv_atm:.1f}%")
+
+    except Exception as e:
+        print(f"ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"status": "error", "message": str(e),
+                "duration_s": round(time.time() - t0, 1)}
+
+    # 6. Persist TT token if refreshed
+    try:
+        persist_token_if_changed("/gamma/tt/token_json", "/tmp/tt_token.json", token_hash)
+    except Exception as e:
+        print(f"ERROR persisting TT token: {e}")
+
+    duration = round(time.time() - t0, 1)
+    print(f"=== DONE sim-collect | phase={phase} | {duration}s ===")
+    return {
+        "status": "ok",
+        "account": "sim-collect",
+        "phase": phase,
+        "date": today_str,
+        "contracts": len(snapshot.contracts),
+        "spx": snapshot.underlying_price,
+        "duration_s": duration,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Lambda entry point
 # ---------------------------------------------------------------------------
 
@@ -299,6 +430,10 @@ def lambda_handler(event, context):
     if account == "warmup":
         print("WARMUP ping — container is warm")
         return {"status": "ok", "account": "warmup", "duration_s": 0}
+
+    # Sim chain collection — separate flow (no subprocess, writes to S3)
+    if account == "sim-collect":
+        return _handle_sim_collect(event)
 
     if account not in ACCOUNTS:
         msg = f"Unknown account: {account!r}. Expected one of {list(ACCOUNTS)}"

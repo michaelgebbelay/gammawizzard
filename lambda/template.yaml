@@ -32,6 +32,7 @@ Resources:
       Environment:
         Variables:
           DRY_RUN: !Ref DryRun
+          SIM_CACHE_BUCKET: !Ref SimCacheBucket
       Policies:
         # Read all /gamma/* params
         - SSMParameterReadPolicy:
@@ -41,6 +42,9 @@ Resources:
             - Effect: Allow
               Action: ssm:PutParameter
               Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/gamma/*/token_json"
+        # S3 access for sim chain cache
+        - S3CrudPolicy:
+            BucketName: !Ref SimCacheBucket
     Metadata:
       Dockerfile: lambda/Dockerfile
       DockerContext: ..
@@ -124,6 +128,78 @@ Resources:
         RoleArn: !GetAtt SchedulerRole.Arn
         Input: '{"account": "morning-check"}'
 
+  # ---------- S3 Bucket for Sim Chain Cache ----------
+  SimCacheBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: gamma-sim-cache
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldChains
+            Status: Enabled
+            ExpirationInDays: 365
+
+  # ---------- Sim Chain Collection Schedules (ET) ----------
+  SimCollectOpen:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: gamma-sim-collect-open
+      Description: "Sim: collect SPX 0DTE chain at market open"
+      State: ENABLED
+      ScheduleExpression: "cron(31 9 ? * MON-FRI *)"
+      ScheduleExpressionTimezone: "America/New_York"
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt TradingFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"account": "sim-collect", "phase": "open"}'
+
+  SimCollectMid:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: gamma-sim-collect-mid
+      Description: "Sim: collect SPX chain at midday"
+      State: ENABLED
+      ScheduleExpression: "cron(0 12 ? * MON-FRI *)"
+      ScheduleExpressionTimezone: "America/New_York"
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt TradingFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"account": "sim-collect", "phase": "mid"}'
+
+  SimCollectClose:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: gamma-sim-collect-close
+      Description: "Sim: collect SPX chain at market close"
+      State: ENABLED
+      ScheduleExpression: "cron(0 16 ? * MON-FRI *)"
+      ScheduleExpressionTimezone: "America/New_York"
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt TradingFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"account": "sim-collect", "phase": "close"}'
+
+  SimCollectClose5:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: gamma-sim-collect-close5
+      Description: "Sim: collect SPX 1DTE chain at close+5"
+      State: ENABLED
+      ScheduleExpression: "cron(5 16 ? * MON-FRI *)"
+      ScheduleExpressionTimezone: "America/New_York"
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt TradingFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"account": "sim-collect", "phase": "close5"}'
+
   # ---------- IAM Role for EventBridge Scheduler ----------
   SchedulerRole:
     Type: AWS::IAM::Role
@@ -154,3 +230,6 @@ Outputs:
   FunctionName:
     Description: "Trading Lambda name (for manual invoke)"
     Value: !Ref TradingFunction
+  SimCacheBucketName:
+    Description: "S3 bucket for sim chain cache"
+    Value: !Ref SimCacheBucket
