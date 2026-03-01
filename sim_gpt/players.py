@@ -1,4 +1,4 @@
-"""Player implementations for the live binary-vertical game."""
+"""Self-learning players for the live binary-vertical game."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import math
 from dataclasses import dataclass
 from typing import Iterable
 
+from sim_gpt.template_rules import template_rule
 from sim_gpt.types import Decision, PublicSnapshot, SideAction, build_decision
 
 
@@ -39,48 +40,126 @@ def _context_key(s: PublicSnapshot) -> str:
 def _deterministic_noise(seed: str) -> float:
     h = hashlib.sha256(seed.encode()).hexdigest()
     val = int(h[:8], 16) / 0xFFFFFFFF
-    return (val - 0.5) * 0.08
+    return (val - 0.5) * 0.05
 
 
 def _template_pool() -> dict[str, Decision]:
-    return {
-        "flat": build_decision(SideAction.NONE, SideAction.NONE, thesis="No edge today.", template_id="flat"),
-        "put_sell_5": build_decision(SideAction.SELL, SideAction.NONE, width=5, thesis="Short put side.", template_id="put_sell_5"),
-        "call_sell_5": build_decision(SideAction.NONE, SideAction.SELL, width=5, thesis="Short call side.", template_id="call_sell_5"),
-        "put_buy_5": build_decision(SideAction.BUY, SideAction.NONE, width=5, thesis="Long put side.", template_id="put_buy_5"),
-        "call_buy_5": build_decision(SideAction.NONE, SideAction.BUY, width=5, thesis="Long call side.", template_id="call_buy_5"),
-        "both_sell_5": build_decision(SideAction.SELL, SideAction.SELL, width=5, thesis="Two-sided short 5w.", template_id="both_sell_5"),
-        "both_buy_5": build_decision(SideAction.BUY, SideAction.BUY, width=5, thesis="Two-sided long 5w.", template_id="both_buy_5"),
-        "both_sell_10": build_decision(SideAction.SELL, SideAction.SELL, width=10, thesis="Two-sided short 10w.", template_id="both_sell_10"),
-        "both_buy_10": build_decision(SideAction.BUY, SideAction.BUY, width=10, thesis="Two-sided long 10w.", template_id="both_buy_10"),
+    templates = {
+        "flat": build_decision(
+            SideAction.NONE,
+            SideAction.NONE,
+            size=1,
+            thesis="No trade.",
+            template_id="flat",
+        )
     }
+
+    widths = (5, 10)
+    sizes = (1, 2, 3)
+    legs = (
+        ("put_sell", SideAction.SELL, SideAction.NONE),
+        ("put_buy", SideAction.BUY, SideAction.NONE),
+        ("call_sell", SideAction.NONE, SideAction.SELL),
+        ("call_buy", SideAction.NONE, SideAction.BUY),
+        ("both_sell", SideAction.SELL, SideAction.SELL),
+        ("both_buy", SideAction.BUY, SideAction.BUY),
+        ("rr_long", SideAction.SELL, SideAction.BUY),
+        ("rr_short", SideAction.BUY, SideAction.SELL),
+    )
+
+    for width in widths:
+        for size in sizes:
+            for name, put_side, call_side in legs:
+                template_id = f"{name}_{width}x{size}"
+                templates[template_id] = build_decision(
+                    put_side,
+                    call_side,
+                    width=width,
+                    size=size,
+                    thesis=f"Self-learning template {template_id}.",
+                    template_id=template_id,
+                )
+    return templates
 
 
 TEMPLATES = _template_pool()
 
 
+def _max_loss_for_template(decision: Decision) -> float:
+    rule = template_rule(decision.template_id)
+    total = 0.0
+    if decision.put_action != SideAction.NONE and decision.put_width:
+        total += float(decision.put_width) * float(decision.size) * rule.risk_per_width_dollars
+    if decision.call_action != SideAction.NONE and decision.call_width:
+        total += float(decision.call_width) * float(decision.size) * rule.risk_per_width_dollars
+    return total
+
+
+def _is_flat(template_id: str) -> bool:
+    return template_id == "flat"
+
+
 @dataclass
 class Player:
     player_id: str
+    explore_coef: float
+    risk_penalty: float
+    flat_penalty: float
+    cold_start_boost: float
+    warmup_rounds: int
 
     def decide(self, snapshot: PublicSnapshot, state: dict) -> Decision:
-        raise NotImplementedError
-
-    def _score_template(
-        self,
-        snapshot: PublicSnapshot,
-        state: dict,
-        template_id: str,
-        base_score: float,
-    ) -> float:
         ctx = _context_key(snapshot)
-        hist = state.get("q", {}).get(ctx, {}).get(template_id, {})
-        avg = float(hist.get("avg", 0.0))
-        n = int(hist.get("n", 0))
-        explore = 0.2 / math.sqrt(n + 1)
+        rounds_seen = int(state.get("meta", {}).get("rounds", 0))
+
+        scored: list[tuple[str, float]] = []
+        for template_id in TEMPLATES:
+            score = self._score_template(snapshot, state, ctx, template_id)
+            scored.append((template_id, score))
+
+        scored.sort(key=lambda t: t[1], reverse=True)
+        best_template = scored[0][0]
+
+        # Force active exploration in the bootstrapping phase.
+        if rounds_seen < self.warmup_rounds and _is_flat(best_template):
+            for template_id, _ in scored:
+                if not _is_flat(template_id):
+                    best_template = template_id
+                    break
+
+        d = TEMPLATES[best_template]
+        return Decision(
+            put_action=d.put_action,
+            call_action=d.call_action,
+            put_width=d.put_width,
+            call_width=d.call_width,
+            size=d.size,
+            template_id=d.template_id,
+            thesis=f"model=self_learning | id={self.player_id} | ctx={ctx} | template={best_template}",
+        )
+
+    def _score_template(self, snapshot: PublicSnapshot, state: dict, ctx: str, template_id: str) -> float:
+        item = _template_stats(state, ctx, template_id)
+        n = int(item.get("n", 0))
+        mean = float(item.get("mean", 0.0))
+        m2 = float(item.get("m2", 0.0))
+        total_n = int(state.get("meta", {}).get("rounds", 0))
+
+        variance = (m2 / (n - 1)) if n > 1 else 0.0
+        std = math.sqrt(max(0.0, variance))
+
+        decision = TEMPLATES[template_id]
+        risk = _max_loss_for_template(decision)
+        risk_norm = max(100.0, risk)
+        mean_per_risk = mean / risk_norm
+        std_per_risk = std / risk_norm
+
+        ucb = self.explore_coef * math.sqrt(math.log(total_n + 2.0) / (n + 1.0))
+        cold = self.cold_start_boost if (n == 0 and not _is_flat(template_id)) else 0.0
+        flat_pen = self.flat_penalty if _is_flat(template_id) else 0.0
         noise = _deterministic_noise(f"{snapshot.signal_date}|{self.player_id}|{template_id}")
-        # Base preference + online memory + small exploration + tiny tie-break noise.
-        return base_score + 0.35 * avg + explore + noise
+
+        return mean_per_risk - (self.risk_penalty * std_per_risk) + ucb + cold - flat_pen + noise
 
     def update_state(
         self,
@@ -92,240 +171,91 @@ class Player:
         ctx = _context_key(snapshot)
         q = state.setdefault("q", {})
         q_ctx = q.setdefault(ctx, {})
-        item = q_ctx.setdefault(template_id, {"n": 0, "avg": 0.0})
-        n = int(item["n"]) + 1
-        avg = float(item["avg"])
-        item["avg"] = avg + (pnl - avg) / n
-        item["n"] = n
+        item = q_ctx.setdefault(template_id, {"n": 0, "mean": 0.0, "m2": 0.0})
+
+        # Backward compatibility for old state shape: {"n":..., "avg":...}
+        if "mean" not in item and "avg" in item:
+            item["mean"] = float(item.get("avg", 0.0))
+            item["m2"] = float(item.get("m2", 0.0))
+
+        n = int(item.get("n", 0))
+        mean = float(item.get("mean", 0.0))
+        m2 = float(item.get("m2", 0.0))
+
+        n_new = n + 1
+        delta = float(pnl) - mean
+        mean_new = mean + delta / n_new
+        delta2 = float(pnl) - mean_new
+        m2_new = m2 + delta * delta2
+
+        item["n"] = n_new
+        item["mean"] = mean_new
+        item["m2"] = m2_new
+        item["avg"] = mean_new
+
+        meta = state.setdefault("meta", {})
+        meta["rounds"] = int(meta.get("rounds", 0)) + 1
         return state
 
 
-class RegimePlayer(Player):
-    def __init__(self):
-        super().__init__("player-regime")
-
-    def decide(self, snapshot: PublicSnapshot, state: dict) -> Decision:
-        v = _vix_bucket(snapshot)
-        base = {
-            "flat": 0.2,
-            "put_sell_5": 0.3,
-            "call_sell_5": 0.3,
-            "put_buy_5": -0.1,
-            "call_buy_5": -0.1,
-            "both_sell_5": 0.6 if v in {"low", "mid"} else 0.1,
-            "both_buy_5": 0.5 if v == "high" else -0.2,
-            "both_sell_10": 0.2 if v == "low" else -0.3,
-            "both_buy_10": 0.3 if v == "high" else -0.3,
-        }
-        return _pick_best(self, snapshot, state, base)
-
-
-class MomentumPlayer(Player):
-    def __init__(self):
-        super().__init__("player-momentum")
-
-    def decide(self, snapshot: PublicSnapshot, state: dict) -> Decision:
-        trend = _trend_bucket(snapshot)
-        # Up trend -> prefer call-side buy / put-side sell.
-        # Down trend -> prefer put-side buy / call-side sell.
-        if trend == "up":
-            base = {
-                "flat": 0.1,
-                "put_sell_5": 0.45,
-                "call_buy_5": 0.55,
-                "call_sell_5": -0.2,
-                "put_buy_5": -0.1,
-                "both_sell_5": 0.2,
-                "both_buy_5": 0.2,
-                "both_sell_10": 0.0,
-                "both_buy_10": 0.1,
-            }
-        elif trend == "down":
-            base = {
-                "flat": 0.1,
-                "put_buy_5": 0.55,
-                "call_sell_5": 0.45,
-                "put_sell_5": -0.2,
-                "call_buy_5": -0.1,
-                "both_sell_5": 0.2,
-                "both_buy_5": 0.2,
-                "both_sell_10": 0.0,
-                "both_buy_10": 0.1,
-            }
-        else:
-            base = {
-                "flat": 0.3,
-                "put_sell_5": 0.35,
-                "call_sell_5": 0.35,
-                "put_buy_5": 0.1,
-                "call_buy_5": 0.1,
-                "both_sell_5": 0.4,
-                "both_buy_5": -0.1,
-                "both_sell_10": 0.1,
-                "both_buy_10": -0.2,
-            }
-        return _pick_best(self, snapshot, state, base)
-
-
-class VolatilityPlayer(Player):
-    def __init__(self):
-        super().__init__("player-volatility")
-
-    def decide(self, snapshot: PublicSnapshot, state: dict) -> Decision:
-        # If implied > realized, bias to selling premium; otherwise buying.
-        implied = _vix1d_pct(snapshot) / 100.0
-        realized = snapshot.rv5 if snapshot.rv5 > 0 else snapshot.rv
-        spread = implied - realized
-        sell_bias = spread > 0.015
-        buy_bias = spread < -0.005
-        base = {
-            "flat": 0.1,
-            "put_sell_5": 0.35 if sell_bias else 0.0,
-            "call_sell_5": 0.35 if sell_bias else 0.0,
-            "both_sell_5": 0.65 if sell_bias else -0.1,
-            "both_sell_10": 0.2 if sell_bias else -0.25,
-            "put_buy_5": 0.3 if buy_bias else -0.05,
-            "call_buy_5": 0.3 if buy_bias else -0.05,
-            "both_buy_5": 0.55 if buy_bias else -0.1,
-            "both_buy_10": 0.25 if buy_bias else -0.25,
-        }
-        return _pick_best(self, snapshot, state, base)
-
-
-class ContrarianPlayer(Player):
-    def __init__(self):
-        super().__init__("player-contrarian")
-
-    def decide(self, snapshot: PublicSnapshot, state: dict) -> Decision:
-        v = _vix_bucket(snapshot)
-        trend = _trend_bucket(snapshot)
-        # Contrarian: fade directional trend and avoid crowding.
-        if trend == "up":
-            base = {
-                "flat": 0.15,
-                "call_sell_5": 0.55,
-                "put_buy_5": 0.45,
-                "put_sell_5": -0.2,
-                "call_buy_5": -0.2,
-                "both_sell_5": 0.25 if v == "high" else 0.1,
-                "both_buy_5": 0.15 if v == "low" else 0.25,
-                "both_sell_10": 0.05,
-                "both_buy_10": 0.1,
-            }
-        elif trend == "down":
-            base = {
-                "flat": 0.15,
-                "put_sell_5": 0.55,
-                "call_buy_5": 0.45,
-                "put_buy_5": -0.2,
-                "call_sell_5": -0.2,
-                "both_sell_5": 0.25 if v == "high" else 0.1,
-                "both_buy_5": 0.15 if v == "low" else 0.25,
-                "both_sell_10": 0.05,
-                "both_buy_10": 0.1,
-            }
-        else:
-            base = {
-                "flat": 0.4,
-                "put_sell_5": 0.25,
-                "call_sell_5": 0.25,
-                "put_buy_5": 0.2,
-                "call_buy_5": 0.2,
-                "both_sell_5": 0.2,
-                "both_buy_5": 0.2,
-                "both_sell_10": 0.05,
-                "both_buy_10": 0.05,
-            }
-        return _pick_best(self, snapshot, state, base)
-
-
-class VixOneBiasPlayer(Player):
-    def __init__(self):
-        super().__init__("player-vixone-bias")
-
-    def decide(self, snapshot: PublicSnapshot, state: dict) -> Decision:
-        vix1d = _vix1d_pct(snapshot)
-
-        # Low VIX1D favors short-vol structures, very high VIX1D favors long-vol.
-        if vix1d <= 11:
-            base = {
-                "flat": 0.2,
-                "put_sell_5": 0.35,
-                "call_sell_5": 0.35,
-                "both_sell_5": 0.55,
-                "both_sell_10": 0.65,
-                "put_buy_5": -0.2,
-                "call_buy_5": -0.2,
-                "both_buy_5": -0.3,
-                "both_buy_10": -0.35,
-            }
-        elif vix1d <= 18:
-            base = {
-                "flat": 0.2,
-                "put_sell_5": 0.4,
-                "call_sell_5": 0.4,
-                "both_sell_5": 0.6,
-                "both_sell_10": 0.2,
-                "put_buy_5": -0.1,
-                "call_buy_5": -0.1,
-                "both_buy_5": -0.15,
-                "both_buy_10": -0.25,
-            }
-        elif vix1d <= 24:
-            base = {
-                "flat": 0.3,
-                "put_sell_5": 0.25,
-                "call_sell_5": 0.25,
-                "both_sell_5": 0.35,
-                "both_sell_10": -0.05,
-                "put_buy_5": 0.15,
-                "call_buy_5": 0.15,
-                "both_buy_5": 0.25,
-                "both_buy_10": 0.1,
-            }
-        else:
-            base = {
-                "flat": 0.35,
-                "put_sell_5": -0.2,
-                "call_sell_5": -0.2,
-                "both_sell_5": -0.25,
-                "both_sell_10": -0.35,
-                "put_buy_5": 0.4,
-                "call_buy_5": 0.4,
-                "both_buy_5": 0.65,
-                "both_buy_10": 0.4,
-            }
-
-        return _pick_best(self, snapshot, state, base)
-
-
-def _pick_best(player: Player, snapshot: PublicSnapshot, state: dict, base_scores: dict[str, float]) -> Decision:
-    scored: list[tuple[str, float]] = []
-    for template_id, decision in TEMPLATES.items():
-        base = float(base_scores.get(template_id, -0.3))
-        score = player._score_template(snapshot, state, template_id, base)
-        scored.append((template_id, score))
-    best = max(scored, key=lambda t: t[1])[0]
-    d = TEMPLATES[best]
-    # Copy decision so each round has explicit model/context metadata.
-    return Decision(
-        put_action=d.put_action,
-        call_action=d.call_action,
-        put_width=d.put_width,
-        call_width=d.call_width,
-        size=d.size,
-        template_id=d.template_id,
-        thesis=f"model={player.player_id} | ctx={_context_key(snapshot)} | template={best}",
-    )
+def _template_stats(state: dict, ctx: str, template_id: str) -> dict:
+    q = state.get("q", {})
+    q_ctx = q.get(ctx, {})
+    item = q_ctx.get(template_id, {})
+    n = int(item.get("n", 0))
+    if "mean" in item:
+        mean = float(item.get("mean", 0.0))
+        m2 = float(item.get("m2", 0.0))
+    else:
+        # Support old schema.
+        mean = float(item.get("avg", 0.0))
+        m2 = float(item.get("m2", 0.0))
+    return {"n": n, "mean": mean, "m2": m2}
 
 
 def build_players() -> list[Player]:
+    # Same learner family, no personality priors. Diversity comes from search parameters.
     return [
-        RegimePlayer(),
-        MomentumPlayer(),
-        VolatilityPlayer(),
-        ContrarianPlayer(),
-        VixOneBiasPlayer(),
+        Player(
+            player_id="player-01",
+            explore_coef=0.75,
+            risk_penalty=0.10,
+            flat_penalty=0.08,
+            cold_start_boost=0.22,
+            warmup_rounds=8,
+        ),
+        Player(
+            player_id="player-02",
+            explore_coef=0.65,
+            risk_penalty=0.14,
+            flat_penalty=0.08,
+            cold_start_boost=0.20,
+            warmup_rounds=8,
+        ),
+        Player(
+            player_id="player-03",
+            explore_coef=0.58,
+            risk_penalty=0.18,
+            flat_penalty=0.08,
+            cold_start_boost=0.18,
+            warmup_rounds=8,
+        ),
+        Player(
+            player_id="player-04",
+            explore_coef=0.50,
+            risk_penalty=0.24,
+            flat_penalty=0.08,
+            cold_start_boost=0.16,
+            warmup_rounds=8,
+        ),
+        Player(
+            player_id="player-05",
+            explore_coef=0.42,
+            risk_penalty=0.30,
+            flat_penalty=0.08,
+            cold_start_boost=0.14,
+            warmup_rounds=8,
+        ),
     ]
 
 

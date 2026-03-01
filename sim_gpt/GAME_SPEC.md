@@ -71,13 +71,15 @@ Suppressed from players:
 
 Active players:
 
-- `player-regime`
-- `player-momentum`
-- `player-volatility`
-- `player-contrarian`
-- `player-vixone-bias`
+- `player-01`
+- `player-02`
+- `player-03`
+- `player-04`
+- `player-05`
 
-Each player chooses from a template set and learns online by context bucket (`vix_bucket|trend_bucket`) using historical average P/L per template.
+Each player is a neutral self-learning agent with no hardcoded directional/personality bias.
+They choose from the same risk-defined template set and learn online by context bucket
+(`vix_bucket|trend_bucket`) from realized P/L.
 
 ## 7. Trade Universe and Allowed Actions
 

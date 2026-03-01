@@ -26,11 +26,11 @@ RISK_BUFFER_PCT = 0.90
 COMMISSION_PER_LEG_DOLLARS = 1.0
 
 PLAYER_IDS = [
-    "player-regime",
-    "player-momentum",
-    "player-volatility",
-    "player-contrarian",
-    "player-vixone-bias",
+    "player-01",
+    "player-02",
+    "player-03",
+    "player-04",
+    "player-05",
 ]
 
 # Google Sheets defaults (from the URL you shared).

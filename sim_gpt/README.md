@@ -12,7 +12,7 @@ Separate game engine for live Leo rounds (independent of `sim/`).
   - `buy`, `sell`, or `none` for call side
 - Allowed widths: `5` or `10` (risk-defined verticals only).
 - No intraday adjustments; one decision per round.
-- Active players: regime, momentum, volatility-spread, contrarian, and `VIXone-bias`.
+- Active players: neutral self-learning agents (`player-01` ... `player-05`) with no personality priors.
 - Starting account per player: `$30,000`.
 - Risk limit per round: `30%` of account value, with a `90%` safety buffer on that cap
   (`effective trade budget = 27%` of account value).
