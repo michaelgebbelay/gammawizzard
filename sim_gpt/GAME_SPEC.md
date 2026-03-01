@@ -80,6 +80,12 @@ Active players:
 Each player is a neutral self-learning agent with no hardcoded directional/personality bias.
 They choose from the same risk-defined template set and learn online by context bucket
 (`vix_bucket|trend_bucket`) from realized P/L.
+Policy scoring is options-aware for cash-settled SPX outcomes:
+- expected move (from VixOne) vs strike distance
+- IV-vs-realized carry (`VixOne` vs `RV5`/`RV`)
+- directional exposure mapping for one-side and risk-reversal structures
+- decision-round exploration counters are updated on entry runs (not only settlement)
+  so agents keep adapting even when outcome fields are delayed
 
 ## 7. Trade Universe and Allowed Actions
 

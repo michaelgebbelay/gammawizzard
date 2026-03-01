@@ -65,6 +65,8 @@ class LiveGameEngine:
         decisions_out = []
         for player in self.players:
             state = self.store.load_player_state(player.player_id)
+            meta = state.setdefault("meta", {})
+            decision_rounds = int(meta.get("decision_rounds", 0))
             decision = player.decide(snapshot, state)
             decision, risk_meta = self._apply_risk_limits(player.player_id, decision)
             valid, err = decision.validate()
@@ -79,6 +81,7 @@ class LiveGameEngine:
 
             decision_payload = decision.to_dict()
             decision_payload.update(risk_meta)
+            decision_payload["decision_round"] = decision_rounds + 1
             self.store.save_decision(
                 signal_date=snapshot.signal_date.isoformat(),
                 player_id=player.player_id,
@@ -86,6 +89,8 @@ class LiveGameEngine:
                 valid=valid,
                 error=err,
             )
+            meta["decision_rounds"] = decision_rounds + 1
+            self.store.save_player_state(player.player_id, state)
             decisions_out.append(
                 {
                     "player_id": player.player_id,

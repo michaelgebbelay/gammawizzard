@@ -99,6 +99,111 @@ def _is_flat(template_id: str) -> bool:
     return template_id == "flat"
 
 
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
+@dataclass(frozen=True)
+class MarketFrame:
+    expected_move_pts: float
+    put_em_ratio: float
+    call_em_ratio: float
+    iv_minus_rv: float
+    directional_edge: float
+
+
+def _market_frame(snapshot: PublicSnapshot) -> MarketFrame:
+    spot = max(1.0, float(snapshot.spx))
+    vix1d = _vix1d_pct(snapshot) / 100.0
+    realized = float(snapshot.rv5 if snapshot.rv5 > 0 else snapshot.rv)
+    expected_move = max(5.0, spot * vix1d / math.sqrt(252.0))
+    put_dist = max(0.0, spot - float(snapshot.limit))
+    call_dist = max(0.0, float(snapshot.climit) - spot)
+
+    # Directional proxy from same-day return + forward basis.
+    trend = float(snapshot.r)
+    fwd_edge = (float(snapshot.forward) - spot) / spot
+    directional_edge = (trend * 120.0) + (fwd_edge * 160.0)
+
+    return MarketFrame(
+        expected_move_pts=expected_move,
+        put_em_ratio=put_dist / expected_move,
+        call_em_ratio=call_dist / expected_move,
+        iv_minus_rv=vix1d - realized,
+        directional_edge=_clamp(directional_edge, -2.0, 2.0),
+    )
+
+
+def _options_prior_score(
+    decision: Decision,
+    frame: MarketFrame,
+    rounds_seen: int,
+    warmup_rounds: int,
+) -> float:
+    if _is_flat(decision.template_id):
+        return -0.05
+
+    score = 0.0
+
+    # Volatility carry edge: positive iv-rv favors short premium, negative favors long premium.
+    carry = _clamp(frame.iv_minus_rv, -0.04, 0.04) * 28.0
+    short_legs = 0
+    long_legs = 0
+
+    put_em = _clamp(frame.put_em_ratio, 0.0, 3.0)
+    call_em = _clamp(frame.call_em_ratio, 0.0, 3.0)
+
+    if decision.put_action == SideAction.SELL:
+        short_legs += 1
+        score += carry
+        # Short put wants distance from spot in expected-move units.
+        score += _clamp((put_em - 1.0) * 0.45, -0.90, 0.90)
+        if put_em < 0.80:
+            score -= (0.80 - put_em) * 1.10
+    elif decision.put_action == SideAction.BUY:
+        long_legs += 1
+        score -= carry
+        # Long put benefits when downside strike is closer.
+        score += _clamp((1.05 - put_em) * 0.32, -0.60, 0.60)
+
+    if decision.call_action == SideAction.SELL:
+        short_legs += 1
+        score += carry
+        # Short call wants distance from spot in expected-move units.
+        score += _clamp((call_em - 1.0) * 0.45, -0.90, 0.90)
+        if call_em < 0.80:
+            score -= (0.80 - call_em) * 1.10
+    elif decision.call_action == SideAction.BUY:
+        long_legs += 1
+        score -= carry
+        # Long call benefits when upside strike is closer.
+        score += _clamp((1.05 - call_em) * 0.32, -0.60, 0.60)
+
+    # Directional mapping for cash-settled structures (no assignment risk, pure payoff at close).
+    dir_exposure = 0.0
+    if decision.put_action == SideAction.SELL:
+        dir_exposure += 0.70
+    elif decision.put_action == SideAction.BUY:
+        dir_exposure -= 0.70
+    if decision.call_action == SideAction.BUY:
+        dir_exposure += 0.70
+    elif decision.call_action == SideAction.SELL:
+        dir_exposure -= 0.70
+    score += dir_exposure * frame.directional_edge * 0.26
+
+    # Two-sided symmetry bonus/penalty (balanced IC-like structures are preferred when distances match).
+    if short_legs == 2 or long_legs == 2:
+        score -= abs(put_em - call_em) * 0.12
+
+    # Notional discipline: softly penalize larger structures, especially during warmup.
+    risk = _max_loss_for_template(decision)
+    score -= (risk / 1000.0) * 0.05
+    if rounds_seen < warmup_rounds and decision.size > 1:
+        score -= 0.12 * (decision.size - 1)
+
+    return score
+
+
 @dataclass
 class Player:
     player_id: str
@@ -110,22 +215,33 @@ class Player:
 
     def decide(self, snapshot: PublicSnapshot, state: dict) -> Decision:
         ctx = _context_key(snapshot)
-        rounds_seen = int(state.get("meta", {}).get("rounds", 0))
+        meta = state.get("meta", {})
+        rounds_seen = int(meta.get("decision_rounds", meta.get("rounds", 0)))
+        frame = _market_frame(snapshot)
 
         scored: list[tuple[str, float]] = []
         for template_id in TEMPLATES:
-            score = self._score_template(snapshot, state, ctx, template_id)
+            score = self._score_template(snapshot, state, ctx, frame, rounds_seen, template_id)
             scored.append((template_id, score))
 
         scored.sort(key=lambda t: t[1], reverse=True)
         best_template = scored[0][0]
 
         # Force active exploration in the bootstrapping phase.
-        if rounds_seen < self.warmup_rounds and _is_flat(best_template):
-            for template_id, _ in scored:
-                if not _is_flat(template_id):
-                    best_template = template_id
-                    break
+        if rounds_seen < self.warmup_rounds:
+            candidates = [tid for tid, _ in scored if not _is_flat(tid)]
+            top = candidates[: max(4, min(8, len(candidates)))]
+            if top:
+                h = hashlib.sha256(
+                    f"{snapshot.signal_date}|{self.player_id}|{rounds_seen}|explore".encode()
+                ).hexdigest()
+                idx = int(h[:8], 16) % len(top)
+                best_template = top[idx]
+            elif _is_flat(best_template):
+                for template_id, _ in scored:
+                    if not _is_flat(template_id):
+                        best_template = template_id
+                        break
 
         d = TEMPLATES[best_template]
         return Decision(
@@ -135,15 +251,31 @@ class Player:
             call_width=d.call_width,
             size=d.size,
             template_id=d.template_id,
-            thesis=f"model=self_learning | id={self.player_id} | ctx={ctx} | template={best_template}",
+            thesis=(
+                f"model=self_learning_options | id={self.player_id} | ctx={ctx} | "
+                f"em={frame.expected_move_pts:.1f} | ivrv={frame.iv_minus_rv:.4f} | "
+                f"dir={frame.directional_edge:.2f} | template={best_template}"
+            ),
         )
 
-    def _score_template(self, snapshot: PublicSnapshot, state: dict, ctx: str, template_id: str) -> float:
+    def _score_template(
+        self,
+        snapshot: PublicSnapshot,
+        state: dict,
+        ctx: str,
+        frame: MarketFrame,
+        rounds_seen: int,
+        template_id: str,
+    ) -> float:
         item = _template_stats(state, ctx, template_id)
         n = int(item.get("n", 0))
         mean = float(item.get("mean", 0.0))
         m2 = float(item.get("m2", 0.0))
-        total_n = int(state.get("meta", {}).get("rounds", 0))
+        meta = state.get("meta", {})
+        total_n = max(
+            int(meta.get("rounds", 0)),
+            int(meta.get("decision_rounds", meta.get("rounds", 0))),
+        )
 
         variance = (m2 / (n - 1)) if n > 1 else 0.0
         std = math.sqrt(max(0.0, variance))
@@ -154,12 +286,18 @@ class Player:
         mean_per_risk = mean / risk_norm
         std_per_risk = std / risk_norm
 
+        prior = _options_prior_score(
+            decision=decision,
+            frame=frame,
+            rounds_seen=rounds_seen,
+            warmup_rounds=self.warmup_rounds,
+        )
         ucb = self.explore_coef * math.sqrt(math.log(total_n + 2.0) / (n + 1.0))
         cold = self.cold_start_boost if (n == 0 and not _is_flat(template_id)) else 0.0
         flat_pen = self.flat_penalty if _is_flat(template_id) else 0.0
         noise = _deterministic_noise(f"{snapshot.signal_date}|{self.player_id}|{template_id}")
 
-        return mean_per_risk - (self.risk_penalty * std_per_risk) + ucb + cold - flat_pen + noise
+        return prior + mean_per_risk - (self.risk_penalty * std_per_risk) + ucb + cold - flat_pen + noise
 
     def update_state(
         self,
