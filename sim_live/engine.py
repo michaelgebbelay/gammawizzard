@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 
 from sim_live.config import (
     ASOF_MAX_STALENESS_MINUTES,
+    COMMISSION_PER_LEG_DOLLARS,
     LIVE_START_DATE,
     MARKET_TZ,
     MAX_RISK_PCT,
@@ -122,7 +123,7 @@ class LiveGameEngine:
                 if not drow["valid"]:
                     continue
                 decision = Decision.from_dict(_json_load(drow["decision_json"]))
-                put_pnl, call_pnl, total_pnl = score_decision(decision, outcomes)
+                put_pnl, call_pnl, gross_total_pnl, fees, total_pnl = score_decision(decision, outcomes)
                 try:
                     snapshot = feed.get_public_snapshot(signal_date)
                 except ValueError:
@@ -139,6 +140,8 @@ class LiveGameEngine:
                     put_pnl=put_pnl,
                     call_pnl=call_pnl,
                     total_pnl=total_pnl,
+                    gross_total_pnl=gross_total_pnl,
+                    fees=fees,
                     equity_pnl=risk["equity_pnl"],
                     drawdown=risk["current_drawdown"],
                     max_drawdown=risk["max_drawdown"],
@@ -279,23 +282,43 @@ def side_pnl(
     return direction * base_short_pnl_5w * width_mult * size * 100.0
 
 
-def score_decision(decision: Decision, outcomes: RoundOutcomes) -> tuple[float, float, float]:
-    put_pnl = side_pnl(
+def score_decision(decision: Decision, outcomes: RoundOutcomes) -> tuple[float, float, float, float, float]:
+    put_gross = side_pnl(
         action=decision.put_action,
         width=decision.put_width,
         base_short_pnl_5w=outcomes.put_short_pnl_5w,
         size=decision.size,
         template_id=decision.template_id,
     )
-    call_pnl = side_pnl(
+    call_gross = side_pnl(
         action=decision.call_action,
         width=decision.call_width,
         base_short_pnl_5w=outcomes.call_short_pnl_5w,
         size=decision.size,
         template_id=decision.template_id,
     )
-    total = put_pnl + call_pnl
-    return round(put_pnl, 2), round(call_pnl, 2), round(total, 2)
+    put_fees = executed_legs(decision.put_action, decision.size) * COMMISSION_PER_LEG_DOLLARS
+    call_fees = executed_legs(decision.call_action, decision.size) * COMMISSION_PER_LEG_DOLLARS
+
+    put_pnl = put_gross - put_fees
+    call_pnl = call_gross - call_fees
+    gross_total = put_gross + call_gross
+    fees = put_fees + call_fees
+    total = gross_total - fees
+    return (
+        round(put_pnl, 2),
+        round(call_pnl, 2),
+        round(gross_total, 2),
+        round(fees, 2),
+        round(total, 2),
+    )
+
+
+def executed_legs(action: SideAction, size: int) -> int:
+    if action == SideAction.NONE:
+        return 0
+    # One vertical side = 2 option legs.
+    return 2 * int(size)
 
 
 def max_loss_dollars(decision: Decision) -> float:

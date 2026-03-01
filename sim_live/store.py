@@ -39,6 +39,8 @@ CREATE TABLE IF NOT EXISTS results (
     put_pnl REAL NOT NULL,
     call_pnl REAL NOT NULL,
     total_pnl REAL NOT NULL,
+    gross_total_pnl REAL NOT NULL DEFAULT 0,
+    fees REAL NOT NULL DEFAULT 0,
     equity_pnl REAL NOT NULL DEFAULT 0,
     drawdown REAL NOT NULL DEFAULT 0,
     max_drawdown REAL NOT NULL DEFAULT 0,
@@ -92,6 +94,8 @@ class Store:
         self._ensure_column("results", "drawdown", "REAL NOT NULL DEFAULT 0")
         self._ensure_column("results", "max_drawdown", "REAL NOT NULL DEFAULT 0")
         self._ensure_column("results", "risk_adjusted", "REAL NOT NULL DEFAULT 0")
+        self._ensure_column("results", "gross_total_pnl", "REAL NOT NULL DEFAULT 0")
+        self._ensure_column("results", "fees", "REAL NOT NULL DEFAULT 0")
 
     def upsert_round(self, signal_date: str, tdate: str, public_snapshot: dict) -> None:
         now_utc = _now()
@@ -153,6 +157,8 @@ class Store:
         put_pnl: float,
         call_pnl: float,
         total_pnl: float,
+        gross_total_pnl: float,
+        fees: float,
         equity_pnl: float,
         drawdown: float,
         max_drawdown: float,
@@ -162,15 +168,17 @@ class Store:
     ) -> None:
         self.conn.execute(
             """INSERT OR REPLACE INTO results
-               (signal_date, player_id, put_pnl, call_pnl, total_pnl, equity_pnl, drawdown,
+               (signal_date, player_id, put_pnl, call_pnl, total_pnl, gross_total_pnl, fees, equity_pnl, drawdown,
                 max_drawdown, risk_adjusted, judge_score, judge_notes, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 signal_date,
                 player_id,
                 put_pnl,
                 call_pnl,
                 total_pnl,
+                gross_total_pnl,
+                fees,
                 equity_pnl,
                 drawdown,
                 max_drawdown,

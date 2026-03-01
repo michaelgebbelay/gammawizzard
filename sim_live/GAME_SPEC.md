@@ -113,6 +113,7 @@ Per-player account settings:
 - starting balance: `$30,000`
 - hard cap: `30%` of current account value per round
 - safety buffer: `90%` applied to cap
+- commission: `$1` per executed option leg
 
 Effective per-round risk budget formula:
 
@@ -164,7 +165,9 @@ Per-side P/L:
 
 Round total:
 
-- `total_pnl = put_pnl + call_pnl`
+- `gross_total_pnl = put_gross + call_gross`
+- `fees = executed_legs * $1` (2 legs per active vertical side, scaled by size)
+- `total_pnl = gross_total_pnl - fees`
 
 ## 10. Judge and Ranking
 
@@ -280,13 +283,13 @@ For API feed:
 ## 16. Non-Goals and Known Gaps
 
 - No butterfly payoff support yet.
-- No transaction cost/slippage model yet.
+- No slippage model yet (commission is modeled).
 - No explicit daily kill switch yet (risk cap is per round).
 - No exchange holiday/early-close calendar logic by design (feed controls run/no-run).
 
 ## 17. Recommended Next Buffers
 
-1. Add slippage and fee haircut in max-loss and realized P/L accounting.
+1. Add slippage haircut in max-loss and realized P/L accounting.
 2. Add daily stop rule (skip new round after configurable daily equity hit).
 3. Add stale-data guard (reject snapshots not matching expected post-close freshness).
 4. Add equity floor mode (force one-side-only or flat under account stress).

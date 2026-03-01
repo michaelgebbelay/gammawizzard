@@ -16,6 +16,7 @@ Separate game engine for live Leo rounds (independent of `sim/`).
 - Starting account per player: `$30,000`.
 - Risk limit per round: `30%` of account value, with a `90%` safety buffer on that cap
   (`effective trade budget = 27%` of account value).
+- Trade cost: `$1` per executed option leg (scaled by size, applied at settlement as commission).
 
 ## Session/Data Guards
 
@@ -81,6 +82,7 @@ python3 -m sim_live.cli settle \
 - The settlement model assumes `Profit` and `CProfit` are side-level 5-wide short-vertical P/L.
 - Buy-side P/L is modeled as the sign-flipped side P/L.
 - 10-wide is modeled with a `2x` width multiplier from 5-wide outcomes.
+- Net P/L is after commission (`$1` per leg; each vertical side has 2 legs).
 - Butterfly support can be added, but needs additional leg-level pricing fields from the Leo feed.
 - Round storage includes UTC timestamps:
   - `signal_timestamp_utc`

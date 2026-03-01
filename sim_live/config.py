@@ -21,6 +21,8 @@ STARTING_ACCOUNT_BALANCE = 30_000.0
 MAX_RISK_PCT = 0.30
 # Safety buffer applied to max risk cap (30% * 0.90 => 27% effective cap).
 RISK_BUFFER_PCT = 0.90
+# Trade cost model: $1 per executed option leg.
+COMMISSION_PER_LEG_DOLLARS = 1.0
 
 PLAYER_IDS = [
     "player-regime",

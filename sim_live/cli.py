@@ -133,7 +133,8 @@ def cmd_round(args) -> None:
         for x in results:
             print(
                 f"- {x['player_id']}: put={x['put_pnl']:.2f} call={x['call_pnl']:.2f} "
-                f"total={x['total_pnl']:.2f} equity={x['equity_pnl']:.2f} "
+                f"gross={x['gross_total_pnl']:.2f} fees={x['fees']:.2f} total={x['total_pnl']:.2f} "
+                f"equity={x['equity_pnl']:.2f} "
                 f"dd={x['drawdown']:.2f} maxdd={x['max_drawdown']:.2f} "
                 f"risk_adj={x['risk_adjusted']:.2f} judge={x['judge_score']:.2f}"
             )
