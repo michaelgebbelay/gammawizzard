@@ -2,13 +2,24 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
-from sim_live.config import LIVE_START_DATE, MAX_RISK_PCT, RISK_BUFFER_PCT, STARTING_ACCOUNT_BALANCE
+from sim_live.config import (
+    ASOF_MAX_STALENESS_MINUTES,
+    LIVE_START_DATE,
+    MARKET_TZ,
+    MAX_RISK_PCT,
+    POST_CLOSE_DELAY_MINUTES,
+    RISK_BUFFER_PCT,
+    STARTING_ACCOUNT_BALANCE,
+)
 from sim_live.feed import LeoFeed
 from sim_live.judge import Judge
 from sim_live.players import Player, build_players, player_by_id
+from sim_live.session_calendar import is_trading_day, session_close_time_et
 from sim_live.store import Store
+from sim_live.template_rules import template_rule
 from sim_live.types import Decision, RoundOutcomes, SideAction, build_decision
 
 
@@ -27,6 +38,8 @@ class LiveGameEngine:
         # Settle any due rounds first.
         settled = self.settle_due(signal_date, feed)
 
+        raw_row = feed.validate_signal_row(signal_date)
+        self._validate_live_signal_window(signal_date, raw_row, allow_prestart=allow_prestart)
         snapshot = feed.get_public_snapshot(signal_date)
         if snapshot is None:
             raise ValueError(f"No Leo data found for signal date: {signal_date.isoformat()}")
@@ -134,23 +147,81 @@ class LiveGameEngine:
 
         return settled_rows
 
+    def _validate_live_signal_window(self, signal_date: date, row: dict, allow_prestart: bool) -> None:
+        if not is_trading_day(signal_date):
+            raise ValueError(f"Signal date {signal_date.isoformat()} is not a market trading day")
+
+        now_utc = datetime.now(timezone.utc)
+        market = ZoneInfo(MARKET_TZ)
+        now_et = now_utc.astimezone(market)
+
+        close_dt_et = datetime.combine(
+            signal_date,
+            session_close_time_et(signal_date),
+            tzinfo=market,
+        )
+        earliest_entry_et = close_dt_et + timedelta(minutes=POST_CLOSE_DELAY_MINUTES)
+
+        # Apply post-close timing checks for same-day live rounds only.
+        if signal_date == now_et.date() and not allow_prestart and now_et < earliest_entry_et:
+            raise ValueError(
+                "Too early for live entry: "
+                f"now={now_et.isoformat()} "
+                f"earliest={earliest_entry_et.isoformat()} "
+                f"tz={MARKET_TZ}"
+            )
+
+        # Guard against accidentally using already-settled columns on same-day runs.
+        if signal_date == now_et.date():
+            if row.get("Profit") not in (None, "") or row.get("CProfit") not in (None, ""):
+                raise ValueError(
+                    "Signal row includes settlement fields (Profit/CProfit) on decision run; refusing to trade"
+                )
+
+        asof = _extract_asof_timestamp(row)
+        if asof is None:
+            return
+        asof_et = asof.astimezone(market)
+
+        if asof_et.date() != signal_date:
+            raise ValueError(
+                f"Data asof date mismatch: asof={asof_et.isoformat()} signal_date={signal_date.isoformat()}"
+            )
+        if asof_et < close_dt_et:
+            raise ValueError(
+                "Data asof is pre-close; expected post-close snapshot "
+                f"(asof={asof_et.isoformat()}, close={close_dt_et.isoformat()})"
+            )
+        max_age = timedelta(minutes=ASOF_MAX_STALENESS_MINUTES)
+        if now_et - asof_et > max_age:
+            raise ValueError(
+                f"Data asof is stale by > {ASOF_MAX_STALENESS_MINUTES} minutes "
+                f"(asof={asof_et.isoformat()}, now={now_et.isoformat()})"
+            )
+
     def _apply_risk_limits(self, player_id: str, decision: Decision) -> tuple[Decision, dict]:
         equity = float(self.store.projected_risk_metrics(player_id)["equity_pnl"])
         account_value = max(0.0, STARTING_ACCOUNT_BALANCE + equity)
         risk_budget = account_value * MAX_RISK_PCT * RISK_BUFFER_PCT
 
         adjusted = Decision.from_dict(decision.to_dict())
-        max_loss = max_loss_dollars(adjusted)
-        risk_note = ""
+        pre_max_loss = max_loss_dollars(adjusted)
+        max_loss = pre_max_loss
+        risk_note = "within_budget"
 
         if max_loss > risk_budget + 1e-6:
             unit_loss = max_loss_dollars(Decision.from_dict({**adjusted.to_dict(), "size": 1}))
             max_size = int(risk_budget // unit_loss) if unit_loss > 0 else 0
+            before_size = adjusted.size
 
             if max_size >= 1:
                 adjusted.size = max_size
                 max_loss = max_loss_dollars(adjusted)
-                risk_note = f"size_clamped_to_{max_size}"
+                risk_note = (
+                    f"size_clamped: before_size={before_size} after_size={max_size} "
+                    f"pre_max_loss={pre_max_loss:.2f} post_max_loss={max_loss:.2f} "
+                    f"budget={risk_budget:.2f}"
+                )
             else:
                 adjusted = build_decision(
                     SideAction.NONE,
@@ -160,12 +231,16 @@ class LiveGameEngine:
                     template_id="risk_guard_flat",
                 )
                 max_loss = 0.0
-                risk_note = "flattened_by_risk_guard"
+                risk_note = (
+                    "flattened_by_risk_guard: "
+                    f"pre_max_loss={pre_max_loss:.2f} budget={risk_budget:.2f}"
+                )
 
         risk_used_pct = (max_loss / account_value * 100.0) if account_value > 0 else 0.0
         return adjusted, {
             "account_value": round(account_value, 2),
             "risk_budget": round(risk_budget, 2),
+            "pre_max_loss": round(pre_max_loss, 2),
             "max_loss": round(max_loss, 2),
             "risk_used_pct": round(risk_used_pct, 2),
             "max_risk_pct": round(MAX_RISK_PCT * 100.0, 2),
@@ -179,14 +254,16 @@ def side_pnl(
     width: int | None,
     base_short_pnl_5w: float,
     size: int,
+    template_id: str,
 ) -> float:
     if action == SideAction.NONE:
         return 0.0
     if width is None:
         return 0.0
 
+    rule = template_rule(template_id)
     direction = 1.0 if action == SideAction.SELL else -1.0
-    width_mult = width / 5.0
+    width_mult = width * rule.pnl_scale_per_width
     return direction * base_short_pnl_5w * width_mult * size * 100.0
 
 
@@ -196,23 +273,26 @@ def score_decision(decision: Decision, outcomes: RoundOutcomes) -> tuple[float, 
         width=decision.put_width,
         base_short_pnl_5w=outcomes.put_short_pnl_5w,
         size=decision.size,
+        template_id=decision.template_id,
     )
     call_pnl = side_pnl(
         action=decision.call_action,
         width=decision.call_width,
         base_short_pnl_5w=outcomes.call_short_pnl_5w,
         size=decision.size,
+        template_id=decision.template_id,
     )
     total = put_pnl + call_pnl
     return round(put_pnl, 2), round(call_pnl, 2), round(total, 2)
 
 
 def max_loss_dollars(decision: Decision) -> float:
+    rule = template_rule(decision.template_id)
     total = 0.0
     if decision.put_action != SideAction.NONE and decision.put_width:
-        total += float(decision.put_width) * 100.0 * float(decision.size)
+        total += float(decision.put_width) * rule.risk_per_width_dollars * float(decision.size)
     if decision.call_action != SideAction.NONE and decision.call_width:
-        total += float(decision.call_width) * 100.0 * float(decision.size)
+        total += float(decision.call_width) * rule.risk_per_width_dollars * float(decision.size)
     return round(total, 2)
 
 
@@ -234,3 +314,34 @@ def _json_load(s: str) -> dict:
         return json.loads(s)
     except json.JSONDecodeError:
         return {}
+
+
+def _extract_asof_timestamp(row: dict) -> datetime | None:
+    candidates = [
+        "asof",
+        "AsOf",
+        "Asof",
+        "asof_utc",
+        "AsOfUtc",
+        "timestamp",
+        "Timestamp",
+        "ts",
+        "ts_utc",
+    ]
+    raw = None
+    for key in candidates:
+        val = row.get(key)
+        if val not in (None, ""):
+            raw = str(val).strip()
+            break
+    if not raw:
+        return None
+
+    raw = raw.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)

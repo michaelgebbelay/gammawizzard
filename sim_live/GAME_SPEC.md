@@ -44,6 +44,11 @@ Required date fields:
 - `Date`
 - `TDate`
 
+Row validity rules:
+
+- there must be exactly one row for the requested `Date`
+- `TDate` must be strictly greater than `Date`
+
 Outcome fields used for settlement:
 
 - `Profit` (put-side 5-wide short baseline)
@@ -117,9 +122,14 @@ Where:
 
 Max loss estimation (before entry):
 
-- put side max loss = `put_width * 100 * size` when put action is not `none`
-- call side max loss = `call_width * 100 * size` when call action is not `none`
+- put side max loss = `put_width * risk_per_width_dollars * size` when put action is not `none`
+- call side max loss = `call_width * risk_per_width_dollars * size` when call action is not `none`
 - total `max_loss = put_max_loss + call_max_loss`
+
+Template rule source of truth:
+
+- each template has explicit metadata (`risk_per_width_dollars`, `pnl_scale_per_width`)
+- risk guard and settlement P/L both reference this same template metadata
 
 Risk guard behavior:
 
@@ -147,7 +157,7 @@ Assumptions:
 Per-side P/L:
 
 - `none`: `0`
-- `sell`: `+ base_short_pnl_5w * (width/5) * size * 100`
+- `sell`: `+ base_short_pnl_5w * (width * pnl_scale_per_width) * size * 100`
 - `buy`: sign-flipped sell P/L
 
 Round total:
@@ -184,6 +194,14 @@ Leaderboard sort order:
 - A rerun on the same day does not create a second position row; it updates/replaces the same day decision record.
 - Operationally this is still one daily decision set, held to expiry.
 
+## 11A. Session Clock and Stale Guards
+
+- Market timezone is explicit: `America/New_York`.
+- For same-day live rounds, execution is blocked until session close plus delay (default `+13 minutes`).
+- Trading day check blocks weekends/holidays (with early-close support).
+- If `asof` is present from API feed, it must be same-day, post-close, and within max staleness window.
+- Same-day decision runs reject rows that already contain settlement fields (`Profit`, `CProfit`).
+
 ## 12. Storage Model (SQLite)
 
 Database default:
@@ -201,6 +219,11 @@ Tables:
 
 - `equity_pnl`, `drawdown`, `max_drawdown`, `risk_adjusted`
 
+`rounds` includes UTC clock fields:
+
+- `signal_timestamp_utc`
+- `settlement_timestamp_utc`
+
 ## 13. Google Sheets Output
 
 Sheet ID default:
@@ -217,6 +240,7 @@ Tabs:
 - decision attributes (`put/call action`, widths, size, template)
 - risk metadata (`account_value`, `risk_budget`, `max_loss`, `risk_used_pct`, `risk_guard`)
 - outcomes (`put_pnl`, `call_pnl`, `total_pnl`, `equity_pnl`, `drawdown`, `max_drawdown`, `risk_adjusted`, `judge_score`)
+- integrity metadata (`round_id`, `decision_checksum`)
 
 ## 14. Operations
 

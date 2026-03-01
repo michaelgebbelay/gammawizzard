@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 from typing import Any
@@ -20,8 +21,11 @@ from sim_live.store import Store
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 RESULT_HEADERS = [
+    "round_id",
     "signal_date",
+    "signal_timestamp_utc",
     "tdate",
+    "settlement_timestamp_utc",
     "player_id",
     "put_action",
     "put_width",
@@ -31,6 +35,7 @@ RESULT_HEADERS = [
     "template_id",
     "account_value",
     "risk_budget",
+    "pre_max_loss",
     "max_loss",
     "risk_used_pct",
     "risk_guard",
@@ -43,6 +48,7 @@ RESULT_HEADERS = [
     "risk_adjusted",
     "judge_score",
     "judge_notes",
+    "decision_checksum",
 ]
 
 LEADERBOARD_HEADERS = [
@@ -126,7 +132,9 @@ def _overwrite_rows(svc, sid: str, tab: str, headers: list[str], rows: list[list
 def _all_result_rows(store: Store) -> list[list[Any]]:
     cur = store.conn.execute(
         """SELECT r.signal_date,
+                  r.signal_timestamp_utc,
                   r.tdate,
+                  r.settlement_timestamp_utc,
                   x.player_id,
                   d.decision_json,
                   x.put_pnl,
@@ -155,10 +163,15 @@ def _all_result_rows(store: Store) -> list[list[Any]]:
                 dec = json.loads(raw)
             except json.JSONDecodeError:
                 dec = {}
+        round_id = f"{r['signal_date']}|{r['player_id']}"
+        checksum = _decision_checksum(r, dec)
         out.append(
             [
+                round_id,
                 r["signal_date"],
+                r.get("signal_timestamp_utc", ""),
                 r["tdate"],
+                r.get("settlement_timestamp_utc", ""),
                 r["player_id"],
                 dec.get("put_action", ""),
                 dec.get("put_width", ""),
@@ -168,6 +181,7 @@ def _all_result_rows(store: Store) -> list[list[Any]]:
                 dec.get("template_id", ""),
                 dec.get("account_value", ""),
                 dec.get("risk_budget", ""),
+                dec.get("pre_max_loss", ""),
                 dec.get("max_loss", ""),
                 dec.get("risk_used_pct", ""),
                 dec.get("risk_guard", ""),
@@ -180,9 +194,24 @@ def _all_result_rows(store: Store) -> list[list[Any]]:
                 round(float(r["risk_adjusted"]), 2),
                 round(float(r["judge_score"]), 2),
                 r.get("judge_notes", ""),
+                checksum,
             ]
         )
     return out
+
+
+def _decision_checksum(result_row: dict, decision: dict) -> str:
+    payload = {
+        "signal_date": result_row.get("signal_date"),
+        "player_id": result_row.get("player_id"),
+        "decision": decision,
+        "put_pnl": round(float(result_row.get("put_pnl", 0.0)), 4),
+        "call_pnl": round(float(result_row.get("call_pnl", 0.0)), 4),
+        "total_pnl": round(float(result_row.get("total_pnl", 0.0)), 4),
+        "risk_adjusted": round(float(result_row.get("risk_adjusted", 0.0)), 4),
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
 def _leaderboard_rows(store: Store) -> list[list[Any]]:

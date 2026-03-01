@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -14,6 +14,8 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS rounds (
     signal_date TEXT PRIMARY KEY,
     tdate TEXT NOT NULL,
+    signal_timestamp_utc TEXT NOT NULL DEFAULT '',
+    settlement_timestamp_utc TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL,                -- pending|settled
     public_snapshot_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
@@ -57,7 +59,7 @@ CREATE TABLE IF NOT EXISTS player_state (
 
 
 def _now() -> str:
-    return datetime.utcnow().isoformat(timespec="seconds")
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 class Store:
@@ -84,32 +86,39 @@ class Store:
 
     def _migrate_schema(self) -> None:
         # Backward-compatible migration for existing cached DBs.
+        self._ensure_column("rounds", "signal_timestamp_utc", "TEXT NOT NULL DEFAULT ''")
+        self._ensure_column("rounds", "settlement_timestamp_utc", "TEXT NOT NULL DEFAULT ''")
         self._ensure_column("results", "equity_pnl", "REAL NOT NULL DEFAULT 0")
         self._ensure_column("results", "drawdown", "REAL NOT NULL DEFAULT 0")
         self._ensure_column("results", "max_drawdown", "REAL NOT NULL DEFAULT 0")
         self._ensure_column("results", "risk_adjusted", "REAL NOT NULL DEFAULT 0")
 
     def upsert_round(self, signal_date: str, tdate: str, public_snapshot: dict) -> None:
+        now_utc = _now()
         self.conn.execute(
             """INSERT INTO rounds
-               (signal_date, tdate, status, public_snapshot_json, created_at, settled_at)
-               VALUES (?, ?, 'pending', ?, ?, NULL)
+               (signal_date, tdate, signal_timestamp_utc, settlement_timestamp_utc, status,
+                public_snapshot_json, created_at, settled_at)
+               VALUES (?, ?, ?, '', 'pending', ?, ?, NULL)
                ON CONFLICT(signal_date) DO UPDATE SET
                    tdate=excluded.tdate,
-                   public_snapshot_json=excluded.public_snapshot_json""",
+                   public_snapshot_json=excluded.public_snapshot_json,
+                   signal_timestamp_utc=excluded.signal_timestamp_utc""",
             (
                 signal_date,
                 tdate,
+                now_utc,
                 json.dumps(public_snapshot),
-                _now(),
+                now_utc,
             ),
         )
         self.conn.commit()
 
     def mark_settled(self, signal_date: str) -> None:
+        now_utc = _now()
         self.conn.execute(
-            "UPDATE rounds SET status='settled', settled_at=? WHERE signal_date=?",
-            (_now(), signal_date),
+            "UPDATE rounds SET status='settled', settled_at=?, settlement_timestamp_utc=? WHERE signal_date=?",
+            (now_utc, now_utc, signal_date),
         )
         self.conn.commit()
 

@@ -6,6 +6,7 @@ Separate game engine for live Leo rounds (independent of `sim/`).
 
 - Decision time: `Date` at ~4:13 PM ET.
 - Expiry/settlement: `TDate` close.
+- Market timezone: `America/New_York` (explicit session clock).
 - Each player can choose per side:
   - `buy`, `sell`, or `none` for put side
   - `buy`, `sell`, or `none` for call side
@@ -15,6 +16,15 @@ Separate game engine for live Leo rounds (independent of `sim/`).
 - Starting account per player: `$30,000`.
 - Risk limit per round: `30%` of account value, with a `90%` safety buffer on that cap
   (`effective trade budget = 27%` of account value).
+
+## Session/Data Guards
+
+- Skip non-trading days (weekends + built-in 2026 US market holidays).
+- Respect early-close sessions for post-close entry timing.
+- Require exactly one source row for each signal date.
+- Require `TDate > Date`.
+- If an `asof` timestamp exists, require same-day post-close and non-stale freshness.
+- Decision-time runs reject rows with `Profit/CProfit` already populated for same-day live rounds.
 
 ## Safety / Leakage Control
 
@@ -72,10 +82,16 @@ python3 -m sim_live.cli settle \
 - Buy-side P/L is modeled as the sign-flipped side P/L.
 - 10-wide is modeled with a `2x` width multiplier from 5-wide outcomes.
 - Butterfly support can be added, but needs additional leg-level pricing fields from the Leo feed.
+- Round storage includes UTC timestamps:
+  - `signal_timestamp_utc`
+  - `settlement_timestamp_utc`
 - Judge and leaderboard are objective risk/reward:
   - maximize cumulative P/L
   - minimize drawdown
   - rank by risk-adjusted score (`equity - 0.60 * max_drawdown`)
+- Sheets results include integrity fields:
+  - `round_id` (`signal_date|player_id`)
+  - `decision_checksum`
 - Google Sheets export auth can use:
   - `GOOGLE_SERVICE_ACCOUNT_JSON` (raw JSON or base64)
   - or `GOOGLE_SERVICE_ACCOUNT_FILE`

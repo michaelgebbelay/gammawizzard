@@ -49,8 +49,9 @@ def cmd_run_live(args) -> None:
         print(
             f"- {d['player_id']}: {status} | put={dec['put_action']}[{dec['put_width']}] "
             f"call={dec['call_action']}[{dec['call_width']}] size={dec['size']} "
-            f"template={dec['template_id']} max_loss=${dec.get('max_loss', 0):.2f} "
-            f"budget=${dec.get('risk_budget', 0):.2f} used={dec.get('risk_used_pct', 0):.2f}%"
+            f"template={dec['template_id']} pre_max_loss=${dec.get('pre_max_loss', 0):.2f} "
+            f"max_loss=${dec.get('max_loss', 0):.2f} budget=${dec.get('risk_budget', 0):.2f} "
+            f"used={dec.get('risk_used_pct', 0):.2f}% guard={dec.get('risk_guard', 'n/a')}"
         )
 
 
