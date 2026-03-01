@@ -235,6 +235,60 @@ class Store:
         )
         return [float(r["total_pnl"]) for r in cur.fetchall()]
 
+    def _player_decisions(self, player_id: str) -> list[dict]:
+        cur = self.conn.execute(
+            "SELECT decision_json FROM decisions WHERE player_id=? AND valid=1 ORDER BY signal_date",
+            (player_id,),
+        )
+        out: list[dict] = []
+        for row in cur.fetchall():
+            try:
+                d = json.loads(row["decision_json"])
+                if isinstance(d, dict):
+                    out.append(d)
+            except json.JSONDecodeError:
+                continue
+        return out
+
+    @staticmethod
+    def _is_trade(decision: dict) -> bool:
+        put_action = str(decision.get("put_action", "none")).lower()
+        call_action = str(decision.get("call_action", "none")).lower()
+        return put_action != "none" or call_action != "none"
+
+    def projected_activity_metrics(self, player_id: str, pending_decision: Optional[dict] = None) -> dict:
+        decisions = self._player_decisions(player_id)
+        if isinstance(pending_decision, dict):
+            decisions.append(dict(pending_decision))
+
+        sessions = 0
+        trades = 0
+        consecutive_holds = 0
+
+        for d in decisions:
+            sessions += 1
+            traded = self._is_trade(d)
+            if traded:
+                trades += 1
+                consecutive_holds = 0
+            else:
+                consecutive_holds += 1
+
+        trade_rate = (trades / sessions) if sessions else 1.0
+        target_trade_rate = 0.90
+        holds_used = sessions - trades
+        max_holds_allowed = int((1.0 - target_trade_rate) * sessions)
+
+        return {
+            "sessions": sessions,
+            "trades": trades,
+            "holds": holds_used,
+            "max_holds_allowed": max_holds_allowed,
+            "trade_rate": round(trade_rate, 4),
+            "consecutive_holds": int(consecutive_holds),
+            "target_trade_rate": target_trade_rate,
+        }
+
     def projected_risk_metrics(self, player_id: str, pending_pnl: Optional[float] = None) -> dict:
         pnls = self._player_pnls(player_id)
         if pending_pnl is not None:

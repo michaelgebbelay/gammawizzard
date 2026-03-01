@@ -7,8 +7,9 @@ import math
 from dataclasses import dataclass
 from typing import Iterable
 
+from sim_gpt.config import ALLOWED_WIDTHS, MAX_CONTRACTS
 from sim_gpt.template_rules import template_rule
-from sim_gpt.types import Decision, PublicSnapshot, SideAction, build_decision
+from sim_gpt.types import Decision, PublicSnapshot, SideAction
 
 
 def _vix1d_pct(s: PublicSnapshot) -> float:
@@ -43,42 +44,67 @@ def _deterministic_noise(seed: str) -> float:
     return (val - 0.5) * 0.05
 
 
+def _side_token(action: SideAction, width: int | None) -> str:
+    if action == SideAction.NONE:
+        return "n"
+    side = "b" if action == SideAction.BUY else "s"
+    return f"{side}{width}"
+
+
+def _template_id(
+    put_action: SideAction,
+    call_action: SideAction,
+    put_width: int | None,
+    call_width: int | None,
+    size: int,
+) -> str:
+    return f"p{_side_token(put_action, put_width)}_c{_side_token(call_action, call_width)}_x{size}"
+
+
 def _template_pool() -> dict[str, Decision]:
-    templates = {
-        "flat": build_decision(
-            SideAction.NONE,
-            SideAction.NONE,
+    templates: dict[str, Decision] = {
+        "flat": Decision(
+            put_action=SideAction.NONE,
+            call_action=SideAction.NONE,
+            put_width=None,
+            call_width=None,
             size=1,
             thesis="No trade.",
             template_id="flat",
         )
     }
 
-    widths = (5, 10)
-    sizes = (1, 2, 3)
-    legs = (
-        ("put_sell", SideAction.SELL, SideAction.NONE),
-        ("put_buy", SideAction.BUY, SideAction.NONE),
-        ("call_sell", SideAction.NONE, SideAction.SELL),
-        ("call_buy", SideAction.NONE, SideAction.BUY),
-        ("both_sell", SideAction.SELL, SideAction.SELL),
-        ("both_buy", SideAction.BUY, SideAction.BUY),
-        ("rr_long", SideAction.SELL, SideAction.BUY),
-        ("rr_short", SideAction.BUY, SideAction.SELL),
-    )
+    widths = sorted(int(w) for w in ALLOWED_WIDTHS)
+    sizes = range(1, MAX_CONTRACTS + 1)
+    actions = (SideAction.NONE, SideAction.BUY, SideAction.SELL)
 
-    for width in widths:
-        for size in sizes:
-            for name, put_side, call_side in legs:
-                template_id = f"{name}_{width}x{size}"
-                templates[template_id] = build_decision(
-                    put_side,
-                    call_side,
-                    width=width,
-                    size=size,
-                    thesis=f"Self-learning template {template_id}.",
-                    template_id=template_id,
-                )
+    for size in sizes:
+        for put_action in actions:
+            for call_action in actions:
+                if put_action == SideAction.NONE and call_action == SideAction.NONE:
+                    continue
+                put_widths = [None] if put_action == SideAction.NONE else widths
+                call_widths = [None] if call_action == SideAction.NONE else widths
+
+                for put_width in put_widths:
+                    for call_width in call_widths:
+                        tid = _template_id(
+                            put_action=put_action,
+                            call_action=call_action,
+                            put_width=put_width,
+                            call_width=call_width,
+                            size=size,
+                        )
+                        templates[tid] = Decision(
+                            put_action=put_action,
+                            call_action=call_action,
+                            put_width=put_width,
+                            call_width=call_width,
+                            size=size,
+                            thesis=f"Self-learning template {tid}.",
+                            template_id=tid,
+                        )
+
     return templates
 
 
@@ -188,6 +214,21 @@ def _options_prior_score(
     return score
 
 
+def _participation_bias(
+    decision: Decision,
+    trade_rate: float,
+    consecutive_holds: int,
+    target_trade_rate: float,
+) -> float:
+    deficit = max(0.0, target_trade_rate - trade_rate)
+    streak = max(0, consecutive_holds)
+    if _is_flat(decision.template_id):
+        # Softly discourage repeated cash-holds, especially when below target.
+        return -(deficit * 3.2) - (max(0, streak - 1) * 0.40)
+    # Encourage taking risk-defined trades when participation falls.
+    return (deficit * 0.70) + (max(0, streak - 1) * 0.08)
+
+
 @dataclass
 class Player:
     player_id: str
@@ -197,7 +238,8 @@ class Player:
     cold_start_boost: float
     warmup_rounds: int
 
-    def decide(self, snapshot: PublicSnapshot, state: dict) -> Decision:
+    def decide(self, snapshot: PublicSnapshot, state: dict, account_ctx: dict | None = None) -> Decision:
+        ctx_input = account_ctx or {}
         ctx = _context_key(snapshot)
         meta = state.get("meta", {})
         rounds_seen = int(meta.get("decision_rounds", meta.get("rounds", 0)))
@@ -205,7 +247,15 @@ class Player:
 
         scored: list[tuple[str, float]] = []
         for template_id in TEMPLATES:
-            score = self._score_template(snapshot, state, ctx, frame, rounds_seen, template_id)
+            score = self._score_template(
+                snapshot=snapshot,
+                state=state,
+                account_ctx=ctx_input,
+                ctx=ctx,
+                frame=frame,
+                rounds_seen=rounds_seen,
+                template_id=template_id,
+            )
             scored.append((template_id, score))
 
         scored.sort(key=lambda t: t[1], reverse=True)
@@ -238,7 +288,8 @@ class Player:
             thesis=(
                 f"model=self_learning_options | id={self.player_id} | ctx={ctx} | "
                 f"em={frame.expected_move_pts:.1f} | ivrv={frame.iv_minus_rv:.4f} | "
-                f"dir={frame.directional_edge:.2f} | template={best_template}"
+                f"dir={frame.directional_edge:.2f} | tr={float(ctx_input.get('trade_rate', 1.0)):.2f} | "
+                f"hold={int(ctx_input.get('consecutive_holds', 0))} | template={best_template}"
             ),
         )
 
@@ -246,6 +297,7 @@ class Player:
         self,
         snapshot: PublicSnapshot,
         state: dict,
+        account_ctx: dict,
         ctx: str,
         frame: MarketFrame,
         rounds_seen: int,
@@ -276,12 +328,27 @@ class Player:
             rounds_seen=rounds_seen,
             warmup_rounds=self.warmup_rounds,
         )
+        participation = _participation_bias(
+            decision=decision,
+            trade_rate=float(account_ctx.get("trade_rate", 1.0)),
+            consecutive_holds=int(account_ctx.get("consecutive_holds", 0)),
+            target_trade_rate=float(account_ctx.get("target_trade_rate", 0.90)),
+        )
         ucb = self.explore_coef * math.sqrt(math.log(total_n + 2.0) / (n + 1.0))
         cold = self.cold_start_boost if (n == 0 and not _is_flat(template_id)) else 0.0
         flat_pen = self.flat_penalty if _is_flat(template_id) else 0.0
         noise = _deterministic_noise(f"{snapshot.signal_date}|{self.player_id}|{template_id}")
 
-        return prior + mean_per_risk - (self.risk_penalty * std_per_risk) + ucb + cold - flat_pen + noise
+        return (
+            prior
+            + participation
+            + mean_per_risk
+            - (self.risk_penalty * std_per_risk)
+            + ucb
+            + cold
+            - flat_pen
+            + noise
+        )
 
     def update_state(
         self,

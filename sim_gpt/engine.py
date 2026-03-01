@@ -67,7 +67,8 @@ class LiveGameEngine:
             state = self.store.load_player_state(player.player_id)
             meta = state.setdefault("meta", {})
             decision_rounds = int(meta.get("decision_rounds", 0))
-            decision = player.decide(snapshot, state)
+            activity_ctx = self.store.projected_activity_metrics(player.player_id)
+            decision = player.decide(snapshot, state, account_ctx=activity_ctx)
             decision, risk_meta = self._apply_risk_limits(player.player_id, decision)
             valid, err = decision.validate()
             if valid:
@@ -82,6 +83,9 @@ class LiveGameEngine:
             decision_payload = decision.to_dict()
             decision_payload.update(risk_meta)
             decision_payload["decision_round"] = decision_rounds + 1
+            decision_payload["trade_rate_context"] = round(float(activity_ctx["trade_rate"]), 4)
+            decision_payload["consecutive_holds_context"] = int(activity_ctx["consecutive_holds"])
+            decision_payload["target_trade_rate"] = round(float(activity_ctx["target_trade_rate"]), 4)
             self.store.save_decision(
                 signal_date=snapshot.signal_date.isoformat(),
                 player_id=player.player_id,
@@ -138,7 +142,9 @@ class LiveGameEngine:
                     player_id=drow["player_id"],
                     pending_pnl=total_pnl,
                 )
-                judge_score, judge_notes = self.judge.score(total_pnl=total_pnl, metrics=risk)
+                activity = self.store.projected_activity_metrics(player_id=drow["player_id"])
+                judge_metrics = {**risk, **activity}
+                judge_score, judge_notes = self.judge.score(total_pnl=total_pnl, metrics=judge_metrics)
                 self.store.save_result(
                     signal_date=signal_date.isoformat(),
                     player_id=drow["player_id"],

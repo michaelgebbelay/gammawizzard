@@ -57,7 +57,10 @@ def cmd_run_live(args) -> None:
             f"call={dec['call_action']}[{dec['call_width']}] size={dec['size']} "
             f"template={dec['template_id']} pre_max_loss=${dec.get('pre_max_loss', 0):.2f} "
             f"max_loss=${dec.get('max_loss', 0):.2f} budget=${dec.get('risk_budget', 0):.2f} "
-            f"used={dec.get('risk_used_pct', 0):.2f}% guard={dec.get('risk_guard', 'n/a')}"
+            f"used={dec.get('risk_used_pct', 0):.2f}% "
+            f"trade_rate={dec.get('trade_rate_context', 1.0):.2f} "
+            f"hold_streak={dec.get('consecutive_holds_context', 0)} "
+            f"guard={dec.get('risk_guard', 'n/a')}"
         )
 
 

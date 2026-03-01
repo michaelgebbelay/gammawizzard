@@ -10,7 +10,9 @@ Separate game engine for live Leo rounds (independent of `sim/`).
 - Each player can choose per side:
   - `buy`, `sell`, or `none` for put side
   - `buy`, `sell`, or `none` for call side
-- Allowed widths: `5` or `10` (risk-defined verticals only).
+- Allowed widths: `5` or `10` (risk-defined structures only).
+- Allowed structures inside this payoff model: any risk-defined combination of put/call vertical sides,
+  including one-side, two-side, and risk-reversal style combinations with asymmetric side widths.
 - No intraday adjustments; one decision per round.
 - Active players: neutral self-learning agents (`player-01` ... `player-05`) with no personality priors.
 - Agent policy is options-aware for cash-settled SPX structures:
@@ -21,6 +23,9 @@ Separate game engine for live Leo rounds (independent of `sim/`).
 - Risk limit per round: `30%` of account value, with a `90%` safety buffer on that cap
   (`effective trade budget = 27%` of account value).
 - Trade cost: `$1` per executed option leg (scaled by size, applied at settlement as commission).
+- Participation target: agents are expected to trade at least `90%` of sessions.
+  Trade-rate and hold-streak context are shown at decision time; judge scoring applies
+  a soft penalty for chronic cash holding (no hard block).
 
 ## Session/Data Guards
 

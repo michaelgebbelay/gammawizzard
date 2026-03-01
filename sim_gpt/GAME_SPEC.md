@@ -106,12 +106,14 @@ Allowed size:
 
 Risk-defined rule:
 
-- Trades must be packaged as defined-width vertical structures (or no-trade).
+- Trades must be packaged as risk-defined structures (or no-trade).
+- Within the current payoff model, this means any combination of put/call vertical sides:
+  one-side, two-side, and risk-reversal style combinations (including asymmetric side widths).
 - Naked option buying/selling is not allowed.
 
 Current implementation note:
 
-- Butterfly is not implemented in settlement/decision templates yet.
+- Butterfly is not implemented in settlement/outcome math yet.
 - To support butterfly, Leo feed needs additional leg-level pricing/outcome fields.
 
 ## 8. Account and Risk Constraints
@@ -122,6 +124,7 @@ Per-player account settings:
 - hard cap: `30%` of current account value per round
 - safety buffer: `90%` applied to cap
 - commission: `$1` per executed option leg
+- participation target: trade at least `90%` of sessions (soft-enforced)
 
 Effective per-round risk budget formula:
 
@@ -157,6 +160,9 @@ Risk metadata stored with every decision:
 - `max_risk_pct`
 - `risk_buffer_pct`
 - `risk_guard`
+- `trade_rate_context`
+- `consecutive_holds_context`
+- `target_trade_rate`
 
 ## 9. P/L Model
 
@@ -193,7 +199,9 @@ Per-round judge score (`0..10`):
 - `base = 5 + (risk_adjusted / 250)`
 - `dd_penalty = min(3, current_drawdown / 200)`
 - `round_term = clamp(total_pnl / 200, -1.5, +1.5)`
-- `judge_score = clamp(base - dd_penalty + round_term, 0, 10)`
+- `hold_rate_penalty = min(2.5, max(0, target_trade_rate - trade_rate) * 8.0)`
+- `hold_streak_penalty = min(1.5, max(0, consecutive_holds - 1) * 0.35)`
+- `judge_score = clamp(base - dd_penalty + round_term - hold_rate_penalty - hold_streak_penalty, 0, 10)`
 
 Leaderboard sort order:
 
