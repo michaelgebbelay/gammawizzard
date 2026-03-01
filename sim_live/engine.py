@@ -4,12 +4,12 @@ from __future__ import annotations
 
 from datetime import date
 
-from sim_live.config import LIVE_START_DATE
+from sim_live.config import LIVE_START_DATE, MAX_RISK_PCT, RISK_BUFFER_PCT, STARTING_ACCOUNT_BALANCE
 from sim_live.feed import LeoFeed
 from sim_live.judge import Judge
 from sim_live.players import Player, build_players, player_by_id
 from sim_live.store import Store
-from sim_live.types import Decision, RoundOutcomes, SideAction
+from sim_live.types import Decision, RoundOutcomes, SideAction, build_decision
 
 
 class LiveGameEngine:
@@ -41,11 +41,23 @@ class LiveGameEngine:
         for player in self.players:
             state = self.store.load_player_state(player.player_id)
             decision = player.decide(snapshot, state)
+            decision, risk_meta = self._apply_risk_limits(player.player_id, decision)
             valid, err = decision.validate()
+            if valid:
+                valid, err = validate_risk_defined_structure(decision)
+            if valid and risk_meta["max_loss"] > risk_meta["risk_budget"] + 1e-6:
+                valid = False
+                err = (
+                    "max_loss exceeds risk budget: "
+                    f"{risk_meta['max_loss']:.2f} > {risk_meta['risk_budget']:.2f}"
+                )
+
+            decision_payload = decision.to_dict()
+            decision_payload.update(risk_meta)
             self.store.save_decision(
                 signal_date=snapshot.signal_date.isoformat(),
                 player_id=player.player_id,
-                decision=decision.to_dict(),
+                decision=decision_payload,
                 valid=valid,
                 error=err,
             )
@@ -54,7 +66,7 @@ class LiveGameEngine:
                     "player_id": player.player_id,
                     "valid": valid,
                     "error": err,
-                    "decision": decision.to_dict(),
+                    "decision": decision_payload,
                 }
             )
 
@@ -122,6 +134,45 @@ class LiveGameEngine:
 
         return settled_rows
 
+    def _apply_risk_limits(self, player_id: str, decision: Decision) -> tuple[Decision, dict]:
+        equity = float(self.store.projected_risk_metrics(player_id)["equity_pnl"])
+        account_value = max(0.0, STARTING_ACCOUNT_BALANCE + equity)
+        risk_budget = account_value * MAX_RISK_PCT * RISK_BUFFER_PCT
+
+        adjusted = Decision.from_dict(decision.to_dict())
+        max_loss = max_loss_dollars(adjusted)
+        risk_note = ""
+
+        if max_loss > risk_budget + 1e-6:
+            unit_loss = max_loss_dollars(Decision.from_dict({**adjusted.to_dict(), "size": 1}))
+            max_size = int(risk_budget // unit_loss) if unit_loss > 0 else 0
+
+            if max_size >= 1:
+                adjusted.size = max_size
+                max_loss = max_loss_dollars(adjusted)
+                risk_note = f"size_clamped_to_{max_size}"
+            else:
+                adjusted = build_decision(
+                    SideAction.NONE,
+                    SideAction.NONE,
+                    size=1,
+                    thesis="risk guard: no-trade",
+                    template_id="risk_guard_flat",
+                )
+                max_loss = 0.0
+                risk_note = "flattened_by_risk_guard"
+
+        risk_used_pct = (max_loss / account_value * 100.0) if account_value > 0 else 0.0
+        return adjusted, {
+            "account_value": round(account_value, 2),
+            "risk_budget": round(risk_budget, 2),
+            "max_loss": round(max_loss, 2),
+            "risk_used_pct": round(risk_used_pct, 2),
+            "max_risk_pct": round(MAX_RISK_PCT * 100.0, 2),
+            "risk_buffer_pct": round(RISK_BUFFER_PCT * 100.0, 2),
+            "risk_guard": risk_note,
+        }
+
 
 def side_pnl(
     action: SideAction,
@@ -154,6 +205,26 @@ def score_decision(decision: Decision, outcomes: RoundOutcomes) -> tuple[float, 
     )
     total = put_pnl + call_pnl
     return round(put_pnl, 2), round(call_pnl, 2), round(total, 2)
+
+
+def max_loss_dollars(decision: Decision) -> float:
+    total = 0.0
+    if decision.put_action != SideAction.NONE and decision.put_width:
+        total += float(decision.put_width) * 100.0 * float(decision.size)
+    if decision.call_action != SideAction.NONE and decision.call_width:
+        total += float(decision.call_width) * 100.0 * float(decision.size)
+    return round(total, 2)
+
+
+def validate_risk_defined_structure(decision: Decision) -> tuple[bool, str]:
+    # This game supports only risk-defined spreads (vertical packages) or no-trade.
+    if decision.active_sides() == 0:
+        return True, ""
+    if decision.put_action != SideAction.NONE and decision.put_width is None:
+        return False, "put side must use a defined vertical width"
+    if decision.call_action != SideAction.NONE and decision.call_width is None:
+        return False, "call side must use a defined vertical width"
+    return True, ""
 
 
 def _json_load(s: str) -> dict:

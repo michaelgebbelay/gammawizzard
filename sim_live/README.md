@@ -9,9 +9,12 @@ Separate game engine for live Leo rounds (independent of `sim/`).
 - Each player can choose per side:
   - `buy`, `sell`, or `none` for put side
   - `buy`, `sell`, or `none` for call side
-- Allowed widths: `5` or `10`.
+- Allowed widths: `5` or `10` (risk-defined verticals only).
 - No intraday adjustments; one decision per round.
 - Active players: regime, momentum, volatility-spread, contrarian, and `VIXone-bias`.
+- Starting account per player: `$30,000`.
+- Risk limit per round: `30%` of account value, with a `90%` safety buffer on that cap
+  (`effective trade budget = 27%` of account value).
 
 ## Safety / Leakage Control
 
@@ -68,6 +71,7 @@ python3 -m sim_live.cli settle \
 - The settlement model assumes `Profit` and `CProfit` are side-level 5-wide short-vertical P/L.
 - Buy-side P/L is modeled as the sign-flipped side P/L.
 - 10-wide is modeled with a `2x` width multiplier from 5-wide outcomes.
+- Butterfly support can be added, but needs additional leg-level pricing fields from the Leo feed.
 - Judge and leaderboard are objective risk/reward:
   - maximize cumulative P/L
   - minimize drawdown

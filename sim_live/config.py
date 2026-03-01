@@ -14,6 +14,10 @@ LIVE_START_DATE = date(2026, 3, 2)
 
 ALLOWED_WIDTHS = {5, 10}
 MAX_CONTRACTS = 3
+STARTING_ACCOUNT_BALANCE = 30_000.0
+MAX_RISK_PCT = 0.30
+# Safety buffer applied to max risk cap (30% * 0.90 => 27% effective cap).
+RISK_BUFFER_PCT = 0.90
 
 PLAYER_IDS = [
     "player-regime",
