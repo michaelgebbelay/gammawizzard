@@ -52,8 +52,6 @@ PUBLIC_COLUMNS = [
     "R",
     "RX",
     "Forward",
-    "Limit",
-    "CLimit",
 ]
 
 # Columns that can leak labels, targets, or direct outcomes.

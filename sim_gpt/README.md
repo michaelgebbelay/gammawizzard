@@ -14,7 +14,7 @@ Separate game engine for live Leo rounds (independent of `sim/`).
 - No intraday adjustments; one decision per round.
 - Active players: neutral self-learning agents (`player-01` ... `player-05`) with no personality priors.
 - Agent policy is options-aware for cash-settled SPX structures:
-  - expected-move vs strike-distance checks
+  - expected-move regime checks (from VixOne/SPX)
   - IV minus realized-vol carry checks
   - directional mapping for risk-reversal style structures
 - Starting account per player: `$30,000`.

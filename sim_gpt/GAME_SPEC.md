@@ -61,7 +61,7 @@ Outcome fields used for settlement:
 
 Players only receive public fields:
 
-- `Date`, `TDate`, `SPX`, `VIX`, `VixOne`, `RV`, `RV5`, `RV10`, `RV20`, `R`, `RX`, `Forward`, `Limit`, `CLimit`
+- `Date`, `TDate`, `SPX`, `VIX`, `VixOne`, `RV`, `RV5`, `RV10`, `RV20`, `R`, `RX`, `Forward`
 
 Suppressed from players:
 
@@ -81,7 +81,7 @@ Each player is a neutral self-learning agent with no hardcoded directional/perso
 They choose from the same risk-defined template set and learn online by context bucket
 (`vix_bucket|trend_bucket`) from realized P/L.
 Policy scoring is options-aware for cash-settled SPX outcomes:
-- expected move (from VixOne) vs strike distance
+- expected-move regime (from `VixOne` + `SPX`)
 - IV-vs-realized carry (`VixOne` vs `RV5`/`RV`)
 - directional exposure mapping for one-side and risk-reversal structures
 - decision-round exploration counters are updated on entry runs (not only settlement)

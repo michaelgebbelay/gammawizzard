@@ -234,8 +234,6 @@ class LeoFeed:
             r=_to_float(row.get("R")),
             rx=_to_float(row.get("RX")),
             forward=_to_float(row.get("Forward")),
-            limit=_to_float(row.get("Limit")),
-            climit=_to_float(row.get("CLimit")),
             payload=payload,
         )
 

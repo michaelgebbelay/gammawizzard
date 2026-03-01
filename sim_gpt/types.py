@@ -30,8 +30,6 @@ class PublicSnapshot:
     r: float
     rx: float
     forward: float
-    limit: float
-    climit: float
     payload: dict
 
 
@@ -126,4 +124,3 @@ def build_decision(
         thesis=thesis,
         template_id=template_id,
     )
-
