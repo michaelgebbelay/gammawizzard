@@ -40,7 +40,8 @@ Separate game engine for live Leo rounds (independent of `sim/`).
 
 Players only receive a public feature view. Signal/outcome columns are suppressed:
 
-- `LeftGo`, `RightGo`, `Cat*`, `TX`, `Win`, `CWin`, `Profit`, `CProfit`, etc.
+- `Limit`, `CLimit`, `Put`, `Call`, `LImp`, `RImp`, `LReturn`, `RReturn`,
+  `LeftGo`, `RightGo`, `Cat*`, `TX`, `Win`, `CWin`, `Profit`, `CProfit`, etc.
 
 Engine/judge can use private outcome fields only during settlement.
 

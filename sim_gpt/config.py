@@ -56,6 +56,10 @@ PUBLIC_COLUMNS = [
 
 # Columns that can leak labels, targets, or direct outcomes.
 SUPPRESSED_COLUMNS = {
+    "Limit",
+    "CLimit",
+    "LImp",
+    "RImp",
     "LeftGo",
     "RightGo",
     "LGo",

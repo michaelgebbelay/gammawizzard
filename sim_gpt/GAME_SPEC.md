@@ -65,7 +65,9 @@ Players only receive public fields:
 
 Suppressed from players:
 
-- `LeftGo`, `RightGo`, `LGo`, `RGo`, `LReturn`, `RReturn`, `Cat`, `Cat1`, `Cat2`, `TX`, `Win`, `CWin`, `Profit`, `CProfit`, `Put`, `Call`
+- `Limit`, `CLimit`, `Put`, `Call`, `LImp`, `RImp`, `LeftGo`, `RightGo`,
+  `LGo`, `RGo`, `LReturn`, `RReturn`, `Cat`, `Cat1`, `Cat2`, `TX`, `Win`,
+  `CWin`, `Profit`, `CProfit`
 
 ## 6. Players
 
