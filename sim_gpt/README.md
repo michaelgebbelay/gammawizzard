@@ -104,6 +104,10 @@ python3 -m sim_gpt.cli settle \
 - Sheets results include integrity fields:
   - `round_id` (`signal_date|player_id`)
   - `decision_checksum`
+- Sheets sync now writes three tabs by default:
+  - `Live_Game_Rounds` (settled outcomes)
+  - `Live_Game_Leaderboard`
+  - `Live_Game_Decisions` (all decisions, including pending rounds, with derived strike legs)
 - Google Sheets export auth can use:
   - `GOOGLE_SERVICE_ACCOUNT_JSON` (raw JSON or base64)
   - or `GOOGLE_SERVICE_ACCOUNT_FILE`

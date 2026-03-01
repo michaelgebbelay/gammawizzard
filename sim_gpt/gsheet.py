@@ -12,6 +12,7 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build as gbuild
 
 from sim_gpt.config import (
+    DEFAULT_DECISIONS_TAB,
     DEFAULT_GSHEET_ID,
     DEFAULT_LEADERBOARD_TAB,
     DEFAULT_RESULTS_TAB,
@@ -66,6 +67,37 @@ LEADERBOARD_HEADERS = [
     "win_rate",
     "avg_pnl",
     "avg_judge",
+]
+
+DECISION_HEADERS = [
+    "signal_date",
+    "tdate",
+    "status",
+    "player_id",
+    "valid",
+    "error",
+    "put_action",
+    "put_width",
+    "put_lower_strike",
+    "put_upper_strike",
+    "put_long_strike",
+    "put_short_strike",
+    "call_action",
+    "call_width",
+    "call_lower_strike",
+    "call_upper_strike",
+    "call_long_strike",
+    "call_short_strike",
+    "size",
+    "template_id",
+    "account_value",
+    "risk_budget",
+    "max_loss",
+    "risk_used_pct",
+    "trade_rate_context",
+    "consecutive_holds_context",
+    "target_trade_rate",
+    "decision_checksum",
 ]
 
 
@@ -228,6 +260,79 @@ def _decision_checksum(result_row: dict, decision: dict) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
+def _decision_only_checksum(row: dict, decision: dict) -> str:
+    payload = {
+        "signal_date": row.get("signal_date"),
+        "tdate": row.get("tdate"),
+        "status": row.get("status"),
+        "player_id": row.get("player_id"),
+        "valid": row.get("valid"),
+        "error": row.get("error"),
+        "decision": decision,
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _all_decision_rows(store: Store) -> list[list[Any]]:
+    cur = store.conn.execute(
+        """SELECT d.signal_date,
+                  r.tdate,
+                  r.status,
+                  d.player_id,
+                  d.valid,
+                  d.error,
+                  d.decision_json
+           FROM decisions d
+           JOIN rounds r ON r.signal_date = d.signal_date
+           ORDER BY d.signal_date DESC, d.player_id ASC"""
+    )
+    out: list[list[Any]] = []
+    for row in cur.fetchall():
+        r = dict(row)
+        dec = {}
+        raw = r.get("decision_json")
+        if raw:
+            try:
+                dec = json.loads(raw)
+            except json.JSONDecodeError:
+                dec = {}
+        checksum = _decision_only_checksum(r, dec)
+        out.append(
+            [
+                r.get("signal_date", ""),
+                r.get("tdate", ""),
+                r.get("status", ""),
+                r.get("player_id", ""),
+                bool(r.get("valid", 0)),
+                r.get("error", ""),
+                dec.get("put_action", ""),
+                dec.get("put_width", ""),
+                dec.get("put_lower_strike", ""),
+                dec.get("put_upper_strike", ""),
+                dec.get("put_long_strike", ""),
+                dec.get("put_short_strike", ""),
+                dec.get("call_action", ""),
+                dec.get("call_width", ""),
+                dec.get("call_lower_strike", ""),
+                dec.get("call_upper_strike", ""),
+                dec.get("call_long_strike", ""),
+                dec.get("call_short_strike", ""),
+                dec.get("size", ""),
+                dec.get("template_id", ""),
+                dec.get("account_value", ""),
+                dec.get("risk_budget", ""),
+                dec.get("max_loss", ""),
+                dec.get("risk_used_pct", ""),
+                dec.get("trade_rate_context", ""),
+                dec.get("consecutive_holds_context", ""),
+                dec.get("target_trade_rate", ""),
+                checksum,
+            ]
+        )
+    return out
+
+
 def _leaderboard_rows(store: Store) -> list[list[Any]]:
     rows = store.leaderboard()
     out: list[list[Any]] = []
@@ -253,6 +358,7 @@ def sync_game_to_sheet(
     sheet_id: str = "",
     results_tab: str = DEFAULT_RESULTS_TAB,
     leaderboard_tab: str = DEFAULT_LEADERBOARD_TAB,
+    decisions_tab: str = DEFAULT_DECISIONS_TAB,
 ) -> dict:
     sid = (sheet_id or "").strip() or os.environ.get("GSHEET_ID", "").strip() or DEFAULT_GSHEET_ID
     if not sid:
@@ -262,6 +368,7 @@ def sync_game_to_sheet(
 
     results_rows = _all_result_rows(store)
     lb_rows = _leaderboard_rows(store)
+    decision_rows = _all_decision_rows(store)
 
     _ensure_tab(svc, sid, results_tab, RESULT_HEADERS)
     _overwrite_rows(svc, sid, results_tab, RESULT_HEADERS, results_rows)
@@ -269,10 +376,15 @@ def sync_game_to_sheet(
     _ensure_tab(svc, sid, leaderboard_tab, LEADERBOARD_HEADERS)
     _overwrite_rows(svc, sid, leaderboard_tab, LEADERBOARD_HEADERS, lb_rows)
 
+    _ensure_tab(svc, sid, decisions_tab, DECISION_HEADERS)
+    _overwrite_rows(svc, sid, decisions_tab, DECISION_HEADERS, decision_rows)
+
     return {
         "sheet_id": sid,
         "results_tab": results_tab,
         "leaderboard_tab": leaderboard_tab,
+        "decisions_tab": decisions_tab,
         "results_rows": len(results_rows),
         "leaderboard_rows": len(lb_rows),
+        "decisions_rows": len(decision_rows),
     }

@@ -166,6 +166,11 @@ Risk metadata stored with every decision:
 - `consecutive_holds_context`
 - `target_trade_rate`
 
+Decision records also store derived strike metadata (engine-side only, not visible to agents):
+
+- `put_lower_strike`, `put_upper_strike`, `put_long_strike`, `put_short_strike`
+- `call_lower_strike`, `call_upper_strike`, `call_long_strike`, `call_short_strike`
+
 ## 9. P/L Model
 
 Assumptions:

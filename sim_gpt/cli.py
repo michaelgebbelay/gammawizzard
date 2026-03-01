@@ -9,6 +9,7 @@ from pathlib import Path
 from sim_gpt.config import (
     DB_PATH,
     LIVE_START_DATE,
+    DEFAULT_DECISIONS_TAB,
     DEFAULT_GSHEET_ID,
     DEFAULT_LEADERBOARD_TAB,
     DEFAULT_RESULTS_TAB,
@@ -84,12 +85,14 @@ def cmd_settle(args) -> None:
                 sheet_id=args.sheet_id,
                 results_tab=args.results_tab,
                 leaderboard_tab=args.leaderboard_tab,
+                decisions_tab=args.decisions_tab,
             )
             print(
                 "Sheet synced: "
                 f"id={summary['sheet_id']} "
                 f"results_tab={summary['results_tab']} rows={summary['results_rows']} "
-                f"leaderboard_tab={summary['leaderboard_tab']} rows={summary['leaderboard_rows']}"
+                f"leaderboard_tab={summary['leaderboard_tab']} rows={summary['leaderboard_rows']} "
+                f"decisions_tab={summary['decisions_tab']} rows={summary['decisions_rows']}"
             )
         except Exception as e:
             print(f"Sheet sync failed: {type(e).__name__}: {e}")
@@ -153,12 +156,14 @@ def cmd_sync_sheet(args) -> None:
             sheet_id=args.sheet_id,
             results_tab=args.results_tab,
             leaderboard_tab=args.leaderboard_tab,
+            decisions_tab=args.decisions_tab,
         )
         print(
             "Sheet synced: "
             f"id={summary['sheet_id']} "
             f"results_tab={summary['results_tab']} rows={summary['results_rows']} "
-            f"leaderboard_tab={summary['leaderboard_tab']} rows={summary['leaderboard_rows']}"
+            f"leaderboard_tab={summary['leaderboard_tab']} rows={summary['leaderboard_rows']} "
+            f"decisions_tab={summary['decisions_tab']} rows={summary['decisions_rows']}"
         )
     except Exception as e:
         print(f"Sheet sync failed: {type(e).__name__}: {e}")
@@ -187,6 +192,7 @@ def main() -> None:
     p_settle.add_argument("--sheet-id", default=DEFAULT_GSHEET_ID, help="Google Sheet ID")
     p_settle.add_argument("--results-tab", default=DEFAULT_RESULTS_TAB, help="Results tab name")
     p_settle.add_argument("--leaderboard-tab", default=DEFAULT_LEADERBOARD_TAB, help="Leaderboard tab name")
+    p_settle.add_argument("--decisions-tab", default=DEFAULT_DECISIONS_TAB, help="Decisions tab name")
 
     sub.add_parser("leaderboard", help="Show live leaderboard")
 
@@ -194,6 +200,7 @@ def main() -> None:
     p_sync.add_argument("--sheet-id", default=DEFAULT_GSHEET_ID, help="Google Sheet ID")
     p_sync.add_argument("--results-tab", default=DEFAULT_RESULTS_TAB, help="Results tab name")
     p_sync.add_argument("--leaderboard-tab", default=DEFAULT_LEADERBOARD_TAB, help="Leaderboard tab name")
+    p_sync.add_argument("--decisions-tab", default=DEFAULT_DECISIONS_TAB, help="Decisions tab name")
 
     p_round = sub.add_parser("round", help="Show one round details")
     p_round.add_argument("--date", required=True, help="Signal date YYYY-MM-DD")

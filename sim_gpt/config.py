@@ -37,6 +37,7 @@ PLAYER_IDS = [
 DEFAULT_GSHEET_ID = "1aBRPbPhYO39YvxrHVdDzo9nxrABRpHxaRk-FE5hXypc"
 DEFAULT_RESULTS_TAB = "Live_Game_Rounds"
 DEFAULT_LEADERBOARD_TAB = "Live_Game_Leaderboard"
+DEFAULT_DECISIONS_TAB = "Live_Game_Decisions"
 
 # Columns that are safe to expose to players at decision time.
 PUBLIC_COLUMNS = [

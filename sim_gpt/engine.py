@@ -82,6 +82,7 @@ class LiveGameEngine:
 
             decision_payload = decision.to_dict()
             decision_payload.update(risk_meta)
+            decision_payload.update(_decision_strike_metadata(decision, raw_row))
             decision_payload["decision_round"] = decision_rounds + 1
             decision_payload["trade_rate_context"] = round(float(activity_ctx["trade_rate"]), 4)
             decision_payload["consecutive_holds_context"] = int(activity_ctx["consecutive_holds"])
@@ -391,3 +392,54 @@ def _extract_asof_timestamp(row: dict) -> datetime | None:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
+
+
+def _to_int_strike(v) -> int | None:
+    try:
+        if v in (None, ""):
+            return None
+        return int(round(float(v)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _decision_strike_metadata(decision: Decision, row: dict) -> dict:
+    out = {
+        "put_lower_strike": None,
+        "put_upper_strike": None,
+        "put_long_strike": None,
+        "put_short_strike": None,
+        "call_lower_strike": None,
+        "call_upper_strike": None,
+        "call_long_strike": None,
+        "call_short_strike": None,
+    }
+
+    limit = _to_int_strike(row.get("Limit"))
+    climit = _to_int_strike(row.get("CLimit"))
+
+    if decision.put_action != SideAction.NONE and decision.put_width and limit is not None:
+        put_low = int(limit - int(decision.put_width))
+        put_high = int(limit)
+        out["put_lower_strike"] = put_low
+        out["put_upper_strike"] = put_high
+        if decision.put_action == SideAction.SELL:
+            out["put_short_strike"] = put_high
+            out["put_long_strike"] = put_low
+        elif decision.put_action == SideAction.BUY:
+            out["put_long_strike"] = put_high
+            out["put_short_strike"] = put_low
+
+    if decision.call_action != SideAction.NONE and decision.call_width and climit is not None:
+        call_low = int(climit)
+        call_high = int(climit + int(decision.call_width))
+        out["call_lower_strike"] = call_low
+        out["call_upper_strike"] = call_high
+        if decision.call_action == SideAction.SELL:
+            out["call_short_strike"] = call_low
+            out["call_long_strike"] = call_high
+        elif decision.call_action == SideAction.BUY:
+            out["call_long_strike"] = call_low
+            out["call_short_strike"] = call_high
+
+    return out
