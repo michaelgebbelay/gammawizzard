@@ -1,0 +1,115 @@
+name: Live Game Sync
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "run_live_and_settle | settle_only | sync_only"
+        required: true
+        default: "run_live_and_settle"
+      signal_date:
+        description: "Signal date YYYY-MM-DD (optional; default=today)"
+        required: false
+      settle_date:
+        description: "Settlement date YYYY-MM-DD (optional; default=today)"
+        required: false
+      api_url:
+        description: "Leo API URL override (optional)"
+        required: false
+      allow_prestart:
+        description: "Allow rounds before 2026-03-02 (true/false)"
+        required: false
+        default: "false"
+
+concurrency:
+  group: live-game-sync
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GSHEET_ID: ${{ secrets.GSHEET_ID }}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+      LEO_LIVE_URL: ${{ secrets.LEO_LIVE_URL }}
+      LEO_LIVE_TOKEN: ${{ secrets.LEO_LIVE_TOKEN }}
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install -r requirements.txt
+
+      - name: Restore live DB cache
+        id: cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: .state/live_game.db
+          key: live-game-db-${{ github.ref_name }}-${{ github.run_id }}
+          restore-keys: |
+            live-game-db-${{ github.ref_name }}-
+
+      - name: Run live game command(s)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .state
+
+          MODE="${{ github.event.inputs.mode }}"
+          SIGNAL_DATE="${{ github.event.inputs.signal_date }}"
+          SETTLE_DATE="${{ github.event.inputs.settle_date }}"
+          INPUT_API_URL="${{ github.event.inputs.api_url }}"
+          ALLOW_PRESTART="${{ github.event.inputs.allow_prestart }}"
+          DB=".state/live_game.db"
+
+          API_URL="${INPUT_API_URL:-}"
+          if [[ -z "${API_URL}" ]]; then
+            API_URL="${LEO_LIVE_URL:-}"
+          fi
+
+          RUN_LIVE_ARGS=""
+          if [[ -n "${SIGNAL_DATE}" ]]; then
+            RUN_LIVE_ARGS="${RUN_LIVE_ARGS} --date ${SIGNAL_DATE}"
+          fi
+          if [[ -n "${API_URL}" ]]; then
+            RUN_LIVE_ARGS="${RUN_LIVE_ARGS} --api-url ${API_URL}"
+          fi
+          if [[ "${ALLOW_PRESTART}" == "true" ]]; then
+            RUN_LIVE_ARGS="${RUN_LIVE_ARGS} --allow-prestart"
+          fi
+
+          SETTLE_ARGS="--push-sheet"
+          if [[ -n "${SETTLE_DATE}" ]]; then
+            SETTLE_ARGS="${SETTLE_ARGS} --date ${SETTLE_DATE}"
+          fi
+          if [[ -n "${API_URL}" ]]; then
+            SETTLE_ARGS="${SETTLE_ARGS} --api-url ${API_URL}"
+          fi
+
+          if [[ "${MODE}" == "run_live_and_settle" ]]; then
+            python -m sim_live.cli --db "${DB}" run-live ${RUN_LIVE_ARGS}
+            python -m sim_live.cli --db "${DB}" settle ${SETTLE_ARGS}
+          elif [[ "${MODE}" == "settle_only" ]]; then
+            python -m sim_live.cli --db "${DB}" settle ${SETTLE_ARGS}
+          elif [[ "${MODE}" == "sync_only" ]]; then
+            python -m sim_live.cli --db "${DB}" sync-sheet
+          else
+            echo "Unsupported mode: ${MODE}"
+            exit 2
+          fi
+
+      - name: Save live DB cache
+        uses: actions/cache/save@v4
+        with:
+          path: .state/live_game.db
+          key: ${{ steps.cache-restore.outputs.cache-primary-key }}
+
