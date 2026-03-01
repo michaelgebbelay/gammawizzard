@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import csv
+import json
 import os
 from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
 
-from sim_gpt.config import PUBLIC_COLUMNS, SUPPRESSED_COLUMNS
+from sim_gpt.config import DEFAULT_LIVE_API_URL, PUBLIC_COLUMNS, SUPPRESSED_COLUMNS
 from sim_gpt.types import PublicSnapshot, RoundOutcomes
 
 
@@ -27,6 +29,14 @@ def _to_float(v, default: float = 0.0) -> float:
         return default
 
 
+def _sanitize_token(v: str | None) -> str:
+    token = (v or "").strip().strip('"').strip("'")
+    if token.lower().startswith("bearer "):
+        parts = token.split(None, 1)
+        return parts[1] if len(parts) > 1 else ""
+    return token
+
+
 class LeoFeed:
     """Fetch rows from Leo data source and expose public/private views."""
 
@@ -37,8 +47,15 @@ class LeoFeed:
         api_token: Optional[str] = None,
     ):
         self.csv_path = Path(csv_path) if csv_path else None
-        self.api_url = api_url or os.environ.get("LEO_LIVE_URL", "").strip()
-        self.api_token = api_token or os.environ.get("LEO_LIVE_TOKEN", "").strip()
+        self.api_url = (
+            api_url
+            or os.environ.get("LEO_LIVE_URL", "").strip()
+            or DEFAULT_LIVE_API_URL
+        )
+        self.api_token = _sanitize_token(api_token or os.environ.get("LEO_LIVE_TOKEN", ""))
+        self.gw_email = os.environ.get("GW_EMAIL", "").strip()
+        self.gw_password = os.environ.get("GW_PASSWORD", "").strip()
+        self._auth_token = self.api_token
         self._rows_by_date: dict[str, list[dict]] = {}
         self._api_cache: dict[str, list[dict]] = {}
         if self.csv_path:
@@ -52,6 +69,72 @@ class LeoFeed:
                 if d:
                     self._rows_by_date.setdefault(d, []).append(dict(row))
 
+    def _api_base_url(self) -> str:
+        parts = urlsplit(self.api_url)
+        if not parts.scheme or not parts.netloc:
+            return ""
+        return f"{parts.scheme}://{parts.netloc}"
+
+    def _auth_with_gw_credentials(self, requests_mod) -> str:
+        if not (self.gw_email and self.gw_password):
+            return ""
+        base = self._api_base_url()
+        if not base:
+            return ""
+
+        resp = requests_mod.post(
+            f"{base}/goauth/authenticateFireUser",
+            data={"email": self.gw_email, "password": self.gw_password},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        payload = resp.json() if resp.content else {}
+        token = _sanitize_token(payload.get("token") or payload.get("Token"))
+        if token:
+            self._auth_token = token
+        return token
+
+    @staticmethod
+    def _rows_from_payload(payload: object) -> list[dict]:
+        rows: list[dict] = []
+
+        if isinstance(payload, list):
+            rows.extend(dict(r) for r in payload if isinstance(r, dict))
+        elif isinstance(payload, dict):
+            if "Date" in payload:
+                rows.append(dict(payload))
+            else:
+                for key in ("Trade", "Predictions", "rows", "items", "data", "Data"):
+                    v = payload.get(key)
+                    if isinstance(v, dict):
+                        rows.append(dict(v))
+                    elif isinstance(v, list):
+                        rows.extend(dict(r) for r in v if isinstance(r, dict))
+
+                # Fallback for nested envelopes.
+                if not rows:
+                    for v in payload.values():
+                        if isinstance(v, dict) and "Date" in v:
+                            rows.append(dict(v))
+                        elif isinstance(v, list):
+                            rows.extend(
+                                dict(r) for r in v if isinstance(r, dict) and "Date" in r
+                            )
+
+        # Drop exact duplicate rows (Trade + Predictions often duplicate latest row).
+        deduped: list[dict] = []
+        seen: set[str] = set()
+        for row in rows:
+            d = str(row.get("Date", "")).strip()[:10]
+            if not d:
+                continue
+            sig = json.dumps(row, sort_keys=True, default=str)
+            if sig in seen:
+                continue
+            seen.add(sig)
+            deduped.append(dict(row))
+        return deduped
+
     def _fetch_api_rows(self, signal_date: date) -> list[dict]:
         if not self.api_url:
             return []
@@ -62,36 +145,32 @@ class LeoFeed:
             return []
 
         headers = {"Accept": "application/json"}
-        if self.api_token:
-            headers["Authorization"] = f"Bearer {self.api_token}"
+        if self._auth_token:
+            headers["Authorization"] = f"Bearer {_sanitize_token(self._auth_token)}"
 
-        resp = requests.get(
-            self.api_url,
-            params={"date": signal_date.isoformat()},
-            headers=headers,
-            timeout=20,
-        )
+        def _get(h: dict) -> object:
+            return requests.get(
+                self.api_url,
+                params={"date": signal_date.isoformat()},
+                headers=h,
+                timeout=20,
+            )
+
+        resp = _get(headers)
+        if resp.status_code in (401, 403):
+            fresh = self._auth_with_gw_credentials(requests)
+            if fresh:
+                headers["Authorization"] = f"Bearer {fresh}"
+                resp = _get(headers)
         resp.raise_for_status()
         data = resp.json()
 
-        if isinstance(data, list):
-            return [
-                dict(row)
-                for row in data
-                if str(row.get("Date", "")).strip()[:10] == signal_date.isoformat()
-            ]
-        if isinstance(data, dict):
-            if "Date" in data:
-                d = str(data.get("Date", "")).strip()[:10]
-                return [dict(data)] if d == signal_date.isoformat() else []
-            rows = data.get("rows") or data.get("items") or []
-            if isinstance(rows, list):
-                return [
-                    dict(row)
-                    for row in rows
-                    if str(row.get("Date", "")).strip()[:10] == signal_date.isoformat()
-                ]
-        return []
+        rows = self._rows_from_payload(data)
+        return [
+            dict(row)
+            for row in rows
+            if str(row.get("Date", "")).strip()[:10] == signal_date.isoformat()
+        ]
 
     def get_rows_for_date(self, signal_date: date) -> list[dict]:
         key = signal_date.isoformat()

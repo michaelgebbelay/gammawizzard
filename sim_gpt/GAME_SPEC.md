@@ -38,7 +38,7 @@ Runtime behavior:
 Source options:
 
 - CSV (`--csv`)
-- API (`--api-url` or `LEO_LIVE_URL` + optional `LEO_LIVE_TOKEN`)
+- API (`--api-url` or `LEO_LIVE_URL`; default endpoint is `https://gandalf.gammawizard.com/rapi/GetUltraPureConstantStable`)
 
 Required date fields:
 
@@ -277,8 +277,9 @@ For sheet sync:
 
 For API feed:
 
-- `LEO_LIVE_URL`
-- `LEO_LIVE_TOKEN` (optional, if endpoint requires bearer auth)
+- `LEO_LIVE_URL` (optional override)
+- `LEO_LIVE_TOKEN` (optional bearer token)
+- `GW_EMAIL` + `GW_PASSWORD` (optional fallback auth when bearer token is not provided)
 
 ## 16. Non-Goals and Known Gaps
 

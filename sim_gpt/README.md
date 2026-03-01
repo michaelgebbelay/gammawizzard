@@ -109,8 +109,9 @@ Expected secrets:
 
 - `GSHEET_ID`
 - `GOOGLE_SERVICE_ACCOUNT_JSON`
-- `LEO_LIVE_URL` (optional but recommended)
+- `LEO_LIVE_URL` (optional override; defaults to `https://gandalf.gammawizard.com/rapi/GetUltraPureConstantStable`)
 - `LEO_LIVE_TOKEN` (optional)
+- `GW_EMAIL` / `GW_PASSWORD` (optional fallback auth if `LEO_LIVE_TOKEN` is not set)
 
 From GitHub Actions UI:
 

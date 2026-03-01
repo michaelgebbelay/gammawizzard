@@ -14,6 +14,7 @@ LIVE_START_DATE = date(2026, 3, 2)
 MARKET_TZ = "America/New_York"
 POST_CLOSE_DELAY_MINUTES = 13
 ASOF_MAX_STALENESS_MINUTES = 180
+DEFAULT_LIVE_API_URL = "https://gandalf.gammawizard.com/rapi/GetUltraPureConstantStable"
 
 ALLOWED_WIDTHS = {5, 10}
 MAX_CONTRACTS = 3
