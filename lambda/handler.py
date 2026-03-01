@@ -298,6 +298,7 @@ def run_script(script, env, timeout_s=100, label=""):
 def _handle_sim_collect(event):
     """Collect SPX chain data and persist to S3 for the trading simulation.
 
+    Uses Schwab API for chain data (full Greeks/IV) with GammaWizard overlay.
     Event payload: {"account": "sim-collect", "phase": "open|mid|close|close5"}
     """
     import logging
@@ -314,40 +315,41 @@ def _handle_sim_collect(event):
 
     print(f"=== sim-collect | phase={phase} ===")
 
-    # 1. Seed TT token from SSM (needed for TT API calls)
-    ssm_paths = {
-        "/gamma/tt/token_json": None,
-        "/gamma/tt/client_id": None,
-        "/gamma/tt/client_secret": None,
-        "/gamma/shared/gw_email": None,
-        "/gamma/shared/gw_password": None,
-    }
-    params = get_ssm_params(list(ssm_paths.keys()))
+    # 1. Seed credentials from SSM
+    ssm_paths = [
+        "/gamma/schwab/token_json",
+        "/gamma/schwab/app_key",
+        "/gamma/schwab/app_secret",
+        "/gamma/shared/gw_email",
+        "/gamma/shared/gw_password",
+    ]
+    params = get_ssm_params(ssm_paths)
     print(f"Fetched {len(params)} SSM params")
 
-    # Seed TT token file
-    tt_token = params.get("/gamma/tt/token_json", "")
-    if tt_token:
-        seed_file("/tmp/tt_token.json", tt_token)
+    # Seed Schwab token file
+    schwab_token = params.get("/gamma/schwab/token_json", "")
+    if schwab_token:
+        seed_file("/tmp/schwab_token.json", schwab_token)
     else:
-        print("WARNING: no TT token from SSM")
+        print("WARNING: no Schwab token from SSM")
 
-    token_hash = file_hash("/tmp/tt_token.json")
+    token_hash = file_hash("/tmp/schwab_token.json")
 
-    # Set env vars for TT API + GW API
-    os.environ["TT_TOKEN_PATH"] = "/tmp/tt_token.json"
-    os.environ["TT_CLIENT_ID"] = params.get("/gamma/tt/client_id", "")
-    os.environ["TT_CLIENT_SECRET"] = params.get("/gamma/tt/client_secret", "")
+    # Set env vars for Schwab API + GW API
+    os.environ["SCHWAB_TOKEN_PATH"] = "/tmp/schwab_token.json"
+    os.environ["SCHWAB_APP_KEY"] = params.get("/gamma/schwab/app_key", "")
+    os.environ["SCHWAB_APP_SECRET"] = params.get("/gamma/schwab/app_secret", "")
     os.environ["GW_EMAIL"] = params.get("/gamma/shared/gw_email", "")
     os.environ["GW_PASSWORD"] = params.get("/gamma/shared/gw_password", "")
     os.environ.setdefault("GW_BASE", "https://gandalf.gammawizard.com")
     os.environ.setdefault("GW_ENDPOINT", "rapi/GetUltraPureConstantStable")
 
-    # 2. Run chain collection
-    from datetime import date as date_type
-    from sim.data.tt_market_data import fetch_tt_spx_chain
-    from sim.data.chain_snapshot import parse_tt_chain
-    from sim.data.features import enrich, FeaturePack
+    # 2. Fetch chain via Schwab API
+    from datetime import date as date_type, datetime, timedelta
+    from zoneinfo import ZoneInfo
+    from scripts.schwab_token_keeper import schwab_client
+    from sim.data.chain_snapshot import parse_schwab_chain
+    from sim.data.features import enrich
     from sim.data.gw_client import fetch_gw_data
     from sim.data.s3_cache import s3_put_json
 
@@ -356,26 +358,66 @@ def _handle_sim_collect(event):
     print(f"Collecting: date={today_str}, phase={phase}")
 
     try:
-        raw = fetch_tt_spx_chain(phase=phase)
-        if raw is None:
-            return {"status": "error", "message": "TT chain fetch returned None",
+        c = schwab_client()
+
+        # Fetch SPX option chain (1-3 DTE window to capture 1DTE)
+        from_date = today
+        to_date = today + timedelta(days=3)
+        resp = c.get_option_chain(
+            "$SPX",
+            contract_type=c.Options.ContractType.ALL,
+            strike_count=40,
+            include_underlying_quote=True,
+            from_date=from_date,
+            to_date=to_date,
+            option_type=c.Options.Type.ALL,
+        )
+        resp.raise_for_status()
+        raw = resp.json()
+
+        # Fetch VIX
+        vix = 0.0
+        try:
+            vix_resp = c.get_quote("$VIX")
+            vix_resp.raise_for_status()
+            vix_data = vix_resp.json()
+            for key, val in vix_data.items():
+                if isinstance(val, dict):
+                    q = val.get("quote", val)
+                    v = q.get("lastPrice") or q.get("last") or q.get("mark")
+                    if v is not None:
+                        vix = float(v)
+                        break
+        except Exception as e:
+            print(f"VIX fetch failed (non-fatal): {e}")
+
+        # Parse into ChainSnapshot
+        snapshot = parse_schwab_chain(raw, phase=phase, vix=vix)
+
+        if not snapshot.expirations:
+            return {"status": "error", "message": "No PM-settled expirations found",
                     "duration_s": round(time.time() - t0, 1)}
 
-        # Validate
-        snapshot = parse_tt_chain(raw)
         if not snapshot.contracts:
             return {"status": "error", "message": "No contracts in chain",
                     "duration_s": round(time.time() - t0, 1)}
 
+        # Log diagnostics
+        has_greeks = sum(1 for oc in snapshot.contracts.values() if oc.delta != 0)
+        has_bid = sum(1 for oc in snapshot.contracts.values() if oc.bid > 0)
         print(f"Chain: {len(snapshot.contracts)} contracts, "
-              f"SPX={snapshot.underlying_price:.0f}, VIX={snapshot.vix:.1f}")
+              f"SPX={snapshot.underlying_price:.0f}, VIX={vix:.1f}, "
+              f"greeks={has_greeks}/{len(snapshot.contracts)}, "
+              f"bids={has_bid}/{len(snapshot.contracts)}")
 
-        # 3. Save chain to S3
+        # 3. Save raw chain to S3
+        timestamp = datetime.now(ZoneInfo("America/New_York")).isoformat()
         s3_put_json(today_str, f"{phase}.json", {
             "trading_date": today_str,
             "phase": phase,
-            "vix": raw.get("_vix", 0.0),
-            "fetched_at": raw.get("_timestamp", ""),
+            "source": "schwab",
+            "vix": vix,
+            "fetched_at": timestamp,
             "chain": raw,
         })
 
@@ -392,7 +434,8 @@ def _handle_sim_collect(event):
             print(f"GW fetch failed (non-fatal): {e}")
 
         # 5. Save FeaturePack to S3
-        prev_close = raw.get("spx_prev_close", 0.0)
+        underlying_quote = raw.get("underlying", {})
+        prev_close = float(underlying_quote.get("previousClose", 0) or 0)
         fp = enrich(snapshot, prev_close=prev_close, gw_data=gw_data)
         s3_put_json(today_str, f"features_{phase}.json", fp.to_dict())
 
@@ -405,11 +448,12 @@ def _handle_sim_collect(event):
         return {"status": "error", "message": str(e),
                 "duration_s": round(time.time() - t0, 1)}
 
-    # 6. Persist TT token if refreshed
+    # 6. Persist Schwab token if refreshed
     try:
-        persist_token_if_changed("/gamma/tt/token_json", "/tmp/tt_token.json", token_hash)
+        persist_token_if_changed("/gamma/schwab/token_json",
+                                 "/tmp/schwab_token.json", token_hash)
     except Exception as e:
-        print(f"ERROR persisting TT token: {e}")
+        print(f"ERROR persisting Schwab token: {e}")
 
     duration = round(time.time() - t0, 1)
     print(f"=== DONE sim-collect | phase={phase} | {duration}s ===")
@@ -420,6 +464,7 @@ def _handle_sim_collect(event):
         "date": today_str,
         "contracts": len(snapshot.contracts),
         "spx": snapshot.underlying_price,
+        "greeks": has_greeks,
         "duration_s": duration,
     }
 
