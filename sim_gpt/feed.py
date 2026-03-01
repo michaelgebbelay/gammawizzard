@@ -1,17 +1,26 @@
-"""Leo data feed adapters for the live game."""
+"""Live feed adapters for public features, settlement spot, and option chains."""
 
 from __future__ import annotations
 
 import csv
 import json
+import math
 import os
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlsplit
 
-from sim_gpt.config import DEFAULT_LIVE_API_URL, PUBLIC_COLUMNS, SUPPRESSED_COLUMNS
-from sim_gpt.types import PublicSnapshot, RoundOutcomes
+from sim_gpt.config import (
+    CHAIN_SOURCE,
+    DEFAULT_LIVE_API_URL,
+    MAX_LEG_SPREAD_POINTS,
+    PUBLIC_COLUMNS,
+    SCHWAB_STRIKE_COUNT,
+    SCHWAB_SYMBOL,
+    SUPPRESSED_COLUMNS,
+)
+from sim_gpt.types import ChainSnapshot, OptionQuote, PublicSnapshot, SettlementSnapshot
 
 
 def _to_date(v) -> date:
@@ -37,8 +46,34 @@ def _sanitize_token(v: str | None) -> str:
     return token
 
 
+def _safe_dt_utc(v) -> datetime | None:
+    if v in (None, ""):
+        return None
+    if isinstance(v, datetime):
+        if v.tzinfo is None:
+            return v.replace(tzinfo=timezone.utc)
+        return v.astimezone(timezone.utc)
+    s = str(v).strip()
+    if not s:
+        return None
+    try:
+        # Schwab often returns epoch milliseconds.
+        if s.isdigit():
+            iv = int(s)
+            if iv > 10_000_000_000:
+                return datetime.fromtimestamp(iv / 1000.0, tz=timezone.utc)
+            return datetime.fromtimestamp(iv, tz=timezone.utc)
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+def _non_empty_row(row: dict | None) -> dict:
+    return dict(row) if isinstance(row, dict) else {}
+
+
 class LeoFeed:
-    """Fetch rows from Leo data source and expose public/private views."""
+    """Fetch rows from data source and expose public + settlement + chain views."""
 
     def __init__(
         self,
@@ -47,17 +82,14 @@ class LeoFeed:
         api_token: Optional[str] = None,
     ):
         self.csv_path = Path(csv_path) if csv_path else None
-        self.api_url = (
-            api_url
-            or os.environ.get("LEO_LIVE_URL", "").strip()
-            or DEFAULT_LIVE_API_URL
-        )
+        self.api_url = api_url or os.environ.get("LEO_LIVE_URL", "").strip() or DEFAULT_LIVE_API_URL
         self.api_token = _sanitize_token(api_token or os.environ.get("LEO_LIVE_TOKEN", ""))
         self.gw_email = os.environ.get("GW_EMAIL", "").strip()
         self.gw_password = os.environ.get("GW_PASSWORD", "").strip()
         self._auth_token = self.api_token
         self._rows_by_date: dict[str, list[dict]] = {}
         self._api_cache: dict[str, list[dict]] = {}
+        self._chain_cache: dict[str, ChainSnapshot] = {}
         if self.csv_path:
             self._load_csv()
 
@@ -111,17 +143,13 @@ class LeoFeed:
                     elif isinstance(v, list):
                         rows.extend(dict(r) for r in v if isinstance(r, dict))
 
-                # Fallback for nested envelopes.
                 if not rows:
                     for v in payload.values():
                         if isinstance(v, dict) and "Date" in v:
                             rows.append(dict(v))
                         elif isinstance(v, list):
-                            rows.extend(
-                                dict(r) for r in v if isinstance(r, dict) and "Date" in r
-                            )
+                            rows.extend(dict(r) for r in v if isinstance(r, dict) and "Date" in r)
 
-        # Drop exact duplicate rows (Trade + Predictions often duplicate latest row).
         deduped: list[dict] = []
         seen: set[str] = set()
         for row in rows:
@@ -166,11 +194,7 @@ class LeoFeed:
         data = resp.json()
 
         rows = self._rows_from_payload(data)
-        return [
-            dict(row)
-            for row in rows
-            if str(row.get("Date", "")).strip()[:10] == signal_date.isoformat()
-        ]
+        return [dict(row) for row in rows if str(row.get("Date", "")).strip()[:10] == signal_date.isoformat()]
 
     def get_rows_for_date(self, signal_date: date) -> list[dict]:
         key = signal_date.isoformat()
@@ -189,20 +213,20 @@ class LeoFeed:
             return None
         if len(rows) > 1:
             raise ValueError(
-                f"Expected exactly one Leo row for {signal_date.isoformat()}, got {len(rows)}"
+                f"Expected exactly one feed row for {signal_date.isoformat()}, got {len(rows)}"
             )
         return dict(rows[0])
 
     def validate_signal_row(self, signal_date: date) -> dict:
         row = self.get_raw_row(signal_date)
         if row is None:
-            raise ValueError(f"No Leo data found for signal date: {signal_date.isoformat()}")
+            raise ValueError(f"No data found for signal date: {signal_date.isoformat()}")
 
         row_date = _to_date(row.get("Date"))
         tdate = _to_date(row.get("TDate"))
         if row_date != signal_date:
             raise ValueError(
-                f"Leo row date mismatch: expected {signal_date.isoformat()}, got {row_date.isoformat()}"
+                f"Row date mismatch: expected {signal_date.isoformat()}, got {row_date.isoformat()}"
             )
         if tdate <= row_date:
             raise ValueError(
@@ -213,14 +237,8 @@ class LeoFeed:
     def get_public_snapshot(self, signal_date: date) -> Optional[PublicSnapshot]:
         row = self.validate_signal_row(signal_date)
 
-        # Only pass non-leaky columns to players.
-        payload = {
-            c: row.get(c)
-            for c in PUBLIC_COLUMNS
-            if c in row and c not in SUPPRESSED_COLUMNS
-        }
+        payload = {c: row.get(c) for c in PUBLIC_COLUMNS if c in row and c not in SUPPRESSED_COLUMNS}
 
-        # Keep a narrow, typed feature object for player logic.
         return PublicSnapshot(
             signal_date=_to_date(row.get("Date")),
             tdate=_to_date(row.get("TDate")),
@@ -237,16 +255,134 @@ class LeoFeed:
             payload=payload,
         )
 
-    def get_outcomes(self, signal_date: date) -> Optional[RoundOutcomes]:
-        row = self.validate_signal_row(signal_date)
-
-        # Settlement data stays private to engine/judge.
-        if "Profit" not in row or "CProfit" not in row:
+    def get_settlement_snapshot(self, settlement_date: date) -> Optional[SettlementSnapshot]:
+        row = self.get_raw_row(settlement_date)
+        if row is None:
             return None
-        if row.get("Profit") in (None, "") or row.get("CProfit") in (None, ""):
+        spx = _to_float(row.get("SPX"), default=math.nan)
+        if math.isnan(spx) or spx <= 0:
             return None
-        return RoundOutcomes(
-            put_short_pnl_5w=_to_float(row.get("Profit")),
-            call_short_pnl_5w=_to_float(row.get("CProfit")),
-            tx=_to_float(row.get("TX")),
+        return SettlementSnapshot(
+            settlement_date=settlement_date,
+            settlement_spx=spx,
         )
+
+    def get_entry_chain(self, signal_date: date, tdate: date) -> ChainSnapshot:
+        if CHAIN_SOURCE.lower() != "schwab":
+            raise ValueError(f"Unsupported CHAIN_SOURCE={CHAIN_SOURCE}")
+
+        cache_key = f"{signal_date.isoformat()}|{tdate.isoformat()}"
+        if cache_key in self._chain_cache:
+            return self._chain_cache[cache_key]
+
+        try:
+            from scripts.schwab_token_keeper import schwab_client
+        except Exception as e:
+            raise RuntimeError(f"Failed to import Schwab client: {e}") from e
+
+        try:
+            client = schwab_client()
+        except KeyError as e:
+            missing = str(e).strip("'")
+            raise RuntimeError(
+                f"Missing Schwab env var: {missing}. "
+                "Set SCHWAB_APP_KEY, SCHWAB_APP_SECRET, and token env/file."
+            ) from e
+        resp = client.get_option_chain(
+            SCHWAB_SYMBOL,
+            contract_type=client.Options.ContractType.ALL,
+            strike_count=SCHWAB_STRIKE_COUNT,
+            include_underlying_quote=True,
+            from_date=tdate,
+            to_date=tdate,
+            option_type=client.Options.Type.ALL,
+        )
+        resp.raise_for_status()
+        raw = _non_empty_row(resp.json())
+        chain = self._parse_schwab_chain(raw, signal_date=signal_date, tdate=tdate)
+        self._chain_cache[cache_key] = chain
+        return chain
+
+    def _parse_schwab_chain(self, raw: dict, signal_date: date, tdate: date) -> ChainSnapshot:
+        underlying_spx = _to_float(raw.get("underlyingPrice"))
+        if underlying_spx <= 0:
+            underlying = raw.get("underlying", {})
+            if isinstance(underlying, dict):
+                underlying_spx = _to_float(
+                    underlying.get("last")
+                    or underlying.get("mark")
+                    or underlying.get("close")
+                    or underlying.get("bid")
+                    or underlying.get("ask")
+                )
+
+        asof = _safe_dt_utc(raw.get("underlyingPriceTime")) or _safe_dt_utc(raw.get("quoteTime"))
+        underlying = _non_empty_row(raw.get("underlying"))
+        asof = asof or _safe_dt_utc(
+            underlying.get("quoteTime")
+            or underlying.get("tradeTime")
+            or underlying.get("closeTime")
+            or underlying.get("lastTradeTime")
+        )
+        asof = asof or datetime.now(timezone.utc)
+
+        puts = self._extract_side(raw.get("putExpDateMap"), "P", tdate)
+        calls = self._extract_side(raw.get("callExpDateMap"), "C", tdate)
+        if not puts or not calls:
+            raise ValueError(
+                f"No usable Schwab contracts for TDate={tdate.isoformat()} "
+                f"(puts={len(puts)} calls={len(calls)})"
+            )
+
+        return ChainSnapshot(
+            signal_date=signal_date,
+            tdate=tdate,
+            asof_utc=asof,
+            underlying_spx=underlying_spx,
+            puts=tuple(sorted(puts, key=lambda q: q.strike)),
+            calls=tuple(sorted(calls, key=lambda q: q.strike)),
+        )
+
+    def _extract_side(self, exp_map: object, put_call: str, tdate: date) -> list[OptionQuote]:
+        out: list[OptionQuote] = []
+        if not isinstance(exp_map, dict):
+            return out
+        tdate_s = tdate.isoformat()
+        for exp_key, strikes_data in exp_map.items():
+            exp_date = str(exp_key).split(":")[0].strip()
+            if exp_date != tdate_s or not isinstance(strikes_data, dict):
+                continue
+
+            for strike_key, contract_list in strikes_data.items():
+                if not isinstance(contract_list, list) or not contract_list:
+                    continue
+                c = _non_empty_row(contract_list[0])
+
+                bid = _to_float(c.get("bid"), default=math.nan)
+                ask = _to_float(c.get("ask"), default=math.nan)
+                strike = _to_float(strike_key, default=math.nan)
+                if math.isnan(strike) or strike <= 0:
+                    continue
+                if math.isnan(bid) or math.isnan(ask):
+                    continue
+                if ask < bid:
+                    continue
+                if ask - bid > MAX_LEG_SPREAD_POINTS:
+                    continue
+
+                mid = _to_float(c.get("mark"), default=(bid + ask) / 2.0)
+                if mid <= 0:
+                    mid = (bid + ask) / 2.0
+
+                out.append(
+                    OptionQuote(
+                        strike=strike,
+                        put_call=put_call,
+                        bid=bid,
+                        ask=ask,
+                        mid=mid,
+                        delta=_to_float(c.get("delta")),
+                        iv=_to_float(c.get("volatility")),
+                    )
+                )
+        return out

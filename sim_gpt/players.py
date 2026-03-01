@@ -7,8 +7,7 @@ import math
 from dataclasses import dataclass
 from typing import Iterable
 
-from sim_gpt.config import ALLOWED_WIDTHS, MAX_CONTRACTS
-from sim_gpt.template_rules import template_rule
+from sim_gpt.config import ALLOWED_WIDTHS, MAX_CONTRACTS, TARGET_DELTAS
 from sim_gpt.types import Decision, PublicSnapshot, SideAction
 
 
@@ -44,11 +43,12 @@ def _deterministic_noise(seed: str) -> float:
     return (val - 0.5) * 0.05
 
 
-def _side_token(action: SideAction, width: int | None) -> str:
+def _side_token(action: SideAction, width: int | None, target_delta: float | None) -> str:
     if action == SideAction.NONE:
         return "n"
     side = "b" if action == SideAction.BUY else "s"
-    return f"{side}{width}"
+    delta_token = "" if target_delta is None else f"d{int(round(target_delta * 100)):02d}"
+    return f"{side}{width}{delta_token}"
 
 
 def _template_id(
@@ -56,9 +56,14 @@ def _template_id(
     call_action: SideAction,
     put_width: int | None,
     call_width: int | None,
+    put_target_delta: float | None,
+    call_target_delta: float | None,
     size: int,
 ) -> str:
-    return f"p{_side_token(put_action, put_width)}_c{_side_token(call_action, call_width)}_x{size}"
+    return (
+        f"p{_side_token(put_action, put_width, put_target_delta)}_"
+        f"c{_side_token(call_action, call_width, call_target_delta)}_x{size}"
+    )
 
 
 def _template_pool() -> dict[str, Decision]:
@@ -68,6 +73,8 @@ def _template_pool() -> dict[str, Decision]:
             call_action=SideAction.NONE,
             put_width=None,
             call_width=None,
+            put_target_delta=None,
+            call_target_delta=None,
             size=1,
             thesis="No trade.",
             template_id="flat",
@@ -75,6 +82,7 @@ def _template_pool() -> dict[str, Decision]:
     }
 
     widths = sorted(int(w) for w in ALLOWED_WIDTHS)
+    deltas = sorted(float(d) for d in TARGET_DELTAS)
     sizes = range(1, MAX_CONTRACTS + 1)
     actions = (SideAction.NONE, SideAction.BUY, SideAction.SELL)
 
@@ -85,25 +93,33 @@ def _template_pool() -> dict[str, Decision]:
                     continue
                 put_widths = [None] if put_action == SideAction.NONE else widths
                 call_widths = [None] if call_action == SideAction.NONE else widths
+                put_deltas = [None] if put_action == SideAction.NONE else deltas
+                call_deltas = [None] if call_action == SideAction.NONE else deltas
 
                 for put_width in put_widths:
                     for call_width in call_widths:
-                        tid = _template_id(
-                            put_action=put_action,
-                            call_action=call_action,
-                            put_width=put_width,
-                            call_width=call_width,
-                            size=size,
-                        )
-                        templates[tid] = Decision(
-                            put_action=put_action,
-                            call_action=call_action,
-                            put_width=put_width,
-                            call_width=call_width,
-                            size=size,
-                            thesis=f"Self-learning template {tid}.",
-                            template_id=tid,
-                        )
+                        for put_delta in put_deltas:
+                            for call_delta in call_deltas:
+                                tid = _template_id(
+                                    put_action=put_action,
+                                    call_action=call_action,
+                                    put_width=put_width,
+                                    call_width=call_width,
+                                    put_target_delta=put_delta,
+                                    call_target_delta=call_delta,
+                                    size=size,
+                                )
+                                templates[tid] = Decision(
+                                    put_action=put_action,
+                                    call_action=call_action,
+                                    put_width=put_width,
+                                    call_width=call_width,
+                                    put_target_delta=put_delta,
+                                    call_target_delta=call_delta,
+                                    size=size,
+                                    thesis=f"Self-learning template {tid}.",
+                                    template_id=tid,
+                                )
 
     return templates
 
@@ -112,12 +128,11 @@ TEMPLATES = _template_pool()
 
 
 def _max_loss_for_template(decision: Decision) -> float:
-    rule = template_rule(decision.template_id)
     total = 0.0
     if decision.put_action != SideAction.NONE and decision.put_width:
-        total += float(decision.put_width) * float(decision.size) * rule.risk_per_width_dollars
+        total += float(decision.put_width) * float(decision.size) * 100.0
     if decision.call_action != SideAction.NONE and decision.call_width:
-        total += float(decision.call_width) * float(decision.size) * rule.risk_per_width_dollars
+        total += float(decision.call_width) * float(decision.size) * 100.0
     return total
 
 
@@ -283,6 +298,8 @@ class Player:
             call_action=d.call_action,
             put_width=d.put_width,
             call_width=d.call_width,
+            put_target_delta=d.put_target_delta,
+            call_target_delta=d.call_target_delta,
             size=d.size,
             template_id=d.template_id,
             thesis=(

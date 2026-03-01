@@ -18,12 +18,22 @@ DEFAULT_LIVE_API_URL = "https://gandalf.gammawizard.com/rapi/GetUltraPureConstan
 
 ALLOWED_WIDTHS = {5, 10}
 MAX_CONTRACTS = 3
+TARGET_DELTAS = (0.10, 0.16, 0.25)
 STARTING_ACCOUNT_BALANCE = 30_000.0
 MAX_RISK_PCT = 0.30
 # Safety buffer applied to max risk cap (30% * 0.90 => 27% effective cap).
 RISK_BUFFER_PCT = 0.90
 # Trade cost model: $1 per executed option leg.
 COMMISSION_PER_LEG_DOLLARS = 1.0
+
+# Chain-pricing model (no Profit/CProfit settlement dependency).
+CHAIN_SOURCE = "schwab"
+SCHWAB_SYMBOL = "$SPX"
+SCHWAB_STRIKE_COUNT = 60
+TARGET_DELTA_MAX_ERROR = 0.20
+MAX_LEG_SPREAD_POINTS = 5.0
+# Conservative mid fill = mid +/- half_spread * factor.
+FILL_HALF_SPREAD_FACTOR = 0.50
 
 PLAYER_IDS = [
     "player-01",

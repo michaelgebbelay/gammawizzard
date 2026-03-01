@@ -55,7 +55,8 @@ def cmd_run_live(args) -> None:
         dec = d["decision"]
         print(
             f"- {d['player_id']}: {status} | put={dec['put_action']}[{dec['put_width']}] "
-            f"call={dec['call_action']}[{dec['call_width']}] size={dec['size']} "
+            f"@d{dec.get('put_target_delta')} "
+            f"call={dec['call_action']}[{dec['call_width']}] @d{dec.get('call_target_delta')} size={dec['size']} "
             f"template={dec['template_id']} pre_max_loss=${dec.get('pre_max_loss', 0):.2f} "
             f"max_loss=${dec.get('max_loss', 0):.2f} budget=${dec.get('risk_budget', 0):.2f} "
             f"used={dec.get('risk_used_pct', 0):.2f}% "

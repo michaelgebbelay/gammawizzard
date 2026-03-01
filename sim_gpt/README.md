@@ -1,134 +1,87 @@
-# Live Binary Vertical Game
+# sim_gpt (Live SPX Risk-Defined Game)
 
-Separate game engine for live Leo rounds (independent of `sim/`).
+Isolated live game engine under:
+
+- `/Users/mgebremichael/Documents/Gamma/sim_gpt`
+
+This game is separate from `sim/` and uses:
+
+- ConstantStable feed rows for session truth + public features
+- Schwab SPX option chain for entry pricing
+- `SPX` on `TDate` row for cash settlement
+
+No `Profit/CProfit` payoff dependency.
 
 ## Core Rules
 
-- Decision time: `Date` at ~4:13 PM ET.
-- Expiry/settlement: `TDate` close.
-- Market timezone: `America/New_York` (explicit session clock).
-- Each player can choose per side:
-  - `buy`, `sell`, or `none` for put side
-  - `buy`, `sell`, or `none` for call side
-- Allowed widths: `5` or `10` (risk-defined structures only).
-- Allowed structures inside this payoff model: any risk-defined combination of put/call vertical sides,
-  including one-side, two-side, and risk-reversal style combinations with asymmetric side widths.
-- No intraday adjustments; one decision per round.
-- Active players: neutral self-learning agents (`player-01` ... `player-05`) with no personality priors.
-- Agent policy is options-aware for cash-settled SPX structures:
-  - expected-move regime checks (from VixOne/SPX)
-  - IV minus realized-vol carry checks
-  - directional mapping for risk-reversal style structures
-- Starting account per player: `$30,000`.
-- Risk limit per round: `30%` of account value, with a `90%` safety buffer on that cap
-  (`effective trade budget = 27%` of account value).
-- Trade cost: `$1` per executed option leg (scaled by size, applied at settlement as commission).
-- Participation target: agents are expected to trade at least `90%` of sessions.
-  Trade-rate and hold-streak context are shown at decision time; judge scoring applies
-  a soft penalty for chronic cash holding (no hard block).
+- One decision set per signal day.
+- Post-close run window in `America/New_York` (default guard: 16:13 ET).
+- Hold to expiry (1DTE).
+- Risk-defined verticals only (put/call sides can be `buy`, `sell`, `none`).
+- Widths: `5` or `10`.
+- Target deltas per active side: `0.10`, `0.16`, `0.25`.
+- Size: `1..3`.
+- Starting balance: `$30,000`.
+- Risk budget: `30%` cap with `90%` buffer (effective `27%`).
+- Commission: `$1` per leg.
 
-## Session/Data Guards
+## Leakage Control
 
-- Feed is source-of-truth: no row for `Date` means no round.
-- Require exactly one source row for each signal date.
-- Require `TDate > Date`.
-- Settle only when `settlement_date >= TDate` and settlement fields (`Profit`, `CProfit`) are present.
-- If an `asof` timestamp exists, require same-day post-close and non-stale freshness.
-- Decision-time runs reject rows with `Profit/CProfit` already populated for same-day live rounds.
+Players only receive public fields:
 
-## Safety / Leakage Control
+- `Date,TDate,SPX,VIX,VixOne,RV,RV5,RV10,RV20,R,RX,Forward`
 
-Players only receive a public feature view. Signal/outcome columns are suppressed:
-
-- `Limit`, `CLimit`, `Put`, `Call`, `LImp`, `RImp`, `LReturn`, `RReturn`,
-  `LeftGo`, `RightGo`, `Cat*`, `TX`, `Win`, `CWin`, `Profit`, `CProfit`, etc.
-
-Engine/judge can use private outcome fields only during settlement.
-
-## Start Date Guard
-
-Live rounds are blocked before:
-
-- `2026-03-02` (Monday)
-
-Use `--allow-prestart` only for local validation.
+Engine suppresses label/outcome fields (including `Limit/CLimit`, `LeftGo/RightGo`, `Profit/CProfit`).
 
 ## CLI
 
 ```bash
 cd /Users/mgebremichael/Documents/Gamma
 
-# Create today's round (and auto-settle any due rounds first)
-python3 -m sim_gpt.cli run-live --csv /Users/mgebremichael/Downloads/leo_profit_Dec25.csv
+# Create a round for a date (settles due rounds first)
+python3 -m sim_gpt.cli run-live --date 2026-03-02 --api-url https://gandalf.gammawizard.com/rapi/GetUltraPureConstantStable
 
-# Validate prestart behavior using historical date
-python3 -m sim_gpt.cli run-live \
-  --date 2025-12-23 \
-  --csv /Users/mgebremichael/Downloads/leo_profit_Dec25.csv \
-  --allow-prestart
+# Settle due rounds
+python3 -m sim_gpt.cli settle --date 2026-03-03 --api-url https://gandalf.gammawizard.com/rapi/GetUltraPureConstantStable
 
-# Settle all due rounds as of a date
-python3 -m sim_gpt.cli settle \
-  --date 2025-12-24 \
-  --csv /Users/mgebremichael/Downloads/leo_profit_Dec25.csv
+# Inspect one round
+python3 -m sim_gpt.cli round --date 2026-03-02
 
 # Leaderboard
 python3 -m sim_gpt.cli leaderboard
 
-# Round detail
-python3 -m sim_gpt.cli round --date 2025-12-23
-
-# Push results to Google Sheets (defaults to your shared sheet ID)
+# Push results/leaderboard/decisions to Google Sheets
 python3 -m sim_gpt.cli sync-sheet
-
-# Or settle + push in one step
-python3 -m sim_gpt.cli settle \
-  --csv /Users/mgebremichael/Downloads/leo_profit_Dec25.csv \
-  --push-sheet
 ```
 
-## Notes
+## Environment
 
-- The settlement model assumes `Profit` and `CProfit` are side-level 5-wide short-vertical P/L.
-- Buy-side P/L is modeled as the sign-flipped side P/L.
-- 10-wide is modeled with a `2x` width multiplier from 5-wide outcomes.
-- Net P/L is after commission (`$1` per leg; each vertical side has 2 legs).
-- Butterfly support can be added, but needs additional leg-level pricing fields from the Leo feed.
-- Round storage includes UTC timestamps:
-  - `signal_timestamp_utc`
-  - `settlement_timestamp_utc`
-- Judge and leaderboard are objective risk/reward:
-  - maximize cumulative P/L
-  - minimize drawdown
-  - rank by risk-adjusted score (`equity - 0.60 * max_drawdown`)
-- Sheets results include integrity fields:
-  - `round_id` (`signal_date|player_id`)
-  - `decision_checksum`
-- Sheets sync now writes three tabs by default:
-  - `Live_Game_Rounds` (settled outcomes)
-  - `Live_Game_Leaderboard`
-  - `Live_Game_Decisions` (all decisions, including pending rounds, with derived strike legs)
-- Google Sheets export auth can use:
-  - `GOOGLE_SERVICE_ACCOUNT_JSON` (raw JSON or base64)
-  - or `GOOGLE_SERVICE_ACCOUNT_FILE`
-  - or `GOOGLE_APPLICATION_CREDENTIALS`
+Required for live chain pricing:
 
-## GitHub Secrets Path
+- `SCHWAB_APP_KEY`
+- `SCHWAB_APP_SECRET`
+- `SCHWAB_TOKEN_JSON` or `SCHWAB_TOKEN_PATH`
 
-If your secrets are only in GitHub, use workflow:
+For feed API:
 
-- [live_game_sync.yml](/Users/mgebremichael/Documents/Gamma/.github/workflows/live_game_sync.yml)
+- `LEO_LIVE_URL` (optional override)
+- `LEO_LIVE_TOKEN` or `GW_EMAIL` + `GW_PASSWORD`
 
-Expected secrets:
+For Google Sheets:
 
-- `GSHEET_ID`
-- `GOOGLE_SERVICE_ACCOUNT_JSON`
-- `LEO_LIVE_URL` (optional override; defaults to `https://gandalf.gammawizard.com/rapi/GetUltraPureConstantStable`)
-- `LEO_LIVE_TOKEN` (optional)
-- `GW_EMAIL` / `GW_PASSWORD` (optional fallback auth if `LEO_LIVE_TOKEN` is not set)
+- `GOOGLE_SERVICE_ACCOUNT_JSON` (or file equivalent)
+- `GSHEET_ID` (optional; default is set in config)
 
-From GitHub Actions UI:
+## Google Sheets Tabs
 
-1. Run **Live Game Sync**
-2. `mode=run_live_and_settle`
-3. leave dates blank for "today"
+- `Live_Game_Rounds`
+- `Live_Game_Leaderboard`
+- `Live_Game_Decisions`
+
+Decisions tab includes:
+
+- chosen target deltas
+- resolved strikes
+- entry prices (points)
+- chain as-of timestamp
+- risk metadata and guard outcome

@@ -37,6 +37,10 @@ jobs:
       GW_TOKEN: ${{ secrets.GW_TOKEN }}
       GW_EMAIL: ${{ secrets.GW_EMAIL }}
       GW_PASSWORD: ${{ secrets.GW_PASSWORD }}
+      SCHWAB_APP_KEY: ${{ secrets.SCHWAB_APP_KEY }}
+      SCHWAB_APP_SECRET: ${{ secrets.SCHWAB_APP_SECRET }}
+      SCHWAB_TOKEN_JSON: ${{ secrets.SCHWAB_TOKEN_JSON }}
+      SCHWAB_TOKEN_PATH: .state/schwab_token.json
       PYTHONDONTWRITEBYTECODE: "1"
     steps:
       - uses: actions/checkout@v4

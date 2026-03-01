@@ -1,238 +1,205 @@
-# Live SPX Risk-Defined Game Spec
+# Live SPX Risk-Defined Game Spec (`sim_gpt`)
 
-This document is the canonical specification for the `sim_gpt` game in:
+Canonical spec for:
 
 - `/Users/mgebremichael/Documents/Gamma/sim_gpt`
 
-It reflects the current implemented behavior.
+## 1. Objective
 
-## 1. Purpose
-
-Run a daily, post-close, 1DTE SPX options competition where multiple players submit one risk-defined trade decision and are ranked by risk-adjusted performance.
-
-Primary objective:
+Daily post-close 1DTE SPX competition with objective scoring:
 
 - maximize cumulative P/L
 - minimize drawdown
 
-## 2. Scope and Start Date
-
-- Game type: live daily simulation on Leo feed rows.
-- Live start guard date: `2026-03-02` (Monday).
-- One decision cycle per signal day.
-- No intraday adjustments.
-
-## 3. Daily Timeline
-
-1. Signal day (`Date`): players decide after close (target around 4:13 PM ET).
-2. Expiry day (`TDate`): round is settled on/after close when outcomes are available.
-
-Runtime behavior:
-
-- `run-live` for a date first settles older due rounds, then creates the current round decisions.
-- `settle` settles all pending rounds with `tdate <= settlement_date`.
-- If feed has no row for the requested `Date`, `run-live` is a no-op (skip, no round created).
-
-## 4. Data Contract
-
-Source options:
-
-- CSV (`--csv`)
-- API (`--api-url` or `LEO_LIVE_URL`; default endpoint is `https://gandalf.gammawizard.com/rapi/GetUltraPureConstantStable`)
-
-Required date fields:
-
-- `Date`
-- `TDate`
-
-Row validity rules:
-
-- there must be exactly one row for the requested `Date`
-- `TDate` must be strictly greater than `Date`
-- settlement requires settlement fields (`Profit`, `CProfit`) to be present
-
-Outcome fields used for settlement:
-
-- `Profit` (put-side 5-wide short baseline)
-- `CProfit` (call-side 5-wide short baseline)
-- `TX` (stored but not used in decision scoring math)
-
-## 5. Information Leakage Controls
-
-Players only receive public fields:
-
-- `Date`, `TDate`, `SPX`, `VIX`, `VixOne`, `RV`, `RV5`, `RV10`, `RV20`, `R`, `RX`, `Forward`
-
-Suppressed from players:
-
-- `Limit`, `CLimit`, `Put`, `Call`, `LImp`, `RImp`, `LeftGo`, `RightGo`,
-  `LGo`, `RGo`, `LReturn`, `RReturn`, `Cat`, `Cat1`, `Cat2`, `TX`, `Win`,
-  `CWin`, `Profit`, `CProfit`
-
-## 6. Players
-
-Active players:
-
-- `player-01`
-- `player-02`
-- `player-03`
-- `player-04`
-- `player-05`
-
-Each player is a neutral self-learning agent with no hardcoded directional/personality bias.
-They choose from the same risk-defined template set and learn online by context bucket
-(`vix_bucket|trend_bucket`) from realized P/L.
-Policy scoring is options-aware for cash-settled SPX outcomes:
-- expected-move regime (from `VixOne` + `SPX`)
-- IV-vs-realized carry (`VixOne` vs `RV5`/`RV`)
-- directional exposure mapping for one-side and risk-reversal structures
-- decision-round exploration counters are updated on entry runs (not only settlement)
-  so agents keep adapting even when outcome fields are delayed
-
-## 7. Trade Universe and Allowed Actions
-
-Per side (put and call), actions are:
-
-- `buy`
-- `sell`
-- `none`
-
-Allowed width:
-
-- `5`
-- `10`
-
-Allowed size:
-
-- integer `1..3`
-
-Risk-defined rule:
-
-- Trades must be packaged as risk-defined structures (or no-trade).
-- Within the current payoff model, this means any combination of put/call vertical sides:
-  one-side, two-side, and risk-reversal style combinations (including asymmetric side widths).
-- Naked option buying/selling is not allowed.
-
-Current implementation note:
-
-- Butterfly is not implemented in settlement/outcome math yet.
-- To support butterfly, Leo feed needs additional leg-level pricing/outcome fields.
-
-## 8. Account and Risk Constraints
-
-Per-player account settings:
-
-- starting balance: `$30,000`
-- hard cap: `30%` of current account value per round
-- safety buffer: `90%` applied to cap
-- commission: `$1` per executed option leg
-- participation target: trade at least `90%` of sessions (soft-enforced)
-
-Effective per-round risk budget formula:
-
-- `risk_budget = account_value * 0.30 * 0.90` (effective 27% of account value)
-
-Where:
-
-- `account_value = max(0, 30000 + cumulative_equity_pnl)`
-
-Max loss estimation (before entry):
-
-- put side max loss = `put_width * risk_per_width_dollars * size` when put action is not `none`
-- call side max loss = `call_width * risk_per_width_dollars * size` when call action is not `none`
-- total `max_loss = put_max_loss + call_max_loss`
-
-Template rule source of truth:
-
-- each template has explicit metadata (`risk_per_width_dollars`, `pnl_scale_per_width`)
-- risk guard and settlement P/L both reference this same template metadata
-
-Risk guard behavior:
-
-1. If `max_loss <= risk_budget`, trade is accepted.
-2. If `max_loss > risk_budget`, size is clamped down to the highest valid size.
-3. If no size can fit budget, trade is flattened to no-trade (`risk_guard_flat`).
-
-Risk metadata stored with every decision:
-
-- `account_value`
-- `risk_budget`
-- `max_loss`
-- `risk_used_pct`
-- `max_risk_pct`
-- `risk_buffer_pct`
-- `risk_guard`
-- `trade_rate_context`
-- `consecutive_holds_context`
-- `target_trade_rate`
-
-Decision records also store derived strike metadata (engine-side only, not visible to agents):
-
-- `put_lower_strike`, `put_upper_strike`, `put_long_strike`, `put_short_strike`
-- `call_lower_strike`, `call_upper_strike`, `call_long_strike`, `call_short_strike`
-
-## 9. P/L Model
-
-Assumptions:
-
-- `Profit` and `CProfit` represent points for 5-wide short vertical baselines.
-- SPX multiplier is `100`.
-
-Per-side P/L:
-
-- `none`: `0`
-- `sell`: `+ base_short_pnl_5w * (width * pnl_scale_per_width) * size * 100`
-- `buy`: sign-flipped sell P/L
-
-Round total:
-
-- `gross_total_pnl = put_gross + call_gross`
-- `fees = executed_legs * $1` (2 legs per active vertical side, scaled by size)
-- `total_pnl = gross_total_pnl - fees`
-
-## 10. Judge and Ranking
-
-Judge is objective and style-agnostic.
-
-Tracked risk metrics:
-
-- `equity_pnl`
-- `current_drawdown`
-- `max_drawdown`
-- `risk_adjusted = equity_pnl - 0.60 * max_drawdown`
-
-Per-round judge score (`0..10`):
-
-- `base = 5 + (risk_adjusted / 250)`
-- `dd_penalty = min(3, current_drawdown / 200)`
-- `round_term = clamp(total_pnl / 200, -1.5, +1.5)`
-- `hold_rate_penalty = min(2.5, max(0, target_trade_rate - trade_rate) * 8.0)`
-- `hold_streak_penalty = min(1.5, max(0, consecutive_holds - 1) * 0.35)`
-- `judge_score = clamp(base - dd_penalty + round_term - hold_rate_penalty - hold_streak_penalty, 0, 10)`
-
-Leaderboard sort order:
+Leaderboard is sorted by:
 
 1. highest `risk_adjusted`
 2. highest `total_pnl`
 3. lowest `max_drawdown`
 
-## 11. One-Trade-Per-Day Semantics
+where `risk_adjusted = equity_pnl - 0.60 * max_drawdown`.
 
-- The system records one round per `signal_date` (`rounds.signal_date` is primary key).
-- A rerun on the same day does not create a second position row; it updates/replaces the same day decision record.
-- Operationally this is still one daily decision set, held to expiry.
+## 2. Timeline and Session Semantics
 
-## 11A. Session Clock and Stale Guards
+- One round per `Date` row.
+- Decision run is after close (`16:00 ET + delay`, default 13 min).
+- Expiry/settlement is `TDate` close.
+- `run-live` always settles due rounds first, then opens the new round.
+- Re-runs are idempotent at round level (`rounds.signal_date` is unique).
 
-- Market timezone is explicit: `America/New_York`.
-- For same-day live rounds, execution is blocked until `16:00 ET + delay` (default `+13 minutes`).
-- No exchange-calendar gating is used; feed row availability is the only session source-of-truth.
-- If `asof` is present from API feed, it must be same-day, post-close, and within max staleness window.
-- Same-day decision runs reject rows that already contain settlement fields (`Profit`, `CProfit`).
+Live start guard:
+
+- `2026-03-02`
+
+## 3. Feed Truth Rules
+
+Feed is source-of-truth for "should we trade today".
+
+Round creation requires:
+
+- exactly one feed row for `Date=YYYY-MM-DD`
+- valid `TDate > Date`
+
+Settlement requires:
+
+- exactly one feed row for `Date=TDate`
+- usable `SPX` settlement value on that `TDate` row
+- settle command date `>= TDate`
+
+No exchange-holiday/early-close calendar logic is used. If feed has no row, nothing happens.
+
+## 4. Data Contract (No Leo Payoff Dependency)
+
+### 4.1 Public feature row (from ConstantStable feed)
+
+Decision-time public fields exposed to players:
+
+- `Date`, `TDate`, `SPX`, `VIX`, `VixOne`, `RV`, `RV5`, `RV10`, `RV20`, `R`, `RX`, `Forward`
+
+Suppressed fields are never sent to players:
+
+- `Limit`, `CLimit`, `Put`, `Call`, `LImp`, `RImp`, `LeftGo`, `RightGo`, `LGo`, `RGo`,
+  `LReturn`, `RReturn`, `Cat`, `Cat1`, `Cat2`, `TX`, `Win`, `CWin`, `Profit`, `CProfit`
+
+### 4.2 Entry pricing input (real chain)
+
+At decision time, engine fetches SPX option chain snapshot from Schwab for expiry `TDate`:
+
+- strikes
+- bid/ask/mark(mid proxy)
+- delta
+- iv
+- chain as-of timestamp
+
+### 4.3 Settlement input
+
+Settlement uses `SPX` from feed row on `TDate` as cash-settlement underlying value.
+
+## 5. Allowed Trade Space
+
+Risk-defined structures only (current implementation):
+
+- put vertical side: `buy` or `sell` or `none`
+- call vertical side: `buy` or `sell` or `none`
+- widths: `5` or `10`
+- target delta per active side: `0.10`, `0.16`, `0.25`
+- size: integer `1..3`
+
+Butterflies are not implemented in `sim_gpt` yet.
+
+## 6. Strike Selection (Deterministic)
+
+For each active side:
+
+1. choose anchor strike by nearest target delta on that option type (`put`/`call`)
+2. compute wing target by requested width
+3. snap to nearest available strike in required direction (down for put wings, up for call wings)
+
+Directional templates:
+
+- put `sell`: short higher put, long lower put
+- put `buy`: long higher put, short lower put
+- call `sell`: short lower call, long higher call
+- call `buy`: long lower call, short higher call
+
+## 7. Entry Fill Model
+
+Fill model: conservative mid (`conservative_mid`)
+
+For each vertical:
+
+- compute spread bid/ask from leg bid/ask
+- mid = `(bid + ask) / 2`
+- half_spread = `(ask - bid) / 2`
+- credit fill = `mid - half_spread * fill_half_spread_factor`
+- debit fill = `mid + half_spread * fill_half_spread_factor`
+
+Default factor:
+
+- `fill_half_spread_factor = 0.50`
+
+## 8. Settlement P/L Model (Intrinsic)
+
+At expiry settlement `S = SPX(TDate)`:
+
+- call intrinsic = `max(0, S - K)`
+- put intrinsic = `max(0, K - S)`
+
+Per vertical side:
+
+- short spread P/L points = `entry_credit - intrinsic_spread_value`
+- long spread P/L points = `intrinsic_spread_value - entry_debit`
+
+Dollar conversion:
+
+- `P/L($) = P/L(points) * 100 * size`
+
+Commission:
+
+- `$1` per leg
+- one vertical side has 2 legs
+- fees are subtracted from realized P/L
+
+## 9. Risk Model
+
+Starting account per player:
+
+- `$30,000`
+
+Risk budget per round:
+
+- `account_value * 0.30 * 0.90` (effective 27%)
+
+`account_value`:
+
+- `max(0, 30000 + cumulative_equity_pnl)`
+
+Max-loss computation is chain-priced:
+
+- derive structure entry cashflow from fills
+- evaluate payoff envelope over strike/boundary knots
+- compute exact worst-case loss per 1x (`unit_max_loss`)
+- scale by size and include commissions
+
+Guard behavior:
+
+1. if max loss <= budget: accept
+2. else clamp size down to largest valid size
+3. if nothing fits: flatten to no-trade (`risk_guard_flat`)
+
+## 10. Participation Control
+
+Soft participation objective:
+
+- players should trade at least 90% of sessions
+
+Enforcement mechanism:
+
+- trade-rate and hold-streak context are injected into decisions
+- judge applies soft penalties for chronic cash-holding
+- no hard trade block
+
+## 11. Judge and Ranking
+
+Judge is style-agnostic and objective.
+
+Tracked metrics:
+
+- `equity_pnl`
+- `current_drawdown`
+- `max_drawdown`
+- `risk_adjusted`
+
+Per-round judge score uses:
+
+- risk-adjusted base
+- drawdown penalty
+- round P/L term
+- hold-rate and hold-streak penalties
 
 ## 12. Storage Model (SQLite)
 
-Database default:
+Default DB:
 
 - `/Users/mgebremichael/Documents/Gamma/sim_gpt/data/live_game.db`
 
@@ -243,18 +210,21 @@ Tables:
 - `results`
 - `player_state`
 
-`results` includes risk analytics fields:
+Important persisted fields:
 
-- `equity_pnl`, `drawdown`, `max_drawdown`, `risk_adjusted`
-
-`rounds` includes UTC clock fields:
-
-- `signal_timestamp_utc`
-- `settlement_timestamp_utc`
+- UTC round timestamps:
+  - `signal_timestamp_utc`
+  - `settlement_timestamp_utc`
+- decision pricing metadata:
+  - target deltas
+  - selected strikes
+  - entry prices
+  - chain as-of
+  - `unit_max_loss`
 
 ## 13. Google Sheets Output
 
-Sheet ID default:
+Default sheet:
 
 - `1aBRPbPhYO39YvxrHVdDzo9nxrABRpHxaRk-FE5hXypc`
 
@@ -262,13 +232,15 @@ Tabs:
 
 - `Live_Game_Rounds`
 - `Live_Game_Leaderboard`
+- `Live_Game_Decisions`
 
-`Live_Game_Rounds` includes:
+Sheets include:
 
-- decision attributes (`put/call action`, widths, size, template)
-- risk metadata (`account_value`, `risk_budget`, `max_loss`, `risk_used_pct`, `risk_guard`)
-- outcomes (`put_pnl`, `call_pnl`, `total_pnl`, `equity_pnl`, `drawdown`, `max_drawdown`, `risk_adjusted`, `judge_score`)
-- integrity metadata (`round_id`, `decision_checksum`)
+- decision settings (actions, widths, target deltas, size, template)
+- resolved strikes and entry prices
+- risk metadata and guard reason
+- realized outcomes and risk-adjusted metrics
+- integrity columns (`round_id`, checksums)
 
 ## 14. Operations
 
@@ -276,44 +248,30 @@ Core commands:
 
 - `python3 -m sim_gpt.cli run-live --date YYYY-MM-DD [--csv ...|--api-url ...]`
 - `python3 -m sim_gpt.cli settle --date YYYY-MM-DD [--csv ...|--api-url ...]`
-- `python3 -m sim_gpt.cli settle --date YYYY-MM-DD --push-sheet ...`
 - `python3 -m sim_gpt.cli leaderboard`
 - `python3 -m sim_gpt.cli round --date YYYY-MM-DD`
 - `python3 -m sim_gpt.cli sync-sheet`
 
-GitHub Actions workflow:
+## 15. Required Environment
 
-- `/Users/mgebremichael/Documents/Gamma/.github/workflows/live_game_sync.yml`
+For feed API access (if not using CSV):
 
-Supported workflow modes:
+- `LEO_LIVE_URL` (optional override)
+- `LEO_LIVE_TOKEN` or `GW_EMAIL` + `GW_PASSWORD`
 
-- `run_live_and_settle`
-- `settle_only`
-- `sync_only`
+For Schwab chain pricing:
 
-## 15. Required Secrets/Env
+- `SCHWAB_APP_KEY`
+- `SCHWAB_APP_SECRET`
+- `SCHWAB_TOKEN_JSON` or `SCHWAB_TOKEN_PATH`
 
 For sheet sync:
 
-- `GOOGLE_SERVICE_ACCOUNT_JSON` or `GOOGLE_SERVICE_ACCOUNT_FILE` or `GOOGLE_APPLICATION_CREDENTIALS`
-- `GSHEET_ID` (optional if using default)
+- `GOOGLE_SERVICE_ACCOUNT_JSON` (or file-based equivalent)
+- `GSHEET_ID` (optional; defaults baked in)
 
-For API feed:
+## 16. Current Gaps
 
-- `LEO_LIVE_URL` (optional override)
-- `LEO_LIVE_TOKEN` (optional bearer token)
-- `GW_EMAIL` + `GW_PASSWORD` (optional fallback auth when bearer token is not provided)
-
-## 16. Non-Goals and Known Gaps
-
-- No butterfly payoff support yet.
-- No slippage model yet (commission is modeled).
-- No explicit daily kill switch yet (risk cap is per round).
-- No exchange holiday/early-close calendar logic by design (feed controls run/no-run).
-
-## 17. Recommended Next Buffers
-
-1. Add slippage haircut in max-loss and realized P/L accounting.
-2. Add daily stop rule (skip new round after configurable daily equity hit).
-3. Add stale-data guard (reject snapshots not matching expected post-close freshness).
-4. Add equity floor mode (force one-side-only or flat under account stress).
+- butterfly template/settlement support not implemented
+- no intraday exits (hold-to-expiry only)
+- no mark-to-market equity curve between entry and settlement
