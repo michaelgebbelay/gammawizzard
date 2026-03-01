@@ -34,6 +34,9 @@ jobs:
       GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
       LEO_LIVE_URL: ${{ secrets.LEO_LIVE_URL }}
       LEO_LIVE_TOKEN: ${{ secrets.LEO_LIVE_TOKEN }}
+      GW_TOKEN: ${{ secrets.GW_TOKEN }}
+      GW_EMAIL: ${{ secrets.GW_EMAIL }}
+      GW_PASSWORD: ${{ secrets.GW_PASSWORD }}
       PYTHONDONTWRITEBYTECODE: "1"
     steps:
       - uses: actions/checkout@v4
@@ -112,4 +115,3 @@ jobs:
         with:
           path: .state/live_game.db
           key: ${{ steps.cache-restore.outputs.cache-primary-key }}
-
