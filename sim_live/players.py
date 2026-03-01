@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import math
 from dataclasses import dataclass
-from datetime import date
 from typing import Iterable
 
 from sim_live.types import Decision, PublicSnapshot, SideAction, build_decision
@@ -63,7 +62,6 @@ TEMPLATES = _template_pool()
 @dataclass
 class Player:
     player_id: str
-    persona: str
 
     def decide(self, snapshot: PublicSnapshot, state: dict) -> Decision:
         raise NotImplementedError
@@ -104,7 +102,7 @@ class Player:
 
 class RegimePlayer(Player):
     def __init__(self):
-        super().__init__("player-regime", "Volatility regime trader.")
+        super().__init__("player-regime")
 
     def decide(self, snapshot: PublicSnapshot, state: dict) -> Decision:
         v = _vix_bucket(snapshot)
@@ -124,7 +122,7 @@ class RegimePlayer(Player):
 
 class MomentumPlayer(Player):
     def __init__(self):
-        super().__init__("player-momentum", "Directional momentum trader.")
+        super().__init__("player-momentum")
 
     def decide(self, snapshot: PublicSnapshot, state: dict) -> Decision:
         trend = _trend_bucket(snapshot)
@@ -171,7 +169,7 @@ class MomentumPlayer(Player):
 
 class VolatilityPlayer(Player):
     def __init__(self):
-        super().__init__("player-volatility", "Realized vs implied vol trader.")
+        super().__init__("player-volatility")
 
     def decide(self, snapshot: PublicSnapshot, state: dict) -> Decision:
         # If implied > realized, bias to selling premium; otherwise buying.
@@ -196,7 +194,7 @@ class VolatilityPlayer(Player):
 
 class ContrarianPlayer(Player):
     def __init__(self):
-        super().__init__("player-contrarian", "Anti-consensus trader.")
+        super().__init__("player-contrarian")
 
     def decide(self, snapshot: PublicSnapshot, state: dict) -> Decision:
         v = _vix_bucket(snapshot)
@@ -241,6 +239,66 @@ class ContrarianPlayer(Player):
         return _pick_best(self, snapshot, state, base)
 
 
+class VixOneBiasPlayer(Player):
+    def __init__(self):
+        super().__init__("player-vixone-bias")
+
+    def decide(self, snapshot: PublicSnapshot, state: dict) -> Decision:
+        vix1d = _vix1d_pct(snapshot)
+
+        # Low VIX1D favors short-vol structures, very high VIX1D favors long-vol.
+        if vix1d <= 11:
+            base = {
+                "flat": 0.2,
+                "put_sell_5": 0.35,
+                "call_sell_5": 0.35,
+                "both_sell_5": 0.55,
+                "both_sell_10": 0.65,
+                "put_buy_5": -0.2,
+                "call_buy_5": -0.2,
+                "both_buy_5": -0.3,
+                "both_buy_10": -0.35,
+            }
+        elif vix1d <= 18:
+            base = {
+                "flat": 0.2,
+                "put_sell_5": 0.4,
+                "call_sell_5": 0.4,
+                "both_sell_5": 0.6,
+                "both_sell_10": 0.2,
+                "put_buy_5": -0.1,
+                "call_buy_5": -0.1,
+                "both_buy_5": -0.15,
+                "both_buy_10": -0.25,
+            }
+        elif vix1d <= 24:
+            base = {
+                "flat": 0.3,
+                "put_sell_5": 0.25,
+                "call_sell_5": 0.25,
+                "both_sell_5": 0.35,
+                "both_sell_10": -0.05,
+                "put_buy_5": 0.15,
+                "call_buy_5": 0.15,
+                "both_buy_5": 0.25,
+                "both_buy_10": 0.1,
+            }
+        else:
+            base = {
+                "flat": 0.35,
+                "put_sell_5": -0.2,
+                "call_sell_5": -0.2,
+                "both_sell_5": -0.25,
+                "both_sell_10": -0.35,
+                "put_buy_5": 0.4,
+                "call_buy_5": 0.4,
+                "both_buy_5": 0.65,
+                "both_buy_10": 0.4,
+            }
+
+        return _pick_best(self, snapshot, state, base)
+
+
 def _pick_best(player: Player, snapshot: PublicSnapshot, state: dict, base_scores: dict[str, float]) -> Decision:
     scored: list[tuple[str, float]] = []
     for template_id, decision in TEMPLATES.items():
@@ -249,7 +307,7 @@ def _pick_best(player: Player, snapshot: PublicSnapshot, state: dict, base_score
         scored.append((template_id, score))
     best = max(scored, key=lambda t: t[1])[0]
     d = TEMPLATES[best]
-    # Copy decision so per-round thesis can be personalized.
+    # Copy decision so each round has explicit model/context metadata.
     return Decision(
         put_action=d.put_action,
         call_action=d.call_action,
@@ -257,7 +315,7 @@ def _pick_best(player: Player, snapshot: PublicSnapshot, state: dict, base_score
         call_width=d.call_width,
         size=d.size,
         template_id=d.template_id,
-        thesis=f"{player.persona} | ctx={_context_key(snapshot)} | template={best}",
+        thesis=f"model={player.player_id} | ctx={_context_key(snapshot)} | template={best}",
     )
 
 
@@ -267,6 +325,7 @@ def build_players() -> list[Player]:
         MomentumPlayer(),
         VolatilityPlayer(),
         ContrarianPlayer(),
+        VixOneBiasPlayer(),
     ]
 
 
@@ -275,4 +334,3 @@ def player_by_id(players: Iterable[Player], player_id: str) -> Player:
         if p.player_id == player_id:
             return p
     raise KeyError(f"Unknown player_id: {player_id}")
-

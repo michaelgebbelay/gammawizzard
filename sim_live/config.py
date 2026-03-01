@@ -20,6 +20,7 @@ PLAYER_IDS = [
     "player-momentum",
     "player-volatility",
     "player-contrarian",
+    "player-vixone-bias",
 ]
 
 # Google Sheets defaults (from the URL you shared).

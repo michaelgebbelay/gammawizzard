@@ -86,13 +86,21 @@ class LiveGameEngine:
                 if snapshot is None:
                     continue
 
-                judge_score, judge_notes = self.judge.score(snapshot, decision, total_pnl)
+                risk = self.store.projected_risk_metrics(
+                    player_id=drow["player_id"],
+                    pending_pnl=total_pnl,
+                )
+                judge_score, judge_notes = self.judge.score(total_pnl=total_pnl, metrics=risk)
                 self.store.save_result(
                     signal_date=signal_date.isoformat(),
                     player_id=drow["player_id"],
                     put_pnl=put_pnl,
                     call_pnl=call_pnl,
                     total_pnl=total_pnl,
+                    equity_pnl=risk["equity_pnl"],
+                    drawdown=risk["current_drawdown"],
+                    max_drawdown=risk["max_drawdown"],
+                    risk_adjusted=risk["risk_adjusted"],
                     judge_score=judge_score,
                     judge_notes=judge_notes,
                 )
@@ -155,4 +163,3 @@ def _json_load(s: str) -> dict:
         return json.loads(s)
     except json.JSONDecodeError:
         return {}
-

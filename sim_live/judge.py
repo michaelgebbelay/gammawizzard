@@ -1,77 +1,35 @@
-"""Judge for process-oriented scoring in the live game."""
+"""Objective judge for risk-adjusted scoring in the live game."""
 
 from __future__ import annotations
 
-from sim_live.types import Decision, PublicSnapshot, SideAction
+from typing import Mapping
 
 
 class Judge:
-    """Rule-based judge for transparent, stable scoring."""
+    """Scores only reward-vs-risk, not player style."""
 
-    def score(self, snapshot: PublicSnapshot, decision: Decision, total_pnl: float) -> tuple[float, str]:
-        outcome = self._outcome_score(total_pnl)
-        discipline = self._discipline_score(decision)
-        regime_fit = self._regime_fit(snapshot, decision)
-        total = (0.45 * outcome) + (0.30 * discipline) + (0.25 * regime_fit)
-        notes = (
-            f"outcome={outcome:.1f}/10, discipline={discipline:.1f}/10, "
-            f"regime_fit={regime_fit:.1f}/10"
+    def __init__(self, drawdown_weight: float = 0.60):
+        self.drawdown_weight = drawdown_weight
+
+    def score(self, total_pnl: float, metrics: Mapping[str, float]) -> tuple[float, str]:
+        equity = float(metrics.get("equity_pnl", 0.0))
+        max_drawdown = float(metrics.get("max_drawdown", 0.0))
+        current_drawdown = float(metrics.get("current_drawdown", 0.0))
+        risk_adjusted = float(
+            metrics.get(
+                "risk_adjusted",
+                equity - (self.drawdown_weight * max_drawdown),
+            )
         )
-        return round(total, 2), notes
 
-    def _outcome_score(self, pnl: float) -> float:
-        if pnl >= 300:
-            return 10.0
-        if pnl >= 150:
-            return 8.5
-        if pnl >= 0:
-            return 7.0
-        if pnl >= -150:
-            return 4.5
-        if pnl >= -300:
-            return 2.5
-        return 1.0
+        # Map risk-adjusted dollars to a bounded 0..10 score.
+        base = 5.0 + (risk_adjusted / 250.0)
+        dd_penalty = min(3.0, current_drawdown / 200.0)
+        round_term = max(-1.5, min(1.5, total_pnl / 200.0))
 
-    def _discipline_score(self, decision: Decision) -> float:
-        active = decision.active_sides()
-        width_penalty = 0.0
-        if decision.put_width == 10:
-            width_penalty += 0.8
-        if decision.call_width == 10:
-            width_penalty += 0.8
-        size_penalty = max(0.0, (decision.size - 1) * 0.7)
-
-        if active == 0:
-            base = 7.5
-        elif active == 1:
-            base = 8.0
-        else:
-            base = 6.5
-        return max(0.0, min(10.0, base - width_penalty - size_penalty))
-
-    def _regime_fit(self, snapshot: PublicSnapshot, decision: Decision) -> float:
-        # High VIX1D: prefer conservative (one side or none).
-        vix1d = snapshot.vix_one * 100.0 if snapshot.vix_one < 1.0 else snapshot.vix_one
-        active = decision.active_sides()
-
-        if vix1d >= 20:
-            if active == 0:
-                return 9.0
-            if active == 1:
-                return 8.0
-            return 5.0
-
-        if vix1d <= 12:
-            if active == 2 and decision.put_action == SideAction.SELL and decision.call_action == SideAction.SELL:
-                return 8.5
-            if active == 1:
-                return 7.0
-            return 6.0
-
-        # Mid-vol default
-        if active == 1:
-            return 8.0
-        if active == 2:
-            return 7.0
-        return 6.5
-
+        score = max(0.0, min(10.0, base - dd_penalty + round_term))
+        notes = (
+            f"equity={equity:.2f}, max_dd={max_drawdown:.2f}, "
+            f"curr_dd={current_drawdown:.2f}, risk_adj={risk_adjusted:.2f}"
+        )
+        return round(score, 2), notes

@@ -32,6 +32,10 @@ RESULT_HEADERS = [
     "put_pnl",
     "call_pnl",
     "total_pnl",
+    "equity_pnl",
+    "drawdown",
+    "max_drawdown",
+    "risk_adjusted",
     "judge_score",
     "judge_notes",
 ]
@@ -41,6 +45,9 @@ LEADERBOARD_HEADERS = [
     "player_id",
     "rounds",
     "total_pnl",
+    "max_drawdown",
+    "risk_adjusted",
+    "win_rate",
     "avg_pnl",
     "avg_judge",
 ]
@@ -120,6 +127,10 @@ def _all_result_rows(store: Store) -> list[list[Any]]:
                   x.put_pnl,
                   x.call_pnl,
                   x.total_pnl,
+                  x.equity_pnl,
+                  x.drawdown,
+                  x.max_drawdown,
+                  x.risk_adjusted,
                   x.judge_score,
                   x.judge_notes
            FROM results x
@@ -153,6 +164,10 @@ def _all_result_rows(store: Store) -> list[list[Any]]:
                 round(float(r["put_pnl"]), 2),
                 round(float(r["call_pnl"]), 2),
                 round(float(r["total_pnl"]), 2),
+                round(float(r["equity_pnl"]), 2),
+                round(float(r["drawdown"]), 2),
+                round(float(r["max_drawdown"]), 2),
+                round(float(r["risk_adjusted"]), 2),
                 round(float(r["judge_score"]), 2),
                 r.get("judge_notes", ""),
             ]
@@ -170,6 +185,9 @@ def _leaderboard_rows(store: Store) -> list[list[Any]]:
                 r["player_id"],
                 int(r["rounds"]),
                 round(float(r["total_pnl"]), 2),
+                round(float(r["max_drawdown"]), 2),
+                round(float(r["risk_adjusted"]), 2),
+                round(float(r["win_rate"]) * 100.0, 2),
                 round(float(r["avg_pnl"]), 2),
                 round(float(r["avg_judge"]), 2),
             ]

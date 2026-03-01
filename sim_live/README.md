@@ -11,6 +11,7 @@ Separate game engine for live Leo rounds (independent of `sim/`).
   - `buy`, `sell`, or `none` for call side
 - Allowed widths: `5` or `10`.
 - No intraday adjustments; one decision per round.
+- Active players: regime, momentum, volatility-spread, contrarian, and `VIXone-bias`.
 
 ## Safety / Leakage Control
 
@@ -67,7 +68,10 @@ python3 -m sim_live.cli settle \
 - The settlement model assumes `Profit` and `CProfit` are side-level 5-wide short-vertical P/L.
 - Buy-side P/L is modeled as the sign-flipped side P/L.
 - 10-wide is modeled with a `2x` width multiplier from 5-wide outcomes.
-- This keeps the game internally consistent for online learning and ranking.
+- Judge and leaderboard are objective risk/reward:
+  - maximize cumulative P/L
+  - minimize drawdown
+  - rank by risk-adjusted score (`equity - 0.60 * max_drawdown`)
 - Google Sheets export auth can use:
   - `GOOGLE_SERVICE_ACCOUNT_JSON` (raw JSON or base64)
   - or `GOOGLE_SERVICE_ACCOUNT_FILE`
