@@ -96,12 +96,12 @@ jobs:
           fi
 
           if [[ "${MODE}" == "run_live_and_settle" ]]; then
-            python -m sim_live.cli --db "${DB}" run-live ${RUN_LIVE_ARGS}
-            python -m sim_live.cli --db "${DB}" settle ${SETTLE_ARGS}
+            python -m sim_gpt.cli --db "${DB}" run-live ${RUN_LIVE_ARGS}
+            python -m sim_gpt.cli --db "${DB}" settle ${SETTLE_ARGS}
           elif [[ "${MODE}" == "settle_only" ]]; then
-            python -m sim_live.cli --db "${DB}" settle ${SETTLE_ARGS}
+            python -m sim_gpt.cli --db "${DB}" settle ${SETTLE_ARGS}
           elif [[ "${MODE}" == "sync_only" ]]; then
-            python -m sim_live.cli --db "${DB}" sync-sheet
+            python -m sim_gpt.cli --db "${DB}" sync-sheet
           else
             echo "Unsupported mode: ${MODE}"
             exit 2

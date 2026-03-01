@@ -8,8 +8,8 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
 
-from sim_live.config import PUBLIC_COLUMNS, SUPPRESSED_COLUMNS
-from sim_live.types import PublicSnapshot, RoundOutcomes
+from sim_gpt.config import PUBLIC_COLUMNS, SUPPRESSED_COLUMNS
+from sim_gpt.types import PublicSnapshot, RoundOutcomes
 
 
 def _to_date(v) -> date:

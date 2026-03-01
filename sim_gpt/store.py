@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from sim_live.config import DB_PATH
+from sim_gpt.config import DB_PATH
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS rounds (

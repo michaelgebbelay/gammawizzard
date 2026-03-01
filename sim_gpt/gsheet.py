@@ -11,12 +11,12 @@ from typing import Any
 from google.oauth2 import service_account
 from googleapiclient.discovery import build as gbuild
 
-from sim_live.config import (
+from sim_gpt.config import (
     DEFAULT_GSHEET_ID,
     DEFAULT_LEADERBOARD_TAB,
     DEFAULT_RESULTS_TAB,
 )
-from sim_live.store import Store
+from sim_gpt.store import Store
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 

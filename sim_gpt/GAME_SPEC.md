@@ -1,8 +1,8 @@
 # Live SPX Risk-Defined Game Spec
 
-This document is the canonical specification for the `sim_live` game in:
+This document is the canonical specification for the `sim_gpt` game in:
 
-- `/Users/mgebremichael/Documents/Gamma/sim_live`
+- `/Users/mgebremichael/Documents/Gamma/sim_gpt`
 
 It reflects the current implemented behavior.
 
@@ -211,7 +211,7 @@ Leaderboard sort order:
 
 Database default:
 
-- `/Users/mgebremichael/Documents/Gamma/sim_live/data/live_game.db`
+- `/Users/mgebremichael/Documents/Gamma/sim_gpt/data/live_game.db`
 
 Tables:
 
@@ -251,12 +251,12 @@ Tabs:
 
 Core commands:
 
-- `python3 -m sim_live.cli run-live --date YYYY-MM-DD [--csv ...|--api-url ...]`
-- `python3 -m sim_live.cli settle --date YYYY-MM-DD [--csv ...|--api-url ...]`
-- `python3 -m sim_live.cli settle --date YYYY-MM-DD --push-sheet ...`
-- `python3 -m sim_live.cli leaderboard`
-- `python3 -m sim_live.cli round --date YYYY-MM-DD`
-- `python3 -m sim_live.cli sync-sheet`
+- `python3 -m sim_gpt.cli run-live --date YYYY-MM-DD [--csv ...|--api-url ...]`
+- `python3 -m sim_gpt.cli settle --date YYYY-MM-DD [--csv ...|--api-url ...]`
+- `python3 -m sim_gpt.cli settle --date YYYY-MM-DD --push-sheet ...`
+- `python3 -m sim_gpt.cli leaderboard`
+- `python3 -m sim_gpt.cli round --date YYYY-MM-DD`
+- `python3 -m sim_gpt.cli sync-sheet`
 
 GitHub Actions workflow:
 

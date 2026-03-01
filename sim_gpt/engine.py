@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta, time, timezone
 from zoneinfo import ZoneInfo
 
-from sim_live.config import (
+from sim_gpt.config import (
     ASOF_MAX_STALENESS_MINUTES,
     COMMISSION_PER_LEG_DOLLARS,
     LIVE_START_DATE,
@@ -15,12 +15,12 @@ from sim_live.config import (
     RISK_BUFFER_PCT,
     STARTING_ACCOUNT_BALANCE,
 )
-from sim_live.feed import LeoFeed
-from sim_live.judge import Judge
-from sim_live.players import Player, build_players, player_by_id
-from sim_live.store import Store
-from sim_live.template_rules import template_rule
-from sim_live.types import Decision, RoundOutcomes, SideAction, build_decision
+from sim_gpt.feed import LeoFeed
+from sim_gpt.judge import Judge
+from sim_gpt.players import Player, build_players, player_by_id
+from sim_gpt.store import Store
+from sim_gpt.template_rules import template_rule
+from sim_gpt.types import Decision, RoundOutcomes, SideAction, build_decision
 
 
 class LiveGameEngine:

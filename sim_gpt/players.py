@@ -7,7 +7,7 @@ import math
 from dataclasses import dataclass
 from typing import Iterable
 
-from sim_live.types import Decision, PublicSnapshot, SideAction, build_decision
+from sim_gpt.types import Decision, PublicSnapshot, SideAction, build_decision
 
 
 def _vix1d_pct(s: PublicSnapshot) -> float:

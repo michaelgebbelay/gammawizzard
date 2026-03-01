@@ -49,30 +49,30 @@ Use `--allow-prestart` only for local validation.
 cd /Users/mgebremichael/Documents/Gamma
 
 # Create today's round (and auto-settle any due rounds first)
-python3 -m sim_live.cli run-live --csv /Users/mgebremichael/Downloads/leo_profit_Dec25.csv
+python3 -m sim_gpt.cli run-live --csv /Users/mgebremichael/Downloads/leo_profit_Dec25.csv
 
 # Validate prestart behavior using historical date
-python3 -m sim_live.cli run-live \
+python3 -m sim_gpt.cli run-live \
   --date 2025-12-23 \
   --csv /Users/mgebremichael/Downloads/leo_profit_Dec25.csv \
   --allow-prestart
 
 # Settle all due rounds as of a date
-python3 -m sim_live.cli settle \
+python3 -m sim_gpt.cli settle \
   --date 2025-12-24 \
   --csv /Users/mgebremichael/Downloads/leo_profit_Dec25.csv
 
 # Leaderboard
-python3 -m sim_live.cli leaderboard
+python3 -m sim_gpt.cli leaderboard
 
 # Round detail
-python3 -m sim_live.cli round --date 2025-12-23
+python3 -m sim_gpt.cli round --date 2025-12-23
 
 # Push results to Google Sheets (defaults to your shared sheet ID)
-python3 -m sim_live.cli sync-sheet
+python3 -m sim_gpt.cli sync-sheet
 
 # Or settle + push in one step
-python3 -m sim_live.cli settle \
+python3 -m sim_gpt.cli settle \
   --csv /Users/mgebremichael/Downloads/leo_profit_Dec25.csv \
   --push-sheet
 ```

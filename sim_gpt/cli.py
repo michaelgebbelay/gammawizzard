@@ -6,16 +6,16 @@ import argparse
 from datetime import date
 from pathlib import Path
 
-from sim_live.config import (
+from sim_gpt.config import (
     DB_PATH,
     LIVE_START_DATE,
     DEFAULT_GSHEET_ID,
     DEFAULT_LEADERBOARD_TAB,
     DEFAULT_RESULTS_TAB,
 )
-from sim_live.engine import LiveGameEngine
-from sim_live.feed import LeoFeed
-from sim_live.store import Store
+from sim_gpt.engine import LiveGameEngine
+from sim_gpt.feed import LeoFeed
+from sim_gpt.store import Store
 
 
 def _parse_date(v: str | None) -> date:
@@ -73,7 +73,7 @@ def cmd_settle(args) -> None:
         print(f"- signal_date={s['signal_date']} tdate={s['tdate']}")
 
     if args.push_sheet:
-        from sim_live.gsheet import sync_game_to_sheet
+        from sim_gpt.gsheet import sync_game_to_sheet
 
         try:
             summary = sync_game_to_sheet(
@@ -141,7 +141,7 @@ def cmd_round(args) -> None:
 
 
 def cmd_sync_sheet(args) -> None:
-    from sim_live.gsheet import sync_game_to_sheet
+    from sim_gpt.gsheet import sync_game_to_sheet
 
     store = Store(Path(args.db) if args.db else DB_PATH)
     try:

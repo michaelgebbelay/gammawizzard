@@ -7,7 +7,7 @@ from datetime import date
 from enum import Enum
 from typing import Optional
 
-from sim_live.config import ALLOWED_WIDTHS, MAX_CONTRACTS
+from sim_gpt.config import ALLOWED_WIDTHS, MAX_CONTRACTS
 
 
 class SideAction(str, Enum):
