@@ -18,17 +18,17 @@ from sim_gpt.config import (
     TARGET_DELTA_MAX_ERROR,
 )
 from sim_gpt.feed import LeoFeed
-from sim_gpt.judge import Judge
 from sim_gpt.players import Player, build_players, player_by_id
 from sim_gpt.store import Store
 from sim_gpt.types import ChainSnapshot, Decision, OptionQuote, SideAction, build_decision
 
 
 class LiveGameEngine:
-    def __init__(self, store: Store, players: list[Player] | None = None, judge: Judge | None = None):
+    def __init__(self, store: Store, players: list[Player] | None = None, judge: object | None = None):
         self.store = store
         self.players = players or build_players()
-        self.judge = judge or Judge()
+        # Judge is deprecated for scoring/ranking in sim_gpt.
+        self.judge = judge
 
     def run_live_round(self, signal_date: date, feed: LeoFeed, allow_prestart: bool = False) -> dict:
         if signal_date < LIVE_START_DATE and not allow_prestart:
@@ -179,10 +179,6 @@ class LiveGameEngine:
                     player_id=drow["player_id"],
                     pending_pnl=total_pnl,
                 )
-                activity = self.store.projected_activity_metrics(player_id=drow["player_id"])
-                judge_metrics = {**risk, **activity}
-                judge_score, judge_notes = self.judge.score(total_pnl=total_pnl, metrics=judge_metrics)
-
                 self.store.save_result(
                     signal_date=signal_date.isoformat(),
                     player_id=drow["player_id"],
@@ -195,12 +191,8 @@ class LiveGameEngine:
                     drawdown=risk["current_drawdown"],
                     max_drawdown=risk["max_drawdown"],
                     risk_adjusted=risk["risk_adjusted"],
-                    judge_score=judge_score,
-                    judge_notes=(
-                        f"{judge_notes} | settle_spx={settlement.settlement_spx:.2f}"
-                        if judge_notes
-                        else f"settle_spx={settlement.settlement_spx:.2f}"
-                    ),
+                    judge_score=0.0,
+                    judge_notes="",
                 )
 
                 player = player_by_id(self.players, drow["player_id"])

@@ -64,8 +64,6 @@ RESULT_HEADERS = [
     "drawdown",
     "max_drawdown",
     "risk_adjusted",
-    "judge_score",
-    "judge_notes",
     "decision_checksum",
 ]
 
@@ -78,7 +76,6 @@ LEADERBOARD_HEADERS = [
     "risk_adjusted",
     "win_rate",
     "avg_pnl",
-    "avg_judge",
 ]
 
 DECISION_HEADERS = [
@@ -210,9 +207,7 @@ def _all_result_rows(store: Store) -> list[list[Any]]:
                   x.equity_pnl,
                   x.drawdown,
                   x.max_drawdown,
-                  x.risk_adjusted,
-                  x.judge_score,
-                  x.judge_notes
+                  x.risk_adjusted
            FROM results x
            JOIN rounds r
              ON r.signal_date = x.signal_date
@@ -276,8 +271,6 @@ def _all_result_rows(store: Store) -> list[list[Any]]:
                 round(float(r["drawdown"]), 2),
                 round(float(r["max_drawdown"]), 2),
                 round(float(r["risk_adjusted"]), 2),
-                round(float(r["judge_score"]), 2),
-                r.get("judge_notes", ""),
                 checksum,
             ]
         )
@@ -403,7 +396,6 @@ def _leaderboard_rows(store: Store) -> list[list[Any]]:
                 round(float(r["risk_adjusted"]), 2),
                 round(float(r["win_rate"]) * 100.0, 2),
                 round(float(r["avg_pnl"]), 2),
-                round(float(r["avg_judge"]), 2),
             ]
         )
     return out

@@ -331,7 +331,6 @@ class Store:
                 """SELECT COUNT(*) AS rounds,
                           SUM(total_pnl) AS total_pnl,
                           AVG(total_pnl) AS avg_pnl,
-                          AVG(judge_score) AS avg_judge,
                           SUM(CASE WHEN total_pnl > 0 THEN 1 ELSE 0 END) * 1.0 / COUNT(*) AS win_rate
                    FROM results
                    WHERE player_id=?""",
@@ -346,7 +345,6 @@ class Store:
                     "rounds": int(agg["rounds"] or 0),
                     "total_pnl": float(agg["total_pnl"] or 0.0),
                     "avg_pnl": float(agg["avg_pnl"] or 0.0),
-                    "avg_judge": float(agg["avg_judge"] or 0.0),
                     "win_rate": float(agg["win_rate"] or 0.0),
                     "equity_pnl": float(metrics["equity_pnl"]),
                     "max_drawdown": float(metrics["max_drawdown"]),
@@ -356,10 +354,9 @@ class Store:
 
         rows.sort(
             key=lambda r: (
-                r["risk_adjusted"],
-                r["total_pnl"],
-                -r["max_drawdown"],
-            ),
-            reverse=True,
+                -float(r["total_pnl"]),
+                float(r["max_drawdown"]),
+                -float(r["win_rate"]),
+            )
         )
         return rows

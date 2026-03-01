@@ -109,13 +109,13 @@ def cmd_leaderboard(args) -> None:
     print("=== Live Game Leaderboard ===")
     print(
         f"{'Rank':>4}  {'Player':<20} {'Rounds':>6} {'Total PnL':>12} "
-        f"{'Max DD':>10} {'Risk Adj':>10} {'Win %':>8} {'Avg PnL':>10} {'Avg Judge':>10}"
+        f"{'Max DD':>10} {'Risk Adj':>10} {'Win %':>8} {'Avg PnL':>10}"
     )
     for i, r in enumerate(rows, 1):
         print(
             f"{i:>4}  {r['player_id']:<20} {r['rounds']:>6} "
             f"{r['total_pnl']:>12.2f} {r['max_drawdown']:>10.2f} {r['risk_adjusted']:>10.2f} "
-            f"{r['win_rate'] * 100:>8.2f} {r['avg_pnl']:>10.2f} {r['avg_judge']:>10.2f}"
+            f"{r['win_rate'] * 100:>8.2f} {r['avg_pnl']:>10.2f}"
         )
 
 
@@ -143,7 +143,7 @@ def cmd_round(args) -> None:
                 f"gross={x['gross_total_pnl']:.2f} fees={x['fees']:.2f} total={x['total_pnl']:.2f} "
                 f"equity={x['equity_pnl']:.2f} "
                 f"dd={x['drawdown']:.2f} maxdd={x['max_drawdown']:.2f} "
-                f"risk_adj={x['risk_adjusted']:.2f} judge={x['judge_score']:.2f}"
+                f"risk_adj={x['risk_adjusted']:.2f}"
             )
 
 

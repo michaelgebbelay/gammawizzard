@@ -13,11 +13,11 @@ Daily post-close 1DTE SPX competition with objective scoring:
 
 Leaderboard is sorted by:
 
-1. highest `risk_adjusted`
-2. highest `total_pnl`
-3. lowest `max_drawdown`
+1. highest `total_pnl`
+2. lowest `max_drawdown` (tie-break)
+3. highest `win_rate` (tie-break)
 
-where `risk_adjusted = equity_pnl - 0.60 * max_drawdown`.
+`risk_adjusted = equity_pnl - 0.60 * max_drawdown` is kept as a descriptive metric only.
 
 ## 2. Timeline and Session Semantics
 
@@ -176,12 +176,9 @@ Soft participation objective:
 Enforcement mechanism:
 
 - trade-rate and hold-streak context are injected into decisions
-- judge applies soft penalties for chronic cash-holding
 - no hard trade block
 
-## 11. Judge and Ranking
-
-Judge is style-agnostic and objective.
+## 11. Performance Metrics
 
 Tracked metrics:
 
@@ -189,13 +186,6 @@ Tracked metrics:
 - `current_drawdown`
 - `max_drawdown`
 - `risk_adjusted`
-
-Per-round judge score uses:
-
-- risk-adjusted base
-- drawdown penalty
-- round P/L term
-- hold-rate and hold-streak penalties
 
 ## 12. Storage Model (SQLite)
 
