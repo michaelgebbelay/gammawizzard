@@ -15,6 +15,9 @@ import time
 import boto3
 
 TASK_ROOT = os.environ.get("LAMBDA_TASK_ROOT", "/var/task")
+REPORT_STEPS = {"cs_summary_to_gsheet.py", "cs_performance_to_gsheet.py"}
+DEFAULT_REPORT_OWNER = "tt-individual"
+DEFAULT_REPORT_DELAY_SECS = 90
 
 # ---------------------------------------------------------------------------
 # Account configurations
@@ -169,6 +172,8 @@ COMMON_ENV = {
     "TT_ACCOUNT_NUMBERS": "5WT09219:tt-individual,5WT20360:tt-ira",
     "CS_SUMMARY_TAB": "CS_Summary",
     "CS_PERFORMANCE_TAB": "CS_Performance",
+    "CS_REPORT_OWNER": DEFAULT_REPORT_OWNER,
+    "CS_REPORT_DELAY_SECS": str(DEFAULT_REPORT_DELAY_SECS),
     "VERT_STEP_WAIT": "15",
     "VERT_POLL_SECS": "2.0",
     "VERT_CANCEL_SETTLE": "1.0",
@@ -295,6 +300,9 @@ def _handle_sim_collect(event):
 
     Event payload: {"account": "sim-collect", "phase": "open|mid|close|close5"}
     """
+    import logging
+    logging.basicConfig(level=logging.INFO, force=True)
+
     t0 = time.time()
     phase = event.get("phase", "")
     valid_phases = ("open", "mid", "close", "close5")
@@ -523,10 +531,29 @@ def lambda_handler(event, context):
     # -- 5. Post-trade steps (best-effort, time-permitting) --
     remaining_ms = context.get_remaining_time_in_millis() if context else 30000
     remaining_s = max(5, int(remaining_ms / 1000) - 5)
+    report_owner = (env.get("CS_REPORT_OWNER") or DEFAULT_REPORT_OWNER).strip()
+    report_delay_secs = int(env.get("CS_REPORT_DELAY_SECS") or str(DEFAULT_REPORT_DELAY_SECS))
+    report_delay_applied = False
+
     for step in cfg.get("post_steps", []):
         try:
+            step_name = os.path.basename(step)
+            is_report_step = step_name in REPORT_STEPS
+
+            # Prevent concurrent full-sheet rewrites by allowing only one account
+            # invocation to run reporting scripts.
+            if is_report_step and account != report_owner:
+                print(f"SKIP {step_name}: reporting owner is {report_owner}, current={account}")
+                continue
+
+            # Give other account invocations time to finish tracking updates first.
+            if is_report_step and not report_delay_applied and report_delay_secs > 0:
+                print(f"Reporting delay: sleeping {report_delay_secs}s before {step_name}")
+                time.sleep(report_delay_secs)
+                report_delay_applied = True
+
             step_timeout = min(30, remaining_s)
-            run_script(step, env, timeout_s=step_timeout, label=os.path.basename(step))
+            run_script(step, env, timeout_s=step_timeout, label=step_name)
             remaining_ms = context.get_remaining_time_in_millis() if context else 10000
             remaining_s = max(5, int(remaining_ms / 1000) - 5)
         except Exception as e:

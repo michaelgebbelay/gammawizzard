@@ -165,12 +165,45 @@ def _extract_quote_list(j: dict) -> list:
     return []
 
 
+def _symbol_candidates(order_sym: str, streamer_sym: str = "") -> List[str]:
+    """Build a list of symbol format candidates for TT quote lookup.
+
+    TT's /market-data/by-type endpoint is picky about symbol format.
+    The streamer symbol (e.g. '.SPXW260227C6940') usually works best,
+    followed by the compact format without spaces.
+    """
+    candidates = []
+    seen = set()
+
+    def _add(s: str):
+        s = s.strip()
+        if s and s not in seen:
+            candidates.append(s)
+            seen.add(s)
+
+    # Streamer symbol is most reliable (e.g. '.SPXW260227C6940')
+    if streamer_sym:
+        _add(streamer_sym)
+        _add(streamer_sym.lstrip("."))
+
+    # Compact (no spaces): 'SPXW260227C06940000'
+    _add(order_sym.replace(" ", ""))
+
+    # Original padded OCC format as last resort
+    _add(order_sym)
+
+    return candidates
+
+
 def _fetch_quotes_batch(symbols: List[str],
-                        batch_size: int = 10) -> Dict[str, dict]:
+                        batch_size: int = 10,
+                        symbol_candidates: Optional[Dict[str, List[str]]] = None,
+                        ) -> Dict[str, dict]:
     """Fetch quotes for multiple option symbols via REST.
 
     TT's /market-data/by-type accepts one symbol at a time.
-    We fetch sequentially with brief pauses to avoid 429s.
+    We try multiple symbol format candidates per contract (streamer,
+    compact, padded) and return on first hit.
     """
     quotes = {}
     total = len(symbols)
@@ -178,15 +211,19 @@ def _fetch_quotes_batch(symbols: List[str],
 
     for i in range(0, total, batch_size):
         batch = symbols[i:i + batch_size]
-        for sym in batch:
-            j = _tt_get("/market-data/by-type", params={"option": sym})
-            items = _extract_quote_list(j)
-            if items:
-                q = items[0]
-                quotes[sym] = q
-                fetched += 1
-            else:
-                logger.debug("No quote data for %s", sym)
+        for order_sym in batch:
+            candidates = (symbol_candidates or {}).get(order_sym, [order_sym])
+            got_quote = False
+            for candidate in candidates:
+                j = _tt_get("/market-data/by-type", params={"option": candidate})
+                items = _extract_quote_list(j)
+                if items:
+                    quotes[order_sym] = items[0]
+                    fetched += 1
+                    got_quote = True
+                    break
+            if not got_quote:
+                logger.debug("No quote data for %s (tried %s)", order_sym, candidates)
 
         # Brief pause between batches to avoid 429s
         if i + batch_size < total:
@@ -272,6 +309,7 @@ def fetch_tt_spx_chain(phase: str = "open",
     call_symbols = []
     put_symbols = []
     strike_map = {}  # symbol → (strike, put_call)
+    symbol_candidates = {}  # order_symbol → [candidate_symbols_to_try]
 
     for st in strikes_list:
         strike_price = _sfloat(st.get("strike-price"))
@@ -280,20 +318,24 @@ def fetch_tt_spx_chain(phase: str = "open",
 
         call_sym = st.get("call", "")
         put_sym = st.get("put", "")
+        call_streamer = st.get("call-streamer-symbol", "")
+        put_streamer = st.get("put-streamer-symbol", "")
 
         if call_sym:
             call_symbols.append(call_sym)
             strike_map[call_sym] = (strike_price, "C")
+            symbol_candidates[call_sym] = _symbol_candidates(call_sym, call_streamer)
         if put_sym:
             put_symbols.append(put_sym)
             strike_map[put_sym] = (strike_price, "P")
+            symbol_candidates[put_sym] = _symbol_candidates(put_sym, put_streamer)
 
     all_symbols = call_symbols + put_symbols
     logger.info("Fetching quotes for %d calls + %d puts = %d symbols",
                 len(call_symbols), len(put_symbols), len(all_symbols))
 
     # Step 3: Fetch quotes/greeks (may be empty after hours)
-    quotes = _fetch_quotes_batch(all_symbols)
+    quotes = _fetch_quotes_batch(all_symbols, symbol_candidates=symbol_candidates)
 
     # Step 4: Fetch VIX and underlying (already fetched above, refresh)
     vix = _fetch_vix()
