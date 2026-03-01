@@ -31,6 +31,7 @@ Runtime behavior:
 
 - `run-live` for a date first settles older due rounds, then creates the current round decisions.
 - `settle` settles all pending rounds with `tdate <= settlement_date`.
+- If feed has no row for the requested `Date`, `run-live` is a no-op (skip, no round created).
 
 ## 4. Data Contract
 
@@ -48,6 +49,7 @@ Row validity rules:
 
 - there must be exactly one row for the requested `Date`
 - `TDate` must be strictly greater than `Date`
+- settlement requires settlement fields (`Profit`, `CProfit`) to be present
 
 Outcome fields used for settlement:
 
@@ -197,8 +199,8 @@ Leaderboard sort order:
 ## 11A. Session Clock and Stale Guards
 
 - Market timezone is explicit: `America/New_York`.
-- For same-day live rounds, execution is blocked until session close plus delay (default `+13 minutes`).
-- Trading day check blocks weekends/holidays (with early-close support).
+- For same-day live rounds, execution is blocked until `16:00 ET + delay` (default `+13 minutes`).
+- No exchange-calendar gating is used; feed row availability is the only session source-of-truth.
 - If `asof` is present from API feed, it must be same-day, post-close, and within max staleness window.
 - Same-day decision runs reject rows that already contain settlement fields (`Profit`, `CProfit`).
 
@@ -280,7 +282,7 @@ For API feed:
 - No butterfly payoff support yet.
 - No transaction cost/slippage model yet.
 - No explicit daily kill switch yet (risk cap is per round).
-- No market-holiday session calendar logic yet.
+- No exchange holiday/early-close calendar logic by design (feed controls run/no-run).
 
 ## 17. Recommended Next Buffers
 

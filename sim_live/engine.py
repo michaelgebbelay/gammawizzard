@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, time, timezone
 from zoneinfo import ZoneInfo
 
 from sim_live.config import (
@@ -17,7 +17,6 @@ from sim_live.config import (
 from sim_live.feed import LeoFeed
 from sim_live.judge import Judge
 from sim_live.players import Player, build_players, player_by_id
-from sim_live.session_calendar import is_trading_day, session_close_time_et
 from sim_live.store import Store
 from sim_live.template_rules import template_rule
 from sim_live.types import Decision, RoundOutcomes, SideAction, build_decision
@@ -38,7 +37,19 @@ class LiveGameEngine:
         # Settle any due rounds first.
         settled = self.settle_due(signal_date, feed)
 
-        raw_row = feed.validate_signal_row(signal_date)
+        try:
+            raw_row = feed.validate_signal_row(signal_date)
+        except ValueError as e:
+            # Feed is source-of-truth: no row means no round today.
+            if "No Leo data found for signal date" in str(e):
+                return {
+                    "status": "skipped",
+                    "reason": str(e),
+                    "signal_date": signal_date.isoformat(),
+                    "settled_rounds": settled,
+                    "decisions": [],
+                }
+            raise
         self._validate_live_signal_window(signal_date, raw_row, allow_prestart=allow_prestart)
         snapshot = feed.get_public_snapshot(signal_date)
         if snapshot is None:
@@ -84,6 +95,7 @@ class LiveGameEngine:
             )
 
         return {
+            "status": "created",
             "signal_date": snapshot.signal_date.isoformat(),
             "tdate": snapshot.tdate.isoformat(),
             "settled_rounds": settled,
@@ -96,7 +108,11 @@ class LiveGameEngine:
 
         for row in due:
             signal_date = date.fromisoformat(row["signal_date"])
-            outcomes = feed.get_outcomes(signal_date)
+            try:
+                outcomes = feed.get_outcomes(signal_date)
+            except ValueError:
+                # Settle only when feed has exactly one valid row for this signal date.
+                continue
             if outcomes is None:
                 # Outcome data not available yet; keep pending.
                 continue
@@ -107,8 +123,9 @@ class LiveGameEngine:
                     continue
                 decision = Decision.from_dict(_json_load(drow["decision_json"]))
                 put_pnl, call_pnl, total_pnl = score_decision(decision, outcomes)
-                snapshot = feed.get_public_snapshot(signal_date)
-                if snapshot is None:
+                try:
+                    snapshot = feed.get_public_snapshot(signal_date)
+                except ValueError:
                     continue
 
                 risk = self.store.projected_risk_metrics(
@@ -148,22 +165,16 @@ class LiveGameEngine:
         return settled_rows
 
     def _validate_live_signal_window(self, signal_date: date, row: dict, allow_prestart: bool) -> None:
-        if not is_trading_day(signal_date):
-            raise ValueError(f"Signal date {signal_date.isoformat()} is not a market trading day")
-
         now_utc = datetime.now(timezone.utc)
         market = ZoneInfo(MARKET_TZ)
         now_et = now_utc.astimezone(market)
+        is_same_day = signal_date == now_et.date()
 
-        close_dt_et = datetime.combine(
-            signal_date,
-            session_close_time_et(signal_date),
-            tzinfo=market,
-        )
+        close_dt_et = datetime.combine(signal_date, time(16, 0), tzinfo=market)
         earliest_entry_et = close_dt_et + timedelta(minutes=POST_CLOSE_DELAY_MINUTES)
 
         # Apply post-close timing checks for same-day live rounds only.
-        if signal_date == now_et.date() and not allow_prestart and now_et < earliest_entry_et:
+        if is_same_day and not allow_prestart and now_et < earliest_entry_et:
             raise ValueError(
                 "Too early for live entry: "
                 f"now={now_et.isoformat()} "
@@ -172,7 +183,7 @@ class LiveGameEngine:
             )
 
         # Guard against accidentally using already-settled columns on same-day runs.
-        if signal_date == now_et.date():
+        if is_same_day:
             if row.get("Profit") not in (None, "") or row.get("CProfit") not in (None, ""):
                 raise ValueError(
                     "Signal row includes settlement fields (Profit/CProfit) on decision run; refusing to trade"
@@ -192,12 +203,13 @@ class LiveGameEngine:
                 "Data asof is pre-close; expected post-close snapshot "
                 f"(asof={asof_et.isoformat()}, close={close_dt_et.isoformat()})"
             )
-        max_age = timedelta(minutes=ASOF_MAX_STALENESS_MINUTES)
-        if now_et - asof_et > max_age:
-            raise ValueError(
-                f"Data asof is stale by > {ASOF_MAX_STALENESS_MINUTES} minutes "
-                f"(asof={asof_et.isoformat()}, now={now_et.isoformat()})"
-            )
+        if is_same_day:
+            max_age = timedelta(minutes=ASOF_MAX_STALENESS_MINUTES)
+            if now_et - asof_et > max_age:
+                raise ValueError(
+                    f"Data asof is stale by > {ASOF_MAX_STALENESS_MINUTES} minutes "
+                    f"(asof={asof_et.isoformat()}, now={now_et.isoformat()})"
+                )
 
     def _apply_risk_limits(self, player_id: str, decision: Decision) -> tuple[Decision, dict]:
         equity = float(self.store.projected_risk_metrics(player_id)["equity_pnl"])

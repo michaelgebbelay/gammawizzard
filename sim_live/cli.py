@@ -36,6 +36,12 @@ def cmd_run_live(args) -> None:
         allow_prestart=args.allow_prestart,
     )
 
+    if result.get("status") == "skipped":
+        print(f"Round skipped: signal_date={result['signal_date']} reason={result.get('reason', '')}")
+        if result["settled_rounds"]:
+            print(f"Auto-settled {len(result['settled_rounds'])} due round(s)")
+        return
+
     print(
         f"Round created: signal_date={result['signal_date']} "
         f"tdate={result['tdate']} "

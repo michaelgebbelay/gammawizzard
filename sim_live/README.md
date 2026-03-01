@@ -19,10 +19,10 @@ Separate game engine for live Leo rounds (independent of `sim/`).
 
 ## Session/Data Guards
 
-- Skip non-trading days (weekends + built-in 2026 US market holidays).
-- Respect early-close sessions for post-close entry timing.
+- Feed is source-of-truth: no row for `Date` means no round.
 - Require exactly one source row for each signal date.
 - Require `TDate > Date`.
+- Settle only when `settlement_date >= TDate` and settlement fields (`Profit`, `CProfit`) are present.
 - If an `asof` timestamp exists, require same-day post-close and non-stale freshness.
 - Decision-time runs reject rows with `Profit/CProfit` already populated for same-day live rounds.
 
