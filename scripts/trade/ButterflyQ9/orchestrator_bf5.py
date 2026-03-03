@@ -472,8 +472,15 @@ def fetch_spx_chain(c, target_exp: date) -> dict:
 
 def parse_chain(raw: dict, target_exp: date) -> Dict[str, Any]:
     underlying = raw.get("underlying") or {}
-    spot = fnum(underlying.get("last")) or fnum(underlying.get("close"))
+    spot = (
+        fnum(underlying.get("last"))
+        or fnum(underlying.get("close"))
+        or fnum(underlying.get("mark"))
+        or fnum(underlying.get("lastPrice"))
+        or fnum(underlying.get("closePrice"))
+    )
     if not spot or spot <= 0:
+        print(f"BF_Q9 DEBUG: underlying keys={list(underlying.keys())[:15]} values(last={underlying.get('last')}, close={underlying.get('close')}, mark={underlying.get('mark')})")
         raise RuntimeError("BF_Q9 FAIL: no underlying spot in chain")
 
     call_map = raw.get("callExpDateMap") or {}

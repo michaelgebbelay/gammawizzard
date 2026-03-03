@@ -507,8 +507,15 @@ def parse_chain(raw: dict, target_exp: date) -> Dict[str, Any]:
       spot, atm_strike, em, atm_call_mid, strikes{strike->{bid,ask,mid}}
     """
     underlying = raw.get("underlying") or {}
-    spot = fnum(underlying.get("last")) or fnum(underlying.get("close"))
+    spot = (
+        fnum(underlying.get("last"))
+        or fnum(underlying.get("close"))
+        or fnum(underlying.get("mark"))
+        or fnum(underlying.get("lastPrice"))
+        or fnum(underlying.get("closePrice"))
+    )
     if not spot or spot <= 0:
+        print(f"BF_Q17 DEBUG: underlying keys={list(underlying.keys())[:15]} values(last={underlying.get('last')}, close={underlying.get('close')}, mark={underlying.get('mark')})")
         raise RuntimeError("BF_Q17 FAIL: no underlying spot in chain")
 
     call_map = raw.get("callExpDateMap") or {}
