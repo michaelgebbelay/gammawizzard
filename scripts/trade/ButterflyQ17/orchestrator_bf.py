@@ -633,6 +633,7 @@ def main():
     # --- Fetch 2DTE chain from Schwab ---
     try:
         raw_chain = fetch_spx_chain(c, target_exp)
+        print(f"BF_Q17 CHAIN_RAW: top_keys={list(raw_chain.keys())[:10]} status={raw_chain.get('status')} isDelayed={raw_chain.get('isDelayed')}")
         chain = parse_chain(raw_chain, target_exp)
     except Exception as e:
         print(f"BF_Q17 SKIP: chain fetch/parse failed: {e}")
