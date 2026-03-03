@@ -165,7 +165,8 @@ def parse_csv_log(csv_path):
             row = [""] * len(HEADERS)
             row[C_TRADE_DATE] = r.get("trade_date", "")
             row[C_EXPIRATION] = r.get("expiration", "")
-            row[C_DIRECTION] = r.get("direction", "")
+            direction = r.get("direction", "")
+            row[C_DIRECTION] = direction
             row[3] = r.get("bucket", "")
             row[4] = vix1d_pct
             row[5] = r.get("vix", "")
@@ -174,7 +175,7 @@ def parse_csv_log(csv_path):
             row[C_WIDTH] = r.get("width", "")
             # Entry mid = NBBO mid at time of entry
             row[C_ENTRY_MID] = r.get("nbbo_mid", "") or r.get("last_price", "")
-            row[C_STATUS] = "OPEN"
+            row[C_STATUS] = "SKIP" if direction == "SKIP" else "OPEN"
             rows.append(row)
 
     return rows

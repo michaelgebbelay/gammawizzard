@@ -15,13 +15,14 @@
 # Strategy trained on 2018-2026 backtest, Q17 quantile VIX1D buckets (2023+ training).
 # 825 trades, $206k total, 1.45 PF, zero losses > $5k.
 
+import csv
 import os
 import sys
 import re
 import time
 import random
 import subprocess
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
 
 import requests
@@ -56,6 +57,51 @@ STRIKE_STEP = 5          # SPX strikes are $5 apart
 BF_UNIT_DOLLARS = 30_000 # $30k equity per 1 butterfly contract
 
 BF_LOG_PATH = os.environ.get("BF_LOG_PATH", "logs/butterfly_q17_trades.csv")
+
+ET = timezone(timedelta(hours=-5))
+
+
+def log_skip_row(bucket, vix1d, vix=None, reason="SKIP"):
+    """Log a SKIP entry to CSV so the tracker can record it in the sheet."""
+    path = os.environ.get("BF_LOG_PATH", BF_LOG_PATH)
+    d = os.path.dirname(path)
+    if d and not os.path.exists(d):
+        os.makedirs(d, exist_ok=True)
+
+    cols = [
+        "ts_utc", "ts_et", "trade_date", "expiration",
+        "direction", "action", "bucket",
+        "lower_osi", "center_osi", "upper_osi",
+        "width", "atm_strike", "spot", "em", "em_mult",
+        "vix", "vix1d",
+        "unit_dollars", "equity", "units",
+        "qty_requested", "qty_filled",
+        "ladder_prices", "last_price",
+        "nbbo_bid", "nbbo_ask", "nbbo_mid",
+        "order_ids", "reason",
+    ]
+
+    now_utc = datetime.now(timezone.utc)
+    now_et = now_utc.astimezone(ET)
+    row = {
+        "ts_utc": now_utc.strftime("%Y-%m-%d %H:%M:%S"),
+        "ts_et": now_et.strftime("%Y-%m-%d %H:%M:%S"),
+        "trade_date": now_et.strftime("%Y-%m-%d"),
+        "direction": "SKIP",
+        "bucket": str(bucket),
+        "vix1d": f"{vix1d:.4f}" if vix1d else "",
+        "vix": f"{vix:.2f}" if vix else "",
+        "qty_filled": "0",
+        "reason": reason,
+    }
+
+    write_header = not os.path.exists(path)
+    with open(path, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=cols)
+        if write_header:
+            w.writeheader()
+        w.writerow({k: row.get(k, "") for k in cols})
+
 
 GW_BASE = os.environ.get("GW_BASE", "https://gandalf.gammawizard.com").rstrip("/")
 GW_ENDPOINT = os.environ.get("GW_ENDPOINT", "rapi/GetUltraPureConstantStable").lstrip("/")
@@ -608,6 +654,8 @@ def main():
 
     if action == "SKIP":
         print(f"BF_Q17 SKIP: Q17 bucket {bucket} -> SKIP")
+        if dry_run:
+            log_skip_row(bucket, vix1d, reason="DRY_RUN")
         return 0
 
     # --- Fetch VIX from Schwab, apply VIX > 23 cap ---
@@ -621,6 +669,8 @@ def main():
 
     if action == "SELL" and vix > VIX_CAP:
         print(f"BF_Q17 SKIP: VIX {vix:.2f} > cap {VIX_CAP} — SELL capped to SKIP")
+        if dry_run:
+            log_skip_row(bucket, vix1d, vix=vix, reason="DRY_RUN")
         return 0
 
     # --- Compute target expiration (2 business days from today) ---

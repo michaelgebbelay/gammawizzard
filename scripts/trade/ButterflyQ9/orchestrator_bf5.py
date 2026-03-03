@@ -47,7 +47,6 @@ __version__ = "1.0.0"
 
 # ---------- Strategy Config ----------
 
-VIX_CAP = 23.0          # SELL -> SKIP when VIX > this
 SELL_EM_MULT = 1.25     # width = EM * 1.25 for SELL
 BUY_EM_MULT = 0.85      # width = EM * 0.85 for BUY
 MIN_WIDTH = 15
@@ -575,18 +574,14 @@ def main():
         print(f"BF_Q9 SKIP: Q9 bucket {bucket} -> SKIP")
         return 0
 
-    # --- Fetch VIX from Schwab, apply VIX > 23 cap ---
+    # --- Fetch VIX from Schwab (informational, no cap) ---
     try:
         vix = fetch_vix(c)
     except Exception as e:
-        print(f"BF_Q9 SKIP: VIX fetch failed: {e}")
-        return 0
+        print(f"BF_Q9 WARN: VIX fetch failed (non-fatal): {e}")
+        vix = 0.0
 
     print(f"BF_Q9 VIX: {vix:.2f}")
-
-    if action == "SELL" and vix > VIX_CAP:
-        print(f"BF_Q9 SKIP: VIX {vix:.2f} > cap {VIX_CAP} — SELL capped to SKIP")
-        return 0
 
     # --- Compute target expiration (5 business days from today) ---
     today = date.today()
