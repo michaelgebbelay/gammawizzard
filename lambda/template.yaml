@@ -112,6 +112,38 @@ Resources:
         RoleArn: !GetAtt SchedulerRole.Arn
         Input: '{"account": "tt-individual"}'
 
+  # ---------- Butterfly Q17 Schedule ----------
+  ButterflySchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: gamma-bf-schwab
+      Description: "ButterflyQ17 SPX 2DTE butterfly (Schwab)"
+      State: ENABLED
+      ScheduleExpression: !Ref ScheduleTime
+      ScheduleExpressionTimezone: "America/New_York"
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt TradingFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"account": "butterfly"}'
+
+  # ---------- Butterfly Q9 5DTE Schedule ----------
+  Butterfly5Schedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: gamma-bf5-schwab
+      Description: "ButterflyQ9 SPX 5DTE butterfly (Schwab)"
+      State: ENABLED
+      ScheduleExpression: !Ref ScheduleTime
+      ScheduleExpressionTimezone: "America/New_York"
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt TradingFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"account": "butterfly5"}'
+
   # ---------- Morning Check Schedule ----------
   MorningCheckSchedule:
     Type: AWS::Scheduler::Schedule
