@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
-"""Butterfly trade tracker — logs entries and settles expired trades in Google Sheets.
+"""Butterfly trade tracker — paper trade logging with daily price updates.
 
 Runs as a post_step for butterfly Lambda accounts.
-Handles two tabs:
-  - BF_Q17_2DTE : 2DTE Q17 butterfly trades
-  - BF_Q9_5DTE  : 5DTE Q9 butterfly trades
+Each invocation handles ONE tab (set via BF_TRACKER_TAB env var).
 
 On each run:
-  1. Reads the current invocation's CSV trade log (if any new trades).
-  2. Appends new trade rows to the appropriate Google Sheet tab.
-  3. Checks both tabs for OPEN trades whose expiration has passed.
-  4. Fetches SPX close from Schwab and computes settlement P&L.
+  1. Reads today's trade from the CSV log (if any, including DRY_RUN).
+  2. Appends new trade row to the Google Sheet tab.
+  3. For OPEN trades: fetches current butterfly NBBO and fills the
+     appropriate intermediate column (d4, d3, d2, d1 based on DTE).
+  4. For expired trades (DTE=0): computes settlement P&L.
 """
 
 import csv
 import os
+import re
 import sys
-from datetime import date
+import time
+import random
+from datetime import date, timedelta
 
 # ---------- path setup ----------
 
@@ -34,6 +36,7 @@ def _add_scripts_root():
 
 
 _IMPORT_ERR = None
+_SCHWAB_ERR = None
 try:
     _add_scripts_root()
     from lib.sheets import sheets_client, ensure_tab, read_existing, col_letter
@@ -41,57 +44,55 @@ except Exception as e:
     sheets_client = None
     _IMPORT_ERR = e
 
+try:
+    from schwab_token_keeper import schwab_client
+except Exception as e:
+    schwab_client = None
+    _SCHWAB_ERR = e
+
 TAG = "BF_TRACKER"
 
 # ---------- config ----------
 
-# Tab configs: each entry maps a CSV log to a Google Sheet tab
-TAB_CONFIGS = [
-    {
-        "tab": "BF_Q17_2DTE",
-        "csv_env": "BF_Q17_LOG_PATH",
-        "csv_default": "/tmp/bf_trades.csv",
-    },
-    {
-        "tab": "BF_Q9_5DTE",
-        "csv_env": "BF_Q9_LOG_PATH",
-        "csv_default": "/tmp/bf5_trades.csv",
-    },
-]
-
 HEADERS = [
-    "trade_date",       # 0
-    "expiration",       # 1
-    "direction",        # 2
-    "bucket",           # 3
-    "vix1d",            # 4
-    "vix",              # 5
-    "spot",             # 6
-    "atm_strike",       # 7
-    "width",            # 8
-    "em",               # 9
-    "em_mult",          # 10
-    "qty_req",          # 11
-    "qty_filled",       # 12
-    "fill_price",       # 13
-    "nbbo_mid",         # 14
-    "status",           # 15
-    "spot_settle",      # 16
-    "settle_value",     # 17
-    "pnl",              # 18
+    "trade_date",     # 0
+    "expiration",     # 1
+    "direction",      # 2
+    "bucket",         # 3
+    "vix1d",          # 4
+    "vix",            # 5
+    "spot",           # 6
+    "atm_strike",     # 7
+    "width",          # 8
+    "entry_mid",      # 9
+    "d4_mid",         # 10
+    "d3_mid",         # 11
+    "d2_mid",         # 12
+    "d1_mid",         # 13
+    "status",         # 14
+    "spot_settle",    # 15
+    "settle_value",   # 16
+    "pnl",            # 17
 ]
 
-IDX_TRADE_DATE = 0
-IDX_EXPIRATION = 1
-IDX_DIRECTION = 2
-IDX_ATM_STRIKE = 7
-IDX_WIDTH = 8
-IDX_FILL_PRICE = 13
-IDX_STATUS = 15
-IDX_SPOT_SETTLE = 16
-IDX_SETTLE_VALUE = 17
-IDX_PNL = 18
-IDX_QTY_FILLED = 12
+# Column indices
+C_TRADE_DATE = 0
+C_EXPIRATION = 1
+C_DIRECTION = 2
+C_ATM_STRIKE = 7
+C_WIDTH = 8
+C_ENTRY_MID = 9
+C_D4 = 10
+C_D3 = 11
+C_D2 = 12
+C_D1 = 13
+C_STATUS = 14
+C_SPOT_SETTLE = 15
+C_SETTLE_VALUE = 16
+C_PNL = 17
+
+# Map DTE (business days to expiration) -> column index
+DTE_COL = {4: C_D4, 3: C_D3, 2: C_D2, 1: C_D1}
 
 
 # ---------- helpers ----------
@@ -121,8 +122,29 @@ def _fnum(x):
         return None
 
 
+def _business_days_between(d1, d2):
+    """Count business days from d1 to d2 (exclusive of d1, inclusive of d2)."""
+    count = 0
+    d = d1
+    while d < d2:
+        d += timedelta(days=1)
+        if d.weekday() < 5:
+            count += 1
+    return count
+
+
+def build_osi(exp_str, strike):
+    """Build OSI symbol from expiration string and strike."""
+    exp_date = date.fromisoformat(exp_str)
+    exp6 = f"{exp_date:%y%m%d}"
+    mills = int(round(float(strike))) * 1000
+    return f"{'SPXW':<6}{exp6}C{mills:08d}"
+
+
+# ---------- CSV log parsing ----------
+
 def parse_csv_log(csv_path):
-    """Parse the butterfly trade CSV log into sheet-ready rows."""
+    """Parse butterfly trade CSV log into sheet-ready rows."""
     if not os.path.exists(csv_path):
         return []
 
@@ -130,9 +152,10 @@ def parse_csv_log(csv_path):
     with open(csv_path, newline="") as f:
         reader = csv.DictReader(f)
         for r in reader:
-            # Skip entries with no fill
+            # Accept both filled trades and DRY_RUN entries
+            reason = r.get("reason", "")
             filled = r.get("qty_filled", "0")
-            if filled in ("0", ""):
+            if reason != "DRY_RUN" and filled in ("0", ""):
                 continue
 
             # VIX1D: convert from decimal to percentage for display
@@ -140,40 +163,80 @@ def parse_csv_log(csv_path):
             vix1d_pct = f"{vix1d_raw * 100:.1f}" if vix1d_raw is not None else ""
 
             row = [""] * len(HEADERS)
-            row[IDX_TRADE_DATE] = r.get("trade_date", "")
-            row[IDX_EXPIRATION] = r.get("expiration", "")
-            row[IDX_DIRECTION] = r.get("direction", "")
+            row[C_TRADE_DATE] = r.get("trade_date", "")
+            row[C_EXPIRATION] = r.get("expiration", "")
+            row[C_DIRECTION] = r.get("direction", "")
             row[3] = r.get("bucket", "")
             row[4] = vix1d_pct
             row[5] = r.get("vix", "")
             row[6] = r.get("spot", "")
-            row[IDX_ATM_STRIKE] = r.get("atm_strike", "")
-            row[IDX_WIDTH] = r.get("width", "")
-            row[9] = r.get("em", "")
-            row[10] = r.get("em_mult", "")
-            row[11] = r.get("qty_requested", "")
-            row[IDX_QTY_FILLED] = filled
-            row[IDX_FILL_PRICE] = r.get("last_price", "")
-            row[14] = r.get("nbbo_mid", "")
-            row[IDX_STATUS] = "OPEN"
+            row[C_ATM_STRIKE] = r.get("atm_strike", "")
+            row[C_WIDTH] = r.get("width", "")
+            # Entry mid = NBBO mid at time of entry
+            row[C_ENTRY_MID] = r.get("nbbo_mid", "") or r.get("last_price", "")
+            row[C_STATUS] = "OPEN"
             rows.append(row)
 
     return rows
 
 
-def settle_butterfly_call(lower, center, upper, spot):
-    """Compute call butterfly settlement value per contract (in points)."""
-    lo = max(0.0, spot - lower)
-    ce = max(0.0, spot - center)
-    hi = max(0.0, spot - upper)
-    return lo - 2 * ce + hi
+# ---------- Schwab option quote helpers ----------
+
+def _sleep_for_429(resp, attempt):
+    ra = resp.headers.get("Retry-After")
+    if ra:
+        try:
+            return max(1.0, float(ra))
+        except Exception:
+            pass
+    return min(6.0, 0.5 * (2 ** attempt)) + random.uniform(0.0, 0.25)
 
 
-def fetch_spx_price():
-    """Fetch current SPX price from Schwab quotes API."""
+def fetch_quotes_batch(c, symbols):
+    """Fetch quotes for multiple option symbols in one Schwab API call."""
+    for attempt in range(4):
+        try:
+            r = c.session.get(
+                "https://api.schwabapi.com/marketdata/v1/quotes",
+                params={"symbols": ",".join(symbols), "fields": "quote"},
+                timeout=20,
+            )
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code == 429:
+                time.sleep(_sleep_for_429(r, attempt))
+                continue
+        except Exception:
+            pass
+        time.sleep(min(3.0, 0.4 * (2 ** attempt)))
+    return {}
+
+
+def butterfly_mid_from_quotes(quotes, lower_osi, center_osi, upper_osi):
+    """Compute butterfly spread mid price from batch quotes response."""
+    def get_mid(osi):
+        data = quotes.get(osi, {})
+        q = data.get("quote", data) if isinstance(data, dict) else {}
+        bid = _fnum(q.get("bidPrice") or q.get("bid"))
+        ask = _fnum(q.get("askPrice") or q.get("ask"))
+        if bid is not None and ask is not None and bid >= 0 and ask >= 0:
+            return (bid + ask) / 2.0
+        return None
+
+    lo_mid = get_mid(lower_osi)
+    ce_mid = get_mid(center_osi)
+    hi_mid = get_mid(upper_osi)
+
+    if lo_mid is None or ce_mid is None or hi_mid is None:
+        return None
+
+    # Long butterfly spread value: +1 lower, -2 center, +1 upper
+    return lo_mid - 2 * ce_mid + hi_mid
+
+
+def fetch_spx_price(c):
+    """Fetch current SPX price from Schwab."""
     try:
-        from schwab_token_keeper import schwab_client
-        c = schwab_client()
         r = c.session.get(
             "https://api.schwabapi.com/marketdata/v1/quotes",
             params={"symbols": "$SPX", "fields": "quote"},
@@ -190,6 +253,14 @@ def fetch_spx_price():
     return None
 
 
+def settle_butterfly_call(lower, center, upper, spot):
+    """Compute call butterfly settlement value per contract (in points)."""
+    lo = max(0.0, spot - lower)
+    ce = max(0.0, spot - center)
+    hi = max(0.0, spot - upper)
+    return lo - 2 * ce + hi
+
+
 # ---------- main ----------
 
 def main() -> int:
@@ -199,122 +270,206 @@ def main() -> int:
         msg = f"google sheets libs not installed ({_IMPORT_ERR})"
         return fail(msg, 2) if strict else skip(msg)
 
-    # Use BF_GSHEET_ID if set, otherwise fall back to GSHEET_ID
     gsheet_id = (os.environ.get("BF_GSHEET_ID") or os.environ.get("GSHEET_ID") or "").strip()
     if not gsheet_id:
-        return fail("BF_GSHEET_ID/GSHEET_ID missing", 2) if strict else skip("BF_GSHEET_ID missing")
+        return fail("BF_GSHEET_ID missing", 2) if strict else skip("BF_GSHEET_ID missing")
 
     if not (os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip():
         return fail("SA creds missing", 2) if strict else skip("SA creds missing")
 
+    tab = (os.environ.get("BF_TRACKER_TAB") or "BF_Q9_5DTE").strip()
+    csv_path = (os.environ.get("BF_LOG_PATH") or "/tmp/bf5_trades.csv").strip()
+
     try:
         svc, _ = sheets_client()
-        sid = gsheet_id  # override with butterfly sheet ID
+        sid = gsheet_id
     except Exception as e:
         msg = f"sheets_client failed: {type(e).__name__}: {e}"
         return fail(msg, 2) if strict else skip(msg)
 
-    today_str = date.today().isoformat()
-    spx_price = None  # lazy-fetched once needed
-
-    for cfg in TAB_CONFIGS:
-        tab = cfg["tab"]
-        csv_path = os.environ.get(cfg["csv_env"], cfg["csv_default"])
-
+    # Schwab client for price updates (best-effort)
+    schwab_c = None
+    if schwab_client is not None:
         try:
-            # Ensure tab exists with headers
-            ensure_tab(svc, sid, tab, HEADERS)
-
-            # Read existing rows
-            existing = read_existing(svc, sid, tab, HEADERS)
-            existing_dates = {row[IDX_TRADE_DATE] for row in existing if row[IDX_TRADE_DATE]}
-
-            # --- 1. Add new trades from CSV log ---
-            new_rows = parse_csv_log(csv_path)
-            appends = []
-            for row in new_rows:
-                if row[IDX_TRADE_DATE] and row[IDX_TRADE_DATE] not in existing_dates:
-                    appends.append(row)
-                    existing.append(row)
-                    existing_dates.add(row[IDX_TRADE_DATE])
-
-            if appends:
-                svc.spreadsheets().values().append(
-                    spreadsheetId=sid,
-                    range=f"{tab}!A1",
-                    valueInputOption="RAW",
-                    insertDataOption="INSERT_ROWS",
-                    body={"values": appends},
-                ).execute()
-                log(f"{tab}: appended {len(appends)} new trade(s)")
-
-            # --- 2. Settle expired trades ---
-            updates = []
-            for i, row in enumerate(existing):
-                if row[IDX_STATUS] != "OPEN":
-                    continue
-
-                exp_date = row[IDX_EXPIRATION]
-                if not exp_date or exp_date > today_str:
-                    continue
-
-                # Trade has expired — compute settlement
-                if spx_price is None:
-                    spx_price = fetch_spx_price()
-                    if spx_price:
-                        log(f"SPX price for settlement: {spx_price:.2f}")
-
-                if spx_price is None:
-                    log("Cannot settle: SPX price unavailable")
-                    break
-
-                atm = _fnum(row[IDX_ATM_STRIKE])
-                width = _fnum(row[IDX_WIDTH])
-                fill = _fnum(row[IDX_FILL_PRICE])
-                direction = row[IDX_DIRECTION]
-                qty = _fnum(row[IDX_QTY_FILLED]) or 1.0
-
-                if atm is None or width is None:
-                    continue
-
-                lower = atm - width
-                upper = atm + width
-                settle_val = settle_butterfly_call(lower, atm, upper, spx_price)
-
-                if fill is not None:
-                    if direction == "SELL":
-                        pnl = (fill - settle_val) * 100 * qty
-                    else:
-                        pnl = (settle_val - fill) * 100 * qty
-                else:
-                    pnl = None
-
-                # Build update: columns P (status) through S (pnl) = indices 15-18
-                # Sheet row = i + 2 (1-indexed, header is row 1)
-                sheet_row = i + 2
-                status_col = col_letter(IDX_STATUS)
-                pnl_col = col_letter(IDX_PNL)
-                range_str = f"{tab}!{status_col}{sheet_row}:{pnl_col}{sheet_row}"
-
-                values = [
-                    "SETTLED",
-                    f"{spx_price:.2f}",
-                    f"{settle_val:.2f}",
-                    f"{pnl:.0f}" if pnl is not None else "",
-                ]
-                updates.append({"range": range_str, "values": [values]})
-
-            if updates:
-                svc.spreadsheets().values().batchUpdate(
-                    spreadsheetId=sid,
-                    body={"valueInputOption": "RAW", "data": updates},
-                ).execute()
-                log(f"{tab}: settled {len(updates)} trade(s)")
-
+            schwab_c = schwab_client()
         except Exception as e:
-            log(f"{tab}: error: {type(e).__name__}: {e}")
-            if strict:
-                return 2
+            log(f"Schwab client init failed (non-fatal): {e}")
+
+    today = date.today()
+    today_str = today.isoformat()
+
+    try:
+        # --- 1. Ensure tab exists ---
+        ensure_tab(svc, sid, tab, HEADERS)
+
+        # --- 2. Read existing rows ---
+        existing = read_existing(svc, sid, tab, HEADERS)
+        existing_dates = {row[C_TRADE_DATE] for row in existing if row[C_TRADE_DATE]}
+
+        # --- 3. Add new trades from CSV log ---
+        new_rows = parse_csv_log(csv_path)
+        appends = []
+        for row in new_rows:
+            if row[C_TRADE_DATE] and row[C_TRADE_DATE] not in existing_dates:
+                appends.append(row)
+                existing.append(row)
+                existing_dates.add(row[C_TRADE_DATE])
+
+        if appends:
+            svc.spreadsheets().values().append(
+                spreadsheetId=sid,
+                range=f"{tab}!A1",
+                valueInputOption="RAW",
+                insertDataOption="INSERT_ROWS",
+                body={"values": appends},
+            ).execute()
+            log(f"appended {len(appends)} new entry(ies)")
+
+        # --- 4. Update intermediate prices + settle expired trades ---
+        if schwab_c is None:
+            log("No Schwab client — skipping price updates")
+            return 0
+
+        # Collect all open trades that need price updates
+        updates = []
+        osi_symbols = set()
+        open_trades = []
+
+        for i, row in enumerate(existing):
+            if row[C_STATUS] != "OPEN":
+                continue
+
+            exp_str = row[C_EXPIRATION]
+            atm = _fnum(row[C_ATM_STRIKE])
+            width = _fnum(row[C_WIDTH])
+            if not exp_str or atm is None or width is None:
+                continue
+
+            try:
+                exp_date = date.fromisoformat(exp_str)
+            except ValueError:
+                continue
+
+            dte = _business_days_between(today, exp_date)
+
+            lower_osi = build_osi(exp_str, atm - width)
+            center_osi = build_osi(exp_str, atm)
+            upper_osi = build_osi(exp_str, atm + width)
+
+            open_trades.append({
+                "row_idx": i,
+                "dte": dte,
+                "exp_str": exp_str,
+                "exp_date": exp_date,
+                "atm": atm,
+                "width": width,
+                "direction": row[C_DIRECTION],
+                "entry_mid": _fnum(row[C_ENTRY_MID]),
+                "lower_osi": lower_osi,
+                "center_osi": center_osi,
+                "upper_osi": upper_osi,
+            })
+
+            # Collect OSI symbols for batch quote (only for non-expired)
+            if dte > 0:
+                osi_symbols.update([lower_osi, center_osi, upper_osi])
+
+        if not open_trades:
+            log("No open trades to update")
+            return 0
+
+        # Fetch all option quotes in one batch
+        quotes = {}
+        if osi_symbols:
+            # Batch in groups of 30 symbols (10 trades × 3 legs)
+            sym_list = list(osi_symbols)
+            for j in range(0, len(sym_list), 30):
+                batch = sym_list[j:j + 30]
+                batch_quotes = fetch_quotes_batch(schwab_c, batch)
+                quotes.update(batch_quotes)
+                if j + 30 < len(sym_list):
+                    time.sleep(0.5)
+
+            log(f"Fetched quotes for {len(quotes)} option symbols")
+
+        # Fetch SPX for settlement (lazy)
+        spx_price = None
+
+        for trade in open_trades:
+            sheet_row = trade["row_idx"] + 2  # 1-indexed, header is row 1
+            dte = trade["dte"]
+
+            if dte > 0 and dte in DTE_COL:
+                # Intermediate price update
+                col_idx = DTE_COL[dte]
+
+                # Skip if already filled
+                current_val = existing[trade["row_idx"]][col_idx] if col_idx < len(existing[trade["row_idx"]]) else ""
+                if current_val:
+                    continue
+
+                bf_mid = butterfly_mid_from_quotes(
+                    quotes,
+                    trade["lower_osi"],
+                    trade["center_osi"],
+                    trade["upper_osi"],
+                )
+                if bf_mid is not None:
+                    col_ltr = col_letter(col_idx)
+                    updates.append({
+                        "range": f"{tab}!{col_ltr}{sheet_row}",
+                        "values": [[f"{bf_mid:.2f}"]],
+                    })
+                    log(f"  {trade['exp_str']} DTE={dte}: bf_mid={bf_mid:.2f}")
+
+            elif dte <= 0:
+                # Expired — compute settlement
+                if spx_price is None:
+                    spx_price = fetch_spx_price(schwab_c)
+                    if spx_price:
+                        log(f"SPX for settlement: {spx_price:.2f}")
+
+                if spx_price is None:
+                    log("Cannot settle: SPX unavailable")
+                    continue
+
+                lower = trade["atm"] - trade["width"]
+                upper = trade["atm"] + trade["width"]
+                settle_val = settle_butterfly_call(lower, trade["atm"], upper, spx_price)
+
+                pnl = None
+                if trade["entry_mid"] is not None:
+                    if trade["direction"] == "SELL":
+                        pnl = (trade["entry_mid"] - settle_val) * 100
+                    else:
+                        pnl = (settle_val - trade["entry_mid"]) * 100
+
+                # Update status through pnl (columns C_STATUS to C_PNL)
+                status_col = col_letter(C_STATUS)
+                pnl_col = col_letter(C_PNL)
+                updates.append({
+                    "range": f"{tab}!{status_col}{sheet_row}:{pnl_col}{sheet_row}",
+                    "values": [[
+                        "SETTLED",
+                        f"{spx_price:.2f}",
+                        f"{settle_val:.2f}",
+                        f"{pnl:.0f}" if pnl is not None else "",
+                    ]],
+                })
+                log(f"  SETTLED {trade['exp_str']}: settle={settle_val:.2f} pnl=${pnl:.0f}" if pnl else f"  SETTLED {trade['exp_str']}")
+
+        if updates:
+            svc.spreadsheets().values().batchUpdate(
+                spreadsheetId=sid,
+                body={"valueInputOption": "RAW", "data": updates},
+            ).execute()
+            log(f"Updated {len(updates)} cell(s)")
+
+    except Exception as e:
+        msg = f"error: {type(e).__name__}: {e}"
+        log(msg)
+        if strict:
+            return 2
 
     return 0
 
