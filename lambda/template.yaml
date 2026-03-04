@@ -72,7 +72,7 @@ Resources:
     Properties:
       Name: gamma-cs-schwab
       Description: "ConstantStable Schwab account"
-      State: ENABLED
+      State: DISABLED
       ScheduleExpression: !Ref ScheduleTime
       ScheduleExpressionTimezone: "America/New_York"
       FlexibleTimeWindow:
@@ -111,22 +111,6 @@ Resources:
         Arn: !GetAtt TradingFunction.Arn
         RoleArn: !GetAtt SchedulerRole.Arn
         Input: '{"account": "tt-individual"}'
-
-  # ---------- Butterfly Q17 Schedule ----------
-  ButterflySchedule:
-    Type: AWS::Scheduler::Schedule
-    Properties:
-      Name: gamma-bf-schwab
-      Description: "ButterflyQ17 SPX 2DTE butterfly (Schwab)"
-      State: ENABLED
-      ScheduleExpression: !Ref ScheduleTime
-      ScheduleExpressionTimezone: "America/New_York"
-      FlexibleTimeWindow:
-        Mode: "OFF"
-      Target:
-        Arn: !GetAtt TradingFunction.Arn
-        RoleArn: !GetAtt SchedulerRole.Arn
-        Input: '{"account": "butterfly"}'
 
   # ---------- Butterfly Q9 5DTE Schedule ----------
   Butterfly5Schedule:

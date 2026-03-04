@@ -5,7 +5,6 @@
 # - Fetches VIX1D (VixOne) from Leo's GammaWizard API.
 # - Fetches VIX quote + 5DTE SPX option chain from Schwab.
 # - Classifies VIX1D into Q9 quantile bucket -> SELL / BUY / SKIP.
-# - VIX > 23 cap: SELL -> SKIP.
 # - Applies adaptive cadence gate (FAST_V1) by equity + drawdown tiers.
 # - Computes ATM strike and expected move (EM).
 # - Selects wings by side-specific put-delta profiles:
@@ -13,7 +12,7 @@
 #   - SELL execution: 35P anchor, symmetric call wing from put width
 # - Falls back to EM-scaled symmetric width only if delta strikes are unavailable.
 # - Builds 3-leg ATM call butterfly: BUY lower + SELL 2x center + BUY upper.
-# - Delegates placement to scripts/trade/ButterflyQ17/place_butterfly.py via BF_* envs.
+# - Delegates placement to scripts/trade/ButterflyQ9/place_butterfly.py via BF_* envs.
 #
 # Strategy trained on 2023-2026 backtest, Q9 quantile VIX1D buckets (BASE).
 # Walk-forward OOS: $96k, PF 1.32, 219 trades.
@@ -58,6 +57,7 @@ MIN_WIDTH = 15
 MAX_WIDTH = 200
 STRIKE_STEP = 5          # SPX strikes are $5 apart
 BF_UNIT_DOLLARS = 30_000 # $30k equity per 1 butterfly contract
+BF_MIN_LIVE_EQUITY = float(os.environ.get("BF_MIN_LIVE_EQUITY", "15000"))
 DTE_BUSINESS_DAYS = 5    # 5 business days to expiration
 BF_PRICE_TICK = 0.05
 
@@ -78,17 +78,24 @@ BF_CADENCE_STATE_PATH = os.environ.get(
     "BF_CADENCE_STATE_PATH",
     str(Path(BF_LOG_PATH).with_name("butterfly_q9_cadence_state.json")),
 )
+BF_CADENCE_STATE_S3_BUCKET = (
+    os.environ.get("BF_CADENCE_STATE_S3_BUCKET")
+    or os.environ.get("SIM_CACHE_BUCKET", "")
+).strip()
+BF_CADENCE_STATE_S3_KEY = (
+    os.environ.get("BF_CADENCE_STATE_S3_KEY", "cadence/butterfly_q9_cadence_state.json")
+).strip()
 
 # FAST_V1 thresholds:
 # 1) DD >= 30% -> Wed only
 # 2) DD >= 20% -> Tue/Thu
-# 3) Balance < 23k -> Tue/Thu
-# 4) 23k-32k -> Mon/Tue/Wed
+# 3) Balance < 15k -> Tue/Thu
+# 4) 15k-32k -> Mon/Tue/Wed
 # 5) 32k-40k -> Mon/Tue/Wed/Thu
 # 6) >= 40k -> Mon-Fri
 FAST_V1_DD_W_ONLY = 0.30
 FAST_V1_DD_TTH = 0.20
-FAST_V1_BAL_TTH = 23_000.0
+FAST_V1_BAL_TTH = 15_000.0
 FAST_V1_BAL_MTW = 32_000.0
 FAST_V1_BAL_MTWTH = 40_000.0
 
@@ -265,7 +272,52 @@ def fnum(x):
         return None
 
 
+def _load_cadence_peak_equity_s3(bucket: str, key: str) -> Optional[float]:
+    if not bucket or not key:
+        return None
+    try:
+        import boto3
+        s3 = boto3.client("s3")
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        body = obj.get("Body")
+        raw = body.read() if body else b""
+        j = json.loads((raw or b"{}").decode("utf-8"))
+        v = fnum((j or {}).get("peak_equity"))
+        if v is None:
+            return 0.0
+        return max(0.0, float(v))
+    except Exception:
+        return None
+
+
+def _save_cadence_peak_equity_s3(bucket: str, key: str, peak_equity: float) -> bool:
+    if not bucket or not key:
+        return False
+    try:
+        import boto3
+        s3 = boto3.client("s3")
+        payload = {
+            "peak_equity": float(max(0.0, peak_equity)),
+            "updated_utc_epoch": int(time.time()),
+        }
+        s3.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=json.dumps(payload, indent=2).encode("utf-8"),
+            ContentType="application/json",
+        )
+        return True
+    except Exception:
+        return False
+
+
 def _load_cadence_peak_equity(path: str) -> float:
+    # Durable store (S3) is preferred when configured (e.g., Lambda).
+    s3_val = _load_cadence_peak_equity_s3(BF_CADENCE_STATE_S3_BUCKET, BF_CADENCE_STATE_S3_KEY)
+    if s3_val is not None:
+        return s3_val
+
+    # Fallback: local file (works for local/dev runs).
     try:
         p = Path(path)
         if not p.exists():
@@ -278,6 +330,15 @@ def _load_cadence_peak_equity(path: str) -> float:
 
 
 def _save_cadence_peak_equity(path: str, peak_equity: float) -> None:
+    # Best effort durable save (S3) first; local fallback remains for dev/local.
+    saved_s3 = _save_cadence_peak_equity_s3(
+        BF_CADENCE_STATE_S3_BUCKET,
+        BF_CADENCE_STATE_S3_KEY,
+        peak_equity,
+    )
+    if saved_s3:
+        return
+
     try:
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -317,9 +378,9 @@ def cadence_fast_v1_allowed_weekdays(equity: float, peak_equity: float) -> Tuple
     if dd >= FAST_V1_DD_TTH:
         return {1, 3}, "TTH_DD20", dd
     if eq < FAST_V1_BAL_TTH:
-        return {1, 3}, "TTH_LT23K", dd
+        return {1, 3}, "TTH_LT15K", dd
     if eq < FAST_V1_BAL_MTW:
-        return {0, 1, 2}, "MTW_23K_32K", dd
+        return {0, 1, 2}, "MTW_15K_32K", dd
     if eq < FAST_V1_BAL_MTWTH:
         return {0, 1, 2, 3}, "MTWTH_32K_40K", dd
     return {0, 1, 2, 3, 4}, "ALL_GTE40K", dd
@@ -780,13 +841,24 @@ def main():
     print(f"BF_Q9 EQUITY: {oc_val} (src={oc_src}, acct={acct_num})")
 
     force_paper_only = False
-    if oc_val is None or oc_val < BF_UNIT_DOLLARS:
-        # Keep recording would-have-traded rows, but never send live orders.
+    if oc_val is None:
+        units = 1
+        force_paper_only = True
+        print("BF_Q9 PAPER_ONLY: equity unavailable — no live order, logging hypothetical trade")
+    elif oc_val < BF_MIN_LIVE_EQUITY:
+        # Keep recording would-have-traded rows, but never send live orders below live floor.
         units = 1
         force_paper_only = True
         print(
-            f"BF_Q9 PAPER_ONLY: equity {oc_val} below minimum ${BF_UNIT_DOLLARS:,} "
-            f"— no live order, logging hypothetical trade"
+            f"BF_Q9 PAPER_ONLY: equity {oc_val} below live minimum ${BF_MIN_LIVE_EQUITY:,.0f} "
+            "— no live order, logging hypothetical trade"
+        )
+    elif oc_val < BF_UNIT_DOLLARS:
+        # Allow live 1-lot below full unit size once equity is above live floor.
+        units = 1
+        print(
+            f"BF_Q9 LIVE_1LOT: equity {oc_val} between "
+            f"${BF_MIN_LIVE_EQUITY:,.0f} and ${BF_UNIT_DOLLARS:,.0f}"
         )
     else:
         units = int(oc_val // BF_UNIT_DOLLARS)
@@ -795,7 +867,10 @@ def main():
     if effective_dry_run:
         print(f"BF_Q9 DRY_RUN effective={effective_dry_run} (user_dry_run={dry_run}, force_paper_only={force_paper_only})")
 
-    print(f"BF_Q9 UNITS: {units} (BF_UNIT_DOLLARS={BF_UNIT_DOLLARS}, equity={oc_val})")
+    print(
+        f"BF_Q9 UNITS: {units} "
+        f"(BF_MIN_LIVE_EQUITY={BF_MIN_LIVE_EQUITY:.0f}, BF_UNIT_DOLLARS={BF_UNIT_DOLLARS}, equity={oc_val})"
+    )
 
     today = date.today()
     cadence_mode = "STATIC"
@@ -1070,12 +1145,15 @@ def main():
         "SCHWAB_ACCT_HASH":  acct_hash,
         "BF_LOG_PATH":       BF_LOG_PATH,
         "BF_DRY_RUN":        "true" if effective_dry_run else "false",
-        "BF_DRY_RUN_REASON": "DRY_RUN_EQUITY_LT_30K" if force_paper_only else "DRY_RUN",
+        "BF_DRY_RUN_REASON": (
+            f"DRY_RUN_EQUITY_LT_{int(BF_MIN_LIVE_EQUITY):d}"
+            if force_paper_only else "DRY_RUN"
+        ),
     })
 
     print(f"BF_Q9 PLACING: {direction} {send_qty}x {width}w butterfly @ {center}")
     rc = subprocess.call(
-        [sys.executable, "scripts/trade/ButterflyQ17/place_butterfly.py"], env=env,
+        [sys.executable, "scripts/trade/ButterflyQ9/place_butterfly.py"], env=env,
     )
     if rc != 0:
         print(f"BF_Q9 PLACER: rc={rc}")

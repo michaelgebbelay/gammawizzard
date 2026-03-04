@@ -18,6 +18,7 @@ TASK_ROOT = os.environ.get("LAMBDA_TASK_ROOT", "/var/task")
 REPORT_STEPS = {"cs_summary_to_gsheet.py", "cs_performance_to_gsheet.py"}
 DEFAULT_REPORT_OWNER = "tt-individual"
 DEFAULT_REPORT_DELAY_SECS = 90
+DISABLE_SCHWAB_CS_DEFAULT = True
 
 # ---------------------------------------------------------------------------
 # Account configurations
@@ -48,31 +49,6 @@ ACCOUNTS = {
             "CS_COST_PER_CONTRACT": "0.97",
         },
     },
-    "butterfly": {
-        "orchestrator": "scripts/trade/ButterflyQ17/orchestrator_bf.py",
-        "post_steps": [
-            "scripts/data/bf_tracker_to_gsheet.py",
-        ],
-        "token_ssm_path": "/gamma/schwab/token_json",
-        "token_file": "/tmp/schwab_token.json",
-        "env_from_ssm": {
-            "SCHWAB_APP_KEY": "/gamma/schwab/app_key",
-            "SCHWAB_APP_SECRET": "/gamma/schwab/app_secret",
-        },
-        "static_env": {
-            "SCHWAB_TOKEN_PATH": "/tmp/schwab_token.json",
-            "BF_LOG_PATH": "/tmp/bf_trades.csv",
-            "BF_TRACKER_TAB": "BF_Q17_2DTE",
-            "BF_GSHEET_ID": "1r3ipwByfs2Zhgb4WmSTmXCpF8HEphxD9CJlMtr7GSGs",
-            "BF_STEP_WAIT": "15",
-            "BF_POLL_SECS": "2.0",
-            "BF_CANCEL_SETTLE": "1.0",
-            "BF_MAX_LADDER": "3",
-            "BF_DRY_RUN": "true",
-            "BF_TOPUP": "1",
-            "BF_GUARD_NO_CLOSE": "1",
-        },
-    },
     "butterfly5": {
         "orchestrator": "scripts/trade/ButterflyQ9/orchestrator_bf5.py",
         "post_steps": [
@@ -93,7 +69,7 @@ ACCOUNTS = {
             "BF_POLL_SECS": "2.0",
             "BF_CANCEL_SETTLE": "1.0",
             "BF_MAX_LADDER": "3",
-            "BF_DRY_RUN": "true",
+            "BF_DRY_RUN": "false",
             "BF_TOPUP": "1",
             "BF_GUARD_NO_CLOSE": "1",
         },
@@ -528,6 +504,12 @@ def lambda_handler(event, context):
     t0 = time.time()
     account = event.get("account", "")
     dry_run = event.get("dry_run", False)
+    disable_schwab_cs = str(
+        os.environ.get(
+            "DISABLE_SCHWAB_CS",
+            "1" if DISABLE_SCHWAB_CS_DEFAULT else "0",
+        )
+    ).strip().lower() in ("1", "true", "yes", "y", "on")
 
     # Warm-up ping — just loads the container, no work done
     if account == "warmup":
@@ -537,6 +519,17 @@ def lambda_handler(event, context):
     # Sim chain collection — separate flow (no subprocess, writes to S3)
     if account == "sim-collect":
         return _handle_sim_collect(event)
+
+    # Safety switch: keep ConstantStable disabled on Schwab while TT stays active.
+    if account == "schwab" and disable_schwab_cs:
+        print("SKIP schwab: ConstantStable disabled by DISABLE_SCHWAB_CS")
+        return {
+            "status": "ok",
+            "account": "schwab",
+            "skipped": True,
+            "reason": "SCHWAB_CS_DISABLED",
+            "duration_s": round(time.time() - t0, 1),
+        }
 
     if account not in ACCOUNTS:
         msg = f"Unknown account: {account!r}. Expected one of {list(ACCOUNTS)}"
@@ -571,6 +564,7 @@ def lambda_handler(event, context):
 
     if dry_run:
         env["VERT_DRY_RUN"] = "true"
+        env["BF_DRY_RUN"] = "true"
 
     # Map SSM values to env vars
     for env_key, ssm_path in cfg["env_from_ssm"].items():
