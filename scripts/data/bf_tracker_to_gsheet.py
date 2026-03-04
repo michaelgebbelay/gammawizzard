@@ -65,14 +65,15 @@ HEADERS = [
     "atm_strike",     # 7
     "width",          # 8
     "entry_mid",      # 9
-    "d4_mid",         # 10
-    "d3_mid",         # 11
-    "d2_mid",         # 12
-    "d1_mid",         # 13
-    "status",         # 14
-    "spot_settle",    # 15
-    "settle_value",   # 16
-    "pnl",            # 17
+    "risk_pts",       # 10
+    "d4_mid",         # 11
+    "d3_mid",         # 12
+    "d2_mid",         # 13
+    "d1_mid",         # 14
+    "status",         # 15
+    "spot_settle",    # 16
+    "settle_value",   # 17
+    "pnl",            # 18
 ]
 
 # Column indices
@@ -82,14 +83,15 @@ C_DIRECTION = 2
 C_ATM_STRIKE = 7
 C_WIDTH = 8
 C_ENTRY_MID = 9
-C_D4 = 10
-C_D3 = 11
-C_D2 = 12
-C_D1 = 13
-C_STATUS = 14
-C_SPOT_SETTLE = 15
-C_SETTLE_VALUE = 16
-C_PNL = 17
+C_RISK_PTS = 10
+C_D4 = 11
+C_D3 = 12
+C_D2 = 13
+C_D1 = 14
+C_STATUS = 15
+C_SPOT_SETTLE = 16
+C_SETTLE_VALUE = 17
+C_PNL = 18
 
 # Map DTE (business days to expiration) -> column index
 DTE_COL = {4: C_D4, 3: C_D3, 2: C_D2, 1: C_D1}
@@ -120,6 +122,25 @@ def _fnum(x):
         return float(x)
     except Exception:
         return None
+
+
+def _parse_width_pair(raw):
+    """
+    Parse width field into (down_width, up_width).
+    Accepts:
+      - symmetric: "65", 65 -> (65, 65)
+      - asymmetric: "175/150" -> (175, 150)
+    """
+    s = str(raw or "").strip()
+    if not s:
+        return (None, None)
+    if "/" in s:
+        left, right = s.split("/", 1)
+        w_dn = _fnum(left)
+        w_up = _fnum(right)
+        return (w_dn, w_up)
+    w = _fnum(s)
+    return (w, w)
 
 
 def _business_days_between(d1, d2):
@@ -153,9 +174,10 @@ def parse_csv_log(csv_path):
         reader = csv.DictReader(f)
         for r in reader:
             # Accept both filled trades and DRY_RUN entries
-            reason = r.get("reason", "")
+            reason = (r.get("reason", "") or "").strip()
+            is_dry_run = reason.upper().startswith("DRY_RUN")
             filled = r.get("qty_filled", "0")
-            if reason != "DRY_RUN" and filled in ("0", ""):
+            if not is_dry_run and filled in ("0", ""):
                 continue
 
             # VIX1D: convert from decimal to percentage for display
@@ -174,7 +196,18 @@ def parse_csv_log(csv_path):
             row[C_ATM_STRIKE] = r.get("atm_strike", "")
             row[C_WIDTH] = r.get("width", "")
             # Entry mid = NBBO mid at time of entry
-            row[C_ENTRY_MID] = r.get("nbbo_mid", "") or r.get("last_price", "")
+            entry_mid_str = r.get("nbbo_mid", "") or r.get("last_price", "")
+            row[C_ENTRY_MID] = entry_mid_str
+            # Risk in SPX points: SELL = width - entry_mid, BUY = entry_mid
+            entry_mid_val = _fnum(entry_mid_str)
+            width_dn, width_up = _parse_width_pair(row[C_WIDTH])
+            if entry_mid_val and entry_mid_val > 0 and width_dn is not None:
+                wing = min(width_dn, width_up) if width_up is not None else width_dn
+                if direction == "SELL":
+                    risk = wing - entry_mid_val
+                else:
+                    risk = entry_mid_val
+                row[C_RISK_PTS] = f"{risk:.1f}" if risk > 0 else ""
             row[C_STATUS] = "SKIP" if direction == "SKIP" else "OPEN"
             rows.append(row)
 
@@ -342,8 +375,8 @@ def main() -> int:
 
             exp_str = row[C_EXPIRATION]
             atm = _fnum(row[C_ATM_STRIKE])
-            width = _fnum(row[C_WIDTH])
-            if not exp_str or atm is None or width is None:
+            width_dn, width_up = _parse_width_pair(row[C_WIDTH])
+            if not exp_str or atm is None or width_dn is None or width_up is None:
                 continue
 
             try:
@@ -353,9 +386,9 @@ def main() -> int:
 
             dte = _business_days_between(today, exp_date)
 
-            lower_osi = build_osi(exp_str, atm - width)
+            lower_osi = build_osi(exp_str, atm - width_dn)
             center_osi = build_osi(exp_str, atm)
-            upper_osi = build_osi(exp_str, atm + width)
+            upper_osi = build_osi(exp_str, atm + width_up)
 
             open_trades.append({
                 "row_idx": i,
@@ -363,7 +396,8 @@ def main() -> int:
                 "exp_str": exp_str,
                 "exp_date": exp_date,
                 "atm": atm,
-                "width": width,
+                "width_dn": width_dn,
+                "width_up": width_up,
                 "direction": row[C_DIRECTION],
                 "entry_mid": _fnum(row[C_ENTRY_MID]),
                 "lower_osi": lower_osi,
@@ -434,8 +468,8 @@ def main() -> int:
                     log("Cannot settle: SPX unavailable")
                     continue
 
-                lower = trade["atm"] - trade["width"]
-                upper = trade["atm"] + trade["width"]
+                lower = trade["atm"] - trade["width_dn"]
+                upper = trade["atm"] + trade["width_up"]
                 settle_val = settle_butterfly_call(lower, trade["atm"], upper, spx_price)
 
                 pnl = None

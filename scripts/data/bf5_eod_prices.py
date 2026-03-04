@@ -59,14 +59,15 @@ HEADERS = [
     "atm_strike",     # 7
     "width",          # 8
     "entry_mid",      # 9
-    "d4_mid",         # 10
-    "d3_mid",         # 11
-    "d2_mid",         # 12
-    "d1_mid",         # 13
-    "status",         # 14
-    "spot_settle",    # 15
-    "settle_value",   # 16
-    "pnl",            # 17
+    "risk_pts",       # 10
+    "d4_mid",         # 11
+    "d3_mid",         # 12
+    "d2_mid",         # 13
+    "d1_mid",         # 14
+    "status",         # 15
+    "spot_settle",    # 16
+    "settle_value",   # 17
+    "pnl",            # 18
 ]
 
 C_TRADE_DATE = 0
@@ -75,16 +76,29 @@ C_DIRECTION = 2
 C_ATM_STRIKE = 7
 C_WIDTH = 8
 C_ENTRY_MID = 9
-C_D4 = 10
-C_D3 = 11
-C_D2 = 12
-C_D1 = 13
-C_STATUS = 14
-C_SPOT_SETTLE = 15
-C_SETTLE_VALUE = 16
-C_PNL = 17
+C_RISK_PTS = 10
+C_D4 = 11
+C_D3 = 12
+C_D2 = 13
+C_D1 = 14
+C_STATUS = 15
+C_SPOT_SETTLE = 16
+C_SETTLE_VALUE = 17
+C_PNL = 18
 
 DTE_COL = {4: C_D4, 3: C_D3, 2: C_D2, 1: C_D1}
+
+
+def _compute_risk_pts(direction, entry_mid, width_dn, width_up):
+    """Risk in SPX points: SELL = wing - entry_mid, BUY = entry_mid."""
+    if entry_mid is None or entry_mid <= 0:
+        return None
+    wing = min(width_dn, width_up) if width_up is not None else width_dn
+    if direction == "SELL":
+        risk = wing - entry_mid
+    else:
+        risk = entry_mid
+    return risk if risk > 0 else None
 
 
 # ---------- helpers ----------
@@ -219,6 +233,50 @@ def settle_butterfly_call(lower, center, upper, spot):
     return lo - 2 * ce + hi
 
 
+# ---------- one-time migration ----------
+
+def _migrate_add_risk_pts_col(svc, gsheet_id, tab):
+    """Insert blank risk_pts column (K) if the sheet still uses the old 18-col layout."""
+    got = (
+        svc.spreadsheets()
+        .values()
+        .get(spreadsheetId=gsheet_id, range=f"{tab}!1:1")
+        .execute()
+        .get("values", [])
+    )
+    if not got:
+        return
+    old_headers = got[0]
+    # Old layout: col 10 = "d4_mid".  New layout: col 10 = "risk_pts".
+    if len(old_headers) >= 11 and old_headers[10] == "d4_mid":
+        log("MIGRATE: inserting risk_pts column at index 10")
+        # Get sheetId
+        meta = svc.spreadsheets().get(spreadsheetId=gsheet_id).execute()
+        sheet_id = None
+        for s in meta.get("sheets", []):
+            if s["properties"]["title"] == tab:
+                sheet_id = s["properties"]["sheetId"]
+                break
+        if sheet_id is None:
+            return
+        # Insert one column at index 10 (shifts d4_mid and everything after right)
+        svc.spreadsheets().batchUpdate(
+            spreadsheetId=gsheet_id,
+            body={"requests": [{
+                "insertDimension": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "dimension": "COLUMNS",
+                        "startIndex": 10,
+                        "endIndex": 11,
+                    },
+                    "inheritFromBefore": False,
+                },
+            }]},
+        ).execute()
+        log("MIGRATE: risk_pts column inserted")
+
+
 # ---------- main ----------
 
 def main() -> int:
@@ -257,6 +315,8 @@ def main() -> int:
     log(f"date={today} tab={tab}")
 
     try:
+        # Check if sheet needs risk_pts column migration
+        _migrate_add_risk_pts_col(svc, gsheet_id, tab)
         ensure_tab(svc, gsheet_id, tab, HEADERS)
         existing = read_existing(svc, gsheet_id, tab, HEADERS)
     except Exception as e:
@@ -299,6 +359,7 @@ def main() -> int:
             "direction": row[C_DIRECTION],
             "entry_mid": _fnum(row[C_ENTRY_MID]),
             "has_entry_mid": (_fnum(row[C_ENTRY_MID]) or 0) > 0 if C_ENTRY_MID < len(row) else False,
+            "has_risk_pts": bool((row[C_RISK_PTS] if C_RISK_PTS < len(row) else "").strip()),
             "lower_osi": lower_osi,
             "center_osi": center_osi,
             "upper_osi": upper_osi,
@@ -352,7 +413,23 @@ def main() -> int:
                 "range": f"{tab}!{entry_col}{sheet_row}",
                 "values": [[f"{bf_mid:.2f}"]],
             })
+            trade["entry_mid"] = bf_mid
             log(f"    BACKFILL entry_mid: {bf_mid:.2f}")
+
+        # --- Backfill risk_pts if missing but entry_mid known ---
+        effective_mid = trade["entry_mid"]
+        if not trade["has_risk_pts"] and effective_mid and effective_mid > 0:
+            risk = _compute_risk_pts(
+                trade["direction"], effective_mid,
+                trade["width_dn"], trade["width_up"],
+            )
+            if risk is not None:
+                risk_col = col_letter(C_RISK_PTS)
+                updates.append({
+                    "range": f"{tab}!{risk_col}{sheet_row}",
+                    "values": [[f"{risk:.1f}"]],
+                })
+                log(f"    BACKFILL risk_pts: {risk:.1f}")
 
         # --- DTE column update ---
         if dte > 0 and dte in DTE_COL:
