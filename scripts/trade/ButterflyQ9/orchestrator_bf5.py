@@ -6,9 +6,12 @@
 # - Fetches VIX quote + 5DTE SPX option chain from Schwab.
 # - Classifies VIX1D into Q9 quantile bucket -> SELL / BUY / SKIP.
 # - VIX > 23 cap: SELL -> SKIP.
-# - Computes ATM strike, expected move (EM), and EM-scaled width.
-#   - SELL execution: width = round(EM * 1.25 / 5) * 5
-#   - BUY execution:  width = round(EM * 0.85 / 5) * 5
+# - Applies adaptive cadence gate (FAST_V1) by equity + drawdown tiers.
+# - Computes ATM strike and expected move (EM).
+# - Selects wings by side-specific put-delta profiles:
+#   - BUY execution: 20P anchor, symmetric call wing from put width
+#   - SELL execution: 35P anchor, symmetric call wing from put width
+# - Falls back to EM-scaled symmetric width only if delta strikes are unavailable.
 # - Builds 3-leg ATM call butterfly: BUY lower + SELL 2x center + BUY upper.
 # - Delegates placement to scripts/trade/ButterflyQ17/place_butterfly.py via BF_* envs.
 #
@@ -20,9 +23,11 @@ import sys
 import re
 import time
 import random
+import json
 import subprocess
 from datetime import date, timedelta
-from typing import Any, Dict, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple, Set
 
 import requests
 
@@ -54,8 +59,38 @@ MAX_WIDTH = 200
 STRIKE_STEP = 5          # SPX strikes are $5 apart
 BF_UNIT_DOLLARS = 30_000 # $30k equity per 1 butterfly contract
 DTE_BUSINESS_DAYS = 5    # 5 business days to expiration
+BF_PRICE_TICK = 0.05
+
+# Static weekday execution gate fallback; default Mon/Tue/Wed (0,1,2).
+ALLOWED_ENTRY_WEEKDAYS = {
+    int(x.strip())
+    for x in (os.environ.get("BF_ENTRY_WEEKDAYS", "0,1,2") or "0,1,2").split(",")
+    if x.strip().isdigit() and 0 <= int(x.strip()) <= 6
+}
+if not ALLOWED_ENTRY_WEEKDAYS:
+    ALLOWED_ENTRY_WEEKDAYS = {0, 1, 2}
 
 BF_LOG_PATH = os.environ.get("BF_LOG_PATH", "logs/butterfly_q9_trades.csv")
+
+# Adaptive cadence (FAST_V1) enabled by default.
+BF_USE_ADAPTIVE_CADENCE = (os.environ.get("BF_USE_ADAPTIVE_CADENCE", "1") or "1").strip().lower() in ("1", "true", "yes", "y")
+BF_CADENCE_STATE_PATH = os.environ.get(
+    "BF_CADENCE_STATE_PATH",
+    str(Path(BF_LOG_PATH).with_name("butterfly_q9_cadence_state.json")),
+)
+
+# FAST_V1 thresholds:
+# 1) DD >= 30% -> Wed only
+# 2) DD >= 20% -> Tue/Thu
+# 3) Balance < 23k -> Tue/Thu
+# 4) 23k-32k -> Mon/Tue/Wed
+# 5) 32k-40k -> Mon/Tue/Wed/Thu
+# 6) >= 40k -> Mon-Fri
+FAST_V1_DD_W_ONLY = 0.30
+FAST_V1_DD_TTH = 0.20
+FAST_V1_BAL_TTH = 23_000.0
+FAST_V1_BAL_MTW = 32_000.0
+FAST_V1_BAL_MTWTH = 40_000.0
 
 GW_BASE = os.environ.get("GW_BASE", "https://gandalf.gammawizard.com").rstrip("/")
 GW_ENDPOINT = os.environ.get("GW_ENDPOINT", "rapi/GetUltraPureConstantStable").lstrip("/")
@@ -79,6 +114,12 @@ Q9_ACTIONS = [
     "BUY",    # B7:  0.173-0.199
     "SELL",   # B8:  >= 0.199  (VIX1D > 19.9%)
 ]
+
+# Side profiles (absolute delta targets).
+BUY_PUT_DELTA = 0.20
+BUY_CALL_DELTA = 0.10
+SELL_PUT_DELTA = 0.35
+SELL_CALL_DELTA = 0.25
 
 # --- TOPUP config (prevent duplicate entries if already positioned) ---
 BF_TOPUP = (os.environ.get("BF_TOPUP", "1") or "1").strip().lower() in ("1", "true", "yes", "y")
@@ -121,6 +162,71 @@ def compute_width(em: float, mult: float) -> int:
     return max(MIN_WIDTH, min(MAX_WIDTH, w))
 
 
+def _leg_mid_from_chain(q: Dict[str, Any]) -> float:
+    m = fnum((q or {}).get("mid"))
+    if m is not None and m > 0:
+        return float(m)
+    b = fnum((q or {}).get("bid"))
+    a = fnum((q or {}).get("ask"))
+    if b is not None and b > 0 and a is not None and a > 0:
+        return float((b + a) / 2.0)
+    return 0.0
+
+
+def _round_price_tick(v: float) -> float:
+    return round(round(float(v) / BF_PRICE_TICK) * BF_PRICE_TICK + 1e-12, 2)
+
+
+def side_delta_targets(action: str) -> Tuple[float, float, str]:
+    """Return (put_delta_abs, call_delta_abs, profile_tag) for BUY/SELL side."""
+    if action == "SELL":
+        return SELL_PUT_DELTA, SELL_CALL_DELTA, "SELL_P35_ANCHORED"
+    return BUY_PUT_DELTA, BUY_CALL_DELTA, "BUY_P20_ANCHORED"
+
+
+def nearest_delta_strike(
+    deltas: Dict[int, float],
+    target_abs: float,
+    center: int,
+    side: str,
+) -> Optional[int]:
+    """
+    Find strike nearest to target absolute delta.
+    side="PUT": prefer strikes below center with negative deltas.
+    side="CALL": prefer strikes above center with positive deltas.
+    """
+    side = side.upper().strip()
+    if side not in ("PUT", "CALL"):
+        return None
+
+    def valid_for_side(strike: int, delta: float) -> bool:
+        if side == "PUT":
+            return strike < center and delta < 0
+        return strike > center and delta > 0
+
+    candidates = [
+        (strike, delta)
+        for strike, delta in deltas.items()
+        if delta is not None and valid_for_side(strike, delta)
+    ]
+
+    # Fallback if strict side filtering leaves nothing (data gaps / sparse greeks).
+    if not candidates:
+        if side == "PUT":
+            candidates = [(s, d) for s, d in deltas.items() if d is not None and d < 0]
+        else:
+            candidates = [(s, d) for s, d in deltas.items() if d is not None and d > 0]
+
+    if not candidates:
+        return None
+
+    best = min(
+        candidates,
+        key=lambda x: (abs(abs(x[1]) - target_abs), abs(x[0] - center)),
+    )
+    return int(best[0])
+
+
 def classify_vix1d(vix1d: float) -> Tuple[int, str]:
     """Returns (bucket_index, action) for a given VIX1D value."""
     for i in range(len(Q9_EDGES) - 1):
@@ -157,6 +263,66 @@ def fnum(x):
         return float(x)
     except Exception:
         return None
+
+
+def _load_cadence_peak_equity(path: str) -> float:
+    try:
+        p = Path(path)
+        if not p.exists():
+            return 0.0
+        j = json.loads(p.read_text(encoding="utf-8"))
+        v = fnum((j or {}).get("peak_equity"))
+        return max(0.0, float(v or 0.0))
+    except Exception:
+        return 0.0
+
+
+def _save_cadence_peak_equity(path: str, peak_equity: float) -> None:
+    try:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "peak_equity": float(max(0.0, peak_equity)),
+            "updated_utc_epoch": int(time.time()),
+        }
+        p.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except Exception:
+        # Non-fatal: cadence can run without persisted peak.
+        pass
+
+
+def _weekday_names(days: Set[int]) -> str:
+    names = {
+        0: "Mon",
+        1: "Tue",
+        2: "Wed",
+        3: "Thu",
+        4: "Fri",
+        5: "Sat",
+        6: "Sun",
+    }
+    return ",".join(names.get(d, str(d)) for d in sorted(days))
+
+
+def cadence_fast_v1_allowed_weekdays(equity: float, peak_equity: float) -> Tuple[Set[int], str, float]:
+    """
+    Return (allowed_weekdays, tier_name, drawdown_pct) for FAST_V1 adaptive cadence.
+    """
+    eq = max(0.0, float(equity))
+    peak = max(eq, float(peak_equity))
+    dd = ((peak - eq) / peak) if peak > 0 else 0.0
+
+    if dd >= FAST_V1_DD_W_ONLY:
+        return {2}, "W_ONLY_DD30", dd
+    if dd >= FAST_V1_DD_TTH:
+        return {1, 3}, "TTH_DD20", dd
+    if eq < FAST_V1_BAL_TTH:
+        return {1, 3}, "TTH_LT23K", dd
+    if eq < FAST_V1_BAL_MTW:
+        return {0, 1, 2}, "MTW_23K_32K", dd
+    if eq < FAST_V1_BAL_MTWTH:
+        return {0, 1, 2, 3}, "MTWTH_32K_40K", dd
+    return {0, 1, 2, 3, 4}, "ALL_GTE40K", dd
 
 
 # ---------- GammaWizard ----------
@@ -461,7 +627,7 @@ def fetch_spx_chain(c, target_exp: date) -> dict:
         c, "https://api.schwabapi.com/marketdata/v1/chains",
         params={
             "symbol": "$SPX",
-            "contractType": "CALL",
+            "contractType": "ALL",
             "fromDate": target_exp.isoformat(),
             "toDate": target_exp.isoformat(),
             "strikeCount": 80,
@@ -491,6 +657,7 @@ def parse_chain(raw: dict, target_exp: date) -> Dict[str, Any]:
 
     strikes_raw = call_map[exp_key]
     strikes = {}
+    call_deltas: Dict[int, float] = {}
     for sk, contracts in strikes_raw.items():
         strike_val = fnum(sk)
         if strike_val is None or not contracts:
@@ -499,7 +666,29 @@ def parse_chain(raw: dict, target_exp: date) -> Dict[str, Any]:
         bid = fnum(c0.get("bid")) or 0.0
         ask = fnum(c0.get("ask")) or 0.0
         mid = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else 0.0
-        strikes[int(round(strike_val))] = {"bid": bid, "ask": ask, "mid": mid}
+        strike_i = int(round(strike_val))
+        strikes[strike_i] = {"bid": bid, "ask": ask, "mid": mid}
+        d = fnum(c0.get("delta"))
+        if d is not None:
+            call_deltas[strike_i] = d
+
+    put_deltas: Dict[int, float] = {}
+    put_map = raw.get("putExpDateMap") or {}
+    exp_key_put = None
+    for k in put_map:
+        if k.startswith(target_exp.isoformat()):
+            exp_key_put = k
+            break
+    if exp_key_put:
+        for sk, contracts in (put_map.get(exp_key_put) or {}).items():
+            strike_val = fnum(sk)
+            if strike_val is None or not contracts:
+                continue
+            c0 = contracts[0] if isinstance(contracts, list) else contracts
+            strike_i = int(round(strike_val))
+            d = fnum(c0.get("delta"))
+            if d is not None:
+                put_deltas[strike_i] = d
 
     if not strikes:
         raise RuntimeError("BF_Q9 FAIL: no strikes parsed from chain")
@@ -515,7 +704,54 @@ def parse_chain(raw: dict, target_exp: date) -> Dict[str, Any]:
         "em": em,
         "atm_call_mid": atm_call_mid,
         "strikes": strikes,
+        "call_deltas": call_deltas,
+        "put_deltas": put_deltas,
     }
+
+
+def estimate_butterfly_quote_from_chain(
+    chain: Dict[str, Any],
+    lower: int,
+    center: int,
+    upper: int,
+) -> Tuple[float, float, float]:
+    """
+    Estimate butterfly (1:-2:1) quote from parsed chain marks.
+    Returns (bid, ask, mid), each >= 0.0. Values may be 0 if unavailable.
+    """
+    strikes = chain.get("strikes", {}) or {}
+    lq = strikes.get(int(lower), {}) or {}
+    cq = strikes.get(int(center), {}) or {}
+    uq = strikes.get(int(upper), {}) or {}
+
+    lb = fnum(lq.get("bid"))
+    la = fnum(lq.get("ask"))
+    cb = fnum(cq.get("bid"))
+    ca = fnum(cq.get("ask"))
+    ub = fnum(uq.get("bid"))
+    ua = fnum(uq.get("ask"))
+
+    bid = 0.0
+    ask = 0.0
+    if None not in (lb, la, cb, ca, ub, ua) and min(lb, la, cb, ca, ub, ua) > 0:
+        bid = max(0.0, _round_price_tick(lb + ub - 2.0 * ca))
+        ask = max(bid, _round_price_tick(la + ua - 2.0 * cb))
+
+    lm = _leg_mid_from_chain(lq)
+    cm = _leg_mid_from_chain(cq)
+    um = _leg_mid_from_chain(uq)
+    mid = max(0.0, _round_price_tick(lm + um - 2.0 * cm)) if min(lm, cm, um) > 0 else 0.0
+
+    if mid <= 0 and bid > 0 and ask > 0:
+        mid = _round_price_tick((bid + ask) / 2.0)
+    if bid <= 0 and ask > 0 and mid > 0:
+        bid = max(0.0, _round_price_tick(min(mid, ask - BF_PRICE_TICK)))
+    if ask <= 0 and mid > 0:
+        ask = max(mid, _round_price_tick(mid + BF_PRICE_TICK))
+
+    if ask < bid:
+        ask = bid
+    return (float(bid), float(ask), float(mid))
 
 
 # ---------- main ----------
@@ -543,17 +779,62 @@ def main():
 
     print(f"BF_Q9 EQUITY: {oc_val} (src={oc_src}, acct={acct_num})")
 
+    force_paper_only = False
     if oc_val is None or oc_val < BF_UNIT_DOLLARS:
-        if dry_run:
-            units = 1
-            print(f"BF_Q9 DRY_RUN: equity {oc_val} below ${BF_UNIT_DOLLARS:,} — using {units} unit(s) for paper trade")
-        else:
-            print(f"BF_Q9 SKIP: equity {oc_val} below minimum ${BF_UNIT_DOLLARS:,} — not trading")
-            return 0
+        # Keep recording would-have-traded rows, but never send live orders.
+        units = 1
+        force_paper_only = True
+        print(
+            f"BF_Q9 PAPER_ONLY: equity {oc_val} below minimum ${BF_UNIT_DOLLARS:,} "
+            f"— no live order, logging hypothetical trade"
+        )
     else:
         units = int(oc_val // BF_UNIT_DOLLARS)
 
+    effective_dry_run = dry_run or force_paper_only
+    if effective_dry_run:
+        print(f"BF_Q9 DRY_RUN effective={effective_dry_run} (user_dry_run={dry_run}, force_paper_only={force_paper_only})")
+
     print(f"BF_Q9 UNITS: {units} (BF_UNIT_DOLLARS={BF_UNIT_DOLLARS}, equity={oc_val})")
+
+    today = date.today()
+    cadence_mode = "STATIC"
+    cadence_tier = "STATIC_BF_ENTRY_WEEKDAYS"
+    cadence_dd = 0.0
+
+    if BF_USE_ADAPTIVE_CADENCE:
+        # Persisted peak equity keeps drawdown tiers stable across runs/days.
+        peak_equity_prev = _load_cadence_peak_equity(BF_CADENCE_STATE_PATH)
+        peak_equity_now = max(float(oc_val or 0.0), peak_equity_prev)
+        if not ov_raw:
+            _save_cadence_peak_equity(BF_CADENCE_STATE_PATH, peak_equity_now)
+
+        allowed_days, cadence_tier, cadence_dd = cadence_fast_v1_allowed_weekdays(
+            float(oc_val or 0.0),
+            peak_equity_now,
+        )
+        cadence_mode = "FAST_V1_ADAPTIVE"
+        allowed_names = _weekday_names(allowed_days)
+        print(
+            "BF_Q9 CADENCE: "
+            f"mode={cadence_mode} tier={cadence_tier} "
+            f"equity={float(oc_val or 0.0):.2f} peak={peak_equity_now:.2f} "
+            f"dd={cadence_dd*100:.2f}% allowed={allowed_names}"
+        )
+    else:
+        allowed_days = set(ALLOWED_ENTRY_WEEKDAYS)
+        allowed_names = _weekday_names(allowed_days)
+        print(
+            f"BF_Q9 CADENCE: mode={cadence_mode} "
+            f"allowed={allowed_names}"
+        )
+
+    if today.weekday() not in allowed_days:
+        print(
+            f"BF_Q9 SKIP: weekday gate today={today} weekday={today.weekday()} "
+            f"allowed={allowed_names} tier={cadence_tier}"
+        )
+        return 0
 
     # --- Fetch VIX1D from Leo's GW API ---
     try:
@@ -584,7 +865,6 @@ def main():
     print(f"BF_Q9 VIX: {vix:.2f}")
 
     # --- Compute target expiration (5 business days from today) ---
-    today = date.today()
     target_exp = _add_business_days(today, DTE_BUSINESS_DAYS)
     print(f"BF_Q9 EXPIRATION: today={today} target_exp={target_exp} (DTE={DTE_BUSINESS_DAYS})")
 
@@ -606,12 +886,68 @@ def main():
         print("BF_Q9 SKIP: EM <= 0")
         return 0
 
-    # --- Compute width and strikes ---
+    # --- Compute strikes ---
     mult = SELL_EM_MULT if action == "SELL" else BUY_EM_MULT
-    width = compute_width(em, mult)
     center = atm_strike
-    lower = center - width
-    upper = center + width
+    lower = None
+    upper = None
+    width = ""
+    width_mode = "EM_WIDTH"
+    put_delta_target = ""
+    call_delta_target = ""
+
+    # Side-specific delta targeting.
+    # New rule: put side anchors width; call side mirrors put width.
+    put_tgt, call_tgt, profile_tag = side_delta_targets(action)
+    put_delta_target = f"{put_tgt:.2f}"
+    call_delta_target = f"{call_tgt:.2f}"
+
+    lower_cand = nearest_delta_strike(
+        chain.get("put_deltas", {}),
+        put_tgt,
+        center,
+        side="PUT",
+    )
+    # Keep call delta lookup for diagnostics only; strike selection is put-anchored.
+    upper_cand = nearest_delta_strike(
+        chain.get("call_deltas", {}),
+        call_tgt,
+        center,
+        side="CALL",
+    )
+
+    if lower_cand is not None and lower_cand < center:
+        put_width = int(center - lower_cand)
+        upper_sym = int(center + put_width)
+
+        # Ensure symmetric upper strike exists in parsed call chain.
+        if upper_sym in chain.get("strikes", {}):
+            lower = int(lower_cand)
+            upper = upper_sym
+            width = str(put_width)
+            width_mode = f"{profile_tag}_PUT_ANCHORED"
+            diag_call = f"{upper_cand}" if upper_cand is not None else "n/a"
+            print(
+                f"BF_Q9 DELTA_PROFILE: {width_mode} "
+                f"(put_target={put_tgt:.2f}, call_target={call_tgt:.2f}, call_diag={diag_call}) "
+                f"-> lower={lower} upper={upper} width={width}"
+            )
+        else:
+            print(
+                "BF_Q9 DELTA_PROFILE WARN: symmetric upper strike missing in chain "
+                f"(center={center}, put_width={put_width}, upper_sym={upper_sym}) "
+                "-- fallback to EM width."
+            )
+    if lower is None or upper is None:
+        print(
+            "BF_Q9 DELTA_PROFILE WARN: could not resolve delta strikes "
+            f"(profile={profile_tag}, put_target={put_tgt:.2f}, call_target={call_tgt:.2f}) "
+            "-- fallback to EM width."
+        )
+        width_pts = compute_width(em, mult)
+        lower = center - width_pts
+        upper = center + width_pts
+        width = str(width_pts)
 
     lower_osi = build_osi("SPXW", target_exp, "C", lower)
     center_osi = build_osi("SPXW", target_exp, "C", center)
@@ -619,11 +955,22 @@ def main():
 
     direction = action  # "SELL" or "BUY"
 
-    print(f"BF_Q9 BUTTERFLY: action={action} width={width} mult={mult:.2f}")
+    print(f"BF_Q9 BUTTERFLY: action={action} width={width} mode={width_mode} mult={mult:.2f}")
     print(f"  lower={lower} ({lower_osi})")
     print(f"  center={center} ({center_osi}) x2")
     print(f"  upper={upper} ({upper_osi})")
     print(f"  direction={direction} qty={units}")
+
+    chain_bid, chain_ask, chain_mid = estimate_butterfly_quote_from_chain(
+        chain,
+        lower,
+        center,
+        upper,
+    )
+    print(
+        "BF_Q9 CHAIN_BFLY_QUOTE: "
+        f"bid={chain_bid:.2f} ask={chain_ask:.2f} mid={chain_mid:.2f}"
+    )
 
     bf = {
         "lower_osi": lower_osi,
@@ -633,7 +980,10 @@ def main():
     }
 
     # --- TOPUP + GUARD ---
-    need_positions = BF_GUARD_NO_CLOSE or BF_TOPUP
+    # If we're below minimum equity and paper-only, always log the signal
+    # regardless of currently open account positions.
+    apply_position_controls = not force_paper_only
+    need_positions = apply_position_controls and (BF_GUARD_NO_CLOSE or BF_TOPUP)
     pos = None
     if need_positions:
         try:
@@ -656,7 +1006,7 @@ def main():
 
     send_qty = units
 
-    if BF_TOPUP:
+    if apply_position_controls and BF_TOPUP:
         if pos is None:
             if BF_TOPUP_FAIL_ACTION != "CONTINUE":
                 print("BF_Q9 SKIP: TOPUP enabled but positions unavailable")
@@ -670,7 +1020,7 @@ def main():
         print("BF_Q9 SKIP: AT_OR_ABOVE_TARGET")
         return 0
 
-    if BF_GUARD_NO_CLOSE:
+    if apply_position_controls and BF_GUARD_NO_CLOSE:
         if pos is None:
             if BF_GUARD_FAIL_ACTION != "CONTINUE":
                 print("BF_Q9 SKIP: GUARD enabled but positions unavailable")
@@ -689,6 +1039,11 @@ def main():
         "BF_UPPER_OSI":      upper_osi,
         "BF_QTY":            str(send_qty),
         "BF_WIDTH":          str(width),
+        "BF_WIDTH_MODE":     width_mode,
+        "BF_LOWER_STRIKE":   str(lower),
+        "BF_UPPER_STRIKE":   str(upper),
+        "BF_PUT_DELTA_TGT":  put_delta_target,
+        "BF_CALL_DELTA_TGT": call_delta_target,
         "BF_ATM_STRIKE":     str(center),
         "BF_EM":             f"{em:.2f}",
         "BF_EM_MULT":        f"{mult:.2f}",
@@ -698,9 +1053,15 @@ def main():
         "BF_BUCKET":         str(bucket),
         "BF_ACTION":         action,
         "BF_EXPIRATION":     target_exp.isoformat(),
+        "BF_CHAIN_BID":      f"{chain_bid:.2f}" if chain_bid > 0 else "",
+        "BF_CHAIN_ASK":      f"{chain_ask:.2f}" if chain_ask > 0 else "",
+        "BF_CHAIN_MID":      f"{chain_mid:.2f}" if chain_mid > 0 else "",
         "BF_UNIT_DOLLARS_V": str(BF_UNIT_DOLLARS),
         "BF_EQUITY":         str(oc_val or 0),
         "BF_UNITS":          str(units),
+        "BF_CADENCE_MODE":   cadence_mode,
+        "BF_CADENCE_TIER":   cadence_tier,
+        "BF_CADENCE_DD_PCT": f"{cadence_dd*100:.4f}",
 
         # needed by placer
         "SCHWAB_APP_KEY":    os.environ["SCHWAB_APP_KEY"],
@@ -708,6 +1069,8 @@ def main():
         "SCHWAB_TOKEN_JSON": os.environ["SCHWAB_TOKEN_JSON"],
         "SCHWAB_ACCT_HASH":  acct_hash,
         "BF_LOG_PATH":       BF_LOG_PATH,
+        "BF_DRY_RUN":        "true" if effective_dry_run else "false",
+        "BF_DRY_RUN_REASON": "DRY_RUN_EQUITY_LT_30K" if force_paper_only else "DRY_RUN",
     })
 
     print(f"BF_Q9 PLACING: {direction} {send_qty}x {width}w butterfly @ {center}")

@@ -71,9 +71,11 @@ def _retry_after_seconds(resp, default_wait):
 
 def price_from_mid(mid: float, off: float, bid: float, ask: float) -> float:
     p = clamp_tick(mid + off)
-    p = max(p, bid)
-    p = min(p, ask)
-    return p
+    if bid is not None and bid > 0:
+        p = max(p, bid)
+    if ask is not None and ask > 0:
+        p = min(p, ask)
+    return max(0.0, clamp_tick(p))
 
 
 # ---------- Schwab API helpers ----------
@@ -125,8 +127,8 @@ def butterfly_nbbo(c, direction: str, lower_osi: str, center_osi: str, upper_osi
       debit_ask  = lo_ask + hi_ask - 2*mid_bid  (most expensive)
 
     SELL butterfly (short): SELL 1 lower + BUY 2 center + SELL 1 upper
-      credit_bid = 2*mid_bid - lo_ask - hi_ask  (least credit, worst for seller)
-      credit_ask = 2*mid_ask - lo_bid - hi_bid  (most credit, best for seller)
+      credit_bid = lo_bid + hi_bid - 2*mid_ask  (least credit, worst for seller)
+      credit_ask = lo_ask + hi_ask - 2*mid_bid  (most credit, best for seller)
 
     Returns (bid, ask, mid) — always positive (debit amount or credit amount).
     """
@@ -137,19 +139,66 @@ def butterfly_nbbo(c, direction: str, lower_osi: str, center_osi: str, upper_osi
     if None in (lb, la, mb, ma, ub, ua):
         return (None, None, None)
 
-    if direction == "BUY":
-        # Long butterfly debit
-        bid = lb + ub - 2 * ma   # cheapest (best for buyer)
-        ask = la + ua - 2 * mb   # most expensive
-    else:
-        # Short butterfly credit
-        bid = 2 * mb - la - ua   # least credit
-        ask = 2 * ma - lb - ub   # most credit
+    # For this 1:-2:1 call fly, long-fly debit and short-fly credit share
+    # the same numeric NBBO range; only order side/type differs.
+    bid = lb + ub - 2 * ma   # minimum achievable debit / minimum credit
+    ask = la + ua - 2 * mb   # maximum achievable debit / maximum credit
 
     bid = max(0.0, clamp_tick(bid))
     ask = max(bid, clamp_tick(ask))
     mid = clamp_tick((bid + ask) / 2.0)
     return bid, ask, mid
+
+
+def _valid_quote(bid, ask, mid) -> bool:
+    return (
+        bid is not None and ask is not None and mid is not None
+        and ask > 0 and mid > 0 and bid >= 0 and ask >= bid
+    )
+
+
+def _chain_quote_from_env():
+    bid = _fnum(os.environ.get("BF_CHAIN_BID", ""))
+    ask = _fnum(os.environ.get("BF_CHAIN_ASK", ""))
+    mid = _fnum(os.environ.get("BF_CHAIN_MID", ""))
+
+    if mid is not None and mid > 0:
+        mid = clamp_tick(mid)
+    else:
+        mid = None
+
+    if bid is not None and bid > 0:
+        bid = clamp_tick(bid)
+    else:
+        bid = None
+
+    if ask is not None and ask > 0:
+        ask = clamp_tick(ask)
+    else:
+        ask = None
+
+    if mid is None and bid is not None and ask is not None and ask > 0:
+        mid = clamp_tick((bid + ask) / 2.0)
+    if bid is None and mid is not None and ask is not None:
+        bid = max(0.0, clamp_tick(min(mid, ask - TICK)))
+    if ask is None and mid is not None and bid is not None:
+        ask = max(mid, clamp_tick(max(mid, bid + TICK)))
+
+    if _valid_quote(bid, ask, mid):
+        return float(bid), float(ask), float(mid)
+    return (None, None, None)
+
+
+def resolve_butterfly_quote(c, direction: str, lower_osi: str, center_osi: str, upper_osi: str):
+    bid, ask, mid = butterfly_nbbo(c, direction, lower_osi, center_osi, upper_osi)
+    if _valid_quote(bid, ask, mid):
+        return bid, ask, mid, "LIVE_NBBO"
+
+    cbid, cask, cmid = _chain_quote_from_env()
+    if _valid_quote(cbid, cask, cmid):
+        return cbid, cask, cmid, "CHAIN_FALLBACK"
+
+    return bid, ask, mid, "INVALID"
 
 
 def order_payload_butterfly(direction: str, lower_osi: str, center_osi: str,
@@ -334,16 +383,18 @@ def place_butterfly_with_ladder(
 
     url_post = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
 
-    # Initial NBBO
-    bid, ask, mid = butterfly_nbbo(c, direction, lower_osi, center_osi, upper_osi)
-    if bid is None or ask is None or mid is None:
+    # Initial quote (live NBBO, then chain fallback if needed)
+    bid, ask, mid, quote_src = resolve_butterfly_quote(
+        c, direction, lower_osi, center_osi, upper_osi,
+    )
+    if not _valid_quote(bid, ask, mid):
         return {
             "filled": 0, "order_ids": [], "last_price": None,
             "nbbo_bid": bid, "nbbo_ask": ask, "nbbo_mid": mid,
-            "reason": "NBBO_UNAVAILABLE", "danger": False,
+            "reason": "NBBO_UNAVAILABLE_OR_NONPOSITIVE", "danger": False,
         }
 
-    print(f"{TAG} NBBO: bid={bid} ask={ask} mid={mid} direction={direction}")
+    print(f"{TAG} NBBO: bid={bid} ask={ask} mid={mid} direction={direction} source={quote_src}")
 
     # Ladder: BUY = debit (pay more each rung), SELL = credit (accept less each rung)
     if direction == "SELL":
@@ -368,15 +419,19 @@ def place_butterfly_with_ladder(
 
         cur_bid, cur_ask, cur_mid = (bid, ask, mid)
         if refresh:
-            cur_bid, cur_ask, cur_mid = butterfly_nbbo(
+            cur_bid, cur_ask, cur_mid, cur_src = resolve_butterfly_quote(
                 c, direction, lower_osi, center_osi, upper_osi,
             )
-            print(f"{TAG} REFRESH NBBO: bid={cur_bid} ask={cur_ask} mid={cur_mid}")
-            if None in (cur_bid, cur_ask, cur_mid):
-                placed_reason = "NBBO_REFRESH_FAIL"
+            print(f"{TAG} REFRESH NBBO: bid={cur_bid} ask={cur_ask} mid={cur_mid} source={cur_src}")
+            if not _valid_quote(cur_bid, cur_ask, cur_mid):
+                placed_reason = "NBBO_REFRESH_FAIL_OR_NONPOSITIVE"
                 break
 
         price = price_from_mid(cur_mid, off, cur_bid, cur_ask)
+        if price <= 0:
+            placed_reason = "NON_POSITIVE_LIMIT_PRICE_GUARD"
+            print(f"{TAG} GUARD: computed non-positive price ({price}); aborting placement")
+            break
         last_price = price
         print(f"{TAG} rung#{idx}: price={price:.2f} remaining={remaining} wait={STEP_WAIT:.2f}s")
 
@@ -465,7 +520,7 @@ def place_butterfly_with_ladder(
         placed_reason = "HTTP_429_RATE_LIMIT" if saw_429 else "NO_FILL"
 
     # final nbbo snapshot
-    b2, a2, m2 = butterfly_nbbo(c, direction, lower_osi, center_osi, upper_osi)
+    b2, a2, m2, _ = resolve_butterfly_quote(c, direction, lower_osi, center_osi, upper_osi)
     return {
         "filled": filled_total,
         "order_ids": order_ids,
@@ -516,15 +571,19 @@ def main():
     unit_dollars = os.environ.get("BF_UNIT_DOLLARS_V", "")
     equity = os.environ.get("BF_EQUITY", "")
     units = os.environ.get("BF_UNITS", "")
+    dry_run_reason = (os.environ.get("BF_DRY_RUN_REASON", "DRY_RUN") or "DRY_RUN").strip()
 
     c = schwab_client()
     acct_hash = resolve_acct_hash(c)
     print(f"{TAG} ACCT_HASH: {acct_hash[:8]}...")
 
     if dry_run:
-        bid, ask, mid = butterfly_nbbo(c, direction, lower_osi, center_osi, upper_osi)
-        print(f"{TAG} DRY_RUN: NBBO bid={bid} ask={ask} mid={mid}")
+        bid, ask, mid, quote_src = resolve_butterfly_quote(
+            c, direction, lower_osi, center_osi, upper_osi,
+        )
+        print(f"{TAG} DRY_RUN: NBBO bid={bid} ask={ask} mid={mid} source={quote_src}")
         print(f"{TAG} DRY_RUN: would place {direction} {qty}x @ mid={mid}")
+        resolved_reason = dry_run_reason if _valid_quote(bid, ask, mid) else f"{dry_run_reason}_NO_VALID_QUOTE"
 
         # Log DRY_RUN trade for paper tracking
         now_utc = datetime.now(timezone.utc)
@@ -558,7 +617,7 @@ def main():
             "nbbo_ask": "" if ask is None else f"{ask:.2f}",
             "nbbo_mid": "" if mid is None else f"{mid:.2f}",
             "order_ids": "",
-            "reason": "DRY_RUN",
+            "reason": resolved_reason,
         })
         return 0
 
