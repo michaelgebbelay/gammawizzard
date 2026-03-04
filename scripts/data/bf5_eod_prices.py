@@ -298,7 +298,7 @@ def main() -> int:
             "width_up": width_up,
             "direction": row[C_DIRECTION],
             "entry_mid": _fnum(row[C_ENTRY_MID]),
-            "has_entry_mid": bool(row[C_ENTRY_MID].strip()) if C_ENTRY_MID < len(row) else False,
+            "has_entry_mid": (_fnum(row[C_ENTRY_MID]) or 0) > 0 if C_ENTRY_MID < len(row) else False,
             "lower_osi": lower_osi,
             "center_osi": center_osi,
             "upper_osi": upper_osi,
