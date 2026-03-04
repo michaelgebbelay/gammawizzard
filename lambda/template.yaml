@@ -128,6 +128,22 @@ Resources:
         RoleArn: !GetAtt SchedulerRole.Arn
         Input: '{"account": "butterfly5"}'
 
+  # ---------- BF5 EOD Price Updater ----------
+  Bf5EodSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: gamma-bf5-eod
+      Description: "BF5 daily mark-to-market for open butterfly positions"
+      State: ENABLED
+      ScheduleExpression: "cron(5 16 ? * MON-FRI *)"
+      ScheduleExpressionTimezone: "America/New_York"
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt TradingFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"account": "bf5-eod"}'
+
   # ---------- Morning Check Schedule ----------
   MorningCheckSchedule:
     Type: AWS::Scheduler::Schedule

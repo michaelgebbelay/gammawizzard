@@ -74,6 +74,21 @@ ACCOUNTS = {
             "BF_GUARD_NO_CLOSE": "1",
         },
     },
+    "bf5-eod": {
+        "orchestrator": "scripts/data/bf5_eod_prices.py",
+        "post_steps": [],
+        "token_ssm_path": "/gamma/schwab/token_json",
+        "token_file": "/tmp/schwab_token.json",
+        "env_from_ssm": {
+            "SCHWAB_APP_KEY": "/gamma/schwab/app_key",
+            "SCHWAB_APP_SECRET": "/gamma/schwab/app_secret",
+        },
+        "static_env": {
+            "SCHWAB_TOKEN_PATH": "/tmp/schwab_token.json",
+            "BF_TRACKER_TAB": "BF_Q9_5DTE",
+            "BF_GSHEET_ID": "1r3ipwByfs2Zhgb4WmSTmXCpF8HEphxD9CJlMtr7GSGs",
+        },
+    },
     "tt-ira": {
         "orchestrator": "TT/Script/ConstantStable/orchestrator.py",
         "post_steps": [
@@ -581,7 +596,7 @@ def lambda_handler(event, context):
         print(f"WARNING: no token content from {cfg['token_ssm_path']}")
 
     # Schwab token keeper reads SCHWAB_TOKEN_JSON env var to auto-seed
-    if account in ("schwab", "butterfly", "butterfly5", "morning-check"):
+    if account in ("schwab", "butterfly", "butterfly5", "bf5-eod", "morning-check"):
         env["SCHWAB_TOKEN_JSON"] = token_content
     elif account == "manual":
         # Manual needs both Schwab + TT tokens
