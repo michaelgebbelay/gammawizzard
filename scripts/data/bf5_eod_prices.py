@@ -159,22 +159,39 @@ def fetch_quotes_batch(c, symbols):
     return {}
 
 
-def butterfly_mid_from_quotes(quotes, lower_osi, center_osi, upper_osi):
-    def get_mid(osi):
-        data = quotes.get(osi, {})
-        q = data.get("quote", data) if isinstance(data, dict) else {}
-        bid = _fnum(q.get("bidPrice") or q.get("bid"))
-        ask = _fnum(q.get("askPrice") or q.get("ask"))
-        if bid is not None and ask is not None and bid >= 0 and ask >= 0:
-            return (bid + ask) / 2.0
-        return None
+def _leg_mid(quotes, osi):
+    """Extract mid price for a single option leg from quotes response.
 
-    lo = get_mid(lower_osi)
-    ce = get_mid(center_osi)
-    hi = get_mid(upper_osi)
+    Tries bid/ask first (live market), then mark, then closePrice (after-hours).
+    """
+    data = quotes.get(osi, {})
+    q = data.get("quote", data) if isinstance(data, dict) else {}
+
+    bid = _fnum(q.get("bidPrice") or q.get("bid"))
+    ask = _fnum(q.get("askPrice") or q.get("ask"))
+    if bid is not None and ask is not None and bid > 0 and ask > 0:
+        return (bid + ask) / 2.0
+
+    # After-hours fallback: mark or closePrice
+    mark = _fnum(q.get("mark"))
+    if mark is not None and mark > 0:
+        return mark
+
+    close = _fnum(q.get("closePrice") or q.get("lastPrice"))
+    if close is not None and close > 0:
+        return close
+
+    return None
+
+
+def butterfly_mid_from_quotes(quotes, lower_osi, center_osi, upper_osi):
+    lo = _leg_mid(quotes, lower_osi)
+    ce = _leg_mid(quotes, center_osi)
+    hi = _leg_mid(quotes, upper_osi)
     if lo is None or ce is None or hi is None:
         return None
-    return lo - 2 * ce + hi
+    val = lo - 2 * ce + hi
+    return val if val > 0 else None
 
 
 def fetch_spx_price(c):
@@ -315,6 +332,10 @@ def main() -> int:
         sheet_row = trade["row_idx"] + 2  # 1-indexed, header = row 1
         dte = trade["dte"]
 
+        log(f"  row={sheet_row} exp={trade['exp_str']} dte={dte} "
+            f"entry_mid={'YES' if trade['has_entry_mid'] else 'MISSING'} "
+            f"dir={trade['direction']} lower={trade['lower_osi']}")
+
         bf_mid = butterfly_mid_from_quotes(
             quotes,
             trade["lower_osi"],
@@ -322,14 +343,16 @@ def main() -> int:
             trade["upper_osi"],
         ) if dte > 0 else None
 
+        log(f"    bf_mid={bf_mid}")
+
         # --- Backfill entry_mid if missing ---
-        if not trade["has_entry_mid"] and bf_mid is not None:
+        if not trade["has_entry_mid"] and bf_mid is not None and bf_mid > 0:
             entry_col = col_letter(C_ENTRY_MID)
             updates.append({
                 "range": f"{tab}!{entry_col}{sheet_row}",
                 "values": [[f"{bf_mid:.2f}"]],
             })
-            log(f"  BACKFILL entry_mid {trade['exp_str']}: {bf_mid:.2f}")
+            log(f"    BACKFILL entry_mid: {bf_mid:.2f}")
 
         # --- DTE column update ---
         if dte > 0 and dte in DTE_COL:
@@ -337,17 +360,20 @@ def main() -> int:
 
             # Skip if already filled
             row_data = existing[trade["row_idx"]]
-            current_val = row_data[col_idx] if col_idx < len(row_data) else ""
+            current_val = (row_data[col_idx] if col_idx < len(row_data) else "").strip()
             if current_val:
-                continue
-
-            if bf_mid is not None:
+                log(f"    d{dte}_mid ALREADY={current_val}")
+            elif bf_mid is not None and bf_mid > 0:
                 col_ltr = col_letter(col_idx)
                 updates.append({
                     "range": f"{tab}!{col_ltr}{sheet_row}",
                     "values": [[f"{bf_mid:.2f}"]],
                 })
-                log(f"  d{dte}_mid {trade['exp_str']}: {bf_mid:.2f}")
+                log(f"    d{dte}_mid: {bf_mid:.2f}")
+            else:
+                log(f"    d{dte}_mid: SKIP (no valid quote)")
+        elif dte > 4:
+            log(f"    dte={dte} > 4, no column to update yet")
 
         elif dte <= 0:
             # --- Settle expired ---
