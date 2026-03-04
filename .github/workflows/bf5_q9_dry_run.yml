@@ -3,6 +3,10 @@ name: BF5 Q9 Dry Run
 on:
   workflow_dispatch:
     inputs:
+      dry_run:
+        description: "true = no order submission, false = submit live order"
+        required: true
+        default: "true"
       sizing_override:
         description: "Optional account size override (e.g. 20000)"
         required: false
@@ -37,7 +41,7 @@ jobs:
       GW_ENDPOINT:        "rapi/GetUltraPureConstantStable"
 
       # BF5 config
-      BF_DRY_RUN: "true"
+      BF_DRY_RUN: ${{ github.event.inputs.dry_run }}
       BF_LOG_PATH: "logs/bf_q9_gh_dry_run.csv"
       BF_USE_ADAPTIVE_CADENCE: ${{ github.event.inputs.use_adaptive_cadence }}
       BF_ENTRY_WEEKDAYS: ${{ github.event.inputs.entry_weekdays }}
