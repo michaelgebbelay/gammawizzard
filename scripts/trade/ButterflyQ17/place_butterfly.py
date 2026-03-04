@@ -150,11 +150,8 @@ def butterfly_nbbo(c, direction: str, lower_osi: str, center_osi: str, upper_osi
     return bid, ask, mid
 
 
-def _valid_quote(bid, ask, mid) -> bool:
-    return (
-        bid is not None and ask is not None and mid is not None
-        and ask > 0 and mid > 0 and bid >= 0 and ask >= bid
-    )
+def _has_positive_mid(mid) -> bool:
+    return mid is not None and float(mid) > 0.0
 
 
 def _chain_quote_from_env():
@@ -184,21 +181,21 @@ def _chain_quote_from_env():
     if ask is None and mid is not None and bid is not None:
         ask = max(mid, clamp_tick(max(mid, bid + TICK)))
 
-    if _valid_quote(bid, ask, mid):
+    if _has_positive_mid(mid):
         return float(bid), float(ask), float(mid)
-    return (None, None, None)
+    return (bid, ask, None)
 
 
 def resolve_butterfly_quote(c, direction: str, lower_osi: str, center_osi: str, upper_osi: str):
     bid, ask, mid = butterfly_nbbo(c, direction, lower_osi, center_osi, upper_osi)
-    if _valid_quote(bid, ask, mid):
+    if _has_positive_mid(mid):
         return bid, ask, mid, "LIVE_NBBO"
 
     cbid, cask, cmid = _chain_quote_from_env()
-    if _valid_quote(cbid, cask, cmid):
+    if _has_positive_mid(cmid):
         return cbid, cask, cmid, "CHAIN_FALLBACK"
 
-    return bid, ask, mid, "INVALID"
+    return bid, ask, mid, "NO_VALID_MID"
 
 
 def order_payload_butterfly(direction: str, lower_osi: str, center_osi: str,
@@ -387,7 +384,7 @@ def place_butterfly_with_ladder(
     bid, ask, mid, quote_src = resolve_butterfly_quote(
         c, direction, lower_osi, center_osi, upper_osi,
     )
-    if not _valid_quote(bid, ask, mid):
+    if not _has_positive_mid(mid):
         return {
             "filled": 0, "order_ids": [], "last_price": None,
             "nbbo_bid": bid, "nbbo_ask": ask, "nbbo_mid": mid,
@@ -419,19 +416,16 @@ def place_butterfly_with_ladder(
 
         cur_bid, cur_ask, cur_mid = (bid, ask, mid)
         if refresh:
-            cur_bid, cur_ask, cur_mid, cur_src = resolve_butterfly_quote(
+            r_bid, r_ask, r_mid, cur_src = resolve_butterfly_quote(
                 c, direction, lower_osi, center_osi, upper_osi,
             )
-            print(f"{TAG} REFRESH NBBO: bid={cur_bid} ask={cur_ask} mid={cur_mid} source={cur_src}")
-            if not _valid_quote(cur_bid, cur_ask, cur_mid):
-                placed_reason = "NBBO_REFRESH_FAIL_OR_NONPOSITIVE"
-                break
+            print(f"{TAG} REFRESH NBBO: bid={r_bid} ask={r_ask} mid={r_mid} source={cur_src}")
+            if _has_positive_mid(r_mid):
+                cur_bid, cur_ask, cur_mid = r_bid, r_ask, r_mid
+            else:
+                print(f"{TAG} REFRESH WARN: no positive mid from refresh; keeping prior quote")
 
         price = price_from_mid(cur_mid, off, cur_bid, cur_ask)
-        if price <= 0:
-            placed_reason = "NON_POSITIVE_LIMIT_PRICE_GUARD"
-            print(f"{TAG} GUARD: computed non-positive price ({price}); aborting placement")
-            break
         last_price = price
         print(f"{TAG} rung#{idx}: price={price:.2f} remaining={remaining} wait={STEP_WAIT:.2f}s")
 
@@ -583,7 +577,7 @@ def main():
         )
         print(f"{TAG} DRY_RUN: NBBO bid={bid} ask={ask} mid={mid} source={quote_src}")
         print(f"{TAG} DRY_RUN: would place {direction} {qty}x @ mid={mid}")
-        resolved_reason = dry_run_reason if _valid_quote(bid, ask, mid) else f"{dry_run_reason}_NO_VALID_QUOTE"
+        resolved_reason = dry_run_reason if _has_positive_mid(mid) else f"{dry_run_reason}_NO_VALID_MID"
 
         # Log DRY_RUN trade for paper tracking
         now_utc = datetime.now(timezone.utc)
