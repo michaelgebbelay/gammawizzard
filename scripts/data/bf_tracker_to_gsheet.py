@@ -65,15 +65,17 @@ HEADERS = [
     "atm_strike",     # 7
     "width",          # 8
     "entry_mid",      # 9
-    "risk_pts",       # 10
-    "d4_mid",         # 11
-    "d3_mid",         # 12
-    "d2_mid",         # 13
-    "d1_mid",         # 14
-    "status",         # 15
-    "spot_settle",    # 16
-    "settle_value",   # 17
-    "pnl",            # 18
+    "acct_bal",       # 10
+    "risk_pts",       # 11
+    "risk_pct",       # 12
+    "d4_mid",         # 13
+    "d3_mid",         # 14
+    "d2_mid",         # 15
+    "d1_mid",         # 16
+    "status",         # 17
+    "spot_settle",    # 18
+    "settle_value",   # 19
+    "pnl",            # 20
 ]
 
 # Column indices
@@ -83,15 +85,17 @@ C_DIRECTION = 2
 C_ATM_STRIKE = 7
 C_WIDTH = 8
 C_ENTRY_MID = 9
-C_RISK_PTS = 10
-C_D4 = 11
-C_D3 = 12
-C_D2 = 13
-C_D1 = 14
-C_STATUS = 15
-C_SPOT_SETTLE = 16
-C_SETTLE_VALUE = 17
-C_PNL = 18
+C_ACCT_BAL = 10
+C_RISK_PTS = 11
+C_RISK_PCT = 12
+C_D4 = 13
+C_D3 = 14
+C_D2 = 15
+C_D1 = 16
+C_STATUS = 17
+C_SPOT_SETTLE = 18
+C_SETTLE_VALUE = 19
+C_PNL = 20
 
 # Map DTE (business days to expiration) -> column index
 DTE_COL = {4: C_D4, 3: C_D3, 2: C_D2, 1: C_D1}
@@ -198,6 +202,10 @@ def parse_csv_log(csv_path):
             # Entry mid = NBBO mid at time of entry
             entry_mid_str = r.get("nbbo_mid", "") or r.get("last_price", "")
             row[C_ENTRY_MID] = entry_mid_str
+            # Account balance at trade time
+            acct_bal_str = r.get("equity", "")
+            acct_bal = _fnum(acct_bal_str)
+            row[C_ACCT_BAL] = f"{acct_bal:.0f}" if acct_bal and acct_bal > 0 else ""
             # Risk in SPX points: SELL = width - entry_mid, BUY = entry_mid
             entry_mid_val = _fnum(entry_mid_str)
             width_dn, width_up = _parse_width_pair(row[C_WIDTH])
@@ -208,6 +216,10 @@ def parse_csv_log(csv_path):
                 else:
                     risk = entry_mid_val
                 row[C_RISK_PTS] = f"{risk:.1f}" if risk > 0 else ""
+                # Risk % = (risk_pts * $100) / acct_bal * 100
+                if acct_bal and acct_bal > 0 and risk > 0:
+                    risk_pct = (risk * 100.0) / acct_bal * 100.0
+                    row[C_RISK_PCT] = f"{risk_pct:.1f}%"
             row[C_STATUS] = "SKIP" if direction == "SKIP" else "OPEN"
             rows.append(row)
 
