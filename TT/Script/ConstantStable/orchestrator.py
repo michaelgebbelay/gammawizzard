@@ -59,7 +59,7 @@ def _add_scripts_root():
 _add_scripts_root()
 from tt_client import request as tt_request
 
-__version__ = "2.3.0"
+__version__ = "2.4.0"
 
 GW_BASE = os.environ.get("GW_BASE", "https://gandalf.gammawizard.com").rstrip("/")
 GW_ENDPOINT = os.environ.get("GW_ENDPOINT", "rapi/GetUltraPureConstantStable").lstrip("/")
@@ -92,6 +92,18 @@ CS_BUNDLE_4LEG = (os.environ.get("CS_BUNDLE_4LEG", "1") or "1").strip().lower() 
 CS_BUNDLE_REQUIRE_EQUAL_QTY = (os.environ.get("CS_BUNDLE_REQUIRE_EQUAL_QTY", "1") or "1").strip().lower() in ("1", "true", "yes", "y")
 CS_BUNDLE_FALLBACK = (os.environ.get("CS_BUNDLE_FALLBACK", "1") or "1").strip().lower() in ("1", "true", "yes", "y")
 CS_PAIR_ALTERNATE = (os.environ.get("CS_PAIR_ALTERNATE", "1") or "1").strip().lower() in ("1", "true", "yes", "y")
+
+# --- IC_LONG regime filter config ---
+# Skip IC_LONG when trailing 5-day avg |SPX move|% < nearest anchor distance%.
+# Decision is pre-computed by ic_long_filter.py and written to S3.
+CS_IC_LONG_FILTER = (os.environ.get("CS_IC_LONG_FILTER", "1") or "1").strip().lower() in ("1", "true", "yes", "y")
+CS_MOVE_STATE_S3_BUCKET = (
+    os.environ.get("CS_MOVE_STATE_S3_BUCKET")
+    or os.environ.get("SIM_CACHE_BUCKET", "")
+).strip()
+CS_IC_DECISION_S3_KEY = os.environ.get(
+    "CS_IC_DECISION_S3_KEY", "cadence/cs_ic_long_decision.json"
+)
 
 
 # ---------- Utility helpers ----------
@@ -424,6 +436,47 @@ def would_close_guard(v: Dict[str, Any], pos: Dict[Tuple[str, str, str], float])
     return False
 
 
+# ---------- IC_LONG filter (reads pre-computed decision from S3) ----------
+
+def _read_ic_long_decision(today_str: str) -> Tuple[bool, str]:
+    """Read the pre-computed IC_LONG skip decision from S3.
+
+    The decision is written by ic_long_filter.py which runs at 4:01 PM ET,
+    before the orchestrators execute at 4:13 PM ET.
+    """
+    if not CS_IC_LONG_FILTER:
+        return False, ""
+    bucket = CS_MOVE_STATE_S3_BUCKET
+    if not bucket:
+        print("CS_VERT_RUN IC_FILTER: no S3 bucket, allowing trade")
+        return False, ""
+    try:
+        import boto3
+        s3 = boto3.client("s3")
+        obj = s3.get_object(Bucket=bucket, Key=CS_IC_DECISION_S3_KEY)
+        decision = json.loads(obj["Body"].read().decode("utf-8"))
+    except Exception as e:
+        print(f"CS_VERT_RUN IC_FILTER: cannot read decision ({e}), allowing trade")
+        return False, ""
+
+    if decision.get("date") != today_str:
+        print(
+            f"CS_VERT_RUN IC_FILTER: stale decision "
+            f"(file={decision.get('date')}, today={today_str}), allowing trade"
+        )
+        return False, ""
+
+    skip = decision.get("ic_long_skip", False)
+    reason = decision.get("reason", "")
+    trail = decision.get("trail_move_pct")
+    anchor = decision.get("anchor_pct")
+    print(
+        f"CS_VERT_RUN IC_FILTER: decision={'SKIP' if skip else 'ALLOW'} "
+        f"trail={trail} anchor={anchor} reason={reason}"
+    )
+    return skip, reason
+
+
 # ---------- main ----------
 
 def main():
@@ -598,6 +651,16 @@ def main():
                     for v in (v_put, v_call):
                         print(f"CS_VERT_RUN {ic_label}_SIZE: {v['name']} target {v['target_qty']} → {ic_target} (ic_mult={ic_mult} bucket={bucket})")
                         v["target_qty"] = ic_target
+
+    # --- IC_LONG regime filter ---
+    is_ic_long = (v_put and v_call
+                  and v_put["side"] == "DEBIT" and v_call["side"] == "DEBIT")
+
+    if is_ic_long:
+        should_skip_ic, skip_reason = _read_ic_long_decision(date.today().isoformat())
+        if should_skip_ic:
+            print(f"CS_VERT_RUN SKIP: {skip_reason}")
+            return 0
 
     # Load positions once if needed (guard and/or topup)
     need_positions = CS_GUARD_NO_CLOSE or CS_TOPUP

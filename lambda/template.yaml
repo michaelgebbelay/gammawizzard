@@ -50,14 +50,14 @@ Resources:
       DockerContext: ..
       DockerTag: latest
 
-  # ---------- Warm-up Schedule (3 min before trade) ----------
+  # ---------- Warm-up Schedule (3 min before earliest trade) ----------
   WarmupSchedule:
     Type: AWS::Scheduler::Schedule
     Properties:
       Name: gamma-cs-warmup
-      Description: "Warm up Lambda container 3 min before trading"
+      Description: "Warm up Lambda container 3 min before BF5 (earliest trade)"
       State: ENABLED
-      ScheduleExpression: "cron(10 16 ? * MON-FRI *)"
+      ScheduleExpression: "cron(58 15 ? * MON-FRI *)"
       ScheduleExpressionTimezone: "America/New_York"
       FlexibleTimeWindow:
         Mode: "OFF"
@@ -72,7 +72,7 @@ Resources:
     Properties:
       Name: gamma-cs-schwab
       Description: "ConstantStable Schwab account"
-      State: DISABLED
+      State: ENABLED
       ScheduleExpression: !Ref ScheduleTime
       ScheduleExpressionTimezone: "America/New_York"
       FlexibleTimeWindow:
@@ -112,14 +112,30 @@ Resources:
         RoleArn: !GetAtt SchedulerRole.Arn
         Input: '{"account": "tt-individual"}'
 
-  # ---------- Butterfly Q9 5DTE Schedule ----------
+  # ---------- IC_LONG Filter Pre-check (4:01 PM ET) ----------
+  IcLongFilterSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: gamma-cs-ic-long-filter
+      Description: "IC_LONG regime filter: compute go/no-go before trade execution"
+      State: ENABLED
+      ScheduleExpression: "cron(1 16 ? * MON-FRI *)"
+      ScheduleExpressionTimezone: "America/New_York"
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt TradingFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"account": "ic-long-filter"}'
+
+  # ---------- Butterfly Q9 5DTE Schedule (EM2d, 4:01 PM ET) ----------
   Butterfly5Schedule:
     Type: AWS::Scheduler::Schedule
     Properties:
       Name: gamma-bf5-schwab
-      Description: "ButterflyQ9 SPX 5DTE butterfly (Schwab)"
+      Description: "ButterflyQ9 SPX 5DTE EM2d butterfly (Schwab) 4:01 PM ET"
       State: ENABLED
-      ScheduleExpression: !Ref ScheduleTime
+      ScheduleExpression: "cron(1 16 ? * MON-FRI *)"
       ScheduleExpressionTimezone: "America/New_York"
       FlexibleTimeWindow:
         Mode: "OFF"

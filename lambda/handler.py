@@ -18,7 +18,7 @@ TASK_ROOT = os.environ.get("LAMBDA_TASK_ROOT", "/var/task")
 REPORT_STEPS = {"cs_summary_to_gsheet.py", "cs_performance_to_gsheet.py"}
 DEFAULT_REPORT_OWNER = "tt-individual"
 DEFAULT_REPORT_DELAY_SECS = 90
-DISABLE_SCHWAB_CS_DEFAULT = True
+DISABLE_SCHWAB_CS_DEFAULT = False
 
 # ---------------------------------------------------------------------------
 # Account configurations
@@ -65,13 +65,14 @@ ACCOUNTS = {
             "BF_LOG_PATH": "/tmp/bf5_trades.csv",
             "BF_TRACKER_TAB": "BF_Q9_5DTE",
             "BF_GSHEET_ID": "1r3ipwByfs2Zhgb4WmSTmXCpF8HEphxD9CJlMtr7GSGs",
-            "BF_STEP_WAIT": "15",
+            "BF_STEP_WAIT": "40",
             "BF_POLL_SECS": "2.0",
             "BF_CANCEL_SETTLE": "1.0",
             "BF_MAX_LADDER": "3",
             "BF_DRY_RUN": "false",
             "BF_TOPUP": "1",
             "BF_GUARD_NO_CLOSE": "1",
+            "SIM_CACHE_BUCKET": "gamma-sim-cache",
         },
     },
     "bf5-eod": {
@@ -171,6 +172,20 @@ ACCOUNTS = {
             "CS_ACCOUNT_LABEL": "manual",
             "CS_COST_PER_CONTRACT": "0.97",
             "CS_MANUAL_TAB": "Manual_Trades",
+        },
+    },
+    "ic-long-filter": {
+        "orchestrator": "scripts/trade/ConstantStable/ic_long_filter.py",
+        "post_steps": [],
+        "token_ssm_path": "/gamma/schwab/token_json",
+        "token_file": "/tmp/schwab_token.json",
+        "env_from_ssm": {
+            "SCHWAB_APP_KEY": "/gamma/schwab/app_key",
+            "SCHWAB_APP_SECRET": "/gamma/schwab/app_secret",
+        },
+        "static_env": {
+            "SCHWAB_TOKEN_PATH": "/tmp/schwab_token.json",
+            "SIM_CACHE_BUCKET": "gamma-sim-cache",
         },
     },
     "morning-check": {
