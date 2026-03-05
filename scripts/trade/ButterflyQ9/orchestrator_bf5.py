@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
-# BUTTERFLY Q9 — SPX 5DTE call butterfly orchestrator
+# BUTTERFLY Q9 — SPX 5DTE call butterfly orchestrator (EM2d strategy)
 #
 # What it does:
 # - Fetches VIX1D (VixOne) from Leo's GammaWizard API.
 # - Fetches VIX quote + 5DTE SPX option chain from Schwab.
-# - Classifies VIX1D into Q9 quantile bucket -> SELL / BUY / SKIP.
-# - Applies adaptive cadence gate (FAST_V1) by equity + drawdown tiers.
-# - Computes ATM strike and expected move (EM).
+# - Computes daily EM ratio (|SPX move| / ATM straddle) and stores it.
+# - Classifies regime via 2-trade trailing EM ratio (EM2d):
+#   - BUY when em2d < 0.80 AND VIX1D < 18
+#   - SELL when em2d > 1.30 AND VIX1D/VIX >= 0.9
+#   - SKIP otherwise
+# - MTW cadence (Mon/Tue/Wed), $10K hard floor.
 # - Selects wings by side-specific put-delta profiles:
 #   - BUY execution: 20P anchor, symmetric call wing from put width
 #   - SELL execution: 35P anchor, symmetric call wing from put width
-# - Falls back to EM-scaled symmetric width only if delta strikes are unavailable.
+# - SKIPs if delta strikes unavailable (no EM-width fallback).
 # - Builds 3-leg ATM call butterfly: BUY lower + SELL 2x center + BUY upper.
 # - Delegates placement to scripts/trade/ButterflyQ9/place_butterfly.py via BF_* envs.
 #
-# Strategy trained on 2023-2026 backtest, Q9 quantile VIX1D buckets (BASE).
-# Walk-forward OOS: $96k, PF 1.32, 219 trades.
+# Strategy: EM2d trailing ratio + VIX1D/VIX filters.
+# Backtest (MTW, 2023-2026): $230k, PF 3.08, 189 trades, MaxDD -$8.8k.
 
 import os
 import sys
@@ -26,7 +29,7 @@ import json
 import subprocess
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, Set
+from typing import Any, Dict, Optional, Tuple
 
 import requests
 
@@ -47,19 +50,23 @@ def _add_scripts_root():
 _add_scripts_root()
 from schwab_token_keeper import schwab_client
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 
 # ---------- Strategy Config ----------
 
-SELL_EM_MULT = 1.25     # width = EM * 1.25 for SELL
-BUY_EM_MULT = 0.85      # width = EM * 0.85 for BUY
-MIN_WIDTH = 15
-MAX_WIDTH = 200
 STRIKE_STEP = 5          # SPX strikes are $5 apart
 BF_UNIT_DOLLARS = 30_000 # $30k equity per 1 butterfly contract
 BF_MIN_LIVE_EQUITY = float(os.environ.get("BF_MIN_LIVE_EQUITY", "15000"))
+BF_HARD_FLOOR = float(os.environ.get("BF_HARD_FLOOR", "10000"))
 DTE_BUSINESS_DAYS = 5    # 5 business days to expiration
 BF_PRICE_TICK = 0.05
+
+# EM2d strategy thresholds
+EM2D_BUY_THRESHOLD = 0.80    # em2d < this -> BUY signal
+EM2D_SELL_THRESHOLD = 1.30   # em2d > this -> SELL signal
+EM2D_VIX1D_BUY_CAP = 18.0   # VIX1D must be < this for BUY
+EM2D_VV_SELL_FLOOR = 0.90    # VIX1D/VIX must be >= this for SELL
+EM2D_WINDOW = 2              # trailing window size
 
 # Static weekday execution gate fallback; default Mon/Tue/Wed (0,1,2).
 ALLOWED_ENTRY_WEEKDAYS = {
@@ -72,55 +79,21 @@ if not ALLOWED_ENTRY_WEEKDAYS:
 
 BF_LOG_PATH = os.environ.get("BF_LOG_PATH", "logs/butterfly_q9_trades.csv")
 
-# Adaptive cadence (FAST_V1) enabled by default.
-BF_USE_ADAPTIVE_CADENCE = (os.environ.get("BF_USE_ADAPTIVE_CADENCE", "1") or "1").strip().lower() in ("1", "true", "yes", "y")
-BF_CADENCE_STATE_PATH = os.environ.get(
-    "BF_CADENCE_STATE_PATH",
-    str(Path(BF_LOG_PATH).with_name("butterfly_q9_cadence_state.json")),
-)
-BF_CADENCE_STATE_S3_BUCKET = (
-    os.environ.get("BF_CADENCE_STATE_S3_BUCKET")
-    or os.environ.get("SIM_CACHE_BUCKET", "")
-).strip()
-BF_CADENCE_STATE_S3_KEY = (
-    os.environ.get("BF_CADENCE_STATE_S3_KEY", "cadence/butterfly_q9_cadence_state.json")
-).strip()
-
-# FAST_V1 thresholds:
-# 1) DD >= 30% -> Wed only
-# 2) DD >= 20% -> Tue/Thu
-# 3) Balance < 15k -> Tue/Thu
-# 4) 15k-32k -> Mon/Tue/Wed
-# 5) 32k-40k -> Mon/Tue/Wed/Thu
-# 6) >= 40k -> Mon-Fri
-FAST_V1_DD_W_ONLY = 0.30
-FAST_V1_DD_TTH = 0.20
-FAST_V1_BAL_TTH = 15_000.0
-FAST_V1_BAL_MTW = 32_000.0
-FAST_V1_BAL_MTWTH = 40_000.0
-
 GW_BASE = os.environ.get("GW_BASE", "https://gandalf.gammawizard.com").rstrip("/")
 GW_ENDPOINT = os.environ.get("GW_ENDPOINT", "rapi/GetUltraPureConstantStable").lstrip("/")
 
-# Q9 bucket edges (VIX1D raw decimal values, NOT x100)
-# Trained on 2023+ data, 9 quantile buckets with SKIP on extremes (0 and 8)
-Q9_EDGES = [
-    0.015, 0.076, 0.099, 0.112, 0.124,
-    0.135, 0.155, 0.173, 0.199, 0.519,
-]
-
-# Q9 bucket actions: index = bucket number (BASE variant — all buckets active)
-Q9_ACTIONS = [
-    "SELL",   # B0:  < 0.076  (VIX1D < 7.6%)
-    "BUY",    # B1:  0.076-0.099
-    "BUY",    # B2:  0.099-0.112
-    "BUY",    # B3:  0.112-0.124
-    "SELL",   # B4:  0.124-0.135
-    "SELL",   # B5:  0.135-0.155
-    "SELL",   # B6:  0.155-0.173
-    "BUY",    # B7:  0.173-0.199
-    "SELL",   # B8:  >= 0.199  (VIX1D > 19.9%)
-]
+# EM state persistence (S3 + local fallback)
+BF_EM_STATE_PATH = os.environ.get(
+    "BF_EM_STATE_PATH",
+    str(Path(BF_LOG_PATH).with_name("butterfly_q9_em_state.json")),
+)
+BF_EM_STATE_S3_BUCKET = (
+    os.environ.get("BF_EM_STATE_S3_BUCKET")
+    or os.environ.get("SIM_CACHE_BUCKET", "")
+).strip()
+BF_EM_STATE_S3_KEY = (
+    os.environ.get("BF_EM_STATE_S3_KEY", "cadence/butterfly_q9_em_state.json")
+).strip()
 
 # Side profiles (absolute delta targets).
 BUY_PUT_DELTA = 0.20
@@ -155,18 +128,6 @@ def build_osi(root: str, exp_date: date, cp: str, strike: int) -> str:
     exp6 = f"{exp_date:%y%m%d}"
     mills = strike * 1000
     return f"{root:<6}{exp6}{cp}{mills:08d}"
-
-
-def round_to_strike(value: float) -> int:
-    """Round to nearest strike step ($5)."""
-    return int(round(value / STRIKE_STEP) * STRIKE_STEP)
-
-
-def compute_width(em: float, mult: float) -> int:
-    """Compute butterfly wing width from expected move and multiplier."""
-    raw = em * mult
-    w = round_to_strike(raw)
-    return max(MIN_WIDTH, min(MAX_WIDTH, w))
 
 
 def _leg_mid_from_chain(q: Dict[str, Any]) -> float:
@@ -234,12 +195,98 @@ def nearest_delta_strike(
     return int(best[0])
 
 
-def classify_vix1d(vix1d: float) -> Tuple[int, str]:
-    """Returns (bucket_index, action) for a given VIX1D value."""
-    for i in range(len(Q9_EDGES) - 1):
-        if vix1d < Q9_EDGES[i + 1]:
-            return (i, Q9_ACTIONS[i])
-    return (len(Q9_ACTIONS) - 1, Q9_ACTIONS[-1])
+def _load_em_state_s3(bucket: str, key: str) -> Optional[list]:
+    if not bucket or not key:
+        return None
+    try:
+        import boto3
+        s3 = boto3.client("s3")
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        body = obj.get("Body")
+        raw = body.read() if body else b""
+        j = json.loads((raw or b"{}").decode("utf-8"))
+        return j.get("em_history", [])
+    except Exception:
+        return None
+
+
+def _save_em_state_s3(bucket: str, key: str, history: list) -> bool:
+    if not bucket or not key:
+        return False
+    try:
+        import boto3
+        s3 = boto3.client("s3")
+        payload = {
+            "em_history": history,
+            "updated_utc_epoch": int(time.time()),
+        }
+        s3.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=json.dumps(payload, indent=2).encode("utf-8"),
+            ContentType="application/json",
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _load_em_state(path: str) -> list:
+    """Load EM ratio history. Returns list of {date, em_ratio} dicts."""
+    s3_val = _load_em_state_s3(BF_EM_STATE_S3_BUCKET, BF_EM_STATE_S3_KEY)
+    if s3_val is not None:
+        return s3_val
+    try:
+        p = Path(path)
+        if not p.exists():
+            return []
+        j = json.loads(p.read_text(encoding="utf-8"))
+        return j.get("em_history", [])
+    except Exception:
+        return []
+
+
+def _save_em_state(path: str, history: list) -> None:
+    """Save EM ratio history. Keeps last 10 entries max."""
+    history = history[-10:]  # trim to last 10
+    saved_s3 = _save_em_state_s3(BF_EM_STATE_S3_BUCKET, BF_EM_STATE_S3_KEY, history)
+    if saved_s3:
+        return
+    try:
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "em_history": history,
+            "updated_utc_epoch": int(time.time()),
+        }
+        p.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def compute_em2d(history: list) -> Optional[float]:
+    """Compute trailing EM2d from history. Returns None if insufficient data."""
+    if len(history) < EM2D_WINDOW:
+        return None
+    recent = history[-EM2D_WINDOW:]
+    vals = [entry.get("em_ratio") for entry in recent if entry.get("em_ratio") is not None]
+    if len(vals) < EM2D_WINDOW:
+        return None
+    return sum(vals) / len(vals)
+
+
+def classify_em2d(em2d: float, vix1d_pct: float, vix: float) -> str:
+    """
+    Classify action based on EM2d trailing ratio and filters.
+    vix1d_pct: VIX1D as percentage (e.g. 12.5 means 12.5%).
+    Returns "BUY", "SELL", or "SKIP".
+    """
+    if em2d < EM2D_BUY_THRESHOLD and vix1d_pct < EM2D_VIX1D_BUY_CAP:
+        return "BUY"
+    vv_ratio = vix1d_pct / vix if vix > 0 else 0.0
+    if em2d > EM2D_SELL_THRESHOLD and vv_ratio >= EM2D_VV_SELL_FLOOR:
+        return "SELL"
+    return "SKIP"
 
 
 def to_osi(sym: str) -> str:
@@ -270,120 +317,6 @@ def fnum(x):
         return float(x)
     except Exception:
         return None
-
-
-def _load_cadence_peak_equity_s3(bucket: str, key: str) -> Optional[float]:
-    if not bucket or not key:
-        return None
-    try:
-        import boto3
-        s3 = boto3.client("s3")
-        obj = s3.get_object(Bucket=bucket, Key=key)
-        body = obj.get("Body")
-        raw = body.read() if body else b""
-        j = json.loads((raw or b"{}").decode("utf-8"))
-        v = fnum((j or {}).get("peak_equity"))
-        if v is None:
-            return 0.0
-        return max(0.0, float(v))
-    except Exception:
-        return None
-
-
-def _save_cadence_peak_equity_s3(bucket: str, key: str, peak_equity: float) -> bool:
-    if not bucket or not key:
-        return False
-    try:
-        import boto3
-        s3 = boto3.client("s3")
-        payload = {
-            "peak_equity": float(max(0.0, peak_equity)),
-            "updated_utc_epoch": int(time.time()),
-        }
-        s3.put_object(
-            Bucket=bucket,
-            Key=key,
-            Body=json.dumps(payload, indent=2).encode("utf-8"),
-            ContentType="application/json",
-        )
-        return True
-    except Exception:
-        return False
-
-
-def _load_cadence_peak_equity(path: str) -> float:
-    # Durable store (S3) is preferred when configured (e.g., Lambda).
-    s3_val = _load_cadence_peak_equity_s3(BF_CADENCE_STATE_S3_BUCKET, BF_CADENCE_STATE_S3_KEY)
-    if s3_val is not None:
-        return s3_val
-
-    # Fallback: local file (works for local/dev runs).
-    try:
-        p = Path(path)
-        if not p.exists():
-            return 0.0
-        j = json.loads(p.read_text(encoding="utf-8"))
-        v = fnum((j or {}).get("peak_equity"))
-        return max(0.0, float(v or 0.0))
-    except Exception:
-        return 0.0
-
-
-def _save_cadence_peak_equity(path: str, peak_equity: float) -> None:
-    # Best effort durable save (S3) first; local fallback remains for dev/local.
-    saved_s3 = _save_cadence_peak_equity_s3(
-        BF_CADENCE_STATE_S3_BUCKET,
-        BF_CADENCE_STATE_S3_KEY,
-        peak_equity,
-    )
-    if saved_s3:
-        return
-
-    try:
-        p = Path(path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "peak_equity": float(max(0.0, peak_equity)),
-            "updated_utc_epoch": int(time.time()),
-        }
-        p.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    except Exception:
-        # Non-fatal: cadence can run without persisted peak.
-        pass
-
-
-def _weekday_names(days: Set[int]) -> str:
-    names = {
-        0: "Mon",
-        1: "Tue",
-        2: "Wed",
-        3: "Thu",
-        4: "Fri",
-        5: "Sat",
-        6: "Sun",
-    }
-    return ",".join(names.get(d, str(d)) for d in sorted(days))
-
-
-def cadence_fast_v1_allowed_weekdays(equity: float, peak_equity: float) -> Tuple[Set[int], str, float]:
-    """
-    Return (allowed_weekdays, tier_name, drawdown_pct) for FAST_V1 adaptive cadence.
-    """
-    eq = max(0.0, float(equity))
-    peak = max(eq, float(peak_equity))
-    dd = ((peak - eq) / peak) if peak > 0 else 0.0
-
-    if dd >= FAST_V1_DD_W_ONLY:
-        return {2}, "W_ONLY_DD30", dd
-    if dd >= FAST_V1_DD_TTH:
-        return {1, 3}, "TTH_DD20", dd
-    if eq < FAST_V1_BAL_TTH:
-        return {1, 3}, "TTH_LT15K", dd
-    if eq < FAST_V1_BAL_MTW:
-        return {0, 1, 2}, "MTW_15K_32K", dd
-    if eq < FAST_V1_BAL_MTWTH:
-        return {0, 1, 2, 3}, "MTWTH_32K_40K", dd
-    return {0, 1, 2, 3, 4}, "ALL_GTE40K", dd
 
 
 # ---------- GammaWizard ----------
@@ -873,43 +806,25 @@ def main():
     )
 
     today = date.today()
-    cadence_mode = "STATIC"
-    cadence_tier = "STATIC_BF_ENTRY_WEEKDAYS"
-    cadence_dd = 0.0
 
-    if BF_USE_ADAPTIVE_CADENCE:
-        # Persisted peak equity keeps drawdown tiers stable across runs/days.
-        peak_equity_prev = _load_cadence_peak_equity(BF_CADENCE_STATE_PATH)
-        peak_equity_now = max(float(oc_val or 0.0), peak_equity_prev)
-        if not ov_raw:
-            _save_cadence_peak_equity(BF_CADENCE_STATE_PATH, peak_equity_now)
-
-        allowed_days, cadence_tier, cadence_dd = cadence_fast_v1_allowed_weekdays(
-            float(oc_val or 0.0),
-            peak_equity_now,
-        )
-        cadence_mode = "FAST_V1_ADAPTIVE"
-        allowed_names = _weekday_names(allowed_days)
+    # Hard floor: if equity drops below $10K, pause until manual review.
+    if oc_val is not None and oc_val < BF_HARD_FLOOR and not force_paper_only:
         print(
-            "BF_Q9 CADENCE: "
-            f"mode={cadence_mode} tier={cadence_tier} "
-            f"equity={float(oc_val or 0.0):.2f} peak={peak_equity_now:.2f} "
-            f"dd={cadence_dd*100:.2f}% allowed={allowed_names}"
+            f"BF_Q9 SKIP: equity ${oc_val:,.0f} below hard floor "
+            f"${BF_HARD_FLOOR:,.0f} — paused until manual review"
         )
-    else:
-        allowed_days = set(ALLOWED_ENTRY_WEEKDAYS)
-        allowed_names = _weekday_names(allowed_days)
-        print(
-            f"BF_Q9 CADENCE: mode={cadence_mode} "
-            f"allowed={allowed_names}"
-        )
+        return 0
 
+    # MTW cadence (Mon/Tue/Wed only — backtested).
+    allowed_days = set(ALLOWED_ENTRY_WEEKDAYS)
     if today.weekday() not in allowed_days:
         print(
             f"BF_Q9 SKIP: weekday gate today={today} weekday={today.weekday()} "
-            f"allowed={allowed_names} tier={cadence_tier}"
+            f"allowed=Mon,Tue,Wed"
         )
         return 0
+
+    print(f"BF_Q9 CADENCE: MTW, equity=${float(oc_val or 0):,.0f}")
 
     # --- Fetch VIX1D from Leo's GW API ---
     try:
@@ -923,19 +838,12 @@ def main():
         print("BF_Q9 SKIP: VixOne not found in GW response")
         return 0
 
-    bucket, action = classify_vix1d(vix1d)
-    print(f"BF_Q9 VIX1D: {vix1d:.4f} -> bucket={bucket} action={action}")
-
-    if action == "SKIP":
-        print(f"BF_Q9 SKIP: Q9 bucket {bucket} -> SKIP")
-        return 0
-
-    # --- Fetch VIX from Schwab (informational, no cap) ---
+    # --- Fetch VIX from Schwab (required for SELL filter) ---
     try:
         vix = fetch_vix(c)
     except Exception as e:
-        print(f"BF_Q9 WARN: VIX fetch failed (non-fatal): {e}")
-        vix = 0.0
+        print(f"BF_Q9 SKIP: VIX fetch failed: {e}")
+        return 0
 
     print(f"BF_Q9 VIX: {vix:.2f}")
 
@@ -961,18 +869,62 @@ def main():
         print("BF_Q9 SKIP: EM <= 0")
         return 0
 
-    # --- Compute strikes ---
-    mult = SELL_EM_MULT if action == "SELL" else BUY_EM_MULT
-    center = atm_strike
-    lower = None
-    upper = None
-    width = ""
-    width_mode = "EM_WIDTH"
-    put_delta_target = ""
-    call_delta_target = ""
+    # --- Compute today's EM ratio and update state ---
+    # SPX previous close: try chain underlying, then SPX quote closePrice.
+    underlying = raw_chain.get("underlying") or {}
+    prev_close = fnum(underlying.get("close")) or fnum(underlying.get("previousClose"))
+    if not prev_close or prev_close <= 0:
+        try:
+            spx_q = schwab_get_json(
+                c, "https://api.schwabapi.com/marketdata/v1/quotes",
+                params={"symbols": "$SPX", "fields": "quote"}, tag="SPX_CLOSE",
+            )
+            prev_close = fnum(((spx_q.get("$SPX") or {}).get("quote") or {}).get("closePrice"))
+        except Exception:
+            prev_close = None
+    if prev_close and prev_close > 0:
+        spot_move = abs(spot - prev_close)
+        today_em_ratio = spot_move / em
+    else:
+        # Fallback: use spot move as fraction of EM from ATM straddle.
+        # If no previous close available, we can't compute EM ratio reliably.
+        today_em_ratio = None
+        print("BF_Q9 WARN: no previous close available for EM ratio computation")
 
-    # Side-specific delta targeting.
-    # New rule: put side anchors width; call side mirrors put width.
+    em_history = _load_em_state(BF_EM_STATE_PATH)
+
+    if today_em_ratio is not None:
+        # Don't double-store if we already ran today
+        today_str = today.isoformat()
+        if not em_history or em_history[-1].get("date") != today_str:
+            em_history.append({"date": today_str, "em_ratio": round(today_em_ratio, 4)})
+        else:
+            em_history[-1]["em_ratio"] = round(today_em_ratio, 4)
+        _save_em_state(BF_EM_STATE_PATH, em_history)
+        print(f"BF_Q9 EM_RATIO: today={today_em_ratio:.4f} (move={spot_move:.2f} em={em:.2f})")
+
+    # --- Compute EM2d trailing and classify ---
+    em2d = compute_em2d(em_history)
+    # Convert VIX1D from decimal to percentage for classification
+    vix1d_pct = vix1d * 100.0 if vix1d < 1.0 else vix1d
+    vv_ratio = vix1d_pct / vix if vix > 0 else 0.0
+
+    if em2d is None:
+        print(f"BF_Q9 SKIP: insufficient EM history for EM2d (have {len(em_history)}, need {EM2D_WINDOW})")
+        return 0
+
+    action = classify_em2d(em2d, vix1d_pct, vix)
+    print(
+        f"BF_Q9 EM2D: em2d={em2d:.4f} VIX1D={vix1d_pct:.2f} VIX={vix:.2f} "
+        f"VV={vv_ratio:.3f} -> action={action}"
+    )
+
+    if action == "SKIP":
+        print(f"BF_Q9 SKIP: EM2d={em2d:.4f} outside trade zone")
+        return 0
+
+    # --- Compute strikes via delta targeting (no EM-width fallback) ---
+    center = atm_strike
     put_tgt, call_tgt, profile_tag = side_delta_targets(action)
     put_delta_target = f"{put_tgt:.2f}"
     call_delta_target = f"{call_tgt:.2f}"
@@ -983,7 +935,7 @@ def main():
         center,
         side="PUT",
     )
-    # Keep call delta lookup for diagnostics only; strike selection is put-anchored.
+    # Call delta lookup for diagnostics; strike selection is put-anchored.
     upper_cand = nearest_delta_strike(
         chain.get("call_deltas", {}),
         call_tgt,
@@ -991,38 +943,33 @@ def main():
         side="CALL",
     )
 
-    if lower_cand is not None and lower_cand < center:
-        put_width = int(center - lower_cand)
-        upper_sym = int(center + put_width)
-
-        # Ensure symmetric upper strike exists in parsed call chain.
-        if upper_sym in chain.get("strikes", {}):
-            lower = int(lower_cand)
-            upper = upper_sym
-            width = str(put_width)
-            width_mode = f"{profile_tag}_PUT_ANCHORED"
-            diag_call = f"{upper_cand}" if upper_cand is not None else "n/a"
-            print(
-                f"BF_Q9 DELTA_PROFILE: {width_mode} "
-                f"(put_target={put_tgt:.2f}, call_target={call_tgt:.2f}, call_diag={diag_call}) "
-                f"-> lower={lower} upper={upper} width={width}"
-            )
-        else:
-            print(
-                "BF_Q9 DELTA_PROFILE WARN: symmetric upper strike missing in chain "
-                f"(center={center}, put_width={put_width}, upper_sym={upper_sym}) "
-                "-- fallback to EM width."
-            )
-    if lower is None or upper is None:
+    if lower_cand is None or lower_cand >= center:
         print(
-            "BF_Q9 DELTA_PROFILE WARN: could not resolve delta strikes "
-            f"(profile={profile_tag}, put_target={put_tgt:.2f}, call_target={call_tgt:.2f}) "
-            "-- fallback to EM width."
+            f"BF_Q9 SKIP: could not resolve put delta strike "
+            f"(profile={profile_tag}, put_target={put_tgt:.2f})"
         )
-        width_pts = compute_width(em, mult)
-        lower = center - width_pts
-        upper = center + width_pts
-        width = str(width_pts)
+        return 0
+
+    put_width = int(center - lower_cand)
+    upper_sym = int(center + put_width)
+
+    if upper_sym not in chain.get("strikes", {}):
+        print(
+            f"BF_Q9 SKIP: symmetric upper strike {upper_sym} missing in chain "
+            f"(center={center}, put_width={put_width})"
+        )
+        return 0
+
+    lower = int(lower_cand)
+    upper = upper_sym
+    width = str(put_width)
+    width_mode = f"{profile_tag}_PUT_ANCHORED"
+    diag_call = f"{upper_cand}" if upper_cand is not None else "n/a"
+    print(
+        f"BF_Q9 DELTA_PROFILE: {width_mode} "
+        f"(put_target={put_tgt:.2f}, call_target={call_tgt:.2f}, call_diag={diag_call}) "
+        f"-> lower={lower} upper={upper} width={width}"
+    )
 
     lower_osi = build_osi("SPXW", target_exp, "C", lower)
     center_osi = build_osi("SPXW", target_exp, "C", center)
@@ -1030,7 +977,7 @@ def main():
 
     direction = action  # "SELL" or "BUY"
 
-    print(f"BF_Q9 BUTTERFLY: action={action} width={width} mode={width_mode} mult={mult:.2f}")
+    print(f"BF_Q9 BUTTERFLY: action={action} width={width} mode={width_mode}")
     print(f"  lower={lower} ({lower_osi})")
     print(f"  center={center} ({center_osi}) x2")
     print(f"  upper={upper} ({upper_osi})")
@@ -1121,11 +1068,13 @@ def main():
         "BF_CALL_DELTA_TGT": call_delta_target,
         "BF_ATM_STRIKE":     str(center),
         "BF_EM":             f"{em:.2f}",
-        "BF_EM_MULT":        f"{mult:.2f}",
         "BF_SPOT":           f"{spot:.2f}",
         "BF_VIX":            f"{vix:.2f}",
         "BF_VIX1D":          f"{vix1d:.4f}",
-        "BF_BUCKET":         str(bucket),
+        "BF_VIX1D_PCT":      f"{vix1d_pct:.2f}",
+        "BF_VV_RATIO":       f"{vv_ratio:.3f}",
+        "BF_EM2D":           f"{em2d:.4f}",
+        "BF_EM_RATIO_TODAY": f"{today_em_ratio:.4f}" if today_em_ratio is not None else "",
         "BF_ACTION":         action,
         "BF_EXPIRATION":     target_exp.isoformat(),
         "BF_CHAIN_BID":      f"{chain_bid:.2f}" if chain_bid > 0 else "",
@@ -1134,9 +1083,7 @@ def main():
         "BF_UNIT_DOLLARS_V": str(BF_UNIT_DOLLARS),
         "BF_EQUITY":         str(oc_val or 0),
         "BF_UNITS":          str(units),
-        "BF_CADENCE_MODE":   cadence_mode,
-        "BF_CADENCE_TIER":   cadence_tier,
-        "BF_CADENCE_DD_PCT": f"{cadence_dd*100:.4f}",
+        "BF_CADENCE_MODE":   "MTW",
 
         # needed by placer
         "SCHWAB_APP_KEY":    os.environ["SCHWAB_APP_KEY"],

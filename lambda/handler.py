@@ -595,6 +595,7 @@ def lambda_handler(event, context):
     if dry_run:
         env["VERT_DRY_RUN"] = "true"
         env["BF_DRY_RUN"] = "true"
+        env["BF_ENTRY_WEEKDAYS"] = "0,1,2,3,4"  # allow any weekday in dry-run
 
     # Map SSM values to env vars
     for env_key, ssm_path in cfg["env_from_ssm"].items():
