@@ -148,6 +148,7 @@ ACCOUNTS = {
             "SCHWAB_TOKEN_PATH": "/tmp/schwab_token.json",
             "SIM_CACHE_BUCKET": "gamma-sim-cache",
             "BF_DRY_RUN": "1",
+            "BF_LOG_PATH": "/tmp/logs/bf_trades.csv",
         },
     },
     "ic-long-filter": {
