@@ -28,7 +28,7 @@ import boto3
 
 ROOT = Path(__file__).resolve().parent
 PLACE_PATH = ROOT / "place.py"
-RESULT_PATH = ROOT / "last_result.json"
+RESULT_PATH = Path(os.environ.get("BF_RESULT_PATH", "/tmp/bf_last_result.json"))
 PLAN_PATH = Path(os.environ.get("BF_PLAN_PATH", "/tmp/bf_plan.json"))
 ET = ZoneInfo("America/New_York")
 CHECK_TIME_ET = dt_time(16, 1)
