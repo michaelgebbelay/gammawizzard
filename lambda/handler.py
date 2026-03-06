@@ -571,6 +571,10 @@ def lambda_handler(event, context):
     if dry_run:
         env["VERT_DRY_RUN"] = "true"
 
+    # Allow event payload to inject env overrides (e.g. BF_NOW_OVERRIDE for testing)
+    for k, v in event.get("env_override", {}).items():
+        env[k] = str(v)
+
     # Map SSM values to env vars
     for env_key, ssm_path in cfg["env_from_ssm"].items():
         env[env_key] = params.get(ssm_path, "")
