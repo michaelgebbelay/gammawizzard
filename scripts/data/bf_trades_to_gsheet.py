@@ -69,6 +69,9 @@ HEADERS = [
     "filled_qty",
     "fill_price",
     "order_ids",
+    "eod_3dte",
+    "eod_2dte",
+    "eod_1dte",
 ]
 
 

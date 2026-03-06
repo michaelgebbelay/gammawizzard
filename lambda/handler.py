@@ -137,6 +137,7 @@ ACCOUNTS = {
         "orchestrator": "scripts/trade/ButterflyTuesday/orchestrator.py",
         "post_steps": [
             "scripts/data/bf_trades_to_gsheet.py",
+            "scripts/data/bf_eod_tracking.py",
         ],
         "token_ssm_path": "/gamma/schwab/token_json",
         "token_file": "/tmp/schwab_token.json",
