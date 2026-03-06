@@ -30,7 +30,7 @@ def _add_repo_root() -> None:
     cur = os.path.abspath(os.path.dirname(__file__))
     while True:
         parent = os.path.dirname(cur)
-        if os.path.basename(cur) == "Gamma":
+        if os.path.basename(cur) == "Gamma" or os.path.isdir(os.path.join(cur, "scripts")):
             if cur not in sys.path:
                 sys.path.insert(0, cur)
             return
