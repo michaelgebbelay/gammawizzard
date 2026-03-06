@@ -55,7 +55,7 @@ Resources:
     Type: AWS::Scheduler::Schedule
     Properties:
       Name: gamma-cs-warmup
-      Description: "Warm up Lambda container 3 min before BF5 (earliest trade)"
+      Description: "Warm up Lambda container 3 min before trade execution"
       State: ENABLED
       ScheduleExpression: "cron(58 15 ? * MON-FRI *)"
       ScheduleExpressionTimezone: "America/New_York"
@@ -112,6 +112,22 @@ Resources:
         RoleArn: !GetAtt SchedulerRole.Arn
         Input: '{"account": "tt-individual"}'
 
+  # ---------- Butterfly Daily (4:01 PM ET) ----------
+  ButterflySchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: gamma-bf-daily
+      Description: "Hybrid butterfly: 4DTE BUY / 3DTE SELL with vol filter"
+      State: ENABLED
+      ScheduleExpression: "cron(1 16 ? * MON-FRI *)"
+      ScheduleExpressionTimezone: "America/New_York"
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt TradingFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"account": "butterfly"}'
+
   # ---------- IC_LONG Filter Pre-check (4:01 PM ET) ----------
   IcLongFilterSchedule:
     Type: AWS::Scheduler::Schedule
@@ -127,38 +143,6 @@ Resources:
         Arn: !GetAtt TradingFunction.Arn
         RoleArn: !GetAtt SchedulerRole.Arn
         Input: '{"account": "ic-long-filter"}'
-
-  # ---------- Butterfly Q9 5DTE Schedule (EM2d, 4:01 PM ET) ----------
-  Butterfly5Schedule:
-    Type: AWS::Scheduler::Schedule
-    Properties:
-      Name: gamma-bf5-schwab
-      Description: "ButterflyQ9 SPX 5DTE EM2d butterfly (Schwab) 4:01 PM ET"
-      State: ENABLED
-      ScheduleExpression: "cron(1 16 ? * MON-FRI *)"
-      ScheduleExpressionTimezone: "America/New_York"
-      FlexibleTimeWindow:
-        Mode: "OFF"
-      Target:
-        Arn: !GetAtt TradingFunction.Arn
-        RoleArn: !GetAtt SchedulerRole.Arn
-        Input: '{"account": "butterfly5"}'
-
-  # ---------- BF5 EOD Price Updater ----------
-  Bf5EodSchedule:
-    Type: AWS::Scheduler::Schedule
-    Properties:
-      Name: gamma-bf5-eod
-      Description: "BF5 daily mark-to-market for open butterfly positions"
-      State: ENABLED
-      ScheduleExpression: "cron(5 16 ? * MON-FRI *)"
-      ScheduleExpressionTimezone: "America/New_York"
-      FlexibleTimeWindow:
-        Mode: "OFF"
-      Target:
-        Arn: !GetAtt TradingFunction.Arn
-        RoleArn: !GetAtt SchedulerRole.Arn
-        Input: '{"account": "bf5-eod"}'
 
   # ---------- Morning Check Schedule ----------
   MorningCheckSchedule:

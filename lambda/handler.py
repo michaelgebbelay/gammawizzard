@@ -49,47 +49,6 @@ ACCOUNTS = {
             "CS_COST_PER_CONTRACT": "0.97",
         },
     },
-    "butterfly5": {
-        "orchestrator": "scripts/trade/ButterflyQ9/orchestrator_bf5.py",
-        "post_steps": [
-            "scripts/data/bf_tracker_to_gsheet.py",
-        ],
-        "token_ssm_path": "/gamma/schwab/token_json",
-        "token_file": "/tmp/schwab_token.json",
-        "env_from_ssm": {
-            "SCHWAB_APP_KEY": "/gamma/schwab/app_key",
-            "SCHWAB_APP_SECRET": "/gamma/schwab/app_secret",
-        },
-        "static_env": {
-            "SCHWAB_TOKEN_PATH": "/tmp/schwab_token.json",
-            "BF_LOG_PATH": "/tmp/bf5_trades.csv",
-            "BF_TRACKER_TAB": "BF_Q9_5DTE",
-            "BF_GSHEET_ID": "1r3ipwByfs2Zhgb4WmSTmXCpF8HEphxD9CJlMtr7GSGs",
-            "BF_STEP_WAIT": "40",
-            "BF_POLL_SECS": "2.0",
-            "BF_CANCEL_SETTLE": "1.0",
-            "BF_MAX_LADDER": "3",
-            "BF_DRY_RUN": "false",
-            "BF_TOPUP": "1",
-            "BF_GUARD_NO_CLOSE": "1",
-            "SIM_CACHE_BUCKET": "gamma-sim-cache",
-        },
-    },
-    "bf5-eod": {
-        "orchestrator": "scripts/data/bf5_eod_prices.py",
-        "post_steps": [],
-        "token_ssm_path": "/gamma/schwab/token_json",
-        "token_file": "/tmp/schwab_token.json",
-        "env_from_ssm": {
-            "SCHWAB_APP_KEY": "/gamma/schwab/app_key",
-            "SCHWAB_APP_SECRET": "/gamma/schwab/app_secret",
-        },
-        "static_env": {
-            "SCHWAB_TOKEN_PATH": "/tmp/schwab_token.json",
-            "BF_TRACKER_TAB": "BF_Q9_5DTE",
-            "BF_GSHEET_ID": "1r3ipwByfs2Zhgb4WmSTmXCpF8HEphxD9CJlMtr7GSGs",
-        },
-    },
     "tt-ira": {
         "orchestrator": "TT/Script/ConstantStable/orchestrator.py",
         "post_steps": [
@@ -172,6 +131,23 @@ ACCOUNTS = {
             "CS_ACCOUNT_LABEL": "manual",
             "CS_COST_PER_CONTRACT": "0.97",
             "CS_MANUAL_TAB": "Manual_Trades",
+        },
+    },
+    "butterfly": {
+        "orchestrator": "scripts/trade/ButterflyTuesday/orchestrator.py",
+        "post_steps": [
+            "scripts/data/bf_trades_to_gsheet.py",
+        ],
+        "token_ssm_path": "/gamma/schwab/token_json",
+        "token_file": "/tmp/schwab_token.json",
+        "env_from_ssm": {
+            "SCHWAB_APP_KEY": "/gamma/schwab/app_key",
+            "SCHWAB_APP_SECRET": "/gamma/schwab/app_secret",
+        },
+        "static_env": {
+            "SCHWAB_TOKEN_PATH": "/tmp/schwab_token.json",
+            "SIM_CACHE_BUCKET": "gamma-sim-cache",
+            "BF_DRY_RUN": "1",
         },
     },
     "ic-long-filter": {
@@ -594,8 +570,6 @@ def lambda_handler(event, context):
 
     if dry_run:
         env["VERT_DRY_RUN"] = "true"
-        env["BF_DRY_RUN"] = "true"
-        env["BF_ENTRY_WEEKDAYS"] = "0,1,2,3,4"  # allow any weekday in dry-run
 
     # Map SSM values to env vars
     for env_key, ssm_path in cfg["env_from_ssm"].items():
@@ -612,7 +586,7 @@ def lambda_handler(event, context):
         print(f"WARNING: no token content from {cfg['token_ssm_path']}")
 
     # Schwab token keeper reads SCHWAB_TOKEN_JSON env var to auto-seed
-    if account in ("schwab", "butterfly", "butterfly5", "bf5-eod", "morning-check"):
+    if account in ("schwab", "morning-check", "butterfly"):
         env["SCHWAB_TOKEN_JSON"] = token_content
     elif account == "manual":
         # Manual needs both Schwab + TT tokens
