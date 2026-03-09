@@ -214,6 +214,7 @@ COMMON_ENV = {
     "VERT_MAX_LADDER": "3",
     "VERT_DRY_RUN": "false",
     "VERT_CANCEL_TRIES": "4",
+    "CS_GW_READY_ET": "16:13:31",
 }
 
 # Shared SSM params (same for all accounts)
@@ -617,12 +618,7 @@ def lambda_handler(event, context):
     # Ensure /tmp writability for logs
     os.makedirs("/tmp/logs", exist_ok=True)
 
-    # -- 4. Wait for signal to stabilize (scheduled accounts only) --
-    if account in ("schwab", "tt-ira", "tt-individual"):
-        delay = int(os.environ.get("CS_TRADE_DELAY_SECS", "30"))
-        if delay > 0:
-            print(f"Signal delay: sleeping {delay}s")
-            time.sleep(delay)
+    # -- 4. Signal wait moved into orchestrator (prep runs while waiting) --
 
     # -- 4b. Run orchestrator (critical path) --
     orch_timeout = 330 if account == "manual" else 100

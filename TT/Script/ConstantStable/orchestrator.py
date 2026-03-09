@@ -37,8 +37,9 @@ import re
 import time
 import random
 import subprocess
-from datetime import date
+from datetime import date, datetime
 from typing import Any, Dict, Tuple
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -96,7 +97,7 @@ CS_PAIR_ALTERNATE = (os.environ.get("CS_PAIR_ALTERNATE", "1") or "1").strip().lo
 # --- IC_LONG regime filter config ---
 # Skip IC_LONG when trailing 5-day avg |SPX move|% < nearest anchor distance%.
 # Decision is pre-computed by ic_long_filter.py and written to S3.
-CS_IC_LONG_FILTER = (os.environ.get("CS_IC_LONG_FILTER", "1") or "1").strip().lower() in ("1", "true", "yes", "y")
+CS_IC_LONG_FILTER = (os.environ.get("CS_IC_LONG_FILTER", "0") or "0").strip().lower() in ("1", "true", "yes", "y")
 CS_MOVE_STATE_S3_BUCKET = (
     os.environ.get("CS_MOVE_STATE_S3_BUCKET")
     or os.environ.get("SIM_CACHE_BUCKET", "")
@@ -104,6 +105,29 @@ CS_MOVE_STATE_S3_BUCKET = (
 CS_IC_DECISION_S3_KEY = os.environ.get(
     "CS_IC_DECISION_S3_KEY", "cadence/cs_ic_long_decision.json"
 )
+
+# --- Signal readiness config ---
+CS_GW_READY_ET = os.environ.get("CS_GW_READY_ET", "").strip()
+
+
+def _wait_for_gw_ready():
+    """Sleep until CS_GW_READY_ET if set and in the future (max 120s)."""
+    if not CS_GW_READY_ET:
+        return
+    try:
+        parts = CS_GW_READY_ET.split(":")
+        hh, mm = int(parts[0]), int(parts[1])
+        ss = int(parts[2]) if len(parts) > 2 else 0
+        now_et = datetime.now(ZoneInfo("America/New_York"))
+        target = now_et.replace(hour=hh, minute=mm, second=ss, microsecond=0)
+        wait = (target - now_et).total_seconds()
+        if 0 < wait <= 120:
+            print(f"CS_VERT_RUN WAIT: {wait:.1f}s until GW ready at {CS_GW_READY_ET} ET")
+            time.sleep(wait)
+        elif wait <= 0:
+            print(f"CS_VERT_RUN WAIT: already past {CS_GW_READY_ET} ET ({-wait:.1f}s ago)")
+    except Exception as e:
+        print(f"CS_VERT_RUN WARN: CS_GW_READY_ET parse error ({e}), proceeding immediately")
 
 
 # ---------- Utility helpers ----------
@@ -525,7 +549,31 @@ def main():
 
     print(f"CS_VERT_RUN UNITS: {units} (CS_UNIT_DOLLARS={CS_UNIT_DOLLARS}, oc_val={oc_val})")
 
-    # --- ConstantStable payload from GammaWizard (or manual override) ---
+    # --- PHASE 1b: Load positions early (while waiting for GW signal) ---
+    need_positions = CS_GUARD_NO_CLOSE or CS_TOPUP
+    pos = None
+    if need_positions:
+        try:
+            pos = positions_map(acct_num)
+            print(
+                f"CS_VERT_RUN POSITIONS: loaded count={len(pos)} "
+                f"(guard={'on' if CS_GUARD_NO_CLOSE else 'off'}, topup={'on' if CS_TOPUP else 'off'})"
+            )
+        except Exception as e:
+            msg = str(e)[:220]
+            guard_ok = (not CS_GUARD_NO_CLOSE) or (CS_GUARD_FAIL_ACTION == "CONTINUE")
+            topup_ok = (not CS_TOPUP) or (CS_TOPUP_FAIL_ACTION == "CONTINUE")
+            if guard_ok and topup_ok:
+                print(f"CS_VERT_RUN POSITIONS WARN: fetch failed ({msg}) — continuing WITHOUT positions (guard/topup degraded).")
+                pos = None
+            else:
+                print(f"CS_VERT_RUN POSITIONS SKIP: fetch failed ({msg}) — skipping ALL trades.")
+                return 0
+
+    # --- PHASE 2: Wait for GW signal readiness ---
+    _wait_for_gw_ready()
+
+    # --- PHASE 3: Fetch GW signal + build + place ---
     signal_override = os.environ.get("CS_SIGNAL_JSON", "").strip()
     if signal_override:
         import json as _json
@@ -661,28 +709,6 @@ def main():
         if should_skip_ic:
             print(f"CS_VERT_RUN SKIP: {skip_reason}")
             return 0
-
-    # Load positions once if needed (guard and/or topup)
-    need_positions = CS_GUARD_NO_CLOSE or CS_TOPUP
-    pos = None
-    if need_positions:
-        try:
-            pos = positions_map(acct_num)
-            print(
-                f"CS_VERT_RUN POSITIONS: loaded count={len(pos)} "
-                f"(guard={'on' if CS_GUARD_NO_CLOSE else 'off'}, topup={'on' if CS_TOPUP else 'off'})"
-            )
-        except Exception as e:
-            msg = str(e)[:220]
-            # decide fail action
-            guard_ok = (not CS_GUARD_NO_CLOSE) or (CS_GUARD_FAIL_ACTION == "CONTINUE")
-            topup_ok = (not CS_TOPUP) or (CS_TOPUP_FAIL_ACTION == "CONTINUE")
-            if guard_ok and topup_ok:
-                print(f"CS_VERT_RUN POSITIONS WARN: fetch failed ({msg}) — continuing WITHOUT positions (guard/topup degraded).")
-                pos = None
-            else:
-                print(f"CS_VERT_RUN POSITIONS SKIP: fetch failed ({msg}) — skipping ALL trades.")
-                return 0
 
     # Apply TOPUP + GUARD to determine send_qty
     def finalize(v: Dict[str, Any]) -> Dict[str, Any] | None:
