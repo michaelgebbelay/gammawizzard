@@ -334,9 +334,12 @@ def main() -> int:
     reason = "NO_FILL"
 
     for offset in offsets:
+        remaining = qty - filled_qty
+        if remaining <= 0:
+            break
         price = price_from_mid(mid, offset, bid, ask)
         last_price = price
-        payload = order_payload(order_side, price, qty, lower_osi, center_osi, upper_osi)
+        payload = order_payload(order_side, price, remaining, lower_osi, center_osi, upper_osi)
         try:
             resp = post_with_retry(c, url_post, payload)
         except Exception as exc:

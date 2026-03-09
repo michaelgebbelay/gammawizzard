@@ -145,6 +145,23 @@ def fetch_vix(c) -> float:
     return 0.0
 
 
+def fetch_spx_prev_close(c) -> float:
+    """Fetch SPX previous close from Schwab quote (closePrice)."""
+    try:
+        resp = c.get_quote("$SPX")
+        resp.raise_for_status()
+        data = resp.json()
+        for val in data.values():
+            if isinstance(val, dict):
+                q = val.get("quote", val)
+                close = q.get("closePrice") or q.get("previousClose")
+                if close is not None:
+                    return float(close)
+    except Exception:
+        pass
+    return 0.0
+
+
 def fetch_chain_for_expiry(target_expiry: date, strike_count: int = 120) -> tuple[ChainSnapshot, date]:
     c = schwab_client()
     resp = c.get_option_chain(
@@ -159,6 +176,7 @@ def fetch_chain_for_expiry(target_expiry: date, strike_count: int = 120) -> tupl
     resp.raise_for_status()
     raw = resp.json()
     snapshot = parse_schwab_chain(raw, phase="close", vix=fetch_vix(c))
+    snapshot.spx_prev_close = fetch_spx_prev_close(c)
     if target_expiry not in snapshot.expirations:
         raise RuntimeError(f"Target expiry {target_expiry} not present in Schwab chain")
     return snapshot, target_expiry

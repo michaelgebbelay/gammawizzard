@@ -229,7 +229,8 @@ def main() -> int:
     state["last_trade_date"] = plan["trade_date"]
     state["last_expiration_date"] = plan["expiry_date"]
     state["last_action"] = result.get("reason", "PLACED")
-    if plan["expiry_date"] not in open_expiries:
+    filled = result.get("filled_qty", 0)
+    if filled and filled > 0 and plan["expiry_date"] not in open_expiries:
         open_expiries.append(plan["expiry_date"])
     state["open_expiries"] = open_expiries
     save_state(state)
