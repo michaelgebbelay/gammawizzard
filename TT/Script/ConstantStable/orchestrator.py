@@ -462,6 +462,63 @@ def would_close_guard(v: Dict[str, Any], pos: Dict[Tuple[str, str, str], float])
 
 # ---------- IC_LONG filter (reads pre-computed decision from S3) ----------
 
+def _defer_ic_long_to_morning(v_put, v_call, trade_date, tdate_iso,
+                              field_used, vol_val, bucket, vix_mult, units, oc_val,
+                              gw_put_price, gw_call_price, account_label):
+    """Save IC_LONG trade plan to S3 for morning placement."""
+    s3_bucket = CS_MOVE_STATE_S3_BUCKET
+    if not s3_bucket:
+        print("CS_VERT_RUN IC_LONG_DEFER FAIL: no S3 bucket configured")
+        return
+
+    def _v_dict(v):
+        return {k: v[k] for k in ("name", "side", "kind", "direction",
+                                   "short_osi", "long_osi", "send_qty",
+                                   "target_qty", "go", "strength")}
+
+    plan = {
+        "date": trade_date,
+        "account_label": account_label,
+        "structure": "IC_LONG",
+        "v_put": _v_dict(v_put),
+        "v_call": _v_dict(v_call),
+        "context": {
+            "trade_date": trade_date,
+            "tdate_iso": tdate_iso,
+            "vol_field": CS_VOL_FIELD,
+            "vol_used": field_used,
+            "vol_value": "" if vol_val is None else str(vol_val),
+            "vol_bucket": str(bucket),
+            "vol_mult": str(vix_mult),
+            "unit_dollars": str(CS_UNIT_DOLLARS),
+            "oc_val": str(oc_val),
+            "units": str(units),
+            "qty_rule": "VIX_BUCKET_TOPUP" if CS_TOPUP else "VIX_BUCKET",
+            "gw_put_price": "" if gw_put_price is None else str(gw_put_price),
+            "gw_call_price": "" if gw_call_price is None else str(gw_call_price),
+        },
+        "deferred_at_utc": int(time.time()),
+    }
+
+    s3_key = f"cadence/cs_ic_long_deferred_{account_label}.json"
+    try:
+        import boto3
+        s3 = boto3.client("s3")
+        s3.put_object(
+            Bucket=s3_bucket, Key=s3_key,
+            Body=json.dumps(plan, indent=2),
+            ContentType="application/json",
+        )
+        print(
+            f"CS_VERT_RUN IC_LONG_DEFERRED: saved to s3://{s3_bucket}/{s3_key} "
+            f"put={v_put['name']}({v_put['short_osi']}|{v_put['long_osi']}) "
+            f"call={v_call['name']}({v_call['short_osi']}|{v_call['long_osi']}) "
+            f"qty={v_put['send_qty']}"
+        )
+    except Exception as e:
+        print(f"CS_VERT_RUN IC_LONG_DEFER FAIL: S3 write failed ({e})")
+
+
 def _read_ic_long_decision(today_str: str) -> Tuple[bool, str]:
     """Read the pre-computed IC_LONG skip decision from S3.
 
@@ -700,16 +757,6 @@ def main():
                         print(f"CS_VERT_RUN {ic_label}_SIZE: {v['name']} target {v['target_qty']} → {ic_target} (ic_mult={ic_mult} bucket={bucket})")
                         v["target_qty"] = ic_target
 
-    # --- IC_LONG regime filter ---
-    is_ic_long = (v_put and v_call
-                  and v_put["side"] == "DEBIT" and v_call["side"] == "DEBIT")
-
-    if is_ic_long:
-        should_skip_ic, skip_reason = _read_ic_long_decision(date.today().isoformat())
-        if should_skip_ic:
-            print(f"CS_VERT_RUN SKIP: {skip_reason}")
-            return 0
-
     # Apply TOPUP + GUARD to determine send_qty
     def finalize(v: Dict[str, Any]) -> Dict[str, Any] | None:
         if not v:
@@ -757,6 +804,19 @@ def main():
         print("CS_VERT_RUN SKIP: nothing to place after TOPUP/GUARD.")
         return 0
 
+    # --- IC_LONG deferral: save plan to S3 for morning placement ---
+    is_ic_long = (v_put_f and v_call_f
+                  and v_put_f["side"] == "DEBIT" and v_call_f["side"] == "DEBIT")
+
+    if is_ic_long:
+        account_label = os.environ.get("CS_ACCOUNT_LABEL", "unknown")
+        _defer_ic_long_to_morning(
+            v_put_f, v_call_f, trade_date, tdate_iso,
+            field_used, vol_val, bucket, vix_mult, units, oc_val,
+            gw_put_price, gw_call_price, account_label,
+        )
+        return 0
+
     qty_rule = "VIX_BUCKET_TOPUP" if CS_TOPUP else "VIX_BUCKET"
 
     def env_for_vertical(v: Dict[str, Any]) -> Dict[str, str]:
@@ -800,20 +860,28 @@ def main():
         })
         return e
 
-    # ----- Place CALL then PUT in alternating ladder (pair mode) -----
+    # ----- Place CALL + PUT together (bundle for IC_SHORT, pair-alternate otherwise) -----
+    is_ic_short = (v_put_f and v_call_f
+                   and v_put_f["side"] == "CREDIT" and v_call_f["side"] == "CREDIT")
+
     if CS_PAIR_ALTERNATE and v_put_f and v_call_f:
         q_put = int(v_put_f["send_qty"])
         q_call = int(v_call_f["send_qty"])
         if q_put > 0 and q_call > 0:
+            mode = "BUNDLE4" if is_ic_short else "PAIR_ALT"
             print(
-                f"CS_VERT_RUN PAIR_ALT: "
+                f"CS_VERT_RUN {mode}: "
                 f"CALL={v_call_f['name']}({v_call_f['short_osi']}|{v_call_f['long_osi']}) qty={q_call} "
                 f"PUT={v_put_f['name']}({v_put_f['short_osi']}|{v_put_f['long_osi']}) qty={q_put}"
             )
 
             env = env_for_vertical({**v_call_f, "send_qty": q_call})
+            if is_ic_short:
+                env["VERT_BUNDLE"] = "true"
+                env["VERT_BUNDLE_FALLBACK"] = "separate"
+            else:
+                env["VERT_PAIR"] = "true"
             env.update({
-                "VERT_PAIR": "true",
                 "VERT2_SIDE":       v_put_f["side"],
                 "VERT2_KIND":       v_put_f["kind"],
                 "VERT2_NAME":       v_put_f["name"],
