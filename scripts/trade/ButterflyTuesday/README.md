@@ -42,6 +42,7 @@ Unfilled orders are cancelled before the next step. Tick size = $0.05.
 - Skips weekends and pre-4:01 PM runs
 - Skips if already evaluated today (dedup via `last_evaluated_date` in state)
 - Skips if a position already exists for the target expiry (`open_expiries` check)
+- Skips if any butterfly strike overlaps an existing Schwab position on the same expiry (prevents accidental close of DualSide/CS legs)
 - State persisted in S3 (`cadence/bf_daily_state.json`) with local file fallback
 
 ## Post-trade steps

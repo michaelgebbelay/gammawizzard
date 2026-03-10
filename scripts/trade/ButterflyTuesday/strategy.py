@@ -145,6 +145,62 @@ def fetch_vix(c) -> float:
     return 0.0
 
 
+def _check_position_conflicts(
+    expiry: date, lower: float, center: float, upper: float
+) -> Optional[str]:
+    """Check if any butterfly strike overlaps an existing Schwab position.
+
+    Returns a conflict description string if overlap found, None if clear.
+    Prevents accidental closing of DualSide/CS legs on the same expiry.
+    """
+    try:
+        c = schwab_client()
+        resp = c.get_account_numbers()
+        resp.raise_for_status()
+        arr = resp.json() or []
+        if not arr:
+            return None
+        acct_hash = str(arr[0].get("hashValue") or arr[0].get("hashvalue") or "")
+        if not acct_hash:
+            return None
+
+        url = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}"
+        resp = c.session.get(url, params={"fields": "positions"}, timeout=20)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        sa = data[0]["securitiesAccount"] if isinstance(data, list) else (data.get("securitiesAccount") or data)
+
+        exp_ymd = expiry.strftime("%y%m%d")
+        bf_strikes = {lower, center, upper}
+
+        for pos in sa.get("positions") or []:
+            ins = pos.get("instrument", {}) or {}
+            atype = (ins.get("assetType") or "").upper()
+            if atype != "OPTION":
+                continue
+            sym = (ins.get("symbol") or "").replace(" ", "").upper()
+            # Check if this position is on the same expiry (YYMMDD in OSI at positions 6-12)
+            if len(sym) < 21:
+                continue
+            pos_exp = sym[6:12]  # YYMMDD
+            pos_cp = sym[12]     # C or P
+            if pos_exp != exp_ymd:
+                continue
+            # Parse strike from OSI (last 8 digits, in thousandths)
+            try:
+                pos_strike = int(sym[-8:]) / 1000.0
+            except ValueError:
+                continue
+            if pos_strike in bf_strikes:
+                qty = float(pos.get("longQuantity", 0)) - float(pos.get("shortQuantity", 0))
+                if abs(qty) > 0:
+                    return f"{pos_cp}{pos_strike:.0f}@exp{expiry}:qty={qty:.0f}"
+    except Exception as e:
+        print(f"BF_GUARD WARN: position check failed: {e}")
+    return None
+
+
 def fetch_spx_prev_close(c) -> float:
     """Fetch SPX previous close from Schwab quote (closePrice)."""
     try:
@@ -449,6 +505,17 @@ def build_trade_plan(trade_day: date) -> dict:
         return {"status": "ERROR", "reason": f"NBBO_FAIL:{type(exc).__name__}:{exc}"}
 
     order_side = "DEBIT" if signal == "BUY" else "CREDIT"
+
+    # Position guard: skip if any butterfly strike overlaps an existing position
+    # on the same expiry (prevents accidental close of DualSide/CS legs)
+    conflict = _check_position_conflicts(exp, lower, center, upper)
+    if conflict:
+        return {
+            "status": "SKIP",
+            "reason": f"POSITION_CONFLICT:{conflict}",
+            "signal": signal,
+            "vix1d": vix1d_points,
+        }
 
     return {
         "status": "OK",
