@@ -148,10 +148,11 @@ def fetch_vix(c) -> float:
 def _check_position_conflicts(
     expiry: date, lower: float, center: float, upper: float
 ) -> Optional[str]:
-    """Check if any butterfly strike overlaps an existing Schwab position.
+    """Check if any butterfly strike already has an open Schwab position.
 
-    Returns a conflict description string if overlap found, None if clear.
-    Prevents accidental closing of DualSide/CS legs on the same expiry.
+    Builds the 3 target OSI keys and checks only those against the account
+    positions (single API call). Skips positions on other expiries entirely.
+    Returns a conflict description if overlap found, None if clear.
     """
     try:
         c = schwab_client()
@@ -164,6 +165,14 @@ def _check_position_conflicts(
         if not acct_hash:
             return None
 
+        # Build the 3 OSI keys we care about (calls on this expiry)
+        exp_ymd = expiry.strftime("%y%m%d")
+        target_osis = set()
+        for strike in (lower, center, upper):
+            mills = int(round(strike * 1000))
+            target_osis.add(f"SPXW  {exp_ymd}C{mills:08d}")
+            target_osis.add(f"SPXW  {exp_ymd}P{mills:08d}")
+
         url = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}"
         resp = c.session.get(url, params={"fields": "positions"}, timeout=20)
         if resp.status_code != 200:
@@ -171,31 +180,16 @@ def _check_position_conflicts(
         data = resp.json()
         sa = data[0]["securitiesAccount"] if isinstance(data, list) else (data.get("securitiesAccount") or data)
 
-        exp_ymd = expiry.strftime("%y%m%d")
-        bf_strikes = {lower, center, upper}
-
         for pos in sa.get("positions") or []:
             ins = pos.get("instrument", {}) or {}
-            atype = (ins.get("assetType") or "").upper()
-            if atype != "OPTION":
+            if (ins.get("assetType") or "").upper() != "OPTION":
                 continue
-            sym = (ins.get("symbol") or "").replace(" ", "").upper()
-            # Check if this position is on the same expiry (YYMMDD in OSI at positions 6-12)
-            if len(sym) < 21:
+            sym = (ins.get("symbol") or "").upper()
+            if sym not in target_osis:
                 continue
-            pos_exp = sym[6:12]  # YYMMDD
-            pos_cp = sym[12]     # C or P
-            if pos_exp != exp_ymd:
-                continue
-            # Parse strike from OSI (last 8 digits, in thousandths)
-            try:
-                pos_strike = int(sym[-8:]) / 1000.0
-            except ValueError:
-                continue
-            if pos_strike in bf_strikes:
-                qty = float(pos.get("longQuantity", 0)) - float(pos.get("shortQuantity", 0))
-                if abs(qty) > 0:
-                    return f"{pos_cp}{pos_strike:.0f}@exp{expiry}:qty={qty:.0f}"
+            qty = float(pos.get("longQuantity", 0)) - float(pos.get("shortQuantity", 0))
+            if abs(qty) > 0:
+                return f"{sym.strip()}:qty={qty:.0f}"
     except Exception as e:
         print(f"BF_GUARD WARN: position check failed: {e}")
     return None
