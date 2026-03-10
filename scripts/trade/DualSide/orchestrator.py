@@ -138,85 +138,89 @@ def get_spx_price_history(c, days: int = 30) -> list:
     return sorted(candles, key=lambda x: x["datetime"])
 
 
-def get_option_chain(c, dte: int) -> dict:
-    """Fetch SPX option chain for a specific DTE.
+def get_option_chain_wide(c, from_dte: int = 3, to_dte: int = 10) -> dict:
+    """Fetch SPX option chain covering a wide DTE window.
 
-    Searches a window of -1 to +2 days around the target to handle weekends
-    (e.g., 5DTE on Monday targets Saturday, but we want Friday).
+    Returns the raw Schwab JSON with all expirations in the range.
     """
     from schwab.client import Client
     today = date.today()
-    target_exp = today + timedelta(days=dte)
 
     r = c.get_option_chain(
         "$SPX",
         contract_type=Client.Options.ContractType.ALL,
         strike_range=Client.Options.StrikeRange.ALL,
-        from_date=target_exp - timedelta(days=1),
-        to_date=target_exp + timedelta(days=2),
+        from_date=today + timedelta(days=from_dte),
+        to_date=today + timedelta(days=to_dte),
         include_underlying_quote=True,
     )
     r.raise_for_status()
     return r.json()
 
 
+def available_expirations(chain_json: dict) -> list:
+    """Extract all unique expiration dates from a Schwab chain, sorted ascending.
+
+    Returns list of (date_str, dte_int) tuples.
+    DTE here is actual calendar days to expiration as reported by Schwab.
+    """
+    seen = {}
+    for side in ("callExpDateMap", "putExpDateMap"):
+        for exp_key in chain_json.get(side, {}):
+            parts = exp_key.split(":")
+            if len(parts) >= 2:
+                try:
+                    seen[parts[0]] = int(parts[1])
+                except ValueError:
+                    pass
+    return sorted(seen.items(), key=lambda x: x[0])
+
+
 # ═══════════════════════════════════════════════════════════════
 # Chain parsing — extract what we need from Schwab chain format
 # ═══════════════════════════════════════════════════════════════
 
-def parse_chain(chain_json: dict, target_dte: int) -> Optional[dict]:
-    """Parse Schwab option chain into our format.
+def parse_chain_for_expiration(chain_json: dict, target_exp_date: str) -> Optional[dict]:
+    """Parse Schwab option chain, extracting only contracts for a specific expiration.
 
-    Returns dict with: spot, contracts (list of dicts with strike, type, bid, ask,
-    implied_vol, delta), expiration.
+    Args:
+        chain_json: raw Schwab chain JSON
+        target_exp_date: expiration date string like "2026-03-14"
+
+    Returns dict with: spot, contracts, expiration.
     """
     underlying = chain_json.get("underlying", {}) or {}
     spot = underlying.get("last") or underlying.get("mark") or underlying.get("close")
     if not spot:
-        # Try underlyingPrice at top level
         spot = chain_json.get("underlyingPrice")
     if not spot or spot <= 0:
         return None
 
     contracts = []
 
-    # Schwab returns callExpDateMap and putExpDateMap
-    # Each is {exp_date_str: {strike_str: [contract_dict]}}
     for side, opt_type in [("callExpDateMap", "C"), ("putExpDateMap", "P")]:
         exp_map = chain_json.get(side, {})
-        # Pick the expiration closest to target_dte
-        best_exp = None
-        best_diff = 999
+        # Find the key matching our target date
+        matched_strikes = None
         for exp_key, strikes_map in exp_map.items():
-            # exp_key format: "2026-03-16:6" (date:dte)
-            parts = exp_key.split(":")
-            if len(parts) >= 2:
-                try:
-                    dte_val = int(parts[1])
-                except ValueError:
-                    continue
-                diff = abs(dte_val - target_dte)
-                if diff < best_diff:
-                    best_diff = diff
-                    best_exp = (exp_key, strikes_map)
+            if exp_key.startswith(target_exp_date):
+                matched_strikes = strikes_map
+                break
 
-        if not best_exp or best_diff > 1:
+        if not matched_strikes:
             continue
 
-        exp_key, strikes_map = best_exp
-        expiration = exp_key.split(":")[0]
-
-        for strike_str, contracts_list in strikes_map.items():
+        for strike_str, contracts_list in matched_strikes.items():
             if not contracts_list:
                 continue
-            c = contracts_list[0]  # first contract at this strike
+            c = contracts_list[0]
             strike = c.get("strikePrice")
             if not strike:
                 continue
 
             bid = c.get("bid", 0) or 0
             ask = c.get("ask", 0) or 0
-            iv = c.get("volatility")  # Schwab returns as percentage (e.g., 16.5)
+            iv = c.get("volatility")
             delta = c.get("delta")
             osi = c.get("symbol", "")
 
@@ -225,10 +229,10 @@ def parse_chain(chain_json: dict, target_dte: int) -> Optional[dict]:
                 "type": opt_type,
                 "bid": float(bid),
                 "ask": float(ask),
-                "implied_vol": float(iv) / 100 if iv else None,  # convert to decimal
+                "implied_vol": float(iv) / 100 if iv else None,
                 "delta": float(delta) if delta is not None else None,
-                "osi": osi,  # keep spaces — Schwab API requires padded OSI
-                "expiration": expiration,
+                "osi": osi,
+                "expiration": target_exp_date,
             })
 
     if not contracts:
@@ -237,7 +241,7 @@ def parse_chain(chain_json: dict, target_dte: int) -> Optional[dict]:
     return {
         "spot": spot,
         "contracts": contracts,
-        "expiration": expiration if contracts else None,
+        "expiration": target_exp_date,
     }
 
 
@@ -556,15 +560,29 @@ def main():
     if rv_in_band:
         print(f"DS_RUN RV_BAND: {rv_ratio:.3f} in [{RV_BAND_LO}, {RV_BAND_HI}) — will skip bullish legs")
 
-    # ── Fetch 6DTE chain (put side) ──
-    print("\nDS_RUN FETCHING 6DTE chain...")
+    # ── Fetch wide chain and resolve expirations by counting forward ──
+    print("\nDS_RUN FETCHING wide chain (3-10 DTE window)...")
     try:
-        chain6_raw = get_option_chain(c, 6)
-        chain6 = parse_chain(chain6_raw, 6)
+        wide_chain = get_option_chain_wide(c, from_dte=3, to_dte=10)
     except Exception as e:
-        print(f"DS_RUN SKIP: 6DTE chain fetch failed: {e}")
+        print(f"DS_RUN SKIP: chain fetch failed: {e}")
         return 1
 
+    expirations = available_expirations(wide_chain)
+    print(f"DS_RUN EXPIRATIONS: {expirations}")
+
+    if len(expirations) < 2:
+        print(f"DS_RUN SKIP: need at least 2 expirations, found {len(expirations)}")
+        return 1
+
+    # 5DTE = 1st expiration (nearer), 6DTE = 2nd expiration (farther)
+    # These are the 1st and 2nd available SPX expirations in our window
+    exp5_date = expirations[0][0]  # call side helper (nearer)
+    exp6_date = expirations[1][0]  # put side directional (farther)
+    print(f"DS_RUN 5DTE={exp5_date} (dte={expirations[0][1]})  6DTE={exp6_date} (dte={expirations[1][1]})")
+
+    # Parse 6DTE chain
+    chain6 = parse_chain_for_expiration(wide_chain, exp6_date)
     if not chain6:
         print("DS_RUN SKIP: 6DTE chain empty or no underlying price")
         return 1
@@ -649,13 +667,8 @@ def main():
     elif rv_in_band:
         call_skip_reason = "RV_BAND (bull_put_credit skipped)"
     else:
-        print("\nDS_RUN FETCHING 5DTE chain...")
-        try:
-            chain5_raw = get_option_chain(c, 5)
-            chain5 = parse_chain(chain5_raw, 5)
-        except Exception as e:
-            call_skip_reason = f"5DTE chain fetch failed: {e}"
-            chain5 = None
+        print(f"\nDS_RUN PARSING 5DTE chain (exp={exp5_date})...")
+        chain5 = parse_chain_for_expiration(wide_chain, exp5_date)
 
         if chain5:
             spot5 = chain5["spot"]
@@ -681,7 +694,7 @@ def main():
             else:
                 call_skip_reason = "no 50-delta put found"
         elif not call_skip_reason:
-            call_skip_reason = "5DTE chain empty"
+            call_skip_reason = f"5DTE chain empty (exp={exp5_date})"
 
     if call_skip_reason:
         print(f"DS_RUN CALL SKIP: {call_skip_reason}")
