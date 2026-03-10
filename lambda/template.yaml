@@ -128,6 +128,22 @@ Resources:
         RoleArn: !GetAtt SchedulerRole.Arn
         Input: '{"account": "butterfly"}'
 
+  # ---------- DualSide (4:13 PM ET, Schwab only) ----------
+  DualSideSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: gamma-ds-schwab
+      Description: "DualSide 6DTE/5DTE vertical strategy (Schwab)"
+      State: ENABLED
+      ScheduleExpression: !Ref ScheduleTime
+      ScheduleExpressionTimezone: "America/New_York"
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt TradingFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"account": "dualside"}'
+
   # ---------- IC_LONG Filter Pre-check (4:01 PM ET) ----------
   IcLongFilterSchedule:
     Type: AWS::Scheduler::Schedule

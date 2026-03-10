@@ -233,6 +233,25 @@ ACCOUNTS = {
             "CS_COST_PER_CONTRACT": "1.72",
         },
     },
+    "dualside": {
+        "orchestrator": "scripts/trade/DualSide/orchestrator.py",
+        "post_steps": [
+            "scripts/data/ds_tracking_to_gsheet.py",
+        ],
+        "token_ssm_path": "/gamma/schwab/token_json",
+        "token_file": "/tmp/schwab_token.json",
+        "env_from_ssm": {
+            "SCHWAB_APP_KEY": "/gamma/schwab/app_key",
+            "SCHWAB_APP_SECRET": "/gamma/schwab/app_secret",
+        },
+        "static_env": {
+            "SCHWAB_TOKEN_PATH": "/tmp/schwab_token.json",
+            "DS_LOG_PATH": "/tmp/logs/dualside_trades.csv",
+            "DS_DRY_RUN": "false",
+            "CS_UNIT_DOLLARS": "10000",
+            "CS_ACCOUNT_LABEL": "dualside",
+        },
+    },
     "morning-check": {
         "orchestrator": "scripts/trade/ConstantStable/morning_check.py",
         "post_steps": [],
@@ -660,7 +679,7 @@ def lambda_handler(event, context):
         print(f"WARNING: no token content from {cfg['token_ssm_path']}")
 
     # Schwab token keeper reads SCHWAB_TOKEN_JSON env var to auto-seed
-    if account in ("schwab", "morning-check", "butterfly", "ic-morning-schwab"):
+    if account in ("schwab", "morning-check", "butterfly", "ic-morning-schwab", "dualside"):
         env["SCHWAB_TOKEN_JSON"] = token_content
     elif account == "manual":
         # Manual needs both Schwab + TT tokens
