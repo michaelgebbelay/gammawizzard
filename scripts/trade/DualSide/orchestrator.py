@@ -138,10 +138,11 @@ def get_spx_price_history(c, days: int = 30) -> list:
     return sorted(candles, key=lambda x: x["datetime"])
 
 
-def get_option_chain_wide(c, from_dte: int = 3, to_dte: int = 10) -> dict:
-    """Fetch SPX option chain covering a wide DTE window.
+def get_option_chain_wide(c) -> dict:
+    """Fetch SPX option chain covering 1-14 calendar days.
 
     Returns the raw Schwab JSON with all expirations in the range.
+    Wide enough to capture the 6th SPX expiration from any weekday.
     """
     from schwab.client import Client
     today = date.today()
@@ -150,8 +151,8 @@ def get_option_chain_wide(c, from_dte: int = 3, to_dte: int = 10) -> dict:
         "$SPX",
         contract_type=Client.Options.ContractType.ALL,
         strike_range=Client.Options.StrikeRange.ALL,
-        from_date=today + timedelta(days=from_dte),
-        to_date=today + timedelta(days=to_dte),
+        from_date=today + timedelta(days=1),
+        to_date=today + timedelta(days=14),
         include_underlying_quote=True,
     )
     r.raise_for_status()
@@ -560,10 +561,10 @@ def main():
     if rv_in_band:
         print(f"DS_RUN RV_BAND: {rv_ratio:.3f} in [{RV_BAND_LO}, {RV_BAND_HI}) — will skip bullish legs")
 
-    # ── Fetch wide chain and resolve expirations by counting forward ──
-    print("\nDS_RUN FETCHING wide chain (3-10 DTE window)...")
+    # ── Fetch wide chain and resolve expirations by counting SPX expirations ──
+    print("\nDS_RUN FETCHING wide chain (1-14 cal days)...")
     try:
-        wide_chain = get_option_chain_wide(c, from_dte=3, to_dte=10)
+        wide_chain = get_option_chain_wide(c)
     except Exception as e:
         print(f"DS_RUN SKIP: chain fetch failed: {e}")
         return 1
@@ -571,15 +572,15 @@ def main():
     expirations = available_expirations(wide_chain)
     print(f"DS_RUN EXPIRATIONS: {expirations}")
 
-    if len(expirations) < 2:
-        print(f"DS_RUN SKIP: need at least 2 expirations, found {len(expirations)}")
+    # 5DTE = 5th SPX expiration from today, 6DTE = 6th
+    # Index 4 and 5 (0-based) since expirations are sorted ascending
+    if len(expirations) < 6:
+        print(f"DS_RUN SKIP: need at least 6 expirations, found {len(expirations)}")
         return 1
 
-    # 5DTE = 1st expiration (nearer), 6DTE = 2nd expiration (farther)
-    # These are the 1st and 2nd available SPX expirations in our window
-    exp5_date = expirations[0][0]  # call side helper (nearer)
-    exp6_date = expirations[1][0]  # put side directional (farther)
-    print(f"DS_RUN 5DTE={exp5_date} (dte={expirations[0][1]})  6DTE={exp6_date} (dte={expirations[1][1]})")
+    exp5_date = expirations[4][0]  # 5th expiration = call side helper
+    exp6_date = expirations[5][0]  # 6th expiration = put side directional
+    print(f"DS_RUN 5DTE={exp5_date} (dte={expirations[4][1]})  6DTE={exp6_date} (dte={expirations[5][1]})")
 
     # Parse 6DTE chain
     chain6 = parse_chain_for_expiration(wide_chain, exp6_date)
