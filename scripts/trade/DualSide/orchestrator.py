@@ -29,7 +29,8 @@ import random
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, Optional, Tuple
 
-import numpy as np
+import statistics
+
 import requests
 
 # ── path setup ──
@@ -329,7 +330,7 @@ def compute_rv(candles, window: int) -> Optional[float]:
     log_rets = [math.log(recent[i] / recent[i-1]) for i in range(1, len(recent))]
     if len(log_rets) < window:
         return None
-    return float(np.std(log_rets, ddof=1) * math.sqrt(252) * 100)
+    return float(statistics.stdev(log_rets) * math.sqrt(252) * 100)
 
 
 # ═══════════════════════════════════════════════════════════════
