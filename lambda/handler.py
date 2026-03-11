@@ -481,9 +481,9 @@ def _handle_sim_collect(event):
     try:
         c = schwab_client()
 
-        # Fetch SPX option chain (1-3 DTE window to capture 1DTE)
+        # Fetch SPX option chain (wide window to capture up to ~7 DTE)
         from_date = today
-        to_date = today + timedelta(days=3)
+        to_date = today + timedelta(days=10)
         resp = c.get_option_chain(
             "$SPX",
             contract_type=c.Options.ContractType.ALL,
@@ -512,7 +512,7 @@ def _handle_sim_collect(event):
         except Exception as e:
             print(f"VIX fetch failed (non-fatal): {e}")
 
-        # Parse into ChainSnapshot
+        # Parse full chain into ChainSnapshot for validation
         snapshot = parse_schwab_chain(raw, phase=phase, vix=vix)
 
         if not snapshot.expirations:
@@ -527,13 +527,66 @@ def _handle_sim_collect(event):
         has_greeks = sum(1 for oc in snapshot.contracts.values() if oc.delta != 0)
         has_bid = sum(1 for oc in snapshot.contracts.values() if oc.bid > 0)
         print(f"Chain: {len(snapshot.contracts)} contracts, "
+              f"{len(snapshot.expirations)} expirations ({snapshot.expirations}), "
               f"SPX={snapshot.underlying_price:.0f}, VIX={vix:.1f}, "
               f"greeks={has_greeks}/{len(snapshot.contracts)}, "
               f"bids={has_bid}/{len(snapshot.contracts)}")
 
-        # 3. Save raw chain to S3
+        # 3. Save raw chain to S3 — split into per-DTE files
+        #    close5.json = 1DTE (0-day expiration), close5_2dte.json = 2DTE, etc.
+        #    This matches the naming convention used by ThetaData downloads
+        #    and expected by all backtesting code.
         timestamp = datetime.now(ZoneInfo("America/New_York")).isoformat()
-        s3_put_json(today_str, f"{phase}.json", {
+
+        # Build per-DTE chain dicts by splitting on expiration date.
+        # ThetaData convention: DTE = Nth SPX expiration (trading days),
+        # NOT calendar days.  Schwab exp_key suffix is calendar DTE which
+        # diverges over weekends.  So we sort unique expiration dates and
+        # assign ordinal positions: 1st exp → close5.json, 2nd → close5_2dte, etc.
+        all_exp_dates = set()
+        for side in ("callExpDateMap", "putExpDateMap"):
+            for exp_key in raw.get(side, {}):
+                exp_date_str = exp_key.split(":")[0]
+                all_exp_dates.add(exp_date_str)
+        sorted_exps = sorted(all_exp_dates)
+        # Map each expiration date to its ordinal DTE (1-based)
+        exp_to_dte = {exp: i + 1 for i, exp in enumerate(sorted_exps)}
+
+        dte_chains = {}  # ordinal_dte -> filtered chain dict
+        for side in ("callExpDateMap", "putExpDateMap"):
+            exp_map = raw.get(side, {})
+            for exp_key, strikes_data in exp_map.items():
+                exp_date_str = exp_key.split(":")[0]
+                dte = exp_to_dte.get(exp_date_str, 0)
+                if dte not in dte_chains:
+                    # Copy top-level metadata (underlyingPrice, volatility, etc.)
+                    dte_chains[dte] = {k: v for k, v in raw.items()
+                                       if k not in ("callExpDateMap", "putExpDateMap")}
+                    dte_chains[dte]["callExpDateMap"] = {}
+                    dte_chains[dte]["putExpDateMap"] = {}
+                dte_chains[dte][side][exp_key] = strikes_data
+
+        # Save each DTE as a separate file (matches ThetaData naming)
+        for dte, dte_raw in sorted(dte_chains.items()):
+            if dte <= 1:
+                filename = f"{phase}.json"
+            else:
+                filename = f"{phase}_{dte}dte.json"
+            s3_put_json(today_str, filename, {
+                "trading_date": today_str,
+                "phase": phase,
+                "source": "schwab",
+                "vix": vix,
+                "fetched_at": timestamp,
+                "chain": dte_raw,
+            })
+            exp_date = sorted_exps[dte - 1] if dte <= len(sorted_exps) else "?"
+            n_calls = sum(len(v) for v in dte_raw.get("callExpDateMap", {}).values())
+            n_puts = sum(len(v) for v in dte_raw.get("putExpDateMap", {}).values())
+            print(f"Saved {filename}: exp={exp_date}, {n_calls}C + {n_puts}P strikes")
+
+        # Also save the full combined chain for reference
+        s3_put_json(today_str, f"{phase}_full.json", {
             "trading_date": today_str,
             "phase": phase,
             "source": "schwab",
