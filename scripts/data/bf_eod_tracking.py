@@ -119,8 +119,8 @@ def fetch_butterfly_mid(c, expiry: date, lower: float, center: float, upper: flo
 
 def main():
     if _IMPORT_ERR:
-        print(f"BF_EOD SKIP: import error: {_IMPORT_ERR}")
-        return 0
+        print(f"BF_EOD FAIL: import error: {_IMPORT_ERR}")
+        return 1
 
     tab = os.environ.get("BF_GSHEET_TAB", "BF_Trades")
     today = date.today()
@@ -132,13 +132,13 @@ def main():
 
     if today.weekday() >= 5:
         print(f"BF_EOD SKIP: weekend ({today})")
-        return 0
+        return 2
 
     try:
         svc, sid = sheets_client()
     except Exception as e:
-        print(f"BF_EOD SKIP: sheets_client failed: {e}")
-        return 0
+        print(f"BF_EOD FAIL: sheets_client failed: {e}")
+        return 1
 
     # Read all data rows
     vals = (
@@ -218,7 +218,7 @@ def main():
 
     if not updates:
         print(f"BF_EOD SKIP: no rows to update today={today}")
-        return 0
+        return 2
 
     for cell, val, dte, exp in updates:
         svc.spreadsheets().values().update(

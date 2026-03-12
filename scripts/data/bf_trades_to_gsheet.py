@@ -84,27 +84,27 @@ def _val(plan, key, default=""):
 
 def main():
     if _IMPORT_ERR:
-        print(f"BF_GSHEET SKIP: import error: {_IMPORT_ERR}")
-        return 0
+        print(f"BF_GSHEET FAIL: import error: {_IMPORT_ERR}")
+        return 1
 
     plan_path = Path(os.environ.get("BF_PLAN_PATH", "/tmp/bf_plan.json"))
     if not plan_path.exists():
         print("BF_GSHEET SKIP: no plan file found")
-        return 0
+        return 2
 
     try:
         plan = json.loads(plan_path.read_text())
     except Exception as e:
-        print(f"BF_GSHEET SKIP: cannot read plan: {e}")
-        return 0
+        print(f"BF_GSHEET FAIL: cannot read plan: {e}")
+        return 1
 
     tab = os.environ.get("BF_GSHEET_TAB", "BF_Trades")
 
     try:
         svc, sid = sheets_client()
     except Exception as e:
-        print(f"BF_GSHEET SKIP: sheets_client failed: {e}")
-        return 0
+        print(f"BF_GSHEET FAIL: sheets_client failed: {e}")
+        return 1
 
     ensure_tab(svc, sid, tab, HEADERS)
 

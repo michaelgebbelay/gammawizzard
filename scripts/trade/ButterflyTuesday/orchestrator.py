@@ -206,8 +206,16 @@ def main() -> int:
         f"se_today={plan.get('se_today')} se_5d={plan.get('se_5d_avg')}"
     )
 
+    # Write plan BEFORE placement so post-steps always have data
+    plan["result"] = {"pending": True}
+    write_plan(plan)
+
     proc = subprocess.run([sys.executable, str(PLACE_PATH)], env=env, cwd=str(ROOT))
     if proc.returncode != 0:
+        plan["status"] = "ERROR"
+        plan["reason"] = f"place.py rc={proc.returncode}"
+        plan["result"] = {"error": True, "rc": proc.returncode}
+        write_plan(plan)
         print(f"BF_DAILY ERROR: place.py returned {proc.returncode}")
         return proc.returncode
 

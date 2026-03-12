@@ -53,7 +53,7 @@ __version__ = "1.0.0"
 
 # ── config ──
 CS_UNIT_DOLLARS = float(os.environ.get("DS_UNIT_DOLLARS", os.environ.get("CS_UNIT_DOLLARS", "10000")))
-DS_LOG_PATH = os.environ.get("DS_LOG_PATH", os.environ.get("CS_LOG_PATH", "logs/dualside_trades.csv"))
+DS_LOG_PATH = os.environ.get("DS_LOG_PATH", "/tmp/logs/dualside_trades.csv")
 DS_DRY_RUN = (os.environ.get("DS_DRY_RUN", os.environ.get("VERT_DRY_RUN", "false")) or "false").strip().lower() in ("1", "true", "yes")
 
 # Strategy parameters
@@ -219,11 +219,17 @@ def parse_chain_for_expiration(chain_json: dict, target_exp_date: str) -> Option
             if not strike:
                 continue
 
+            # Skip AM-settled SPX options (root "SPX" not "SPXW").
+            # On 3rd-Friday expirations, Schwab returns both AM and PM contracts.
+            osi = c.get("symbol", "")
+            osi_root = osi.strip()[:4] if osi else ""
+            if osi and osi_root != "SPXW":
+                continue
+
             bid = c.get("bid", 0) or 0
             ask = c.get("ask", 0) or 0
             iv = c.get("volatility")
             delta = c.get("delta")
-            osi = c.get("symbol", "")
 
             contracts.append({
                 "strike": float(strike),

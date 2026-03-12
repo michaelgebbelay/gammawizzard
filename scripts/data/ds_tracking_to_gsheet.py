@@ -59,16 +59,15 @@ DS_TRACKING_HEADER = [
 ]
 
 STRICT = (os.environ.get("DS_GSHEET_STRICT", "0") or "0").strip() == "1"
-CSV_PATH = os.environ.get("DS_LOG_PATH", os.environ.get("CS_LOG_PATH", "logs/dualside_trades.csv"))
+CSV_PATH = os.environ.get("DS_LOG_PATH", "/tmp/logs/dualside_trades.csv")
 TAB = os.environ.get("DS_TRACKING_TAB", "DS_Tracking")
 
 
-def _bail(msg: str):
-    if STRICT:
-        print(f"DS_GSHEET ERROR: {msg}", file=sys.stderr)
-        sys.exit(1)
-    print(f"DS_GSHEET SKIP: {msg}")
-    sys.exit(0)
+def _bail(msg: str, rc: int = 1):
+    """Exit with structured code: rc=1 for failures, rc=2 for expected skips."""
+    label = "FAIL" if rc == 1 else "SKIP"
+    print(f"DS_GSHEET {label}: {msg}")
+    sys.exit(rc)
 
 
 def _osi_strikes(short_osi: str, long_osi: str) -> str:
@@ -91,7 +90,7 @@ def _osi_strikes(short_osi: str, long_osi: str) -> str:
 
 def _read_csv() -> list[dict]:
     if not os.path.exists(CSV_PATH):
-        _bail(f"CSV not found: {CSV_PATH}")
+        _bail(f"CSV not found: {CSV_PATH}", rc=2)
     with open(CSV_PATH, newline="") as f:
         return list(csv.DictReader(f))
 
@@ -191,7 +190,15 @@ def _upsert(svc, sid: str, tab: str, new_rows: list[list[str]]):
         k = (nr[0], nr[1])
         if k in idx_map:
             sheet_row = idx_map[k] + 2  # +1 header, +1 one-based
-            updates.append((sheet_row, nr))
+            # Merge: keep existing values where new values are empty
+            # (prevents 2nd Lambda invocation from blanking 1st invocation's data)
+            existing_row = existing[idx_map[k]]
+            merged = []
+            for col_i in range(len(DS_TRACKING_HEADER)):
+                new_val = nr[col_i] if col_i < len(nr) else ""
+                old_val = existing_row[col_i] if col_i < len(existing_row) else ""
+                merged.append(new_val if new_val else old_val)
+            updates.append((sheet_row, merged))
         else:
             appends.append(nr)
 
@@ -236,8 +243,8 @@ def main():
     # Read CSV
     rows = _read_csv()
     if not rows:
-        print("DS_GSHEET: no rows in CSV")
-        return
+        print("DS_GSHEET SKIP: no rows in CSV")
+        sys.exit(2)
 
     # Pivot
     pivoted = _pivot_rows(rows)

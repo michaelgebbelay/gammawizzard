@@ -138,6 +138,7 @@ ACCOUNTS = {
         "post_steps": [
             "scripts/data/bf_trades_to_gsheet.py",
             "scripts/data/bf_eod_tracking.py",
+            "scripts/data/reconcile_reporting.py",
         ],
         "token_ssm_path": "/gamma/schwab/token_json",
         "token_file": "/tmp/schwab_token.json",
@@ -150,6 +151,7 @@ ACCOUNTS = {
             "SIM_CACHE_BUCKET": "gamma-sim-cache",
             "BF_DRY_RUN": "0",
             "BF_LOG_PATH": "/tmp/logs/bf_trades.csv",
+            "RECONCILE_CHECKS": "BF_Trades:1",
         },
     },
     "ic-long-filter": {
@@ -237,6 +239,7 @@ ACCOUNTS = {
         "orchestrator": "scripts/trade/DualSide/orchestrator.py",
         "post_steps": [
             "scripts/data/ds_tracking_to_gsheet.py",
+            "scripts/data/reconcile_reporting.py",
         ],
         "token_ssm_path": "/gamma/schwab/token_json",
         "token_file": "/tmp/schwab_token.json",
@@ -250,6 +253,7 @@ ACCOUNTS = {
             "DS_DRY_RUN": "false",
             "CS_UNIT_DOLLARS": "10000",
             "CS_ACCOUNT_LABEL": "dualside",
+            "RECONCILE_CHECKS": "DS_Tracking:1",
         },
     },
     "morning-check": {
@@ -771,14 +775,16 @@ def lambda_handler(event, context):
     report_delay_secs = int(env.get("CS_REPORT_DELAY_SECS") or str(DEFAULT_REPORT_DELAY_SECS))
     report_delay_applied = False
 
+    post_results = {}
     for step in cfg.get("post_steps", []):
+        step_name = os.path.basename(step)
         try:
-            step_name = os.path.basename(step)
             is_report_step = step_name in REPORT_STEPS
 
             # Prevent concurrent full-sheet rewrites by allowing only one account
             # invocation to run reporting scripts.
             if is_report_step and account != report_owner:
+                post_results[step_name] = "SKIP:not_owner"
                 print(f"SKIP {step_name}: reporting owner is {report_owner}, current={account}")
                 continue
 
@@ -789,11 +795,25 @@ def lambda_handler(event, context):
                 report_delay_applied = True
 
             step_timeout = min(30, remaining_s)
-            run_script(step, env, timeout_s=step_timeout, label=step_name)
+            rc = run_script(step, env, timeout_s=step_timeout, label=step_name)
+            if rc == 0:
+                post_results[step_name] = "OK"
+            elif rc == 2:
+                post_results[step_name] = "SOFT_SKIP"
+            elif rc == 124:
+                post_results[step_name] = "TIMEOUT"
+            elif rc == -1:
+                post_results[step_name] = "NOT_FOUND"
+            else:
+                post_results[step_name] = f"FAIL:rc={rc}"
             remaining_ms = context.get_remaining_time_in_millis() if context else 10000
             remaining_s = max(5, int(remaining_ms / 1000) - 5)
         except Exception as e:
+            post_results[step_name] = f"ERROR:{e}"
             print(f"WARN post-step {step}: {e}")
+
+    # Structured log line for CloudWatch Insights queries
+    print(f"REPORT_SUMMARY {json.dumps(post_results)}")
 
     # -- 6. Persist tokens back to SSM if refreshed --
     try:
@@ -826,5 +846,6 @@ def lambda_handler(event, context):
         "status": status,
         "account": account,
         "orchestrator_rc": orch_rc,
+        "post_results": post_results,
         "duration_s": duration,
     }
