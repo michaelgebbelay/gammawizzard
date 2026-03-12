@@ -98,6 +98,13 @@ def main():
         print(f"BF_GSHEET FAIL: cannot read plan: {e}")
         return 1
 
+    # Refuse to append a stale pending plan (orchestrator timed out before
+    # the handler could finalize it)
+    result = plan.get("result", {})
+    if isinstance(result, dict) and result.get("pending"):
+        print("BF_GSHEET FAIL: plan result is still pending (orchestrator did not finish)")
+        return 1
+
     tab = os.environ.get("BF_GSHEET_TAB", "BF_Trades")
 
     try:
@@ -107,8 +114,6 @@ def main():
         return 1
 
     ensure_tab(svc, sid, tab, HEADERS)
-
-    result = plan.get("result", {})
 
     row = [
         datetime.now(ET).strftime("%Y-%m-%d %H:%M:%S"),

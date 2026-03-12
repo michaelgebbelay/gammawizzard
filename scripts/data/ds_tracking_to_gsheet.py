@@ -5,15 +5,13 @@ Push DualSide trade CSV rows to a Google Sheet tab.
 Reads the trade CSV at DS_LOG_PATH, pivots PUT + CALL rows for the same
 (trade_date, tdate) into one combined row, and upserts to a "DS_Tracking" tab.
 
-NON-BLOCKING BY DEFAULT: silently exits if GSHEET_ID or SA JSON is missing
-unless DS_GSHEET_STRICT=1.
+Exit codes: 0 = data written, 1 = failure, 2 = expected skip (no CSV/no rows).
 
 Env:
   GSHEET_ID                    - spreadsheet ID
   GOOGLE_SERVICE_ACCOUNT_JSON  - full JSON string for service account
-  DS_LOG_PATH                  - path to trade CSV (default logs/dualside_trades.csv)
+  DS_LOG_PATH                  - path to trade CSV (default /tmp/logs/dualside_trades.csv)
   DS_TRACKING_TAB              - sheet tab name (default "DS_Tracking")
-  DS_GSHEET_STRICT             - "1" to fail hard on errors
 """
 
 import os
@@ -58,7 +56,6 @@ DS_TRACKING_HEADER = [
     "vix_value",
 ]
 
-STRICT = (os.environ.get("DS_GSHEET_STRICT", "0") or "0").strip() == "1"
 CSV_PATH = os.environ.get("DS_LOG_PATH", "/tmp/logs/dualside_trades.csv")
 TAB = os.environ.get("DS_TRACKING_TAB", "DS_Tracking")
 

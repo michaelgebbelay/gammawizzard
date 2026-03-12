@@ -151,7 +151,7 @@ ACCOUNTS = {
             "SIM_CACHE_BUCKET": "gamma-sim-cache",
             "BF_DRY_RUN": "0",
             "BF_LOG_PATH": "/tmp/logs/bf_trades.csv",
-            "RECONCILE_CHECKS": "BF_Trades:1",
+            "RECONCILE_CHECKS": "BF_Trades:trade_date:status:signal",
         },
     },
     "ic-long-filter": {
@@ -253,7 +253,7 @@ ACCOUNTS = {
             "DS_DRY_RUN": "false",
             "CS_UNIT_DOLLARS": "10000",
             "CS_ACCOUNT_LABEL": "dualside",
-            "RECONCILE_CHECKS": "DS_Tracking:1",
+            "RECONCILE_CHECKS": "DS_Tracking:trade_date:put_structure",
         },
     },
     "morning-check": {
@@ -413,6 +413,31 @@ def run_script(script, env, timeout_s=100, label=""):
     if result.returncode != 0:
         print(f"EXIT {result.returncode}: {label or script}")
     return result.returncode
+
+
+def _finalize_bf_plan(env, orch_rc):
+    """Patch a pending BF plan to ERROR when orchestrator failed/timed out.
+
+    Prevents bf_trades_to_gsheet from appending a stale pending-plan row
+    as if the day was successfully handled.
+    """
+    plan_path = env.get("BF_PLAN_PATH", "/tmp/bf_plan.json")
+    try:
+        with open(plan_path, "r") as f:
+            plan = json.load(f)
+        result = plan.get("result", {})
+        if isinstance(result, dict) and result.get("pending"):
+            reason = "TIMEOUT" if orch_rc == 124 else f"orch_rc={orch_rc}"
+            plan["status"] = "ERROR"
+            plan["reason"] = reason
+            plan["result"] = {"error": True, "rc": orch_rc}
+            with open(plan_path, "w") as f:
+                json.dump(plan, f, indent=2)
+            print(f"BF_PLAN finalized: pending -> ERROR ({reason})")
+    except FileNotFoundError:
+        pass  # No plan written yet — nothing to finalize
+    except Exception as e:
+        print(f"WARN BF_PLAN finalize: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -768,6 +793,10 @@ def lambda_handler(event, context):
     orch_timeout = 330 if account == "manual" else 100
     orch_rc = run_script(cfg["orchestrator"], env, timeout_s=orch_timeout, label="orchestrator")
 
+    # -- 4c. Finalize pending BF plan if orchestrator failed/timed out --
+    if account == "butterfly" and orch_rc != 0:
+        _finalize_bf_plan(env, orch_rc)
+
     # -- 5. Post-trade steps (best-effort, time-permitting) --
     remaining_ms = context.get_remaining_time_in_millis() if context else 30000
     remaining_s = max(5, int(remaining_ms / 1000) - 5)
@@ -813,7 +842,8 @@ def lambda_handler(event, context):
             print(f"WARN post-step {step}: {e}")
 
     # Structured log line for CloudWatch Insights queries
-    print(f"REPORT_SUMMARY {json.dumps(post_results)}")
+    summary = {"account": account, "orchestrator_rc": orch_rc, "steps": post_results}
+    print(f"REPORT_SUMMARY {json.dumps(summary)}")
 
     # -- 6. Persist tokens back to SSM if refreshed --
     try:

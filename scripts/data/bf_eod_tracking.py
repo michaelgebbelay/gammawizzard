@@ -150,11 +150,13 @@ def main():
     )
 
     if not vals:
-        print("BF_EOD SKIP: no rows")
-        return 0
+        print("BF_EOD FAIL: sheet is empty (no data rows)")
+        return 1
 
     # Find rows that need EOD tracking
     updates = []
+    eligible = 0  # rows that matched DTE and needed a quote
+    quote_failures = 0
     c = None  # lazy init Schwab client
 
     for row_idx, row in enumerate(vals):
@@ -197,17 +199,20 @@ def main():
         except (ValueError, IndexError):
             continue
 
+        eligible += 1
+
         # Lazy init Schwab client
         if c is None:
             try:
                 c = schwab_client()
             except Exception as e:
-                print(f"BF_EOD SKIP: schwab_client failed: {e}")
-                return 0
+                print(f"BF_EOD FAIL: schwab_client failed: {e}")
+                return 1
 
         mid = fetch_butterfly_mid(c, expiry, lower, center, upper)
         if mid is None:
             print(f"BF_EOD WARN: could not fetch mid for row {row_idx + 2} expiry={expiry_str}")
+            quote_failures += 1
             continue
 
         # Sheet row is row_idx + 2 (1-indexed, header is row 1)
@@ -216,9 +221,13 @@ def main():
         cell = f"{tab}!{col}{sheet_row}"
         updates.append((cell, str(mid), trading_dte, expiry_str))
 
-    if not updates:
-        print(f"BF_EOD SKIP: no rows to update today={today}")
+    if eligible == 0:
+        print(f"BF_EOD SKIP: no eligible rows to update today={today}")
         return 2
+
+    if not updates and quote_failures > 0:
+        print(f"BF_EOD FAIL: {quote_failures}/{eligible} quote fetches failed, 0 updates")
+        return 1
 
     for cell, val, dte, exp in updates:
         svc.spreadsheets().values().update(
