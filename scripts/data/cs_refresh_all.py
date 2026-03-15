@@ -61,6 +61,18 @@ STEPS = [
         "description": "CS_Summary -> CS_Performance",
         "timeout": 30,
     },
+    {
+        "name": "chart_data",
+        "script": "scripts/data/cs_chart_data_to_gsheet.py",
+        "description": "CS_Summary -> CS_Chart_Daily / CS_Chart_Monthly",
+        "timeout": 30,
+    },
+    {
+        "name": "dashboard",
+        "script": "scripts/data/cs_build_dashboard_tab.py",
+        "description": "Build CS_Dashboard tab + charts",
+        "timeout": 30,
+    },
 ]
 
 
@@ -182,7 +194,8 @@ def main():
     env.setdefault("GW_ENDPOINT", "rapi/GetUltraPureConstantStable")
     env.setdefault("CS_VOL_FIELD", "VixOne")
     env.setdefault("CS_VIX_BREAKS", "0.1636779,0.3276571,0.3702533,0.4514141")
-    env.setdefault("CS_VIX_MULTS", "2,3,4,4,10")
+    # env.setdefault("CS_VIX_MULTS", "2,3,4,4,10")  # USC scaling - disabled 2026-03-15 after drawdown
+    env.setdefault("CS_VIX_MULTS", "1,1,1,1,1")
     env.setdefault("TT_ACCOUNT_NUMBERS", "5WT09219:tt-individual,5WT20360:tt-ira")
 
     results = {}
