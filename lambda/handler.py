@@ -109,7 +109,8 @@ ACCOUNTS = {
             "CS_UNIT_DOLLARS": "7000",
             "CS_ACCOUNT_LABEL": "tt-individual",
             "CS_COST_PER_CONTRACT": "1.72",
-            "CS_CLOSE_ORDERS_ENABLE": "1",
+            # "CS_CLOSE_ORDERS_ENABLE": "1",  # 50% profit-take disabled 2026-03-15
+            "CS_CLOSE_ORDERS_ENABLE": "0",
         },
     },
     "manual": {
