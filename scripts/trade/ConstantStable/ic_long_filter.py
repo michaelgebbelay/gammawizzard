@@ -413,8 +413,8 @@ def main():
         switch_to_rr_short = True
 
     trail_skip = is_ic_long and trail < anchor_pct
-    # Skip IC_LONG when EITHER the trail filter OR chop filter fires
-    skip = trail_skip or (is_ic_long and chop_skip)
+    # Skip IC_LONG on trail filter only (ER3/SE5d chop disabled — anti-predictive per backtest)
+    skip = trail_skip
 
     # Switch to RR_SHORT supersedes skip (the switch IS the action for this regime)
     if switch_to_rr_short:
@@ -429,8 +429,6 @@ def main():
     ]
     if trail_skip:
         reason = f"IC_LONG_SKIP: trail{TRAIL_DAYS}_move={trail:.3f}% < anchor_dist={anchor_pct:.3f}%"
-    elif is_ic_long and chop_skip:
-        reason = f"IC_LONG_SKIP: {chop_reason}"
     else:
         reason = "ALLOW"
 
