@@ -412,9 +412,9 @@ def main():
     if is_ic_long and regime_fires:
         switch_to_rr_short = True
 
-    trail_skip = is_ic_long and trail < anchor_pct
-    # Skip IC_LONG on trail filter only (ER3/SE5d chop disabled — anti-predictive per backtest)
-    skip = trail_skip
+    # All skip filters disabled — backtest showed trail/chop/ER3 all destroy value.
+    # Live rule is pure L1: switch IC_LONG → RR_SHORT when regime fires, keep otherwise.
+    skip = False
 
     # Switch to RR_SHORT supersedes skip (the switch IS the action for this regime)
     if switch_to_rr_short:
@@ -427,10 +427,7 @@ def main():
         f"ER3={er3_val:.3f}" if er3_val is not None else "ER3=N/A",
         f"SE5D={se5d_val:.3f}" if se5d_val is not None else "SE5D=N/A",
     ]
-    if trail_skip:
-        reason = f"IC_LONG_SKIP: trail{TRAIL_DAYS}_move={trail:.3f}% < anchor_dist={anchor_pct:.3f}%"
-    else:
-        reason = "ALLOW"
+    reason = "ALLOW"
 
     # 5. If skipping IC_LONG, fetch Profit signal as substitute (Strategy C)
     profit_signal = None
