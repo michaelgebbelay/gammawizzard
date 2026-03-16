@@ -59,8 +59,121 @@ def _add_scripts_root():
 
 _add_scripts_root()
 from schwab_token_keeper import schwab_client
+from pathlib import Path
 
 __version__ = "2.4.0"
+
+# ── Event reporting (best-effort, never blocks trading) ──
+_ew = None
+try:
+    _repo_root = str(Path(__file__).resolve().parent.parent.parent.parent)
+    if _repo_root not in sys.path:
+        sys.path.insert(0, _repo_root)
+    from reporting.events import EventWriter
+    _EVENTS_AVAILABLE = True
+except ImportError:
+    _EVENTS_AVAILABLE = False
+
+
+def _init_events(today: date):
+    global _ew
+    if not _EVENTS_AVAILABLE:
+        return None
+    try:
+        _ew = EventWriter(strategy="constantstable", account="schwab", trade_date=today)
+        return _ew
+    except Exception as e:
+        print(f"CS_VERT_RUN WARN: EventWriter init failed: {e}")
+        return None
+
+
+def _emit(method: str, **kwargs):
+    """Best-effort event emission. Never raises."""
+    if _ew is None:
+        return
+    try:
+        getattr(_ew, method)(**kwargs)
+    except Exception as e:
+        print(f"CS_VERT_RUN WARN: event emit failed ({method}): {e}")
+
+
+def _close_events():
+    """Close EventWriter. Best-effort."""
+    if _ew is not None:
+        try:
+            _ew.close()
+        except Exception:
+            pass
+
+
+def _csv_row_count() -> int:
+    """Count current rows in CS_LOG_PATH. Returns 0 if file doesn't exist."""
+    try:
+        import csv as _csv
+        with open(CS_LOG_PATH) as f:
+            return sum(1 for _ in _csv.DictReader(f))
+    except Exception:
+        return 0
+
+
+def _read_back_fills(group_ids: list[str], rows_before: int):
+    """Read placement results from CS_LOG_PATH and emit order_submitted + fill events.
+
+    Uses rows_before to identify exactly which CSV rows were written by this
+    invocation (handles bundle fallback writing 4 rows instead of 2).
+    Each new row is paired with its corresponding trade_group_id from group_ids
+    by matching on the vertical name.
+
+    Best-effort — never blocks trading.
+    """
+    if _ew is None:
+        return
+    try:
+        import csv as _csv
+        with open(CS_LOG_PATH) as f:
+            all_rows = list(_csv.DictReader(f))
+        new_rows = all_rows[rows_before:]
+        if not new_rows:
+            return
+
+        # Build name → group_id mapping from the saved pairs
+        # group_ids is a list of (name, group_id) tuples
+        name_to_group = {name: gid for name, gid in group_ids}
+
+        # Emit one order_submitted + fill per CSV row (per real broker order).
+        # Bundle+fallback writes multiple rows for the same vertical; each row
+        # is a distinct broker execution and must be preserved as-is for
+        # order-level reconciliation.
+        for row in new_rows:
+            name = row.get("name", "")
+            saved_gid = name_to_group.get(name)
+            if saved_gid and _ew is not None:
+                _ew.trade_group_id = saved_gid
+
+            oids = [x for x in (row.get("order_ids") or "").split(",") if x]
+            filled = int(row.get("qty_filled") or 0)
+            price = float(row.get("last_price") or 0) if row.get("last_price") else 0
+            short_osi = row.get("short_osi", "")
+            long_osi = row.get("long_osi", "")
+            kind = row.get("kind", "")
+            requested = int(row.get("qty_requested") or 0)
+
+            for oid in oids:
+                _emit("order_submitted", order_id=oid,
+                      legs=[
+                          {"osi": short_osi, "option_type": kind, "action": "SELL_TO_OPEN", "qty": requested},
+                          {"osi": long_osi, "option_type": kind, "action": "BUY_TO_OPEN", "qty": requested},
+                      ],
+                      limit_price=price)
+            if filled > 0:
+                _emit("fill", order_id=oids[0] if oids else "",
+                      fill_qty=filled, fill_price=price,
+                      legs=[
+                          {"osi": short_osi, "option_type": kind, "qty": filled},
+                          {"osi": long_osi, "option_type": kind, "qty": filled},
+                      ])
+    except Exception as e:
+        print(f"CS_VERT_RUN WARN: could not read placement result: {e}")
 
 GW_BASE = os.environ.get("GW_BASE", "https://gandalf.gammawizard.com").rstrip("/")
 GW_ENDPOINT = os.environ.get("GW_ENDPOINT", "rapi/GetUltraPureConstantStable").lstrip("/")
@@ -588,18 +701,19 @@ def _defer_ic_long_to_morning(v_put, v_call, trade_date, tdate_iso,
         print(f"CS_VERT_RUN IC_LONG_DEFER FAIL: S3 write failed ({e})")
 
 
-def _read_ic_long_decision(today_str: str) -> Tuple[bool, str]:
-    """Read the pre-computed IC_LONG skip decision from S3.
+def _read_ic_long_decision(today_str: str) -> Tuple[bool, bool, str]:
+    """Read the pre-computed IC_LONG decision from S3.
 
+    Returns (skip, switch_to_rr_short, reason).
     The decision is written by ic_long_filter.py which runs at 4:01 PM ET,
     before the orchestrators execute at 4:13 PM ET.
     """
     if not CS_IC_LONG_FILTER:
-        return False, ""
+        return False, False, ""
     bucket = CS_MOVE_STATE_S3_BUCKET
     if not bucket:
         print("CS_VERT_RUN IC_FILTER: no S3 bucket, allowing trade")
-        return False, ""
+        return False, False, ""
     try:
         import boto3
         s3 = boto3.client("s3")
@@ -607,35 +721,54 @@ def _read_ic_long_decision(today_str: str) -> Tuple[bool, str]:
         decision = json.loads(obj["Body"].read().decode("utf-8"))
     except Exception as e:
         print(f"CS_VERT_RUN IC_FILTER: cannot read decision ({e}), allowing trade")
-        return False, ""
+        return False, False, ""
 
     if decision.get("date") != today_str:
         print(
             f"CS_VERT_RUN IC_FILTER: stale decision "
             f"(file={decision.get('date')}, today={today_str}), allowing trade"
         )
-        return False, ""
+        return False, False, ""
 
     skip = decision.get("ic_long_skip", False)
+    switch = decision.get("switch_to_rr_short", False)
     reason = decision.get("reason", "")
+    regime_reason = decision.get("regime_reason", "")
     trail = decision.get("trail_move_pct")
     anchor = decision.get("anchor_pct")
+    vix_rv10 = decision.get("vix_rv10_ratio")
+    rv5_rv20 = decision.get("rv5_rv20_ratio")
+
+    # Switch supersedes skip
+    if switch:
+        skip = False
+
+    display_reason = regime_reason if switch else reason
     print(
-        f"CS_VERT_RUN IC_FILTER: decision={'SKIP' if skip else 'ALLOW'} "
-        f"trail={trail} anchor={anchor} reason={reason}"
+        f"CS_VERT_RUN IC_FILTER: skip={'SKIP' if skip else 'no'} "
+        f"switch={'RR_SHORT' if switch else 'no'} "
+        f"trail={trail} anchor={anchor} "
+        f"VIX/RV10={vix_rv10} RV5/RV20={rv5_rv20} "
+        f"reason={display_reason}"
     )
-    return skip, reason
+    return skip, switch, display_reason
 
 
 # ---------- main ----------
 
 def main():
+    today = date.today()
+    ew = _init_events(today)
+
     # --- Schwab + equity (with override & fallback) ---
     try:
         c = schwab_client()
         oc_val, oc_src, acct_num = opening_cash_for_account(c)
         acct_hash = get_account_hash(c)
     except Exception as e:
+        _emit("strategy_run", signal="SKIP", config="", reason=f"Schwab init failed: {e}")
+        _emit("error", message=str(e), stage="schwab_init")
+        _close_events()
         print(f"CS_VERT_RUN SKIP: Schwab init failed: {e}")
         return 1
 
@@ -681,6 +814,9 @@ def main():
                 print(f"CS_VERT_RUN POSITIONS WARN: fetch failed ({msg}) — continuing WITHOUT positions (guard/topup degraded).")
                 pos = None
             else:
+                _emit("strategy_run", signal="SKIP", config="", reason=f"POSITIONS_FETCH_FAILED: {msg}")
+                _emit("skip", reason="POSITIONS_FETCH_FAILED", signal="SKIP")
+                _close_events()
                 print(f"CS_VERT_RUN POSITIONS SKIP: fetch failed ({msg}) — skipping ALL trades.")
                 return 0
 
@@ -698,10 +834,16 @@ def main():
             api = gw_fetch()
             tr = extract_trade(api)
         except Exception as e:
+            _emit("strategy_run", signal="SKIP", config="", reason=f"GW_FETCH_FAILED: {e}")
+            _emit("skip", reason="GW_FETCH_FAILED", signal="SKIP")
+            _close_events()
             print(f"CS_VERT_RUN SKIP: GW fetch failed: {e}")
             return 0
 
     if not tr:
+        _emit("strategy_run", signal="SKIP", config="", reason="NO_TRADE_PAYLOAD")
+        _emit("skip", reason="NO_TRADE_PAYLOAD", signal="SKIP")
+        _close_events()
         print("CS_VERT_RUN SKIP: NO_TRADE_PAYLOAD")
         return 0
 
@@ -782,8 +924,28 @@ def main():
             }
 
     if not v_put and not v_call:
+        _emit("strategy_run", signal="SKIP", config="",
+              reason="NO_CANDIDATES", spot=0.0,
+              vix=float(vol_val or 0), vix1d=float(vol_val or 0))
+        _emit("skip", reason="NO_CANDIDATES", signal="SKIP")
+        _close_events()
         print("CS_VERT_RUN SKIP: no verticals to trade (LeftGo/RightGo zero or vix_mult=0).")
         return 0
+
+    # --- Regime rule: IC_LONG → RR_SHORT switch ---
+    is_ic_long_candidate = (v_put and v_call
+                            and v_put["side"] == "DEBIT" and v_call["side"] == "DEBIT")
+    if is_ic_long_candidate:
+        _, switch_rr, regime_reason = _read_ic_long_decision(today.isoformat())
+        if switch_rr:
+            print(f"CS_VERT_RUN REGIME_SWITCH: IC_LONG → RR_SHORT | {regime_reason}")
+            # Flip put side: DEBIT → CREDIT (PUT_LONG → PUT_SHORT)
+            # Call side stays DEBIT (CALL_LONG) — result is RR_SHORT
+            v_put = {
+                "name": "PUT_SHORT", "kind": "PUT", "side": "CREDIT", "direction": "SHORT",
+                "short_osi": put_high_osi, "long_osi": put_low_osi,
+                "go": left_go, "strength": put_strength, "target_qty": v_put["target_qty"],
+            }
 
     # Structure-based sizing adjustments
     if v_put and v_call:
@@ -858,21 +1020,15 @@ def main():
     v_call_f = finalize(v_call) if v_call else None
 
     if not v_put_f and not v_call_f:
+        _emit("strategy_run", signal="SKIP", config="",
+              reason="TOPUP_GUARD_FILTERED", vix=float(vol_val or 0))
+        _emit("skip", reason="TOPUP_GUARD_FILTERED", signal="SKIP")
+        _close_events()
         print("CS_VERT_RUN SKIP: nothing to place after TOPUP/GUARD.")
         return 0
 
-    # --- IC_LONG deferral: save plan to S3 for morning placement ---
-    is_ic_long = (v_put_f and v_call_f
-                  and v_put_f["side"] == "DEBIT" and v_call_f["side"] == "DEBIT")
-
-    if is_ic_long:
-        account_label = os.environ.get("CS_ACCOUNT_LABEL", "unknown")
-        _defer_ic_long_to_morning(
-            v_put_f, v_call_f, trade_date, tdate_iso,
-            field_used, vol_val, bucket, vix_mult, units, oc_val,
-            gw_put_price, gw_call_price, account_label,
-        )
-        return 0
+    # IC_LONG deferral removed — all structures (including IC_LONG) place at 4:13 PM.
+    # If regime rule fired, IC_LONG was already switched to RR_SHORT above.
 
     qty_rule = "VIX_BUCKET_TOPUP" if CS_TOPUP else "VIX_BUCKET"
 
@@ -926,11 +1082,43 @@ def main():
         q_call = int(v_call_f["send_qty"])
         if q_put > 0 and q_call > 0:
             mode = "BUNDLE4" if is_ic_short else "PAIR_ALT"
+
+            # Determine structure label for events
+            if is_ic_short:
+                struct_label = "IC_SHORT"
+            elif v_put_f["side"] != v_call_f["side"]:
+                struct_label = "RR"
+            else:
+                struct_label = "IC_LONG"
+
+            _emit("strategy_run", signal=struct_label, config=f"{v_put_f['name']}+{v_call_f['name']}",
+                  reason="OK", vix=float(vol_val or 0),
+                  extra={"mode": mode, "trade_date": trade_date, "tdate": tdate_iso,
+                         "vol_field": field_used, "vol_bucket": bucket, "vol_mult": vix_mult})
+
+            # Emit trade_intent for each vertical, capturing trade_group_id per name
+            _saved_groups = []
+            for v_side in (v_call_f, v_put_f):
+                if _ew is not None:
+                    _ew.new_trade_group()
+                    _saved_groups.append((v_side["name"], _ew.trade_group_id))
+                _emit("trade_intent", side=v_side["side"], direction=v_side["direction"],
+                      legs=[
+                          {"osi": v_side["short_osi"], "strike": 0,
+                           "option_type": v_side["kind"], "action": "SELL_TO_OPEN", "qty": v_side["send_qty"]},
+                          {"osi": v_side["long_osi"], "strike": 0,
+                           "option_type": v_side["kind"], "action": "BUY_TO_OPEN", "qty": v_side["send_qty"]},
+                      ],
+                      target_qty=v_side["send_qty"],
+                      extra={"name": v_side["name"]})
+
             print(
                 f"CS_VERT_RUN {mode}: "
                 f"CALL={v_call_f['name']}({v_call_f['short_osi']}|{v_call_f['long_osi']}) qty={q_call} "
                 f"PUT={v_put_f['name']}({v_put_f['short_osi']}|{v_put_f['long_osi']}) qty={q_put}"
             )
+
+            _rows_before = _csv_row_count()
 
             env = env_for_vertical({**v_call_f, "send_qty": q_call})
             if is_ic_short:
@@ -953,26 +1141,58 @@ def main():
 
             rc = subprocess.call([sys.executable, "scripts/trade/ConstantStable/place.py"], env=env)
             if rc != 0:
+                _emit("error", message=f"placer rc={rc}", stage=f"placement_{mode}")
                 print(f"CS_VERT_RUN PAIR_ALT: placer rc={rc}")
+            else:
+                _read_back_fills(_saved_groups, _rows_before)
+            _close_events()
             return 0
 
         print(f"CS_VERT_RUN PAIR_ALT SKIP: qty missing (put={q_put} call={q_call}) — placing separately")
 
     # ----- Fallback: place separately -----
+    # Emit strategy_run once for the whole run
+    active_names = [v["name"] for v in (v_put_f, v_call_f) if v]
+    _emit("strategy_run", signal="+".join(active_names), config="+".join(active_names),
+          reason="OK", vix=float(vol_val or 0),
+          extra={"mode": "SEPARATE", "trade_date": trade_date, "tdate": tdate_iso,
+                 "vol_field": field_used, "vol_bucket": bucket, "vol_mult": vix_mult})
+
     for v in (v_put_f, v_call_f):
         if not v:
             continue
+
+        if _ew is not None:
+            _ew.new_trade_group()
+
+        _saved_gid = _ew.trade_group_id if _ew else ""
+
+        _emit("trade_intent", side=v["side"], direction=v["direction"],
+              legs=[
+                  {"osi": v["short_osi"], "strike": 0,
+                   "option_type": v["kind"], "action": "SELL_TO_OPEN", "qty": v["send_qty"]},
+                  {"osi": v["long_osi"], "strike": 0,
+                   "option_type": v["kind"], "action": "BUY_TO_OPEN", "qty": v["send_qty"]},
+              ],
+              target_qty=v["send_qty"],
+              extra={"name": v["name"]})
+
         print(
             f"CS_VERT_RUN {v['name']}: side={v['side']} kind={v['kind']} "
             f"short={v['short_osi']} long={v['long_osi']} "
             f"go={v['go']} target_qty={v['target_qty']} send_qty={v['send_qty']} "
             f"(units={units} vix_mult={vix_mult} bucket={bucket})"
         )
+        _rows_before = _csv_row_count()
         env = env_for_vertical(v)
         rc = subprocess.call([sys.executable, "scripts/trade/ConstantStable/place.py"], env=env)
         if rc != 0:
+            _emit("error", message=f"placer rc={rc}", stage=f"placement_{v['name']}")
             print(f"CS_VERT_RUN {v['name']}: placer rc={rc}")
+        else:
+            _read_back_fills([(v["name"], _saved_gid)], _rows_before)
 
+    _close_events()
     return 0
 
 

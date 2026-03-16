@@ -5,9 +5,10 @@ Fetches today's SPX move from Schwab, updates trailing move history in S3,
 fetches Leo's signal from GammaWizard to get anchor strikes, and writes
 a go/no-go decision to S3 for the orchestrators to read.
 
-Rule: Skip IC_LONG when trailing 5-day avg |SPX move|% < nearest anchor
-distance%. Backtested over 10 years: IC_LONG in this regime is 0 EV
-(40% WR, -$1/trade over 169 trades). All other structures unaffected.
+Rules (skip IC_LONG when ANY fires):
+  1. Trailing 5-day avg |SPX move|% < nearest anchor distance%
+  2. ER3 < 0.60 (choppy market — same rule as butterfly SELL)
+  3. SE 5d avg > 1.00 (straddle efficiency too high — same rule as butterfly SELL)
 
 Scheduled at 4:01 PM ET (before 4:13 trade execution).
 """
@@ -15,10 +16,12 @@ Scheduled at 4:01 PM ET (before 4:13 trade execution).
 __version__ = "2.0.0"
 
 import json
+import math
 import os
+import statistics
 import sys
 import time
-from datetime import date
+from datetime import date, datetime, timedelta
 
 import boto3
 import requests
@@ -152,6 +155,132 @@ def extract_trade(j):
     return {}
 
 
+# ---------- Chop filter (shared with butterfly SELL) ----------
+
+IC_LONG_ER3_THRESHOLD = float(os.environ.get("CS_IC_LONG_ER3_THRESHOLD", "0.60"))
+IC_LONG_SE5D_THRESHOLD = float(os.environ.get("CS_IC_LONG_SE5D_THRESHOLD", "1.00"))
+SE_HISTORY_S3_KEY = "cadence/bf_straddle_eff_history.json"
+
+
+# --- IV/RV Regime Rule: IC_LONG → RR_SHORT switch ---
+# Backtested rule: +$11,243 edge over 315 IC_LONG trades (2016-2026).
+# When VIX overprices fear (high VIX/RV10) and vol term structure is flat or
+# contracting (low RV5/RV20), IC_LONG loses because SPX stays range-bound.
+# Switching to RR_SHORT (sell put spread + buy call spread) is profitable.
+IC_LONG_RR_SHORT_VIX_RV10_THRESHOLD = 2.04238
+IC_LONG_RR_SHORT_RV5_RV20_THRESHOLD = 1.02536
+
+
+def fetch_spx_closes(c, lookback_days=40):
+    """Fetch recent SPX daily close prices from Schwab for RV computation."""
+    try:
+        end = datetime.now()
+        start = end - timedelta(days=lookback_days)
+        r = c.get_price_history_every_day(
+            "$SPX", start_datetime=start, end_datetime=end,
+            need_extended_hours_data=False,
+        )
+        r.raise_for_status()
+        candles = sorted(r.json().get("candles", []), key=lambda x: x["datetime"])
+        return [candle["close"] for candle in candles if candle.get("close")]
+    except Exception as e:
+        print(f"IC_FILTER WARN: SPX closes fetch failed: {e}")
+        return []
+
+
+def compute_realized_vol(closes, n):
+    """Compute n-day annualized realized vol (decimal) from daily closes."""
+    if len(closes) < n + 1:
+        return None
+    recent = closes[-(n + 1):]
+    log_rets = [math.log(recent[i + 1] / recent[i]) for i in range(n)]
+    if len(log_rets) < 2:
+        return None
+    return statistics.stdev(log_rets) * math.sqrt(252)
+
+
+def regime_rule_check(vix_decimal, rv5, rv10, rv20):
+    """Check VIX/RV10 + RV5/RV20 regime rule for IC_LONG → RR_SHORT switch.
+
+    Returns (switch_to_rr_short, vix_rv10_ratio, rv5_rv20_ratio, reason).
+    """
+    if rv10 is None or rv10 <= 0 or rv5 is None or rv20 is None or rv20 <= 0:
+        return False, None, None, "RV data unavailable — KEEP IC_LONG"
+
+    vix_rv10 = vix_decimal / rv10
+    rv5_rv20 = rv5 / rv20
+
+    switch = (vix_rv10 >= IC_LONG_RR_SHORT_VIX_RV10_THRESHOLD
+              and rv5_rv20 <= IC_LONG_RR_SHORT_RV5_RV20_THRESHOLD)
+
+    tag = "SWITCH_TO_RR_SHORT" if switch else "KEEP_IC_LONG"
+    reason = (f"{tag}: VIX/RV10={vix_rv10:.4f} (thr={IC_LONG_RR_SHORT_VIX_RV10_THRESHOLD}) "
+              f"RV5/RV20={rv5_rv20:.5f} (thr={IC_LONG_RR_SHORT_RV5_RV20_THRESHOLD})")
+    return switch, vix_rv10, rv5_rv20, reason
+
+
+def compute_er3(c):
+    """Compute 3-day price efficiency ratio from Schwab SPX candles.
+
+    ER3 = |Close[t] - Close[t-3]| / (|d1| + |d2| + |d3|)
+    Low = choppy/mean-reverting, high = directional trend.
+    """
+    try:
+        end = datetime.now()
+        start = end - timedelta(days=15)
+        r = c.get_price_history_every_day(
+            "$SPX", start_datetime=start, end_datetime=end,
+            need_extended_hours_data=False,
+        )
+        r.raise_for_status()
+        candles = sorted(r.json().get("candles", []), key=lambda x: x["datetime"])
+        closes = [candle["close"] for candle in candles if candle.get("close")]
+        if len(closes) < 4:
+            return None
+        recent = closes[-4:]
+        d1, d2, d3 = recent[1] - recent[0], recent[2] - recent[1], recent[3] - recent[2]
+        total_path = abs(d1) + abs(d2) + abs(d3)
+        if total_path == 0:
+            return 1.0
+        return abs(recent[3] - recent[0]) / total_path
+    except Exception as e:
+        print(f"IC_FILTER WARN: ER3 compute failed: {e}")
+        return None
+
+
+def read_se_5d_avg():
+    """Read SE 5d avg from butterfly's persisted SE history in S3."""
+    data = s3_get_json(SE_HISTORY_S3_KEY)
+    if not data:
+        return None
+    history = data.get("history", [])
+    recent = [h["se"] for h in history[-5:] if h.get("se") is not None]
+    if not recent:
+        return None
+    return sum(recent) / len(recent)
+
+
+def chop_filter_check(c):
+    """Check ER3 + SE5d chop filter (same rule as butterfly SELL).
+
+    Returns (should_skip, er3, se_5d, reason).
+    """
+    er3 = compute_er3(c)
+    se_5d = read_se_5d_avg()
+
+    if er3 is None:
+        return True, er3, se_5d, "ER3=None — data missing, IC_LONG skipped"
+    if se_5d is None:
+        return True, er3, se_5d, "SE5D=None — data missing, IC_LONG skipped"
+
+    if se_5d > IC_LONG_SE5D_THRESHOLD:
+        return True, er3, se_5d, f"SE5D={se_5d:.3f}>{IC_LONG_SE5D_THRESHOLD} — IC_LONG skipped"
+    if er3 < IC_LONG_ER3_THRESHOLD:
+        return True, er3, se_5d, f"ER3={er3:.3f}<{IC_LONG_ER3_THRESHOLD} — choppy market, IC_LONG skipped"
+
+    return False, er3, se_5d, f"PASS (SE5D={se_5d:.3f}, ER3={er3:.3f})"
+
+
 # ---------- Core logic ----------
 
 def main():
@@ -205,6 +334,10 @@ def main():
 
     trail = sum(recent) / len(recent)
 
+    # 3b. Chop filter (ER3 + SE5d — same rule as butterfly SELL)
+    chop_skip, er3_val, se5d_val, chop_reason = chop_filter_check(c)
+    print(f"IC_FILTER CHOP: {chop_reason}")
+
     # 4. Fetch GW signal for anchor strikes
     try:
         tr = gw_fetch_signal()
@@ -245,15 +378,59 @@ def main():
     anchor_pct = (min_dist / spx * 100.0) if spx > 0 else 0.0
 
     structure = "IC_LONG" if is_ic_long else "OTHER"
-    skip = is_ic_long and trail < anchor_pct
+
+    # 5. Regime rule: always compute RV + ratios (data ready before structure is known)
+    #    The switch decision is only applied when structure is IC_LONG.
+    switch_to_rr_short = False
+    vix_rv10_ratio = None
+    rv5_rv20_ratio = None
+    regime_reason = ""
+    regime_fires = False
+
+    vix_gw = fnum(tr.get("VIX"))
+    if vix_gw is not None and vix_gw > 0:
+        # Ensure VIX is in decimal form (same unit as RV output)
+        vix_dec = vix_gw / 100.0 if vix_gw > 1 else vix_gw
+        closes = fetch_spx_closes(c, lookback_days=40)
+        if len(closes) >= 21:
+            rv5 = compute_realized_vol(closes, 5)
+            rv10 = compute_realized_vol(closes, 10)
+            rv20 = compute_realized_vol(closes, 20)
+            if all(v is not None for v in (rv5, rv10, rv20)):
+                print(f"IC_FILTER REGIME_RV: vix={vix_dec:.5f} rv5={rv5:.5f} rv10={rv10:.5f} rv20={rv20:.5f}")
+            else:
+                print("IC_FILTER REGIME_RV: insufficient return data for RV")
+            regime_fires, vix_rv10_ratio, rv5_rv20_ratio, regime_reason = \
+                regime_rule_check(vix_dec, rv5, rv10, rv20)
+        else:
+            regime_reason = f"insufficient closes ({len(closes)}) for RV computation"
+    else:
+        regime_reason = "VIX unavailable from GW signal"
+    print(f"IC_FILTER REGIME: {regime_reason}")
+
+    # Only switch if structure is actually IC_LONG
+    if is_ic_long and regime_fires:
+        switch_to_rr_short = True
+
+    trail_skip = is_ic_long and trail < anchor_pct
+    # Skip IC_LONG when EITHER the trail filter OR chop filter fires
+    skip = trail_skip or (is_ic_long and chop_skip)
+
+    # Switch to RR_SHORT supersedes skip (the switch IS the action for this regime)
+    if switch_to_rr_short:
+        skip = False
 
     reason_parts = [
         f"structure={structure}",
         f"trail{TRAIL_DAYS}={trail:.3f}%",
         f"anchor={anchor_pct:.3f}%",
+        f"ER3={er3_val:.3f}" if er3_val is not None else "ER3=N/A",
+        f"SE5D={se5d_val:.3f}" if se5d_val is not None else "SE5D=N/A",
     ]
-    if skip:
+    if trail_skip:
         reason = f"IC_LONG_SKIP: trail{TRAIL_DAYS}_move={trail:.3f}% < anchor_dist={anchor_pct:.3f}%"
+    elif is_ic_long and chop_skip:
+        reason = f"IC_LONG_SKIP: {chop_reason}"
     else:
         reason = "ALLOW"
 
@@ -290,10 +467,17 @@ def main():
     decision = {
         "date": today_str,
         "ic_long_skip": skip,
+        "switch_to_rr_short": switch_to_rr_short,
         "reason": reason,
+        "regime_reason": regime_reason,
         "structure": structure,
         "trail_move_pct": round(trail, 5),
         "anchor_pct": round(anchor_pct, 5),
+        "er3": round(er3_val, 3) if er3_val is not None else None,
+        "se_5d_avg": round(se5d_val, 3) if se5d_val is not None else None,
+        "chop_skip": chop_skip,
+        "vix_rv10_ratio": round(vix_rv10_ratio, 5) if vix_rv10_ratio is not None else None,
+        "rv5_rv20_ratio": round(rv5_rv20_ratio, 5) if rv5_rv20_ratio is not None else None,
         "spot": round(spot, 2),
         "inner_put": inner_put,
         "inner_call": inner_call,
@@ -306,12 +490,15 @@ def main():
 
     s3_put_json(S3_DECISION_KEY, decision)
 
-    tag = "SKIP" if skip else "ALLOW"
+    tag = "SWITCH_RR_SHORT" if switch_to_rr_short else ("SKIP" if skip else "ALLOW")
     profit_tag = ""
     if skip and profit_signal:
         profit_tag = f" | profit_sub={'IC_LONG' if profit_signal['is_ic_long'] else 'IC_SHORT'}"
+    regime_tag = ""
+    if vix_rv10_ratio is not None:
+        regime_tag = f" | VIX/RV10={vix_rv10_ratio:.4f} RV5/RV20={rv5_rv20_ratio:.5f}"
     print(
-        f"IC_FILTER DECISION: {tag} | {' | '.join(reason_parts)} | "
+        f"IC_FILTER DECISION: {tag} | {' | '.join(reason_parts)}{regime_tag} | "
         f"put_anchor={inner_put} call_anchor={inner_call} spx={spx:.0f}{profit_tag}"
     )
     return 0

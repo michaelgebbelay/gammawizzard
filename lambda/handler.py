@@ -283,8 +283,7 @@ COMMON_ENV = {
     "GW_ENDPOINT": "rapi/GetUltraPureConstantStable",
     "CS_VOL_FIELD": "VixOne",
     "CS_VIX_BREAKS": "0.1636779,0.3276571,0.3702533,0.4514141",
-    # "CS_VIX_MULTS": "2,3,4,4,10",  # USC scaling - disabled 2026-03-15 after drawdown
-    "CS_VIX_MULTS": "1,1,1,1,1",
+    "CS_VIX_MULTS": "2,3,4,4,10",
     "CS_RR_CREDIT_RATIOS": "0.50,0.6667,0.75,1.00,1.00",
     "CS_IC_SHORT_MULTS": "",
     "CS_IC_LONG_MULTS": "",
