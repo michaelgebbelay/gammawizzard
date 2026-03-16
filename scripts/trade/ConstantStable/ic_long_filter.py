@@ -167,8 +167,8 @@ SE_HISTORY_S3_KEY = "cadence/bf_straddle_eff_history.json"
 # When VIX overprices fear (high VIX/RV10) and vol term structure is flat or
 # contracting (low RV5/RV20), IC_LONG loses because SPX stays range-bound.
 # Switching to RR_SHORT (buy put spread + sell call spread) is profitable.
-IC_LONG_RR_SHORT_VIX_RV10_THRESHOLD = 2.04238
-IC_LONG_RR_SHORT_RV5_RV20_THRESHOLD = 1.02536
+IC_LONG_RR_SHORT_VIX_RV10_THRESHOLD = 1.95
+IC_LONG_RR_SHORT_RV5_RV20_THRESHOLD = 1.10
 
 
 def fetch_spx_closes(c, lookback_days=40):
