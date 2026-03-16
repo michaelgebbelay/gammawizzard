@@ -743,11 +743,13 @@ def main():
         return 0
 
     # --- Regime rule: IC_LONG → RR_SHORT switch ---
+    regime_switched = False
     is_ic_long_candidate = (v_put and v_call
                             and v_put["side"] == "DEBIT" and v_call["side"] == "DEBIT")
     if is_ic_long_candidate:
         _, switch_rr, regime_reason = _read_ic_long_decision(date.today().isoformat())
         if switch_rr:
+            regime_switched = True
             print(f"CS_VERT_RUN REGIME_SWITCH: IC_LONG → RR_SHORT | {regime_reason}")
             # Flip call side: DEBIT → CREDIT (CALL_LONG → CALL_SHORT)
             # Put side stays DEBIT (PUT_LONG) — result is RR_SHORT
@@ -762,7 +764,7 @@ def main():
     if v_put and v_call:
         base_mults = parse_csv_floats(CS_VIX_MULTS)
 
-        if v_put["side"] != v_call["side"] and CS_RR_CREDIT_RATIOS:
+        if v_put["side"] != v_call["side"] and CS_RR_CREDIT_RATIOS and not regime_switched:
             # RR: per-bucket credit ratio for the credit side
             ratios = parse_csv_floats(CS_RR_CREDIT_RATIOS)
             if len(ratios) == len(base_mults):
