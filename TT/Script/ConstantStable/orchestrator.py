@@ -519,18 +519,19 @@ def _defer_ic_long_to_morning(v_put, v_call, trade_date, tdate_iso,
         print(f"CS_VERT_RUN IC_LONG_DEFER FAIL: S3 write failed ({e})")
 
 
-def _read_ic_long_decision(today_str: str) -> Tuple[bool, str]:
-    """Read the pre-computed IC_LONG skip decision from S3.
+def _read_ic_long_decision(today_str: str) -> Tuple[bool, bool, str]:
+    """Read the pre-computed IC_LONG decision from S3.
 
+    Returns (skip, switch_to_rr_short, reason).
     The decision is written by ic_long_filter.py which runs at 4:01 PM ET,
     before the orchestrators execute at 4:13 PM ET.
     """
     if not CS_IC_LONG_FILTER:
-        return False, ""
+        return False, False, ""
     bucket = CS_MOVE_STATE_S3_BUCKET
     if not bucket:
         print("CS_VERT_RUN IC_FILTER: no S3 bucket, allowing trade")
-        return False, ""
+        return False, False, ""
     try:
         import boto3
         s3 = boto3.client("s3")
@@ -538,24 +539,37 @@ def _read_ic_long_decision(today_str: str) -> Tuple[bool, str]:
         decision = json.loads(obj["Body"].read().decode("utf-8"))
     except Exception as e:
         print(f"CS_VERT_RUN IC_FILTER: cannot read decision ({e}), allowing trade")
-        return False, ""
+        return False, False, ""
 
     if decision.get("date") != today_str:
         print(
             f"CS_VERT_RUN IC_FILTER: stale decision "
             f"(file={decision.get('date')}, today={today_str}), allowing trade"
         )
-        return False, ""
+        return False, False, ""
 
     skip = decision.get("ic_long_skip", False)
+    switch = decision.get("switch_to_rr_short", False)
     reason = decision.get("reason", "")
+    regime_reason = decision.get("regime_reason", "")
     trail = decision.get("trail_move_pct")
     anchor = decision.get("anchor_pct")
+    vix_rv10 = decision.get("vix_rv10_ratio")
+    rv5_rv20 = decision.get("rv5_rv20_ratio")
+
+    # Switch supersedes skip
+    if switch:
+        skip = False
+
+    display_reason = regime_reason if switch else reason
     print(
-        f"CS_VERT_RUN IC_FILTER: decision={'SKIP' if skip else 'ALLOW'} "
-        f"trail={trail} anchor={anchor} reason={reason}"
+        f"CS_VERT_RUN IC_FILTER: skip={'SKIP' if skip else 'no'} "
+        f"switch={'RR_SHORT' if switch else 'no'} "
+        f"trail={trail} anchor={anchor} "
+        f"VIX/RV10={vix_rv10} RV5/RV20={rv5_rv20} "
+        f"reason={display_reason}"
     )
-    return skip, reason
+    return skip, switch, display_reason
 
 
 # ---------- main ----------
@@ -727,6 +741,22 @@ def main():
     if not v_put and not v_call:
         print("CS_VERT_RUN SKIP: no verticals to trade (LeftGo/RightGo zero or vix_mult=0).")
         return 0
+
+    # --- Regime rule: IC_LONG → RR_SHORT switch ---
+    is_ic_long_candidate = (v_put and v_call
+                            and v_put["side"] == "DEBIT" and v_call["side"] == "DEBIT")
+    if is_ic_long_candidate:
+        _, switch_rr, regime_reason = _read_ic_long_decision(date.today().isoformat())
+        if switch_rr:
+            print(f"CS_VERT_RUN REGIME_SWITCH: IC_LONG → RR_SHORT | {regime_reason}")
+            # Flip call side: DEBIT → CREDIT (CALL_LONG → CALL_SHORT)
+            # Put side stays DEBIT (PUT_LONG) — result is RR_SHORT
+            # RR_SHORT = buy put spread + sell call spread (bearish)
+            v_call = {
+                "name": "CALL_SHORT", "kind": "CALL", "side": "CREDIT", "direction": "SHORT",
+                "short_osi": call_low_osi, "long_osi": call_high_osi,
+                "go": right_go, "strength": call_strength, "target_qty": v_call["target_qty"],
+            }
 
     # Structure-based sizing adjustments
     if v_put and v_call:

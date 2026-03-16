@@ -939,12 +939,13 @@ def main():
         _, switch_rr, regime_reason = _read_ic_long_decision(today.isoformat())
         if switch_rr:
             print(f"CS_VERT_RUN REGIME_SWITCH: IC_LONG → RR_SHORT | {regime_reason}")
-            # Flip put side: DEBIT → CREDIT (PUT_LONG → PUT_SHORT)
-            # Call side stays DEBIT (CALL_LONG) — result is RR_SHORT
-            v_put = {
-                "name": "PUT_SHORT", "kind": "PUT", "side": "CREDIT", "direction": "SHORT",
-                "short_osi": put_high_osi, "long_osi": put_low_osi,
-                "go": left_go, "strength": put_strength, "target_qty": v_put["target_qty"],
+            # Flip call side: DEBIT → CREDIT (CALL_LONG → CALL_SHORT)
+            # Put side stays DEBIT (PUT_LONG) — result is RR_SHORT
+            # RR_SHORT = buy put spread + sell call spread (bearish)
+            v_call = {
+                "name": "CALL_SHORT", "kind": "CALL", "side": "CREDIT", "direction": "SHORT",
+                "short_osi": call_low_osi, "long_osi": call_high_osi,
+                "go": right_go, "strength": call_strength, "target_qty": v_call["target_qty"],
             }
 
     # Structure-based sizing adjustments
