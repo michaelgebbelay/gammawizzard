@@ -163,7 +163,7 @@ SE_HISTORY_S3_KEY = "cadence/bf_straddle_eff_history.json"
 
 
 # --- IV/RV Regime Rule: IC_LONG → RR_SHORT switch ---
-# Backtested rule: +$11,243 edge over 315 IC_LONG trades (2016-2026).
+# Backtested rule: +$5,557 edge over 315 IC_LONG trades (2016-2026).
 # When VIX overprices fear (high VIX/RV10) and vol term structure is flat or
 # contracting (low RV5/RV20), IC_LONG loses because SPX stays range-bound.
 # Switching to RR_SHORT (buy put spread + sell call spread) is profitable.

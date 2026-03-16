@@ -155,7 +155,7 @@ def compute_ic_long_rr_short_regime_metrics(
     Compute the exact auditable regime metrics for the IC_LONG -> RR_SHORT rule.
 
     Base switch rule:
-      switch when VIX/RV10 >= 2.04238 AND RV5/RV20 <= 1.02536
+      switch when VIX/RV10 >= 1.95 AND RV5/RV20 <= 1.10
 
     Inputs can be either:
       - precomputed ratios, or
