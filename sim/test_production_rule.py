@@ -124,8 +124,8 @@ def run_test():
     print(f"  Edge: {edge:+.2f} sized pts (${edge*100:+,.0f})")
 
     # Compare against known backtest values
-    EXPECTED_SWITCHES = 57
-    EXPECTED_EDGE = 112.43  # from backtest L1 edge
+    EXPECTED_SWITCHES = 73
+    EXPECTED_EDGE = 55.57  # from backtest L1 edge (1.95 / 1.10 thresholds)
     EXPECTED_BASELINE = 692.26
 
     print(f"\n  BACKTEST COMPARISON")

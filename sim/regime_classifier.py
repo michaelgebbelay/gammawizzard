@@ -1453,10 +1453,10 @@ def report_regime_performance(merged: pd.DataFrame):
             print(f"    Switch edge:        {edge:>+10.2f}")
 
     # ── Comparison to user's existing rule ──
-    if "VIX_RV10_ratio" in merged.columns and "rv5_rv10_ratio" in merged.columns:
+    if "VIX_RV10_ratio" in merged.columns and "rv5_rv20_ratio" in merged.columns:
         merged["user_rule"] = (
-            (merged["VIX_RV10_ratio"] >= 2.04238) &
-            (merged["rv5_rv10_ratio"] <= 1.02536))
+            (merged["VIX_RV10_ratio"] >= IC_LONG_RR_SHORT_VIX_RV10_THRESHOLD) &
+            (merged["rv5_rv20_ratio"] <= IC_LONG_RR_SHORT_RV5_RV20_THRESHOLD))
 
         print(f"\n  --- Comparison to Existing User Rule ---")
         new = merged["signal_confirmed"] == "AVOID"
