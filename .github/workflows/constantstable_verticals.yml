@@ -39,7 +39,7 @@ jobs:
       # Guardrails (keep as-is)
       CS_GUARD_NO_CLOSE: "1"
       CS_GUARD_FAIL_ACTION: "SKIP_ALL"
-      CS_TOPUP_ENABLE: "1"
+      CS_TOPUP: "1"
 
       # Edge guard sheet (already in your repo flow)
       GSHEET_ID: ${{ secrets.GSHEET_ID }}

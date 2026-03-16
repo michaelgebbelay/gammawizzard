@@ -290,7 +290,7 @@ COMMON_ENV = {
     "CS_LOG_PATH": "/tmp/cs_trades.csv",
     "CS_GUARD_NO_CLOSE": "1",
     "CS_GUARD_FAIL_ACTION": "SKIP_ALL",
-    "CS_TOPUP_ENABLE": "1",
+    "CS_TOPUP": "1",
     "CS_GW_SIGNAL_TAB": "GW_Signal",
     "CS_EDGE_GSHEET_TAB": "ConstantStableEdge",
     "CS_TRACKING_TAB": "CS_Tracking",

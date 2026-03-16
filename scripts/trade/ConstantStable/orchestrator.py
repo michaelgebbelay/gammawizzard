@@ -939,6 +939,10 @@ def main():
     if is_ic_long_candidate:
         skip_ic, switch_rr, regime_reason = _read_ic_long_decision(today.isoformat())
         if skip_ic:
+            _emit("strategy_run", signal="SKIP", config="",
+                  reason=f"IC_LONG_SKIP: {regime_reason}")
+            _emit("skip", reason="IC_LONG_SKIP", signal="SKIP")
+            _close_events()
             print(f"CS_VERT_RUN IC_LONG_SKIP: {regime_reason}")
             return 0
         if switch_rr:
