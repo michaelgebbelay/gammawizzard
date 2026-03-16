@@ -166,7 +166,7 @@ SE_HISTORY_S3_KEY = "cadence/bf_straddle_eff_history.json"
 # Backtested rule: +$11,243 edge over 315 IC_LONG trades (2016-2026).
 # When VIX overprices fear (high VIX/RV10) and vol term structure is flat or
 # contracting (low RV5/RV20), IC_LONG loses because SPX stays range-bound.
-# Switching to RR_SHORT (sell put spread + buy call spread) is profitable.
+# Switching to RR_SHORT (buy put spread + sell call spread) is profitable.
 IC_LONG_RR_SHORT_VIX_RV10_THRESHOLD = 2.04238
 IC_LONG_RR_SHORT_RV5_RV20_THRESHOLD = 1.02536
 

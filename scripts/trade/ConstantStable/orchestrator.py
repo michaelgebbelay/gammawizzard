@@ -937,7 +937,10 @@ def main():
     is_ic_long_candidate = (v_put and v_call
                             and v_put["side"] == "DEBIT" and v_call["side"] == "DEBIT")
     if is_ic_long_candidate:
-        _, switch_rr, regime_reason = _read_ic_long_decision(today.isoformat())
+        skip_ic, switch_rr, regime_reason = _read_ic_long_decision(today.isoformat())
+        if skip_ic:
+            print(f"CS_VERT_RUN IC_LONG_SKIP: {regime_reason}")
+            return 0
         if switch_rr:
             regime_switched = True
             print(f"CS_VERT_RUN REGIME_SWITCH: IC_LONG → RR_SHORT | {regime_reason}")

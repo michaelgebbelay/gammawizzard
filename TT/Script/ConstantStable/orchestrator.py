@@ -747,7 +747,10 @@ def main():
     is_ic_long_candidate = (v_put and v_call
                             and v_put["side"] == "DEBIT" and v_call["side"] == "DEBIT")
     if is_ic_long_candidate:
-        _, switch_rr, regime_reason = _read_ic_long_decision(date.today().isoformat())
+        skip_ic, switch_rr, regime_reason = _read_ic_long_decision(date.today().isoformat())
+        if skip_ic:
+            print(f"CS_VERT_RUN IC_LONG_SKIP: {regime_reason}")
+            return 0
         if switch_rr:
             regime_switched = True
             print(f"CS_VERT_RUN REGIME_SWITCH: IC_LONG → RR_SHORT | {regime_reason}")
@@ -836,18 +839,8 @@ def main():
         print("CS_VERT_RUN SKIP: nothing to place after TOPUP/GUARD.")
         return 0
 
-    # --- IC_LONG deferral: save plan to S3 for morning placement ---
-    is_ic_long = (v_put_f and v_call_f
-                  and v_put_f["side"] == "DEBIT" and v_call_f["side"] == "DEBIT")
-
-    if is_ic_long:
-        account_label = os.environ.get("CS_ACCOUNT_LABEL", "unknown")
-        _defer_ic_long_to_morning(
-            v_put_f, v_call_f, trade_date, tdate_iso,
-            field_used, vol_val, bucket, vix_mult, units, oc_val,
-            gw_put_price, gw_call_price, account_label,
-        )
-        return 0
+    # IC_LONG deferral removed — TT places IC_LONGs at 4:13 PM directly
+    # (morning placers are disabled in template.yaml)
 
     qty_rule = "VIX_BUCKET_TOPUP" if CS_TOPUP else "VIX_BUCKET"
 

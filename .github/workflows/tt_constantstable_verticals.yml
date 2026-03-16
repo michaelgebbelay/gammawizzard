@@ -26,11 +26,12 @@ jobs:
       # NOTE:
       # - Breaks are for VixOne (decimal), not VIX.
       # - 5 buckets => 4 breaks + 5 multipliers
-      CS_UNIT_DOLLARS: "7000"
+      CS_UNIT_DOLLARS: "15000"
       CS_VOL_FIELD:  "VixOne"
       CS_VIX_BREAKS: "0.1636779,0.3276571,0.3702533,0.4514141"
-      # CS_VIX_MULTS:  "1,2,4,8,10"  # USC scaling - disabled 2026-03-15 after drawdown
-      CS_VIX_MULTS:  "1,1,1,1,1"
+      CS_VIX_MULTS:  "2,3,4,4,10"
+      CS_RR_CREDIT_RATIOS: "0.50,0.6667,0.75,1.00,1.00"
+      CS_IC_LONG_FILTER: "1"
 
       # Logging
       CS_LOG_PATH: "logs/constantstable_vertical_trades.csv"
