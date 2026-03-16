@@ -33,6 +33,7 @@ Resources:
         Variables:
           DRY_RUN: !Ref DryRun
           SIM_CACHE_BUCKET: !Ref SimCacheBucket
+          CS_IC_LONG_FILTER: "1"
       Policies:
         # Read all /gamma/* params
         - SSMParameterReadPolicy:
@@ -128,14 +129,14 @@ Resources:
         RoleArn: !GetAtt SchedulerRole.Arn
         Input: '{"account": "butterfly"}'
 
-  # ---------- DualSide (4:13 PM ET, Schwab only) ----------
+  # ---------- DualSide (4:05 PM ET, Schwab only) ----------
   DualSideSchedule:
     Type: AWS::Scheduler::Schedule
     Properties:
       Name: gamma-ds-schwab
       Description: "DualSide 6DTE/5DTE vertical strategy (Schwab)"
       State: ENABLED
-      ScheduleExpression: !Ref ScheduleTime
+      ScheduleExpression: "cron(5 16 ? * MON-FRI *)"
       ScheduleExpressionTimezone: "America/New_York"
       FlexibleTimeWindow:
         Mode: "OFF"
@@ -159,52 +160,6 @@ Resources:
         Arn: !GetAtt TradingFunction.Arn
         RoleArn: !GetAtt SchedulerRole.Arn
         Input: '{"account": "ic-long-filter"}'
-
-  # ---------- IC_LONG Morning Placement (9:35 AM ET) ----------
-  IcMorningSchwabSchedule:
-    Type: AWS::Scheduler::Schedule
-    Properties:
-      Name: gamma-cs-ic-morning-schwab
-      Description: "IC_LONG deferred morning placement (Schwab)"
-      State: ENABLED
-      ScheduleExpression: "cron(35 9 ? * MON-FRI *)"
-      ScheduleExpressionTimezone: "America/New_York"
-      FlexibleTimeWindow:
-        Mode: "OFF"
-      Target:
-        Arn: !GetAtt TradingFunction.Arn
-        RoleArn: !GetAtt SchedulerRole.Arn
-        Input: '{"account": "ic-morning-schwab"}'
-
-  IcMorningTtIraSchedule:
-    Type: AWS::Scheduler::Schedule
-    Properties:
-      Name: gamma-cs-ic-morning-tt-ira
-      Description: "IC_LONG deferred morning placement (TT IRA)"
-      State: ENABLED
-      ScheduleExpression: "cron(35 9 ? * MON-FRI *)"
-      ScheduleExpressionTimezone: "America/New_York"
-      FlexibleTimeWindow:
-        Mode: "OFF"
-      Target:
-        Arn: !GetAtt TradingFunction.Arn
-        RoleArn: !GetAtt SchedulerRole.Arn
-        Input: '{"account": "ic-morning-tt-ira"}'
-
-  IcMorningTtIndividualSchedule:
-    Type: AWS::Scheduler::Schedule
-    Properties:
-      Name: gamma-cs-ic-morning-tt-individual
-      Description: "IC_LONG deferred morning placement (TT Individual)"
-      State: ENABLED
-      ScheduleExpression: "cron(35 9 ? * MON-FRI *)"
-      ScheduleExpressionTimezone: "America/New_York"
-      FlexibleTimeWindow:
-        Mode: "OFF"
-      Target:
-        Arn: !GetAtt TradingFunction.Arn
-        RoleArn: !GetAtt SchedulerRole.Arn
-        Input: '{"account": "ic-morning-tt-individual"}'
 
   # ---------- Morning Check Schedule ----------
   MorningCheckSchedule:

@@ -462,63 +462,6 @@ def would_close_guard(v: Dict[str, Any], pos: Dict[Tuple[str, str, str], float])
 
 # ---------- IC_LONG filter (reads pre-computed decision from S3) ----------
 
-def _defer_ic_long_to_morning(v_put, v_call, trade_date, tdate_iso,
-                              field_used, vol_val, bucket, vix_mult, units, oc_val,
-                              gw_put_price, gw_call_price, account_label):
-    """Save IC_LONG trade plan to S3 for morning placement."""
-    s3_bucket = CS_MOVE_STATE_S3_BUCKET
-    if not s3_bucket:
-        print("CS_VERT_RUN IC_LONG_DEFER FAIL: no S3 bucket configured")
-        return
-
-    def _v_dict(v):
-        return {k: v[k] for k in ("name", "side", "kind", "direction",
-                                   "short_osi", "long_osi", "send_qty",
-                                   "target_qty", "go", "strength")}
-
-    plan = {
-        "date": trade_date,
-        "account_label": account_label,
-        "structure": "IC_LONG",
-        "v_put": _v_dict(v_put),
-        "v_call": _v_dict(v_call),
-        "context": {
-            "trade_date": trade_date,
-            "tdate_iso": tdate_iso,
-            "vol_field": CS_VOL_FIELD,
-            "vol_used": field_used,
-            "vol_value": "" if vol_val is None else str(vol_val),
-            "vol_bucket": str(bucket),
-            "vol_mult": str(vix_mult),
-            "unit_dollars": str(CS_UNIT_DOLLARS),
-            "oc_val": str(oc_val),
-            "units": str(units),
-            "qty_rule": "VIX_BUCKET_TOPUP" if CS_TOPUP else "VIX_BUCKET",
-            "gw_put_price": "" if gw_put_price is None else str(gw_put_price),
-            "gw_call_price": "" if gw_call_price is None else str(gw_call_price),
-        },
-        "deferred_at_utc": int(time.time()),
-    }
-
-    s3_key = f"cadence/cs_ic_long_deferred_{account_label}.json"
-    try:
-        import boto3
-        s3 = boto3.client("s3")
-        s3.put_object(
-            Bucket=s3_bucket, Key=s3_key,
-            Body=json.dumps(plan, indent=2),
-            ContentType="application/json",
-        )
-        print(
-            f"CS_VERT_RUN IC_LONG_DEFERRED: saved to s3://{s3_bucket}/{s3_key} "
-            f"put={v_put['name']}({v_put['short_osi']}|{v_put['long_osi']}) "
-            f"call={v_call['name']}({v_call['short_osi']}|{v_call['long_osi']}) "
-            f"qty={v_put['send_qty']}"
-        )
-    except Exception as e:
-        print(f"CS_VERT_RUN IC_LONG_DEFER FAIL: S3 write failed ({e})")
-
-
 def _read_ic_long_decision(today_str: str) -> Tuple[bool, bool, str]:
     """Read the pre-computed IC_LONG decision from S3.
 
