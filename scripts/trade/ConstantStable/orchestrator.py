@@ -980,8 +980,65 @@ def main():
         print("CS_VERT_RUN SKIP: nothing to place after TOPUP/GUARD.")
         return 0
 
-    # IC_LONG deferral removed — all structures (including IC_LONG) place at 4:13 PM.
-    # If regime rule fired, IC_LONG was already switched to RR_SHORT above.
+    # --- IC_LONG deferred morning entry ---
+    # If IC_LONG (both sides DEBIT) and NOT regime-switched to RR_SHORT,
+    # save the plan to S3 and skip evening placement.  A morning Lambda
+    # trigger (9:35 AM ET next day) will read the plan, fetch fresh quotes,
+    # and place with price filters ($2.20 max total, $0.40 min per side).
+    CS_IC_LONG_DEFER = os.environ.get("CS_IC_LONG_DEFER", "1").strip() in ("1", "true", "yes")
+    CS_IC_DEFER_S3_KEY = os.environ.get("CS_IC_DEFER_S3_KEY", "cadence/cs_ic_long_deferred.json")
+
+    is_ic_long_final = (v_put_f and v_call_f
+                        and v_put_f["side"] == "DEBIT" and v_call_f["side"] == "DEBIT"
+                        and not regime_switched)
+    if CS_IC_LONG_DEFER and is_ic_long_final:
+        defer_plan = {
+            "trade_date": trade_date,
+            "execute_date": tdate_iso,
+            "inner_put": inner_put,
+            "inner_call": inner_call,
+            "p_low": p_low, "p_high": p_high,
+            "c_low": c_low, "c_high": c_high,
+            "exp6": exp6,
+            "put_low_osi": put_low_osi, "put_high_osi": put_high_osi,
+            "call_low_osi": call_low_osi, "call_high_osi": call_high_osi,
+            "put_credit_close": gw_put_price,
+            "call_credit_close": gw_call_price,
+            "put_qty": v_put_f["send_qty"],
+            "call_qty": v_call_f["send_qty"],
+            "put_strength": v_put_f["strength"],
+            "call_strength": v_call_f["strength"],
+            "put_go": v_put_f.get("go"),
+            "call_go": v_call_f.get("go"),
+            "vol_field": field_used, "vol_value": vol_val,
+            "vol_bucket": bucket, "vol_mult": vix_mult,
+            "units": units, "unit_dollars": CS_UNIT_DOLLARS,
+            "status": "pending",
+            "saved_utc": datetime.now(timezone.utc).isoformat(),
+        }
+        bucket_name = CS_MOVE_STATE_S3_BUCKET
+        if bucket_name:
+            try:
+                import boto3
+                s3 = boto3.client("s3")
+                s3.put_object(
+                    Bucket=bucket_name,
+                    Key=CS_IC_DEFER_S3_KEY,
+                    Body=json.dumps(defer_plan, indent=2),
+                    ContentType="application/json",
+                )
+                print(f"CS_VERT_RUN IC_LONG_DEFERRED: saved plan to s3://{bucket_name}/{CS_IC_DEFER_S3_KEY}")
+                print(f"  strikes: put {p_low}/{p_high}  call {c_low}/{c_high}  exp={tdate_iso}")
+                print(f"  close prices: put={gw_put_price} call={gw_call_price}")
+                print(f"  qty: put={v_put_f['send_qty']} call={v_call_f['send_qty']}")
+                _emit("strategy_run", signal="IC_LONG_DEFERRED", config=f"{v_put_f['name']}+{v_call_f['name']}",
+                      reason="DEFERRED_TO_MORNING", vix=float(vol_val or 0))
+                _close_events()
+                return 0
+            except Exception as e:
+                print(f"CS_VERT_RUN IC_LONG_DEFER WARN: S3 write failed ({e}), placing at close instead")
+        else:
+            print("CS_VERT_RUN IC_LONG_DEFER WARN: no S3 bucket, placing at close instead")
 
     qty_rule = "VIX_BUCKET_TOPUP" if CS_TOPUP else "VIX_BUCKET"
 

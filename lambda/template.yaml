@@ -33,6 +33,8 @@ Resources:
         Variables:
           DRY_RUN: !Ref DryRun
           SIM_CACHE_BUCKET: !Ref SimCacheBucket
+          GAMMA_EVENT_BUCKET: !Ref SimCacheBucket
+          GAMMA_EVENT_PREFIX: reporting/events
           CS_IC_LONG_FILTER: "1"
       Policies:
         # Read all /gamma/* params
@@ -160,6 +162,22 @@ Resources:
         Arn: !GetAtt TradingFunction.Arn
         RoleArn: !GetAtt SchedulerRole.Arn
         Input: '{"account": "ic-long-filter"}'
+
+  # ---------- IC_LONG Deferred Morning Entry (9:35 AM ET) ----------
+  IcLongMorningSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: gamma-cs-ic-long-morning
+      Description: "IC_LONG deferred morning entry with price filters"
+      State: ENABLED
+      ScheduleExpression: "cron(35 9 ? * MON-FRI *)"
+      ScheduleExpressionTimezone: "America/New_York"
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt TradingFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"account": "ic-long-morning"}'
 
   # ---------- Morning Check Schedule ----------
   MorningCheckSchedule:

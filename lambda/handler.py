@@ -11,6 +11,7 @@ import os
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 
 import boto3
 
@@ -171,6 +172,25 @@ ACCOUNTS = {
             "SIM_CACHE_BUCKET": "gamma-sim-cache",
         },
     },
+    "ic-long-morning": {
+        "orchestrator": "scripts/trade/ConstantStable/ic_long_morning.py",
+        "post_steps": [
+            "scripts/data/cs_trades_to_gsheet.py",
+        ],
+        "token_ssm_path": "/gamma/schwab/token_json",
+        "token_file": "/tmp/schwab_token.json",
+        "env_from_ssm": {
+            "SCHWAB_APP_KEY": "/gamma/schwab/app_key",
+            "SCHWAB_APP_SECRET": "/gamma/schwab/app_secret",
+        },
+        "static_env": {
+            "SCHWAB_TOKEN_PATH": "/tmp/schwab_token.json",
+            "CS_MOVE_STATE_S3_BUCKET": "gamma-sim-cache",
+            "CS_MORNING_MAX_TOTAL": "2.20",
+            "CS_MORNING_MIN_SIDE": "0.40",
+            "CS_MORNING_MAX_SINGLE": "2.00",
+        },
+    },
     "dualside": {
         "orchestrator": "scripts/trade/DualSide/orchestrator.py",
         "post_steps": [
@@ -241,6 +261,8 @@ COMMON_ENV = {
     "VERT_DRY_RUN": "false",
     "VERT_CANCEL_TRIES": "4",
     "CS_GW_READY_ET": "16:13:31",
+    "GAMMA_EVENT_DIR": "/tmp/gamma_events",
+    "GAMMA_EVENT_PREFIX": "reporting/events",
 }
 
 # Shared SSM params (same for all accounts)
@@ -349,6 +371,57 @@ def run_script(script, env, timeout_s=100, label=""):
     if result.returncode != 0:
         print(f"EXIT {result.returncode}: {label or script}")
     return result.returncode
+
+
+def upload_event_files(env, trade_date: str) -> dict:
+    """Upload EventWriter JSONL files from Lambda /tmp to S3.
+
+    Without this step, runs that skip or place no orders vanish from reporting
+    because EventWriter only writes local files under /tmp/gamma_events.
+    """
+    bucket = (
+        env.get("GAMMA_EVENT_BUCKET")
+        or os.environ.get("GAMMA_EVENT_BUCKET")
+        or env.get("SIM_CACHE_BUCKET")
+        or os.environ.get("SIM_CACHE_BUCKET")
+        or ""
+    ).strip()
+    prefix = (env.get("GAMMA_EVENT_PREFIX") or os.environ.get("GAMMA_EVENT_PREFIX") or "reporting/events").strip("/")
+    event_dir = env.get("GAMMA_EVENT_DIR") or os.environ.get("GAMMA_EVENT_DIR") or "/tmp/gamma_events"
+    trade_path = os.path.join(event_dir, trade_date)
+
+    stats = {
+        "bucket": bucket,
+        "prefix": prefix,
+        "trade_date": trade_date,
+        "files": 0,
+        "uploaded": 0,
+        "errors": 0,
+    }
+
+    if not bucket:
+        print("EVENT_UPLOAD SKIP: no GAMMA_EVENT_BUCKET/SIM_CACHE_BUCKET configured")
+        return stats
+    if not os.path.isdir(trade_path):
+        print(f"EVENT_UPLOAD SKIP: no event dir at {trade_path}")
+        return stats
+
+    s3 = boto3.client("s3")
+    for name in sorted(os.listdir(trade_path)):
+        if not name.endswith(".jsonl"):
+            continue
+        stats["files"] += 1
+        local_path = os.path.join(trade_path, name)
+        key = f"{prefix}/{trade_date}/{name}"
+        try:
+            s3.upload_file(local_path, bucket, key)
+            stats["uploaded"] += 1
+            print(f"EVENT_UPLOAD OK: s3://{bucket}/{key}")
+        except Exception as e:
+            stats["errors"] += 1
+            print(f"EVENT_UPLOAD FAIL: {local_path} -> s3://{bucket}/{key} ({e})")
+
+    return stats
 
 
 def _finalize_bf_plan(env, orch_rc):
@@ -615,6 +688,7 @@ def _handle_sim_collect(event):
 
 def lambda_handler(event, context):
     t0 = time.time()
+    trade_date = datetime.now(timezone.utc).date().isoformat()
     account = event.get("account", "")
     dry_run = event.get("dry_run", False)
     disable_schwab_cs = str(
@@ -781,6 +855,9 @@ def lambda_handler(event, context):
     summary = {"account": account, "orchestrator_rc": orch_rc, "steps": post_results}
     print(f"REPORT_SUMMARY {json.dumps(summary)}")
 
+    event_upload = upload_event_files(env, trade_date)
+    print(f"EVENT_UPLOAD_SUMMARY {json.dumps(event_upload)}")
+
     # -- 6. Persist tokens back to SSM if refreshed --
     try:
         persist_token_if_changed(cfg["token_ssm_path"], cfg["token_file"], token_hash)
@@ -813,5 +890,6 @@ def lambda_handler(event, context):
         "account": account,
         "orchestrator_rc": orch_rc,
         "post_results": post_results,
+        "event_upload": event_upload,
         "duration_s": duration,
     }
