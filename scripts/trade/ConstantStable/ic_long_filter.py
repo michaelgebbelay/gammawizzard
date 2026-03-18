@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """IC_LONG regime filter — pre-check that runs before trade execution.
 
-Fetches today's SPX move from Schwab, updates trailing move history in S3,
-fetches Leo's signal from GammaWizard to get anchor strikes, and writes
-a go/no-go decision to S3 for the orchestrators to read.
+Fetches VIX (GammaWizard with Schwab fallback), computes realized-vol
+ratios from SPX closes, and writes a go/no-go decision to S3 for the
+orchestrators to read.
 
-Rules (skip IC_LONG when ANY fires):
-  1. Trailing 5-day avg |SPX move|% < nearest anchor distance%
-  2. ER3 < 0.60 (choppy market — same rule as butterfly SELL)
-  3. SE 5d avg > 1.00 (straddle efficiency too high — same rule as butterfly SELL)
+Live rule (L1 regime switch — flip IC_LONG to RR_SHORT):
+  VIX/RV10 >= 1.95  AND  RV5/RV20 <= 1.10
+
+All skip filters (trail/ER3/SE) are disabled — backtest showed they
+destroy value.
 
 Scheduled at 4:01 PM ET (before 4:13 trade execution).
 """
