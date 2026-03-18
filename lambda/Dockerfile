@@ -7,6 +7,11 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt
 COPY scripts/ ${LAMBDA_TASK_ROOT}/scripts/
 COPY TT/ ${LAMBDA_TASK_ROOT}/TT/
 
+# Copy lightweight reporting runtime used by live event emission
+RUN mkdir -p ${LAMBDA_TASK_ROOT}/reporting
+COPY reporting/__init__.py ${LAMBDA_TASK_ROOT}/reporting/__init__.py
+COPY reporting/events.py ${LAMBDA_TASK_ROOT}/reporting/events.py
+
 # Copy sim data layer (chain collection, no heavy deps)
 COPY sim/__init__.py ${LAMBDA_TASK_ROOT}/sim/__init__.py
 COPY sim/config.py ${LAMBDA_TASK_ROOT}/sim/config.py
