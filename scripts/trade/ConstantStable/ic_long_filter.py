@@ -103,6 +103,22 @@ def fetch_spx_quote(c):
     return spot, prev_close
 
 
+def fetch_vix_quote(c):
+    """Fetch VIX from Schwab as fallback when GW doesn't provide it."""
+    try:
+        r = c.session.get(
+            "https://api.schwabapi.com/marketdata/v1/quotes",
+            params={"symbols": "$VIX", "fields": "quote"},
+            timeout=20,
+        )
+        r.raise_for_status()
+        q = (r.json().get("$VIX") or {}).get("quote") or {}
+        return fnum(q.get("lastPrice"))
+    except Exception as e:
+        print(f"IC_FILTER WARN: VIX quote fetch failed: {e}")
+        return None
+
+
 # ---------- GammaWizard ----------
 
 def gw_fetch_signal(endpoint=None):
@@ -387,17 +403,28 @@ def main():
     regime_reason = ""
     regime_fires = False
 
+    # Try GW VIX first, fall back to Schwab quote
     vix_gw = fnum(tr.get("VIX"))
+    vix_source = "GW"
     if vix_gw is not None and vix_gw > 0:
-        # Ensure VIX is in decimal form (same unit as RV output)
         vix_dec = vix_gw / 100.0 if vix_gw > 1 else vix_gw
+    else:
+        vix_schwab = fetch_vix_quote(c)
+        if vix_schwab is not None and vix_schwab > 0:
+            vix_dec = vix_schwab / 100.0 if vix_schwab > 1 else vix_schwab
+            vix_source = "Schwab"
+            print(f"IC_FILTER VIX: GW unavailable, using Schwab VIX={vix_schwab:.2f}")
+        else:
+            vix_dec = None
+
+    if vix_dec is not None and vix_dec > 0:
         closes = fetch_spx_closes(c, lookback_days=40)
         if len(closes) >= 21:
             rv5 = compute_realized_vol(closes, 5)
             rv10 = compute_realized_vol(closes, 10)
             rv20 = compute_realized_vol(closes, 20)
             if all(v is not None for v in (rv5, rv10, rv20)):
-                print(f"IC_FILTER REGIME_RV: vix={vix_dec:.5f} rv5={rv5:.5f} rv10={rv10:.5f} rv20={rv20:.5f}")
+                print(f"IC_FILTER REGIME_RV: vix={vix_dec:.5f} (src={vix_source}) rv5={rv5:.5f} rv10={rv10:.5f} rv20={rv20:.5f}")
             else:
                 print("IC_FILTER REGIME_RV: insufficient return data for RV")
             regime_fires, vix_rv10_ratio, rv5_rv20_ratio, regime_reason = \
@@ -405,11 +432,13 @@ def main():
         else:
             regime_reason = f"insufficient closes ({len(closes)}) for RV computation"
     else:
-        regime_reason = "VIX unavailable from GW signal"
+        regime_reason = "VIX unavailable from both GW and Schwab"
     print(f"IC_FILTER REGIME: {regime_reason}")
 
-    # Only switch if structure is actually IC_LONG
-    if is_ic_long and regime_fires:
+    # Set switch flag when regime fires — the orchestrator will check structure.
+    # At 4:01 PM GW may not have LeftGo/RightGo yet (structure=OTHER),
+    # but the orchestrator at 4:13 PM gets the signal and checks is_ic_long itself.
+    if regime_fires:
         switch_to_rr_short = True
 
     # All skip filters disabled — backtest showed trail/chop/ER3 all destroy value.

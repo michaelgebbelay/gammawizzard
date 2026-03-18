@@ -582,6 +582,7 @@ def place_order_with_ladder(
     CANCEL_SETTLE = float(os.environ.get("VERT_CANCEL_SETTLE", "1.0"))
     MAX_LADDER = int(os.environ.get("VERT_MAX_LADDER", "3"))
     CANCEL_TRIES = int(os.environ.get("VERT_CANCEL_TRIES", "4"))
+    hard_limit = _fnum(os.environ.get("VERT_LIMIT_PRICE", ""))
 
     url_post = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders"
 
@@ -605,7 +606,13 @@ def place_order_with_ladder(
 
     preview = []
     for off, refresh in ladder_spec[:MAX_LADDER]:
-        preview.append("REFRESH" if refresh else f"{price_from_mid(mid, off, bid, ask):.2f}")
+        if refresh:
+            preview.append("REFRESH")
+        else:
+            p = price_from_mid(mid, off, bid, ask)
+            if hard_limit is not None:
+                p = min(p, clamp_tick(hard_limit)) if side.upper() == "DEBIT" else max(p, clamp_tick(hard_limit))
+            preview.append(f"{p:.2f}")
     preview_str = "[" + ", ".join(preview) + "]"
     print(f"CS_VERT_PLACE ladder_plan={preview}")
 
@@ -627,6 +634,8 @@ def place_order_with_ladder(
                 break
 
         price = price_from_mid(cur_mid, off, cur_bid, cur_ask)
+        if hard_limit is not None:
+            price = min(price, clamp_tick(hard_limit)) if side.upper() == "DEBIT" else max(price, clamp_tick(hard_limit))
         last_price = price
         print(f"CS_VERT_PLACE rung#{idx}: price={price:.2f} remaining={remaining} wait={STEP_WAIT:.2f}s poll={POLL_SECS:.2f}s")
 
@@ -1433,6 +1442,9 @@ def main():
         FIRST_WAIT = float(os.environ.get("VERT_FIRST_WAIT", "20"))
         b2, a2, m2 = bid0, ask0, mid0
         mid_price = price_from_mid(m2, 0.0, b2, a2)
+        hard_limit = _fnum(os.environ.get("VERT_LIMIT_PRICE", ""))
+        if hard_limit is not None:
+            mid_price = min(mid_price, clamp_tick(hard_limit)) if side_pkg == "DEBIT" else max(mid_price, clamp_tick(hard_limit))
         print(f"CS_VERT_PLACE BUNDLE_MID: price={mid_price:.2f} qty={qty} wait={FIRST_WAIT:.2f}s")
         res = place_order_at_price(
             c=c,

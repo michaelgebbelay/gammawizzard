@@ -48,6 +48,8 @@ ACCOUNTS = {
             "CS_UNIT_DOLLARS": "15000",
             "CS_ACCOUNT_LABEL": "schwab",
             "CS_COST_PER_CONTRACT": "0.97",
+            "CS_IC_LONG_FILTER": "1",
+            "CS_MOVE_STATE_S3_BUCKET": "gamma-sim-cache",
         },
     },
     "tt-ira": {
@@ -771,7 +773,7 @@ def lambda_handler(event, context):
         print(f"WARNING: no token content from {cfg['token_ssm_path']}")
 
     # Schwab token keeper reads SCHWAB_TOKEN_JSON env var to auto-seed
-    if account in ("schwab", "morning-check", "butterfly", "dualside"):
+    if account in ("schwab", "ic-long-morning", "morning-check", "butterfly", "dualside"):
         env["SCHWAB_TOKEN_JSON"] = token_content
     elif account == "manual":
         # Manual needs both Schwab + TT tokens
