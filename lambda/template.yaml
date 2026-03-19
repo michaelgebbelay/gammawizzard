@@ -195,6 +195,22 @@ Resources:
         RoleArn: !GetAtt SchedulerRole.Arn
         Input: '{"account": "morning-check"}'
 
+  # ---------- Daily P&L Email (4:45 PM ET, after all trades + settlement) ----------
+  DailyPnlSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: gamma-daily-pnl
+      Description: "Daily P&L email: pull Schwab orders, compute P&L, send summary"
+      State: ENABLED
+      ScheduleExpression: "cron(45 16 ? * MON-FRI *)"
+      ScheduleExpressionTimezone: "America/New_York"
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt TradingFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"account": "daily-pnl"}'
+
   # ---------- S3 Bucket for Sim Chain Cache ----------
   SimCacheBucket:
     Type: AWS::S3::Bucket

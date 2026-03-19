@@ -682,6 +682,67 @@ def _handle_sim_collect(event):
 
 
 # ---------------------------------------------------------------------------
+# Daily P&L email handler
+# ---------------------------------------------------------------------------
+
+
+def _handle_daily_pnl(event, t0):
+    """Pull Schwab orders, compute P&L, send email.
+
+    Event payload: {"account": "daily-pnl", "dry_run": true/false}
+    Needs SSM: Schwab creds (orders) + SMTP creds (email).
+    """
+    dry_run = event.get("dry_run", False)
+    print(f"=== daily-pnl | dry_run={dry_run} ===")
+
+    # Fetch SSM params
+    ssm_paths = {
+        "SCHWAB_APP_KEY": "/gamma/schwab/app_key",
+        "SCHWAB_APP_SECRET": "/gamma/schwab/app_secret",
+        "_schwab_token": "/gamma/schwab/token_json",
+        "SMTP_USER": "/gamma/shared/smtp_user",
+        "SMTP_PASS": "/gamma/shared/smtp_pass",
+    }
+    all_paths = list(set(ssm_paths.values()))
+    params = get_ssm_params(all_paths)
+    print(f"Fetched {len(params)}/{len(all_paths)} SSM params")
+
+    # Set env vars for Schwab client + SMTP
+    os.environ["SCHWAB_APP_KEY"] = params.get("/gamma/schwab/app_key", "")
+    os.environ["SCHWAB_APP_SECRET"] = params.get("/gamma/schwab/app_secret", "")
+    os.environ["SMTP_USER"] = params.get("/gamma/shared/smtp_user", "")
+    os.environ["SMTP_PASS"] = params.get("/gamma/shared/smtp_pass", "")
+
+    # Seed Schwab token
+    token_content = params.get("/gamma/schwab/token_json", "")
+    if token_content:
+        token_path = "/tmp/schwab_token.json"
+        with open(token_path, "w") as f:
+            f.write(token_content)
+        os.environ["SCHWAB_TOKEN_PATH"] = token_path
+
+    # Run P&L email
+    try:
+        from reporting.daily_pnl_email import run_daily_pnl_email
+        result = run_daily_pnl_email(dry_run=dry_run)
+        print(f"daily-pnl result: {result}")
+    except Exception as e:
+        print(f"daily-pnl ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        result = {"error": str(e)}
+
+    duration = round(time.time() - t0, 1)
+    print(f"=== DONE daily-pnl | {duration}s ===")
+    return {
+        "status": "ok" if "error" not in result else "error",
+        "account": "daily-pnl",
+        "result": result,
+        "duration_s": duration,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Lambda entry point
 # ---------------------------------------------------------------------------
 
@@ -706,6 +767,10 @@ def lambda_handler(event, context):
     # Sim chain collection — separate flow (no subprocess, writes to S3)
     if account == "sim-collect":
         return _handle_sim_collect(event)
+
+    # Daily P&L email — pulls Schwab orders, computes P&L, sends email
+    if account == "daily-pnl":
+        return _handle_daily_pnl(event, t0)
 
     # Safety switch: keep ConstantStable disabled on Schwab while TT stays active.
     if account == "schwab" and disable_schwab_cs:
