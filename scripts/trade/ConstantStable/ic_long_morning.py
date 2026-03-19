@@ -20,8 +20,11 @@ Each account reads its own deferred plan from a per-account S3 key
 import csv
 import json
 import os
+import re
 import subprocess
 import sys
+import time
+import random
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -48,6 +51,165 @@ PLACER_SCRIPT = (
     "TT/Script/ConstantStable/place.py" if _IS_TT_ACCOUNT
     else "scripts/trade/ConstantStable/place.py"
 )
+
+
+# ---------------------------------------------------------------------------
+# NO-CLOSE guard — re-check positions before morning placement
+# ---------------------------------------------------------------------------
+
+def _to_osi(sym: str) -> str:
+    raw = (sym or "").strip().upper().lstrip(".").replace("_", "")
+    m = (
+        re.match(r"^([A-Z.$^]{1,6})(\d{6})([CP])(\d{1,5})(?:\.(\d{1,3}))?$", raw)
+        or re.match(r"^([A-Z.$^]{1,6})(\d{6})([CP])(\d{8})$", raw)
+    )
+    if not m:
+        raise ValueError(f"Cannot parse option symbol: {sym}")
+    root, ymd, cp, strike, frac = (m.groups() + ("",))[:5]
+    if len(strike) < 8:
+        mills = int(strike) * 1000 + (int((frac or "0").ljust(3, "0")) if frac else 0)
+    else:
+        mills = int(strike)
+    return f"{root:<6}{ymd}{cp}{int(mills):08d}"
+
+
+def _osi_canon(osi: str):
+    s = (osi or "")
+    if len(s) < 21:
+        return ("", "", "")
+    return (s[6:12], s[12], s[-8:])
+
+
+def _would_close(plan, side, pos):
+    """Return True if placing this side would net/close an existing position."""
+    if side == "PUT":
+        sell_osi, buy_osi = plan["put_low_osi"], plan["put_high_osi"]
+    else:
+        sell_osi, buy_osi = plan["call_high_osi"], plan["call_low_osi"]
+
+    buy_key = _osi_canon(buy_osi)
+    sell_key = _osi_canon(sell_osi)
+    buy_pos = float(pos.get(buy_key, 0.0))
+    sell_pos = float(pos.get(sell_key, 0.0))
+
+    unsafe = buy_pos < -1e-9 or sell_pos > 1e-9
+    print(
+        f"CS_MORNING GUARD {side}: "
+        f"BUY {buy_osi} pos={buy_pos:+g} ; "
+        f"SELL {sell_osi} pos={sell_pos:+g} → "
+        f"{'BLOCK' if unsafe else 'OK'}"
+    )
+    return unsafe
+
+
+def _fetch_schwab_positions(c):
+    """Fetch Schwab option positions as canon → net_qty dict."""
+    try:
+        r = c.get_account_numbers()
+        r.raise_for_status()
+        arr = r.json() or []
+        if not arr:
+            return None
+        acct_hash = str(arr[0].get("hashValue") or arr[0].get("hashvalue") or "")
+        if not acct_hash:
+            return None
+
+        url = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}"
+        r2 = c.session.get(url, params={"fields": "positions"}, timeout=20)
+        r2.raise_for_status()
+        j = r2.json()
+        sa = j[0]["securitiesAccount"] if isinstance(j, list) else (j.get("securitiesAccount") or j)
+
+        out = {}
+        for p in (sa.get("positions") or []):
+            ins = p.get("instrument", {}) or {}
+            if (ins.get("assetType") or "").upper() != "OPTION":
+                continue
+            sym = (ins.get("symbol") or "").strip()
+            if not sym:
+                continue
+            try:
+                osi = _to_osi(re.sub(r"\s+", "", sym))
+            except Exception:
+                continue
+            qty = float(p.get("longQuantity", 0)) - float(p.get("shortQuantity", 0))
+            if abs(qty) < 1e-9:
+                continue
+            key = _osi_canon(osi)
+            out[key] = out.get(key, 0.0) + qty
+        return out
+    except Exception as e:
+        print(f"CS_MORNING GUARD WARN: Schwab positions fetch failed ({e})")
+        return None
+
+
+def _fetch_tt_positions():
+    """Fetch TastyTrade option positions as canon → net_qty dict."""
+    try:
+        # Import TT client (available when TT/Script is on sys.path)
+        tt_script_dir = os.path.join(_REPO_ROOT or "", "TT", "Script")
+        if tt_script_dir not in sys.path:
+            sys.path.append(tt_script_dir)
+        from tt_client import request as tt_request
+
+        acct = (os.environ.get("TT_ACCOUNT_NUMBER") or "").strip()
+        if not acct:
+            print("CS_MORNING GUARD WARN: TT_ACCOUNT_NUMBER missing")
+            return None
+
+        last_err = ""
+        for i in range(4):
+            try:
+                r = tt_request("GET", f"/accounts/{acct}/positions")
+                j = r.json()
+                break
+            except Exception as e:
+                resp = getattr(e, "response", None)
+                if resp is not None and resp.status_code == 429:
+                    ra = resp.headers.get("Retry-After")
+                    wait = max(1.0, float(ra)) if ra else min(8.0, 0.6 * (2 ** i)) + random.uniform(0, 0.25)
+                    time.sleep(wait)
+                    continue
+                last_err = str(e)
+                time.sleep(min(6.0, 0.5 * (2 ** i)))
+        else:
+            print(f"CS_MORNING GUARD WARN: TT positions fetch failed ({last_err})")
+            return None
+
+        data = j.get("data") if isinstance(j, dict) else {}
+        items = (data.get("items") if isinstance(data, dict) else None) or []
+
+        out = {}
+        for p in items:
+            atype = (p.get("instrument-type") or p.get("instrument_type") or "").upper()
+            if "OPTION" not in atype:
+                continue
+            sym = (p.get("symbol") or "").strip()
+            if not sym:
+                continue
+            try:
+                osi = _to_osi(re.sub(r"\s+", "", sym))
+            except Exception:
+                continue
+            qty = float(p.get("quantity", 0) or 0)
+            direction = str(p.get("quantity-direction") or p.get("quantity_direction") or "").lower()
+            if direction.startswith("short"):
+                qty = -abs(qty)
+            if abs(qty) < 1e-9:
+                continue
+            key = _osi_canon(osi)
+            out[key] = out.get(key, 0.0) + qty
+        return out
+    except Exception as e:
+        print(f"CS_MORNING GUARD WARN: TT positions fetch failed ({e})")
+        return None
+
+
+def _fetch_positions(c):
+    """Fetch positions for the current account type."""
+    if _IS_TT_ACCOUNT:
+        return _fetch_tt_positions()
+    return _fetch_schwab_positions(c)
 
 
 def _add_scripts_root():
@@ -496,6 +658,32 @@ def main():
         print("CS_MORNING SKIP: no sides pass price rules")
         _emit("skip", reason="PRICE_RULES", signal="SKIP")
         mark_plan_status(plan, "skipped", "SKIP: price_rules")
+        _close_events()
+        return 0
+
+    # NO-CLOSE guard: re-check positions before morning placement.
+    # Overnight assignments or close-order fills could make placement unsafe.
+    pos = _fetch_positions(c)
+    if pos is not None:
+        print(f"CS_MORNING GUARD: loaded {len(pos)} option positions")
+        safe_sides = []
+        for side, limit in sides_to_trade:
+            if not _would_close(plan, side, pos):
+                safe_sides.append((side, limit))
+            else:
+                print(f"CS_MORNING GUARD SKIP: {side} blocked — would close existing position")
+                _emit("skip", reason=f"GUARD_WOULD_CLOSE_{side}", signal="SKIP")
+        sides_to_trade = safe_sides
+        if not sides_to_trade:
+            print("CS_MORNING SKIP: all sides blocked by guard")
+            mark_plan_status(plan, "skipped", "SKIP: guard_would_close")
+            _close_events()
+            return 0
+    else:
+        # If we can't fetch positions, skip all trades (safe default).
+        print("CS_MORNING SKIP: cannot fetch positions for guard check — skipping all")
+        _emit("skip", reason="GUARD_POSITIONS_UNAVAILABLE", signal="SKIP")
+        mark_plan_status(plan, "skipped", "SKIP: guard_positions_unavailable")
         _close_events()
         return 0
 
