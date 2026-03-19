@@ -8,7 +8,13 @@ the trade at morning prices with cost filters:
   2. Total debit <= $2.20  BUT  one side < $0.40     →  buy expensive side only (limit $2.00)
   3. Total debit >  $2.20                             →  buy expensive side only (limit $2.00)
 
-Invoked via EventBridge at 9:35 AM ET, account="ic-long-morning".
+Invoked via EventBridge at 9:35 AM ET for all three accounts:
+  account="ic-long-morning"              (Schwab — uses Schwab placer)
+  account="ic-long-morning-tt-ira"       (TT IRA 5WT20360 — uses TT placer)
+  account="ic-long-morning-tt-individual" (TT Individual 5WT09219 — uses TT placer)
+
+Each account reads its own deferred plan from a per-account S3 key
+(CS_IC_DEFER_S3_KEY).  Quotes always come from Schwab.
 """
 
 import csv
@@ -34,6 +40,14 @@ MAX_SINGLE_SIDE = float(os.environ.get("CS_MORNING_MAX_SINGLE", "2.00"))
 
 DRY_RUN = os.environ.get("CS_DRY_RUN", "0").strip() in ("1", "true", "yes")
 CS_LOG_PATH = os.environ.get("CS_LOG_PATH", "/tmp/logs/cs_trades.csv")
+CS_ACCOUNT_LABEL = os.environ.get("CS_ACCOUNT_LABEL", "schwab").strip()
+
+# Placer script depends on account type
+_IS_TT_ACCOUNT = CS_ACCOUNT_LABEL.startswith("tt-")
+PLACER_SCRIPT = (
+    "TT/Script/ConstantStable/place.py" if _IS_TT_ACCOUNT
+    else "scripts/trade/ConstantStable/place.py"
+)
 
 
 def _add_scripts_root():
@@ -72,7 +86,7 @@ def _init_events(exec_date: date):
     if not _EVENTS_AVAILABLE:
         return None
     try:
-        _ew = EventWriter(strategy="constantstable", account="schwab", trade_date=exec_date)
+        _ew = EventWriter(strategy="constantstable", account=CS_ACCOUNT_LABEL, trade_date=exec_date)
         return _ew
     except Exception as e:
         print(f"CS_MORNING WARN: EventWriter init failed ({e})")
@@ -319,12 +333,21 @@ def place_vertical(plan, side, limit_price):
         "CS_LOG_PATH": CS_LOG_PATH,
     })
 
+    # TT placer needs TT-specific env vars
+    if _IS_TT_ACCOUNT:
+        env.update({
+            "TT_TOKEN_JSON": os.environ.get("TT_TOKEN_JSON", ""),
+            "TT_ACCOUNT_NUMBER": os.environ.get("TT_ACCOUNT_NUMBER", ""),
+            "TT_BASE_URL": os.environ.get("TT_BASE_URL", "https://api.tastyworks.com"),
+            "TT_CLIENT_AUTH": os.environ.get("TT_CLIENT_AUTH", ""),
+        })
+
     if DRY_RUN:
-        print(f"CS_MORNING DRY_RUN: would place {side}_LONG qty={qty} limit={limit_price:.2f} {short_osi}/{long_osi}")
+        print(f"CS_MORNING DRY_RUN: would place {side}_LONG qty={qty} limit={limit_price:.2f} {short_osi}/{long_osi} placer={PLACER_SCRIPT}")
         return 0
 
     rc = subprocess.call(
-        [sys.executable, "scripts/trade/ConstantStable/place.py"],
+        [sys.executable, PLACER_SCRIPT],
         env=env,
     )
     return rc
@@ -377,15 +400,24 @@ def place_full_ic(plan, put_limit, call_limit):
         "CS_LOG_PATH": CS_LOG_PATH,
     })
 
+    # TT placer needs TT-specific env vars
+    if _IS_TT_ACCOUNT:
+        env.update({
+            "TT_TOKEN_JSON": os.environ.get("TT_TOKEN_JSON", ""),
+            "TT_ACCOUNT_NUMBER": os.environ.get("TT_ACCOUNT_NUMBER", ""),
+            "TT_BASE_URL": os.environ.get("TT_BASE_URL", "https://api.tastyworks.com"),
+            "TT_CLIENT_AUTH": os.environ.get("TT_CLIENT_AUTH", ""),
+        })
+
     if DRY_RUN:
         print(
             "CS_MORNING DRY_RUN: would place FULL_IC "
-            f"qty={plan['put_qty']} total_limit={total_limit:.2f}"
+            f"qty={plan['put_qty']} total_limit={total_limit:.2f} placer={PLACER_SCRIPT}"
         )
         return [("FULL_IC", 0)]
 
     rc = subprocess.call(
-        [sys.executable, "scripts/trade/ConstantStable/place.py"],
+        [sys.executable, PLACER_SCRIPT],
         env=env,
     )
     return [("FULL_IC", rc)]
@@ -398,6 +430,7 @@ def main():
     exec_date = date.today()
     print("=" * 60)
     print(f"CS_MORNING IC_LONG deferred entry — {datetime.now(timezone.utc).isoformat()}")
+    print(f"  account={CS_ACCOUNT_LABEL}  placer={PLACER_SCRIPT}")
     print(f"  max_total={MAX_TOTAL_DEBIT}  min_side={MIN_SIDE_PRICE}  max_single={MAX_SINGLE_SIDE}")
     print(f"  dry_run={DRY_RUN}")
     print("=" * 60)

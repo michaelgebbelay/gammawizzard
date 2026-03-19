@@ -81,6 +81,7 @@ ACCOUNTS = {
             "CS_ACCOUNT_LABEL": "tt-ira",
             "CS_COST_PER_CONTRACT": "1.72",
             "CS_VIX_MULTS": "1,1,1,1,1",
+            "CS_IC_DEFER_S3_KEY": "cadence/cs_ic_long_deferred_tt_ira.json",
         },
     },
     "tt-individual": {
@@ -114,6 +115,7 @@ ACCOUNTS = {
             "CS_VIX_MULTS": "1,1,1,1,1",
             # "CS_CLOSE_ORDERS_ENABLE": "1",  # 50% profit-take disabled 2026-03-15
             "CS_CLOSE_ORDERS_ENABLE": "0",
+            "CS_IC_DEFER_S3_KEY": "cadence/cs_ic_long_deferred_tt_individual.json",
         },
     },
     "manual": {
@@ -189,6 +191,59 @@ ACCOUNTS = {
             "CS_MORNING_MAX_TOTAL": "2.20",
             "CS_MORNING_MIN_SIDE": "0.40",
             "CS_MORNING_MAX_SINGLE": "2.00",
+            "CS_ACCOUNT_LABEL": "schwab",
+        },
+    },
+    "ic-long-morning-tt-ira": {
+        "orchestrator": "scripts/trade/ConstantStable/ic_long_morning.py",
+        "post_steps": [
+            "TT/data/cs_trades_to_gsheet.py",
+        ],
+        "token_ssm_path": "/gamma/tt/token_json",
+        "token_file": "/tmp/tt_token.json",
+        "env_from_ssm": {
+            "TT_CLIENT_ID": "/gamma/tt/client_id",
+            "TT_CLIENT_SECRET": "/gamma/tt/client_secret",
+            "SCHWAB_APP_KEY": "/gamma/schwab/app_key",
+            "SCHWAB_APP_SECRET": "/gamma/schwab/app_secret",
+        },
+        "static_env": {
+            "TT_ACCOUNT_NUMBER": "5WT20360",
+            "TT_TOKEN_PATH": "/tmp/tt_token.json",
+            "TT_QUOTE_TOKEN_PATH": "/tmp/tt_quote_token.json",
+            "SCHWAB_TOKEN_PATH": "/tmp/schwab_token.json",
+            "CS_MOVE_STATE_S3_BUCKET": "gamma-sim-cache",
+            "CS_IC_DEFER_S3_KEY": "cadence/cs_ic_long_deferred_tt_ira.json",
+            "CS_MORNING_MAX_TOTAL": "2.20",
+            "CS_MORNING_MIN_SIDE": "0.40",
+            "CS_MORNING_MAX_SINGLE": "2.00",
+            "CS_ACCOUNT_LABEL": "tt-ira",
+        },
+    },
+    "ic-long-morning-tt-individual": {
+        "orchestrator": "scripts/trade/ConstantStable/ic_long_morning.py",
+        "post_steps": [
+            "TT/data/cs_trades_to_gsheet.py",
+        ],
+        "token_ssm_path": "/gamma/tt/token_json",
+        "token_file": "/tmp/tt_token.json",
+        "env_from_ssm": {
+            "TT_CLIENT_ID": "/gamma/tt/client_id",
+            "TT_CLIENT_SECRET": "/gamma/tt/client_secret",
+            "SCHWAB_APP_KEY": "/gamma/schwab/app_key",
+            "SCHWAB_APP_SECRET": "/gamma/schwab/app_secret",
+        },
+        "static_env": {
+            "TT_ACCOUNT_NUMBER": "5WT09219",
+            "TT_TOKEN_PATH": "/tmp/tt_token.json",
+            "TT_QUOTE_TOKEN_PATH": "/tmp/tt_quote_token.json",
+            "SCHWAB_TOKEN_PATH": "/tmp/schwab_token.json",
+            "CS_MOVE_STATE_S3_BUCKET": "gamma-sim-cache",
+            "CS_IC_DEFER_S3_KEY": "cadence/cs_ic_long_deferred_tt_individual.json",
+            "CS_MORNING_MAX_TOTAL": "2.20",
+            "CS_MORNING_MIN_SIDE": "0.40",
+            "CS_MORNING_MAX_SINGLE": "2.00",
+            "CS_ACCOUNT_LABEL": "tt-individual",
         },
     },
     "dualside": {
@@ -798,7 +853,8 @@ def lambda_handler(event, context):
     ssm_names["_token"] = cfg["token_ssm_path"]     # primary token
 
     # For TT accounts, also fetch Schwab token (edge guard / quotes need it)
-    if account.startswith("tt-"):
+    _needs_schwab_token = account.startswith("tt-") or account.startswith("ic-long-morning-tt-")
+    if _needs_schwab_token:
         ssm_names["_schwab_token"] = "/gamma/schwab/token_json"
 
     # Manual account needs both Schwab (primary) + TT token
@@ -845,6 +901,13 @@ def lambda_handler(event, context):
         if tt_token:
             seed_file("/tmp/tt_token.json", tt_token)
             env["TT_TOKEN_JSON"] = tt_token
+    elif account.startswith("ic-long-morning-tt-"):
+        # TT morning: primary token is TT (for placement), also need Schwab (for quotes)
+        env["TT_TOKEN_JSON"] = token_content
+        sw_token = params.get("/gamma/schwab/token_json", "")
+        if sw_token:
+            seed_file("/tmp/schwab_token.json", sw_token)
+            env["SCHWAB_TOKEN_JSON"] = sw_token
     else:
         # TT: set token content as env var (orchestrator passes to placer)
         env["TT_TOKEN_JSON"] = token_content
@@ -854,7 +917,7 @@ def lambda_handler(event, context):
             seed_file("/tmp/schwab_token.json", sw_token)
             env["SCHWAB_TOKEN_JSON"] = sw_token
 
-    _is_tt_account = account.startswith("tt-")
+    _is_tt_account = account.startswith("tt-") or account.startswith("ic-long-morning-tt-")
     token_hash = file_hash(cfg["token_file"])
     tt_token_hash = file_hash("/tmp/tt_token.json") if account == "manual" else None
     schwab_hash = file_hash("/tmp/schwab_token.json") if _is_tt_account else None
