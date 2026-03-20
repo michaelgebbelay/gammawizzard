@@ -37,7 +37,7 @@ import json
 import time
 import random
 import subprocess
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Any, Dict, Tuple
 from zoneinfo import ZoneInfo
 
