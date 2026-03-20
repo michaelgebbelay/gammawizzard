@@ -2,27 +2,28 @@
 """
 DualSide Strategy — SPX vertical orchestrator (Schwab)
 
-v1.1.0 — 2026-03-19 regime-follow + 5-wide
+v1.3.0 — 2026-03-20 skip-bear on call side
 
-Changes from v1.0.0:
-  - Width reduced from $10 to $5 on both sides (halves max loss per trade)
-  - 50-delta (call side) now follows the regime switch instead of always bullish
-    When bearish: bear_put_debit at 50-delta (buy higher put, sell 5 lower)
-    When bullish: bull_put_credit at 50-delta (sell higher put, buy 5 lower)
+Call side now only trades on bull-regime days.  On bear days the put side
+is already running bear_put_debit; adding a bull BPC at 50-delta creates
+a long iron-condor that loses when SPX lands in the gap between the two
+spreads.  Backtest (2023-06 → 2026-03): skip-bear is the best combined
+variant at $60,916 vs $59,192 for always-bull — fewer trades, higher avg,
+same WR.
 
-Put side (25-delta): 6DTE 5-wide em0.75 direction switch
+Put side (25-delta): 6DTE 10-wide em0.75 direction switch
   If iv_minus_vix >= -0.0502 AND rr25 <= -0.9976: bull_put_credit
   Else: bear_put_debit
 
-Call side (50-delta): 5DTE 5-wide 50-delta, follows same regime switch
-  When bullish: bull_put_credit (sell higher put, buy 5 lower)
-  When bearish: bear_put_debit (buy higher put, sell 5 lower)
+Call side (50-delta): 5DTE 10-wide 50-delta, bull_put_credit on BULL days only
+  Skipped on bear-regime days.
 
 Filters:
   1. VIX1D veto: skip ALL when 10.0 <= VIX1D < 11.5
   2. VIX < 10: skip call side
   3. RV5/RV20 0.70-0.85: skip bullish legs (bull_put_credit on either side)
      Bear_put_debit always trades.
+  4. Bear regime: skip call side (avoid long IC)
 
 Delegates placement to scripts/trade/DualSide/place.py (same as ConstantStable placer).
 """
@@ -92,7 +93,7 @@ def _emit(method: str, **kwargs):
     except Exception as e:
         print(f"DS_RUN WARN: event emit failed ({method}): {e}")
 
-__version__ = "1.1.0"
+__version__ = "1.3.0"
 
 # ── config ──
 CS_UNIT_DOLLARS = float(os.environ.get("DS_UNIT_DOLLARS", os.environ.get("CS_UNIT_DOLLARS", "10000")))
@@ -100,8 +101,8 @@ DS_LOG_PATH = os.environ.get("DS_LOG_PATH", "/tmp/logs/dualside_trades.csv")
 DS_DRY_RUN = (os.environ.get("DS_DRY_RUN", os.environ.get("VERT_DRY_RUN", "false")) or "false").strip().lower() in ("1", "true", "yes")
 
 # Strategy parameters
-PUT_WIDTH = 5
-CALL_WIDTH = 5
+PUT_WIDTH = 10
+CALL_WIDTH = 10
 EM_FACTOR = 0.75
 
 # Signal thresholds
@@ -752,14 +753,17 @@ def main():
         print(f"DS_RUN PUT: {v_put['name']} strikes={v_put['long_strike']}/{v_put['short_strike']} "
               f"short={v_put['short_osi']} long={v_put['long_osi']}")
 
-    # ── Fetch 5DTE chain (call side — follows regime switch) ──
+    # ── Fetch 5DTE chain (call side — bull BPC, skip on bear days) ──
     v_call = None
     call_skip_reason = None
 
+    # Filter 4: skip call on bear regime (avoid long IC)
+    if not is_bull:
+        call_skip_reason = "BEAR_REGIME (call side skipped)"
     # Filter 2: VIX < 10 skips call
-    if vix is not None and vix < VIX_CALL_SKIP:
+    elif vix is not None and vix < VIX_CALL_SKIP:
         call_skip_reason = f"VIX<{VIX_CALL_SKIP} ({vix:.2f})"
-    elif is_bull and rv_in_band:
+    elif rv_in_band:
         call_skip_reason = "RV_BAND (bull_put_credit skipped)"
     else:
         print(f"\nDS_RUN PARSING 5DTE chain (exp={exp5_date})...")
@@ -771,35 +775,20 @@ def main():
             contracts5 = chain5["contracts"]
             print(f"DS_RUN 5DTE: spot={spot5:.2f} exp={exp5} contracts={len(contracts5)}")
 
-            # 50-delta — follows regime switch (v1.1.0)
+            # 50-delta — bull_put_credit on bull days only (v1.3.0)
             call_p = find_by_delta(contracts5, "P", 0.50)
             if call_p:
-                if is_bull:
-                    # Bull put credit: sell higher put, buy CALL_WIDTH lower
-                    short_strike = call_p["strike"]
-                    long_strike = short_strike - CALL_WIDTH
-                    short_osi = call_p.get("osi") or build_osi(exp5, "P", short_strike)
-                    long_c = find_strike_near(contracts5, "P", long_strike)
-                    long_osi = long_c.get("osi", build_osi(exp5, "P", long_strike)) if long_c else build_osi(exp5, "P", long_strike)
-                    v_call = {
-                        "name": "BULL_PUT_CREDIT", "kind": "PUT", "side": "CREDIT", "direction": "LONG",
-                        "short_osi": short_osi, "long_osi": long_osi,
-                        "short_strike": short_strike, "long_strike": long_strike,
-                        "target_qty": qty, "strength": 1.0,
-                    }
-                else:
-                    # Bear put debit: buy higher put, sell CALL_WIDTH lower
-                    long_strike = call_p["strike"]
-                    short_strike = long_strike - CALL_WIDTH
-                    long_osi = call_p.get("osi") or build_osi(exp5, "P", long_strike)
-                    short_c = find_strike_near(contracts5, "P", short_strike)
-                    short_osi = short_c.get("osi", build_osi(exp5, "P", short_strike)) if short_c else build_osi(exp5, "P", short_strike)
-                    v_call = {
-                        "name": "BEAR_PUT_DEBIT", "kind": "PUT", "side": "DEBIT", "direction": "LONG",
-                        "short_osi": short_osi, "long_osi": long_osi,
-                        "short_strike": short_strike, "long_strike": long_strike,
-                        "target_qty": qty, "strength": 1.0,
-                    }
+                short_strike = call_p["strike"]
+                long_strike = short_strike - CALL_WIDTH
+                short_osi = call_p.get("osi") or build_osi(exp5, "P", short_strike)
+                long_c = find_strike_near(contracts5, "P", long_strike)
+                long_osi = long_c.get("osi", build_osi(exp5, "P", long_strike)) if long_c else build_osi(exp5, "P", long_strike)
+                v_call = {
+                    "name": "CALL_HELPER_BPC", "kind": "PUT", "side": "CREDIT", "direction": "LONG",
+                    "short_osi": short_osi, "long_osi": long_osi,
+                    "short_strike": short_strike, "long_strike": long_strike,
+                    "target_qty": qty, "strength": 1.0,
+                }
             else:
                 call_skip_reason = "no 50-delta put found"
         elif not call_skip_reason:
