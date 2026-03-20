@@ -2,17 +2,26 @@
 """
 DualSide Strategy — SPX vertical orchestrator (Schwab)
 
-Put side: 6DTE 10-wide em0.75 direction switch
+v1.1.0 — 2026-03-19 regime-follow + 5-wide
+
+Changes from v1.0.0:
+  - Width reduced from $10 to $5 on both sides (halves max loss per trade)
+  - 50-delta (call side) now follows the regime switch instead of always bullish
+    When bearish: bear_put_debit at 50-delta (buy higher put, sell 5 lower)
+    When bullish: bull_put_credit at 50-delta (sell higher put, buy 5 lower)
+
+Put side (25-delta): 6DTE 5-wide em0.75 direction switch
   If iv_minus_vix >= -0.0502 AND rr25 <= -0.9976: bull_put_credit
   Else: bear_put_debit
 
-Call side: 5DTE 10-wide 50-delta bull_put_credit (always long direction)
-  Uses puts instead of calls to avoid strike overlap with butterfly call legs.
+Call side (50-delta): 5DTE 5-wide 50-delta, follows same regime switch
+  When bullish: bull_put_credit (sell higher put, buy 5 lower)
+  When bearish: bear_put_debit (buy higher put, sell 5 lower)
 
 Filters:
   1. VIX1D veto: skip ALL when 10.0 <= VIX1D < 11.5
   2. VIX < 10: skip call side
-  3. RV5/RV20 0.70-0.85: skip bullish legs (bull_put_credit + bull_put_credit)
+  3. RV5/RV20 0.70-0.85: skip bullish legs (bull_put_credit on either side)
      Bear_put_debit always trades.
 
 Delegates placement to scripts/trade/DualSide/place.py (same as ConstantStable placer).
@@ -27,6 +36,7 @@ import subprocess
 import time
 import random
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import statistics
@@ -49,7 +59,40 @@ def _add_scripts_root():
 _add_scripts_root()
 from schwab_token_keeper import schwab_client
 
-__version__ = "1.0.0"
+# ── Event reporting (best-effort, never blocks trading) ──
+_ew = None
+try:
+    _repo_root = str(Path(__file__).resolve().parent.parent.parent.parent)
+    if _repo_root not in sys.path:
+        sys.path.insert(0, _repo_root)
+    from reporting.events import EventWriter
+    _EVENTS_AVAILABLE = True
+except ImportError:
+    _EVENTS_AVAILABLE = False
+
+
+def _init_events(today: date):
+    global _ew
+    if not _EVENTS_AVAILABLE:
+        return None
+    try:
+        _ew = EventWriter(strategy="dualside", account="schwab", trade_date=today)
+        return _ew
+    except Exception as e:
+        print(f"DS_RUN WARN: EventWriter init failed: {e}")
+        return None
+
+
+def _emit(method: str, **kwargs):
+    """Best-effort event emission. Never raises."""
+    if _ew is None:
+        return
+    try:
+        getattr(_ew, method)(**kwargs)
+    except Exception as e:
+        print(f"DS_RUN WARN: event emit failed ({method}): {e}")
+
+__version__ = "1.1.0"
 
 # ── config ──
 CS_UNIT_DOLLARS = float(os.environ.get("DS_UNIT_DOLLARS", os.environ.get("CS_UNIT_DOLLARS", "10000")))
@@ -57,8 +100,8 @@ DS_LOG_PATH = os.environ.get("DS_LOG_PATH", "/tmp/logs/dualside_trades.csv")
 DS_DRY_RUN = (os.environ.get("DS_DRY_RUN", os.environ.get("VERT_DRY_RUN", "false")) or "false").strip().lower() in ("1", "true", "yes")
 
 # Strategy parameters
-PUT_WIDTH = 10
-CALL_WIDTH = 10
+PUT_WIDTH = 5
+CALL_WIDTH = 5
 EM_FACTOR = 0.75
 
 # Signal thresholds
@@ -78,6 +121,9 @@ PLACER_SCRIPT = os.path.join(os.path.dirname(__file__), "place.py")
 # Guard
 DS_GUARD_NO_CLOSE = (os.environ.get("CS_GUARD_NO_CLOSE", "1") or "1").strip().lower() in ("1", "true", "yes")
 DS_TOPUP = (os.environ.get("CS_TOPUP", "1") or "1").strip().lower() in ("1", "true", "yes")
+
+# Bull put credit position cap: skip new BPC if >= MAX_OPEN_BPC already open
+MAX_OPEN_BPC = 3
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -505,6 +551,35 @@ def would_close_guard(v, pos):
     return buy_leg_pos < -1e-9 or sell_leg_pos > 1e-9
 
 
+def count_open_bpc(pos):
+    """Count open bull_put_credit spreads from broker positions.
+
+    A bull_put_credit is a short put with a matching long put WIDTH points lower.
+    We count distinct short-put legs that have a paired long put.
+    """
+    # Group by (expiration, put_call) → key is (ymd, cp, strike_padded)
+    short_puts = []  # (exp, strike) where qty < 0 and type=P
+    long_puts = set()  # (exp, strike) where qty > 0 and type=P
+    for (ymd, cp, strike_str), qty in pos.items():
+        if cp != "P":
+            continue
+        try:
+            strike = int(strike_str) / 1000.0
+        except (ValueError, TypeError):
+            continue
+        if qty < -1e-9:
+            short_puts.append((ymd, strike, abs(qty)))
+        elif qty > 1e-9:
+            long_puts.add((ymd, strike))
+
+    count = 0
+    for ymd, strike, qty in short_puts:
+        # Check for a matching long put at current or legacy width
+        if (ymd, strike - PUT_WIDTH) in long_puts or (ymd, strike - 10) in long_puts:
+            count += int(qty + 0.5)
+    return count
+
+
 # ═══════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════
@@ -512,12 +587,19 @@ def would_close_guard(v, pos):
 def main():
     print(f"DS_RUN v{__version__} DRY_RUN={DS_DRY_RUN}")
 
+    today = date.today()
+    ew = _init_events(today)
+
     # ── Schwab client + account ──
     try:
         c = schwab_client()
         oc_val, oc_src, acct_num = opening_cash_for_account(c)
         acct_hash = get_account_hash(c)
     except Exception as e:
+        _emit("error", message=f"Schwab init failed: {e}", stage="init")
+        if ew:
+            try: ew.close()
+            except Exception: pass
         print(f"DS_RUN SKIP: Schwab init failed: {e}")
         return 1
 
@@ -548,6 +630,12 @@ def main():
 
     # ── Filter 1: VIX1D veto ──
     if vix1d is not None and VIX1D_VETO_LO <= vix1d < VIX1D_VETO_HI:
+        _emit("strategy_run", signal="SKIP", config="",
+              reason=f"VIX1D veto ({vix1d:.2f})", vix=float(vix or 0), vix1d=float(vix1d))
+        _emit("skip", reason=f"VIX1D veto ({vix1d:.2f})", signal="SKIP")
+        if ew:
+            try: ew.close()
+            except Exception: pass
         print(f"DS_RUN SKIP: VIX1D veto ({vix1d:.2f} in [{VIX1D_VETO_LO}, {VIX1D_VETO_HI}))")
         return 0
 
@@ -664,14 +752,14 @@ def main():
         print(f"DS_RUN PUT: {v_put['name']} strikes={v_put['long_strike']}/{v_put['short_strike']} "
               f"short={v_put['short_osi']} long={v_put['long_osi']}")
 
-    # ── Fetch 5DTE chain (call side) ──
+    # ── Fetch 5DTE chain (call side — follows regime switch) ──
     v_call = None
     call_skip_reason = None
 
     # Filter 2: VIX < 10 skips call
     if vix is not None and vix < VIX_CALL_SKIP:
         call_skip_reason = f"VIX<{VIX_CALL_SKIP} ({vix:.2f})"
-    elif rv_in_band:
+    elif is_bull and rv_in_band:
         call_skip_reason = "RV_BAND (bull_put_credit skipped)"
     else:
         print(f"\nDS_RUN PARSING 5DTE chain (exp={exp5_date})...")
@@ -683,21 +771,35 @@ def main():
             contracts5 = chain5["contracts"]
             print(f"DS_RUN 5DTE: spot={spot5:.2f} exp={exp5} contracts={len(contracts5)}")
 
-            # 50-delta bull put credit (same strikes/payoff as old bull call debit,
-            # but uses puts to avoid call-type overlap with butterfly legs)
+            # 50-delta — follows regime switch (v1.1.0)
             call_p = find_by_delta(contracts5, "P", 0.50)
             if call_p:
-                short_strike = call_p["strike"]
-                long_strike = short_strike - CALL_WIDTH
-                short_osi = call_p.get("osi") or build_osi(exp5, "P", short_strike)
-                long_c = find_strike_near(contracts5, "P", long_strike)
-                long_osi = long_c.get("osi", build_osi(exp5, "P", long_strike)) if long_c else build_osi(exp5, "P", long_strike)
-                v_call = {
-                    "name": "BULL_PUT_CREDIT", "kind": "PUT", "side": "CREDIT", "direction": "LONG",
-                    "short_osi": short_osi, "long_osi": long_osi,
-                    "short_strike": short_strike, "long_strike": long_strike,
-                    "target_qty": qty, "strength": 1.0,
-                }
+                if is_bull:
+                    # Bull put credit: sell higher put, buy CALL_WIDTH lower
+                    short_strike = call_p["strike"]
+                    long_strike = short_strike - CALL_WIDTH
+                    short_osi = call_p.get("osi") or build_osi(exp5, "P", short_strike)
+                    long_c = find_strike_near(contracts5, "P", long_strike)
+                    long_osi = long_c.get("osi", build_osi(exp5, "P", long_strike)) if long_c else build_osi(exp5, "P", long_strike)
+                    v_call = {
+                        "name": "BULL_PUT_CREDIT", "kind": "PUT", "side": "CREDIT", "direction": "LONG",
+                        "short_osi": short_osi, "long_osi": long_osi,
+                        "short_strike": short_strike, "long_strike": long_strike,
+                        "target_qty": qty, "strength": 1.0,
+                    }
+                else:
+                    # Bear put debit: buy higher put, sell CALL_WIDTH lower
+                    long_strike = call_p["strike"]
+                    short_strike = long_strike - CALL_WIDTH
+                    long_osi = call_p.get("osi") or build_osi(exp5, "P", long_strike)
+                    short_c = find_strike_near(contracts5, "P", short_strike)
+                    short_osi = short_c.get("osi", build_osi(exp5, "P", short_strike)) if short_c else build_osi(exp5, "P", short_strike)
+                    v_call = {
+                        "name": "BEAR_PUT_DEBIT", "kind": "PUT", "side": "DEBIT", "direction": "LONG",
+                        "short_osi": short_osi, "long_osi": long_osi,
+                        "short_strike": short_strike, "long_strike": long_strike,
+                        "target_qty": qty, "strength": 1.0,
+                    }
             else:
                 call_skip_reason = "no 50-delta put found"
         elif not call_skip_reason:
@@ -711,21 +813,35 @@ def main():
 
     # ── Nothing to trade? ──
     if not v_put and not v_call:
+        _emit("strategy_run", signal="SKIP", config="",
+              reason="no verticals after filters", spot=float(spot),
+              vix=float(vix or 0), vix1d=float(vix1d or 0),
+              filters={"put_skip": put_skip_reason, "call_skip": call_skip_reason,
+                        "rv_in_band": rv_in_band, "iv_minus_vix": iv_minus_vix})
+        _emit("skip", reason="no verticals to trade after filters")
+        if ew:
+            try: ew.close()
+            except Exception: pass
         print("DS_RUN SKIP: no verticals to trade after filters.")
         return 0
 
     # ── Position guard + topup ──
     pos = None
-    if DS_GUARD_NO_CLOSE or DS_TOPUP:
-        try:
-            pos = positions_map(c, acct_hash)
-            print(f"DS_RUN POSITIONS: loaded {len(pos)} legs")
-        except Exception as e:
-            print(f"DS_RUN POSITIONS SKIP: fetch failed ({e}) — skipping ALL trades.")
-            return 0
+    open_bpc_count = 0
+    try:
+        pos = positions_map(c, acct_hash)
+        open_bpc_count = count_open_bpc(pos)
+        print(f"DS_RUN POSITIONS: loaded {len(pos)} legs, open BPC={open_bpc_count}")
+    except Exception as e:
+        print(f"DS_RUN POSITIONS SKIP: fetch failed ({e}) — skipping ALL trades.")
+        return 0
 
     def finalize(v):
         if not v:
+            return None
+        # BPC cap: skip any new bull_put_credit (put-side or call-side helper) if at cap
+        if v["side"] == "CREDIT" and v["kind"] == "PUT" and open_bpc_count >= MAX_OPEN_BPC:
+            print(f"DS_RUN BPC_CAP_SKIP {v['name']}: open={open_bpc_count} >= cap={MAX_OPEN_BPC}")
             return None
         target = int(v["target_qty"])
         open_qty = 0
@@ -749,8 +865,22 @@ def main():
     v_call_f = finalize(v_call)
 
     if not v_put_f and not v_call_f:
+        _emit("strategy_run", signal=direction, config="",
+              reason="nothing after TOPUP/GUARD", spot=float(spot),
+              vix=float(vix or 0), vix1d=float(vix1d or 0))
+        _emit("skip", reason="nothing to place after TOPUP/GUARD")
+        if ew:
+            try: ew.close()
+            except Exception: pass
         print("DS_RUN SKIP: nothing to place after TOPUP/GUARD.")
         return 0
+
+    # Emit strategy_run event for actual trade
+    _emit("strategy_run", signal=direction, config=f"PUT:{v_put_f['name'] if v_put_f else 'SKIP'}_CALL:{v_call_f['name'] if v_call_f else 'SKIP'}",
+          reason="OK", spot=float(spot), vix=float(vix or 0), vix1d=float(vix1d or 0),
+          filters={"iv_minus_vix": iv_minus_vix, "rr25": rr25_vol_pts, "rv_ratio": rv_ratio,
+                    "rv_in_band": rv_in_band, "put_skip": put_skip_reason, "call_skip": call_skip_reason},
+          extra={"em": em, "em075": em075, "exp5": exp5_date, "exp6": exp6_date})
 
     # ── Place orders ──
     def env_for_vertical(v):
@@ -790,6 +920,21 @@ def main():
     for v in (v_put_f, v_call_f):
         if not v:
             continue
+
+        # Each vertical gets its own trade_group_id
+        if _ew is not None:
+            _ew.new_trade_group()
+
+        _emit("trade_intent", side=v["side"], direction=v["direction"],
+              legs=[
+                  {"osi": v["short_osi"], "strike": v.get("short_strike", 0),
+                   "option_type": v["kind"], "action": "SELL_TO_OPEN", "qty": v["send_qty"]},
+                  {"osi": v["long_osi"], "strike": v.get("long_strike", 0),
+                   "option_type": v["kind"], "action": "BUY_TO_OPEN", "qty": v["send_qty"]},
+              ],
+              target_qty=v["send_qty"],
+              extra={"name": v["name"], "expiration": v.get("expiration", "")})
+
         print(
             f"\nDS_RUN PLACING {v['name']}: side={v['side']} kind={v['kind']} "
             f"short={v['short_osi']} long={v['long_osi']} qty={v['send_qty']}"
@@ -797,7 +942,44 @@ def main():
         env = env_for_vertical(v)
         rc = subprocess.call([sys.executable, PLACER_SCRIPT], env=env)
         if rc != 0:
+            _emit("error", message=f"placer rc={rc}", stage=f"placement_{v['name']}")
             print(f"DS_RUN {v['name']}: placer rc={rc}")
+        else:
+            # Read back placement result from CSV log (last line)
+            try:
+                import csv as _csv
+                with open(DS_LOG_PATH) as _lf:
+                    rows = list(_csv.DictReader(_lf))
+                if rows:
+                    last = rows[-1]
+                    oids = [x for x in (last.get("order_ids") or "").split(",") if x]
+                    filled = int(last.get("qty_filled") or 0)
+                    last_price = float(last.get("last_price") or 0) if last.get("last_price") else 0
+                    requested = v["send_qty"]
+                    for oid in oids:
+                        _emit("order_submitted", order_id=oid,
+                              legs=[
+                                  {"osi": v["short_osi"], "strike": v.get("short_strike", 0),
+                                   "option_type": v["kind"], "action": "SELL_TO_OPEN", "qty": requested},
+                                  {"osi": v["long_osi"], "strike": v.get("long_strike", 0),
+                                   "option_type": v["kind"], "action": "BUY_TO_OPEN", "qty": requested},
+                              ],
+                              limit_price=last_price)
+                    if filled > 0:
+                        _emit("fill", order_id=oids[0] if oids else "",
+                              fill_qty=filled, fill_price=last_price,
+                              legs=[
+                                  {"osi": v["short_osi"], "strike": v.get("short_strike", 0),
+                                   "option_type": v["kind"], "qty": filled},
+                                  {"osi": v["long_osi"], "strike": v.get("long_strike", 0),
+                                   "option_type": v["kind"], "qty": filled},
+                              ])
+            except Exception as _e:
+                print(f"DS_RUN WARN: could not read placement result: {_e}")
+
+    if ew:
+        try: ew.close()
+        except Exception: pass
 
     return 0
 
