@@ -872,6 +872,8 @@ def lambda_handler(event, context):
 
     if dry_run:
         env["VERT_DRY_RUN"] = "true"
+        env["DS_DRY_RUN"] = "true"
+        env["BF_DRY_RUN"] = "1"
 
     # Allow event payload to inject env overrides (e.g. BF_NOW_OVERRIDE for testing)
     for k, v in event.get("env_override", {}).items():
@@ -943,7 +945,9 @@ def lambda_handler(event, context):
     report_delay_applied = False
 
     post_results = {}
-    for step in cfg.get("post_steps", []):
+    if dry_run:
+        print("DRY_RUN: skipping all post-steps")
+    for step in ([] if dry_run else cfg.get("post_steps", [])):
         step_name = os.path.basename(step)
         try:
             is_report_step = step_name in REPORT_STEPS
@@ -983,7 +987,10 @@ def lambda_handler(event, context):
     summary = {"account": account, "orchestrator_rc": orch_rc, "steps": post_results}
     print(f"REPORT_SUMMARY {json.dumps(summary)}")
 
-    event_upload = upload_event_files(env, trade_date)
+    if dry_run:
+        event_upload = {"skipped": "dry_run"}
+    else:
+        event_upload = upload_event_files(env, trade_date)
     print(f"EVENT_UPLOAD_SUMMARY {json.dumps(event_upload)}")
 
     # -- 6. Persist tokens back to SSM if refreshed --
