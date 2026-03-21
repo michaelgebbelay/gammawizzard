@@ -30,6 +30,12 @@ class FixedDateTime(datetime):
         return cls(2026, 3, 19, 16, 45, tzinfo=tz)
 
 
+class LaterFixedDateTime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return cls(2026, 3, 21, 10, 0, tzinfo=tz)
+
+
 def _same_day_expiry_order(status="FILLED"):
     return {
         "status": status,
@@ -181,3 +187,29 @@ def test_run_daily_pnl_email_sends_health_email_and_skips_behavior_when_clean(is
     assert payload["delivery"]["sent"] is True
     assert payload["settled_today"] == 1
     assert payload["scope"] == "schwab_only"
+
+
+def test_run_daily_pnl_email_honors_report_date_override(isolated_db, monkeypatch):
+    sends = []
+
+    monkeypatch.setattr("reporting.daily_pnl_email.datetime", LaterFixedDateTime)
+    monkeypatch.setattr(
+        "reporting.daily_pnl_email.load_orders_from_schwab",
+        lambda lookback_days=120: [_same_day_expiry_order()],
+    )
+    monkeypatch.setattr(
+        "reporting.daily_pnl_email.load_settlements",
+        lambda: {"2026-03-19": 6520.0},
+    )
+
+    def fake_send(subject, body, dry_run=False):
+        sends.append({"subject": subject, "body": body, "dry_run": dry_run})
+        return {"sent": True, "dry_run": dry_run, "subject": subject}
+
+    monkeypatch.setattr("reporting.daily_pnl_email._send_email", fake_send)
+
+    result = run_daily_pnl_email(report_date=date(2026, 3, 19))
+
+    assert result["positions"] == 1
+    assert len(sends) == 1
+    assert sends[0]["subject"] == "[Gamma] Health: Today +$405 | MTD +$405 | YTD +$405 — 2026-03-19"

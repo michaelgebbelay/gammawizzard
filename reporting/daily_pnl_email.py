@@ -521,9 +521,10 @@ def run_daily_pnl_email(
     dry_run: bool = False,
     orders_file: str | None = None,
     lookback_days: int = 120,
+    report_date: date | None = None,
 ) -> dict:
     """Full pipeline: load orders → classify → compute P&L → send email."""
-    report_date = datetime.now(ET).date()
+    report_date = report_date or datetime.now(ET).date()
 
     # Load orders
     if orders_file:
@@ -597,12 +598,17 @@ def main():
                         help="Use cached orders file instead of API")
     parser.add_argument("--lookback", type=int, default=30,
                         help="Days of order history to pull (default: 30)")
+    parser.add_argument("--report-date", type=str, default=None,
+                        help="Override report date (YYYY-MM-DD)")
     args = parser.parse_args()
+
+    report_date = date.fromisoformat(args.report_date) if args.report_date else None
 
     result = run_daily_pnl_email(
         dry_run=args.dry_run,
         orders_file=args.file,
         lookback_days=args.lookback,
+        report_date=report_date,
     )
     print(f"\nResult: {result}")
 

@@ -744,11 +744,13 @@ def _handle_sim_collect(event):
 def _handle_daily_pnl(event, t0):
     """Pull Schwab orders, compute P&L, send email.
 
-    Event payload: {"account": "daily-pnl", "dry_run": true/false}
+    Event payload: {"account": "daily-pnl", "dry_run": true/false,
+                    "report_date": "YYYY-MM-DD"}
     Needs SSM: Schwab creds (orders) + SMTP creds (email).
     """
     dry_run = event.get("dry_run", False)
-    print(f"=== daily-pnl | dry_run={dry_run} ===")
+    report_date = event.get("report_date")
+    print(f"=== daily-pnl | dry_run={dry_run} | report_date={report_date or 'auto'} ===")
 
     # Fetch SSM params
     ssm_paths = {
@@ -779,7 +781,10 @@ def _handle_daily_pnl(event, t0):
     # Run P&L email
     try:
         from reporting.daily_pnl_email import run_daily_pnl_email
-        result = run_daily_pnl_email(dry_run=dry_run)
+        kwargs = {"dry_run": dry_run}
+        if report_date:
+            kwargs["report_date"] = datetime.fromisoformat(str(report_date)).date()
+        result = run_daily_pnl_email(**kwargs)
         print(f"daily-pnl result: {result}")
     except Exception as e:
         print(f"daily-pnl ERROR: {e}")
