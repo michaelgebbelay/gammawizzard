@@ -28,8 +28,6 @@ from typing import Any
 from reporting.broker_pnl import (
     ET,
     API_TAG,
-    STRATEGY_LABELS,
-    STRATEGY_ORDER,
     build_positions,
     classify_order,
     load_orders_from_schwab,
@@ -166,6 +164,28 @@ def _recent_business_days(report_date: date, count: int = 5) -> list[date]:
     return list(reversed(days))
 
 
+EMAIL_GROUPS = (
+    {
+        "key": "constantstable",
+        "label": "ConstantStable",
+        "short": "CS",
+        "members": ("constantstable", "cs_morning"),
+    },
+    {
+        "key": "dualside",
+        "label": "DualSide",
+        "short": "DS",
+        "members": ("dualside",),
+    },
+    {
+        "key": "butterfly",
+        "label": "Butterfly Tuesday",
+        "short": "BF",
+        "members": ("butterfly",),
+    },
+)
+
+
 def _build_email(positions: list[dict], report_date: date) -> tuple[str, str]:
     """Build the portfolio-health email.
 
@@ -185,16 +205,17 @@ def _build_email(positions: list[dict], report_date: date) -> tuple[str, str]:
     ytd_stats = _stats(ytd_positions)
 
     strat_rows = []
-    for strat in STRATEGY_ORDER:
-        strat_all = [p for p in settled if p["strategy"] == strat]
-        strat_ytd = [p for p in ytd_positions if p["strategy"] == strat]
-        strat_mtd = [p for p in mtd_positions if p["strategy"] == strat]
-        strat_5d = [p for p in five_day_positions if p["strategy"] == strat]
+    for group in EMAIL_GROUPS:
+        members = set(group["members"])
+        strat_all = [p for p in settled if p["strategy"] in members]
+        strat_ytd = [p for p in ytd_positions if p["strategy"] in members]
+        strat_mtd = [p for p in mtd_positions if p["strategy"] in members]
+        strat_5d = [p for p in five_day_positions if p["strategy"] in members]
         if not strat_ytd and not strat_mtd and not strat_5d:
             continue
         ytd_stats_strat = _stats(strat_ytd)
         strat_rows.append({
-            "label": STRATEGY_LABELS.get(strat, strat),
+            "label": group["label"],
             "five_day_pnl": float(sum(p["pnl"] or 0 for p in strat_5d)),
             "mtd_pnl": float(sum(p["pnl"] or 0 for p in strat_mtd)),
             "ytd_pnl": float(sum(p["pnl"] or 0 for p in strat_ytd)),
@@ -213,23 +234,18 @@ def _build_email(positions: list[dict], report_date: date) -> tuple[str, str]:
         f"MTD {_fmt(mtd_stats['pnl'])} | YTD {_fmt(ytd_stats['pnl'])} — {as_of_str}"
     )
 
-    short_labels = {
-        "butterfly": "BF",
-        "constantstable": "CS",
-        "cs_morning": "CS AM",
-        "dualside": "DS",
-    }
     recent_map: dict[tuple[date, str], float] = defaultdict(float)
     for p in settled:
         settled_day = _settle_date(p)
         if settled_day in recent_days:
-            recent_map[(settled_day, p["strategy"])] += float(p["pnl"] or 0)
+            for group in EMAIL_GROUPS:
+                if p["strategy"] in group["members"]:
+                    recent_map[(settled_day, group["key"])] += float(p["pnl"] or 0)
+                    break
 
     lines = [
         f"Gamma Portfolio Pulse (Schwab) — {as_of_str}",
         f"{'=' * 50}",
-        "",
-        "Realized P&L only. Behavior anomalies arrive in a separate email when needed.",
         "",
     ]
 
@@ -250,30 +266,27 @@ def _build_email(positions: list[dict], report_date: date) -> tuple[str, str]:
     lines.append("Last 5 Sessions")
     lines.append(
         f"{'Date':<10} "
-        f"{short_labels['butterfly']:>10} "
-        f"{short_labels['constantstable']:>10} "
-        f"{short_labels['cs_morning']:>10} "
-        f"{short_labels['dualside']:>10} "
+        f"{'CS':>10} "
+        f"{'DS':>10} "
+        f"{'BF':>10} "
         f"{'Total':>10}"
     )
     lines.append(
-        f"{'-' * 10} {'-' * 10} {'-' * 10} {'-' * 10} {'-' * 10} {'-' * 10}"
+        f"{'-' * 10} {'-' * 10} {'-' * 10} {'-' * 10} {'-' * 10}"
     )
     for day in recent_days:
-        bf = recent_map[(day, "butterfly")]
         cs = recent_map[(day, "constantstable")]
-        csm = recent_map[(day, "cs_morning")]
         ds = recent_map[(day, "dualside")]
-        total = bf + cs + csm + ds
+        bf = recent_map[(day, "butterfly")]
+        total = cs + ds + bf
         lines.append(
             f"{day.isoformat():<10} "
-            f"{_fmt(bf):>10} "
             f"{_fmt(cs):>10} "
-            f"{_fmt(csm):>10} "
             f"{_fmt(ds):>10} "
+            f"{_fmt(bf):>10} "
             f"{_fmt(total):>10}"
         )
-    lines.append("Legend: BF=Butterfly, CS=ConstantStable, CS AM=Morning, DS=DualSide")
+    lines.append("Legend: CS=ConstantStable incl. morning, DS=DualSide, BF=Butterfly")
 
     lines.append("")
     lines.append("Strategy Contribution")

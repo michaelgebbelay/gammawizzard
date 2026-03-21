@@ -102,9 +102,11 @@ def test_build_email_reports_health_metrics():
     assert "Risk State" in body
     assert "Current streak: L2" in body
     assert "DualSide" in body
-    assert "ConstantStable (IC_LONG)" in body
+    assert "ConstantStable" in body
     assert "2026-03-19" in body
-    assert "Legend: BF=Butterfly, CS=ConstantStable, CS AM=Morning, DS=DualSide" in body
+    assert "Legend: CS=ConstantStable incl. morning, DS=DualSide, BF=Butterfly" in body
+    assert "CS Morning" not in body
+    assert "Behavior anomalies arrive in a separate email when needed." not in body
     assert "Open Positions" not in body
 
 
