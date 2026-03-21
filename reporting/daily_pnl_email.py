@@ -1,7 +1,7 @@
 """Daily P&L email — compact summary of automated strategy performance.
 
-Pulls fresh orders from Schwab, classifies by strategy, computes P&L,
-and sends a concise email via SMTP.
+Pulls fresh orders from Schwab, classifies by strategy, computes same-day
+settled P&L, archives the rendered email, and sends a concise SMTP summary.
 
 Designed to run as a Lambda post-market step (~4:45 PM ET) after
 close5 collection ensures settlement data is available.
@@ -14,13 +14,16 @@ Usage:
 
 from __future__ import annotations
 
+import json
 import os
 import smtplib
-from datetime import date, timedelta
+import uuid
+from datetime import datetime, date
 from email.message import EmailMessage
 from typing import Any
 
 from reporting.broker_pnl import (
+    ET,
     STRATEGY_LABELS,
     STRATEGY_ORDER,
     build_positions,
@@ -57,10 +60,10 @@ def _build_email(positions: list[dict], report_date: date) -> tuple[str, str]:
                      or (p["exit_method"] == "EXPIRED" and p["expiry"] == today_str)]
     opened_today = [p for p in positions if p["fill_date"] == today_str]
 
-    # Per-strategy totals
+    # Daily settled performance by strategy
     strat_data: dict[str, dict[str, Any]] = {}
     for strat in STRATEGY_ORDER:
-        strat_pos = [p for p in settled if p["strategy"] == strat]
+        strat_pos = [p for p in settled_today if p["strategy"] == strat]
         if not strat_pos:
             continue
         total = sum(p["pnl"] or 0 for p in strat_pos)
@@ -69,7 +72,6 @@ def _build_email(positions: list[dict], report_date: date) -> tuple[str, str]:
             "trades": len(strat_pos),
             "wins": wins,
             "total": total,
-            "open": len([p for p in still_open if p["strategy"] == strat]),
         }
 
     grand_pnl = sum(d["total"] for d in strat_data.values())
@@ -82,8 +84,10 @@ def _build_email(positions: list[dict], report_date: date) -> tuple[str, str]:
 
     # Body
     lines = [
-        f"Gamma Portfolio — {today_str}",
+        f"Gamma Automated Strategies (Schwab) — {today_str}",
         f"{'=' * 50}",
+        "",
+        "Daily settled P&L summary. Open positions are shown for context.",
         "",
     ]
 
@@ -102,6 +106,10 @@ def _build_email(positions: list[dict], report_date: date) -> tuple[str, str]:
     wr_total = f"{grand_wins/grand_trades*100:.0f}%" if grand_trades > 0 else "—"
     lines.append(f"{'-' * 25} {'-' * 7} {'-' * 6} {'-' * 12}")
     lines.append(f"{'TOTAL':<25} {grand_trades:>7} {wr_total:>6} {_fmt(grand_pnl):>12}")
+
+    if not settled_today:
+        lines.append("")
+        lines.append("No settled automated trades today.")
 
     # Today's activity
     if settled_today:
@@ -149,6 +157,51 @@ def _build_email(positions: list[dict], report_date: date) -> tuple[str, str]:
     lines.append("— Gamma Reporting (automated)")
 
     return subject, "\n".join(lines)
+
+
+def _archive_email(
+    *,
+    report_date: date,
+    subject: str,
+    body: str,
+    delivery_state: dict[str, Any],
+    source: str,
+    positions: list[dict],
+) -> None:
+    """Persist the rendered email for historical QA and replay."""
+    from reporting.db import execute, get_connection, init_schema
+
+    settled_today = [
+        p for p in positions
+        if p["exit_method"] in ("EXPIRED", "CLOSED_EARLY")
+        and (
+            p.get("close_date") == report_date.isoformat()
+            or (p["exit_method"] == "EXPIRED" and p["expiry"] == report_date.isoformat())
+        )
+    ]
+    payload = {
+        "subject": subject,
+        "body": body,
+        "source": source,
+        "delivery": delivery_state,
+        "positions": len(positions),
+        "settled_today": len(settled_today),
+        "scope": "schwab_only",
+    }
+
+    con = get_connection()
+    init_schema(con)
+    execute(
+        """INSERT INTO daily_report_outputs
+           (id, report_date, format, content, trust_banner)
+           VALUES (?, ?, 'email', ?, NULL)""",
+        [
+            uuid.uuid4().hex[:16],
+            report_date.isoformat(),
+            json.dumps(payload, sort_keys=True),
+        ],
+        con=con,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +259,7 @@ def run_daily_pnl_email(
     lookback_days: int = 30,
 ) -> dict:
     """Full pipeline: load orders → classify → compute P&L → send email."""
-    report_date = date.today()
+    report_date = datetime.now(ET).date()
 
     # Load orders
     if orders_file:
@@ -225,7 +278,12 @@ def run_daily_pnl_email(
     # Process
     trades = parse_filled_orders(raw_orders)
     settlements = load_settlements()
-    positions = build_positions(trades, settlements, as_of=report_date)
+    positions = build_positions(
+        trades,
+        settlements,
+        as_of=report_date,
+        include_same_day_expiry=True,
+    )
 
     auto = [p for p in positions if p["strategy"] not in ("manual", "butterfly_manual")]
     print(f"[daily_pnl] {len(auto)} automated positions "
@@ -237,6 +295,20 @@ def run_daily_pnl_email(
     result = send_pnl_email(subject, body, dry_run=dry_run)
     result["source"] = source
     result["positions"] = len(auto)
+    try:
+        _archive_email(
+            report_date=report_date,
+            subject=subject,
+            body=body,
+            delivery_state=result,
+            source=source,
+            positions=auto,
+        )
+        result["archived"] = True
+    except Exception as e:
+        print(f"[daily_pnl] archive ERROR: {e}")
+        result["archived"] = False
+        result["archive_error"] = str(e)
 
     return result
 

@@ -25,13 +25,14 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 API_TAG = "TA_1michaelbelaygmailcom1755679459"
-ET = timezone(timedelta(hours=-4))
+ET = ZoneInfo("America/New_York")
 SPX_MULTIPLIER = 100
 
 
@@ -322,11 +323,15 @@ def _spread_intrinsic(strikes: list[float], option_types: list[str],
     return 0.0
 
 
-def build_positions(trades: list[dict], settlements: dict[str, float],
-                    as_of: date | None = None) -> list[dict]:
+def build_positions(
+    trades: list[dict],
+    settlements: dict[str, float],
+    as_of: date | None = None,
+    include_same_day_expiry: bool = False,
+) -> list[dict]:
     """Match opens with closes, compute P&L for each position."""
     if as_of is None:
-        as_of = date.today()
+        as_of = datetime.now(ET).date()
 
     auto_strategies = ("constantstable", "dualside", "cs_morning", "butterfly")
     opens = [t for t in trades if t["strategy"] in auto_strategies and t["is_opening"]]
@@ -379,7 +384,9 @@ def build_positions(trades: list[dict], settlements: dict[str, float],
             pnl = pnl_per * qty * SPX_MULTIPLIER
             exit_price = matched_close["price"]
 
-        elif expiry_date and expiry_date < as_of:
+        elif expiry_date and (
+            expiry_date < as_of or (include_same_day_expiry and expiry_date == as_of)
+        ):
             settlement = settlements.get(expiry)
             if settlement:
                 exit_method = "EXPIRED"
@@ -440,7 +447,7 @@ def _fmt(val: float) -> str:
 
 def print_report(positions: list[dict], strategy_filter: str | None = None):
     """Print formatted P&L report."""
-    today = date.today()
+    today = datetime.now(ET).date()
 
     if strategy_filter:
         sf = strategy_filter.lower()
