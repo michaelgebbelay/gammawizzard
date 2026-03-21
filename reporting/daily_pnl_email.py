@@ -156,18 +156,31 @@ def _first_of_year(report_date: date) -> date:
     return report_date.replace(month=1, day=1)
 
 
+def _recent_business_days(report_date: date, count: int = 5) -> list[date]:
+    days: list[date] = []
+    d = report_date
+    while len(days) < count:
+        if d.weekday() < 5:
+            days.append(d)
+        d -= timedelta(days=1)
+    return list(reversed(days))
+
+
 def _build_email(positions: list[dict], report_date: date) -> tuple[str, str]:
     """Build the portfolio-health email.
 
     Returns (subject, body).
     """
-    today_str = report_date.isoformat()
+    as_of_str = report_date.isoformat()
     settled = _settled_positions(positions)
-    today_positions = _window_positions(settled, report_date, report_date)
+    recent_days = _recent_business_days(report_date, count=5)
+    five_day_start = recent_days[0]
+    five_day_end = recent_days[-1]
+    five_day_positions = _window_positions(settled, five_day_start, five_day_end)
     mtd_positions = _window_positions(settled, _first_of_month(report_date), report_date)
     ytd_positions = _window_positions(settled, _first_of_year(report_date), report_date)
 
-    today_stats = _stats(today_positions)
+    five_day_stats = _stats(five_day_positions)
     mtd_stats = _stats(mtd_positions)
     ytd_stats = _stats(ytd_positions)
 
@@ -176,13 +189,13 @@ def _build_email(positions: list[dict], report_date: date) -> tuple[str, str]:
         strat_all = [p for p in settled if p["strategy"] == strat]
         strat_ytd = [p for p in ytd_positions if p["strategy"] == strat]
         strat_mtd = [p for p in mtd_positions if p["strategy"] == strat]
-        strat_today = [p for p in today_positions if p["strategy"] == strat]
-        if not strat_ytd and not strat_mtd and not strat_today:
+        strat_5d = [p for p in five_day_positions if p["strategy"] == strat]
+        if not strat_ytd and not strat_mtd and not strat_5d:
             continue
         ytd_stats_strat = _stats(strat_ytd)
         strat_rows.append({
             "label": STRATEGY_LABELS.get(strat, strat),
-            "today_pnl": float(sum(p["pnl"] or 0 for p in strat_today)),
+            "five_day_pnl": float(sum(p["pnl"] or 0 for p in strat_5d)),
             "mtd_pnl": float(sum(p["pnl"] or 0 for p in strat_mtd)),
             "ytd_pnl": float(sum(p["pnl"] or 0 for p in strat_ytd)),
             "trades_ytd": ytd_stats_strat["trades"],
@@ -195,29 +208,36 @@ def _build_email(positions: list[dict], report_date: date) -> tuple[str, str]:
     current_dd_mtd, max_dd_mtd = _drawdown_stats(settled, _first_of_month(report_date), report_date)
     portfolio_streak = _current_streak(settled)
 
-    best_mtd = max(strat_rows, key=lambda r: r["mtd_pnl"], default=None)
-    worst_mtd = min(strat_rows, key=lambda r: r["mtd_pnl"], default=None)
-    best_ytd = max(strat_rows, key=lambda r: r["ytd_pnl"], default=None)
-    worst_ytd = min(strat_rows, key=lambda r: r["ytd_pnl"], default=None)
-
     subject = (
-        f"[Gamma] Health: Today {_fmt(today_stats['pnl'])} | "
-        f"MTD {_fmt(mtd_stats['pnl'])} | YTD {_fmt(ytd_stats['pnl'])} — {today_str}"
+        f"[Gamma] Health: 5D {_fmt(five_day_stats['pnl'])} | "
+        f"MTD {_fmt(mtd_stats['pnl'])} | YTD {_fmt(ytd_stats['pnl'])} — {as_of_str}"
     )
 
+    short_labels = {
+        "butterfly": "BF",
+        "constantstable": "CS",
+        "cs_morning": "CS AM",
+        "dualside": "DS",
+    }
+    recent_map: dict[tuple[date, str], float] = defaultdict(float)
+    for p in settled:
+        settled_day = _settle_date(p)
+        if settled_day in recent_days:
+            recent_map[(settled_day, p["strategy"])] += float(p["pnl"] or 0)
+
     lines = [
-        f"Gamma Portfolio Health (Schwab) — {today_str}",
+        f"Gamma Portfolio Pulse (Schwab) — {as_of_str}",
         f"{'=' * 50}",
         "",
-        "Realized performance only. Behavior anomalies arrive in a separate email when needed.",
+        "Realized P&L only. Behavior anomalies arrive in a separate email when needed.",
         "",
     ]
 
-    lines.append("Portfolio Summary")
+    lines.append("Portfolio")
     lines.append(f"{'Window':<10} {'Trades':>7} {'Win%':>6} {'P&L':>12} {'Avg/Trade':>12}")
     lines.append(f"{'-' * 10} {'-' * 7} {'-' * 6} {'-' * 12} {'-' * 12}")
     for label, stat in (
-        ("Today", today_stats),
+        ("5D", five_day_stats),
         ("MTD", mtd_stats),
         ("YTD", ytd_stats),
     ):
@@ -227,9 +247,38 @@ def _build_email(positions: list[dict], report_date: date) -> tuple[str, str]:
         )
 
     lines.append("")
-    lines.append("By Strategy")
+    lines.append("Last 5 Sessions")
     lines.append(
-        f"{'Strategy':<25} {'Today':>10} {'MTD':>10} {'YTD':>10} "
+        f"{'Date':<10} "
+        f"{short_labels['butterfly']:>10} "
+        f"{short_labels['constantstable']:>10} "
+        f"{short_labels['cs_morning']:>10} "
+        f"{short_labels['dualside']:>10} "
+        f"{'Total':>10}"
+    )
+    lines.append(
+        f"{'-' * 10} {'-' * 10} {'-' * 10} {'-' * 10} {'-' * 10} {'-' * 10}"
+    )
+    for day in recent_days:
+        bf = recent_map[(day, "butterfly")]
+        cs = recent_map[(day, "constantstable")]
+        csm = recent_map[(day, "cs_morning")]
+        ds = recent_map[(day, "dualside")]
+        total = bf + cs + csm + ds
+        lines.append(
+            f"{day.isoformat():<10} "
+            f"{_fmt(bf):>10} "
+            f"{_fmt(cs):>10} "
+            f"{_fmt(csm):>10} "
+            f"{_fmt(ds):>10} "
+            f"{_fmt(total):>10}"
+        )
+    lines.append("Legend: BF=Butterfly, CS=ConstantStable, CS AM=Morning, DS=DualSide")
+
+    lines.append("")
+    lines.append("Strategy Contribution")
+    lines.append(
+        f"{'Strategy':<25} {'5D':>10} {'MTD':>10} {'YTD':>10} "
         f"{'Trades':>7} {'Win%':>6} {'Streak':>7}"
     )
     lines.append(
@@ -239,7 +288,7 @@ def _build_email(positions: list[dict], report_date: date) -> tuple[str, str]:
     if strat_rows:
         for row in strat_rows:
             lines.append(
-                f"{row['label']:<25} {_fmt(row['today_pnl']):>10} {_fmt(row['mtd_pnl']):>10} "
+                f"{row['label']:<25} {_fmt(row['five_day_pnl']):>10} {_fmt(row['mtd_pnl']):>10} "
                 f"{_fmt(row['ytd_pnl']):>10} {row['trades_ytd']:>7} {row['wr_ytd']:>6} {row['streak']:>7}"
             )
     else:
@@ -248,20 +297,8 @@ def _build_email(positions: list[dict], report_date: date) -> tuple[str, str]:
     lines.append("")
     lines.append("Risk State")
     lines.append(f"- Current streak: {portfolio_streak}")
-    lines.append(f"- Current drawdown (MTD): {_fmt(-current_dd_mtd)} from peak")
-    lines.append(f"- Max drawdown (MTD): {_fmt(-max_dd_mtd)}")
-    lines.append(f"- Current drawdown (YTD): {_fmt(-current_dd_ytd)} from peak")
-    lines.append(f"- Max drawdown (YTD): {_fmt(-max_dd_ytd)}")
-    if best_mtd and worst_mtd:
-        lines.append(
-            f"- MTD contributors: best {best_mtd['label']} {_fmt(best_mtd['mtd_pnl'])}, "
-            f"worst {worst_mtd['label']} {_fmt(worst_mtd['mtd_pnl'])}"
-        )
-    if best_ytd and worst_ytd:
-        lines.append(
-            f"- YTD contributors: best {best_ytd['label']} {_fmt(best_ytd['ytd_pnl'])}, "
-            f"worst {worst_ytd['label']} {_fmt(worst_ytd['ytd_pnl'])}"
-        )
+    lines.append(f"- MTD drawdown: current {_fmt(-current_dd_mtd)} | max {_fmt(-max_dd_mtd)}")
+    lines.append(f"- YTD drawdown: current {_fmt(-current_dd_ytd)} | max {_fmt(-max_dd_ytd)}")
 
     lines.append("")
     lines.append("— Gamma Reporting (automated)")

@@ -94,14 +94,17 @@ def test_build_email_reports_health_metrics():
 
     subject, body = _build_email(positions, date(2026, 3, 19))
 
-    assert subject == "[Gamma] Health: Today -$130 | MTD -$1,085 | YTD -$1,085 — 2026-03-19"
-    assert "Gamma Portfolio Health (Schwab) — 2026-03-19" in body
-    assert "Portfolio Summary" in body
-    assert "By Strategy" in body
+    assert subject == "[Gamma] Health: 5D -$130 | MTD -$1,085 | YTD -$1,085 — 2026-03-19"
+    assert "Gamma Portfolio Pulse (Schwab) — 2026-03-19" in body
+    assert "Portfolio" in body
+    assert "Last 5 Sessions" in body
+    assert "Strategy Contribution" in body
     assert "Risk State" in body
     assert "Current streak: L2" in body
     assert "DualSide" in body
     assert "ConstantStable (IC_LONG)" in body
+    assert "2026-03-19" in body
+    assert "Legend: BF=Butterfly, CS=ConstantStable, CS AM=Morning, DS=DualSide" in body
     assert "Open Positions" not in body
 
 
@@ -171,9 +174,9 @@ def test_run_daily_pnl_email_sends_health_email_and_skips_behavior_when_clean(is
     assert result["positions"] == 1
     assert result["behavior_email"]["skipped"] == "no behavior issues"
     assert len(sends) == 1
-    assert sends[0]["subject"] == "[Gamma] Health: Today +$405 | MTD +$405 | YTD +$405 — 2026-03-19"
-    assert "Portfolio Summary" in sends[0]["body"]
-    assert "By Strategy" in sends[0]["body"]
+    assert sends[0]["subject"] == "[Gamma] Health: 5D +$405 | MTD +$405 | YTD +$405 — 2026-03-19"
+    assert "Last 5 Sessions" in sends[0]["body"]
+    assert "Strategy Contribution" in sends[0]["body"]
     assert "Open Positions" not in sends[0]["body"]
 
     con = get_connection()
@@ -212,4 +215,4 @@ def test_run_daily_pnl_email_honors_report_date_override(isolated_db, monkeypatc
 
     assert result["positions"] == 1
     assert len(sends) == 1
-    assert sends[0]["subject"] == "[Gamma] Health: Today +$405 | MTD +$405 | YTD +$405 — 2026-03-19"
+    assert sends[0]["subject"] == "[Gamma] Health: 5D +$405 | MTD +$405 | YTD +$405 — 2026-03-19"
