@@ -17,7 +17,7 @@ jobs:
       TT_TOKEN_JSON: ${{ secrets.TT_TOKEN_JSON }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: actions/setup-python@v5
         with:
