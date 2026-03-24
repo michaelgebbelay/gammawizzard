@@ -991,7 +991,9 @@ def main():
     is_ic_long_final = (v_put_f and v_call_f
                         and v_put_f["side"] == "DEBIT" and v_call_f["side"] == "DEBIT"
                         and not regime_switched)
-    if CS_IC_LONG_DEFER and is_ic_long_final:
+    # Skip deferral on weekends — market is closed, morning entry can't quote
+    _today_wd = date.today().weekday()
+    if CS_IC_LONG_DEFER and is_ic_long_final and _today_wd < 5:
         defer_plan = {
             "trade_date": trade_date,
             "execute_date": tdate_iso,

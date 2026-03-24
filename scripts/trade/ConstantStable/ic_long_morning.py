@@ -374,30 +374,38 @@ def mark_plan_status(plan, status, result, **extra):
         print(f"CS_MORNING WARN: failed to mark plan executed ({e})")
 
 
+QUOTE_RETRIES = 4
+
+
+def _get_quote_with_retry(c, osi: str) -> tuple:
+    """Fetch bid/ask for a single OSI with retry (same pattern as placer)."""
+    for i in range(QUOTE_RETRIES):
+        try:
+            r = c.get_quote(osi)
+            if r.status_code == 200:
+                j = r.json()
+                d = list(j.values())[0] if isinstance(j, dict) else {}
+                q = d.get("quote", d)
+                b = q.get("bidPrice") or q.get("bid") or q.get("bidPriceInDouble")
+                a = q.get("askPrice") or q.get("ask") or q.get("askPriceInDouble")
+                return (float(b) if b is not None else None,
+                        float(a) if a is not None else None)
+            if r.status_code == 429:
+                wait = min(6.0, 0.5 * (2 ** i)) + random.uniform(0, 0.25)
+                time.sleep(wait)
+                continue
+            time.sleep(min(2.0, 0.35 * (2 ** i)))
+        except Exception as e:
+            print(f"CS_MORNING WARN: quote retry {i+1}/{QUOTE_RETRIES} for {osi}: {e}")
+            time.sleep(min(2.0, 0.35 * (2 ** i)))
+    return (None, None)
+
+
 def get_morning_prices(c, plan):
-    """Fetch current mid prices for both spreads from Schwab chain."""
-    # Get quotes for all 4 legs
-    symbols = [
-        plan["put_low_osi"], plan["put_high_osi"],
-        plan["call_low_osi"], plan["call_high_osi"],
-    ]
-
-    try:
-        resp = c.get_quotes(symbols)
-        if hasattr(resp, "json"):
-            quotes = resp.json()
-        else:
-            quotes = resp
-    except Exception as e:
-        print(f"CS_MORNING ERROR: quote fetch failed ({e})")
-        return None, None
-
-    def mid_price(sym):
-        q = quotes.get(sym, {})
-        ref = q.get("reference", q.get("quote", q))
-        bid = ref.get("bidPrice", 0) or 0
-        ask = ref.get("askPrice", 0) or 0
-        if bid <= 0 and ask <= 0:
+    """Fetch current mid prices for both spreads from Schwab (per-leg with retry)."""
+    def mid_price(osi):
+        bid, ask = _get_quote_with_retry(c, osi)
+        if bid is None or ask is None or (bid <= 0 and ask <= 0):
             return None
         return round((bid + ask) / 2, 2)
 
@@ -590,6 +598,12 @@ def main():
         os.chdir(_REPO_ROOT)
 
     exec_date = date.today()
+
+    # Weekend guard — market is closed, quotes will fail, don't waste the plan
+    if exec_date.weekday() >= 5:  # 5=Saturday, 6=Sunday
+        print(f"CS_MORNING SKIP: weekend ({exec_date.isoformat()}, weekday={exec_date.weekday()})")
+        return 0
+
     print("=" * 60)
     print(f"CS_MORNING IC_LONG deferred entry — {datetime.now(timezone.utc).isoformat()}")
     print(f"  account={CS_ACCOUNT_LABEL}  placer={PLACER_SCRIPT}")
@@ -642,9 +656,10 @@ def main():
     # Fetch morning prices
     put_price, call_price = get_morning_prices(c, plan)
     if put_price is None or call_price is None:
-        print("CS_MORNING SKIP: could not get morning prices")
+        print("CS_MORNING SKIP: could not get morning prices — plan stays pending for retry")
         _emit("skip", reason="NO_MORNING_PRICES", signal="SKIP")
-        mark_plan_status(plan, "skipped", "SKIP: no_morning_prices")
+        # Do NOT mark plan as skipped — keep "pending" so the next account
+        # invocation (or a manual retry) can try again with fresh quotes.
         _close_events()
         return 0
 
