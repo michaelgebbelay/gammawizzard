@@ -13,6 +13,8 @@ COPY reporting/__init__.py ${LAMBDA_TASK_ROOT}/reporting/__init__.py
 COPY reporting/events.py ${LAMBDA_TASK_ROOT}/reporting/events.py
 COPY reporting/broker_pnl.py ${LAMBDA_TASK_ROOT}/reporting/broker_pnl.py
 COPY reporting/daily_pnl_email.py ${LAMBDA_TASK_ROOT}/reporting/daily_pnl_email.py
+COPY reporting/db.py ${LAMBDA_TASK_ROOT}/reporting/db.py
+COPY reporting/schema.sql ${LAMBDA_TASK_ROOT}/reporting/schema.sql
 
 # Copy sim data layer (chain collection, no heavy deps)
 COPY sim/__init__.py ${LAMBDA_TASK_ROOT}/sim/__init__.py
