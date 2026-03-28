@@ -246,6 +246,28 @@ ACCOUNTS = {
             "CS_ACCOUNT_LABEL": "tt-individual",
         },
     },
+    "novix": {
+        "orchestrator": "scripts/trade/Novix/orchestrator.py",
+        "post_steps": [
+            "scripts/data/cs_trades_to_gsheet.py",
+        ],
+        "token_ssm_path": "/gamma/schwab/token_json",
+        "token_file": "/tmp/schwab_token.json",
+        "env_from_ssm": {
+            "SCHWAB_APP_KEY": "/gamma/schwab/app_key",
+            "SCHWAB_APP_SECRET": "/gamma/schwab/app_secret",
+        },
+        "static_env": {
+            "SCHWAB_TOKEN_PATH": "/tmp/schwab_token.json",
+            "CS_UNIT_DOLLARS": "15000",
+            "CS_ACCOUNT_LABEL": "novix",
+            "CS_COST_PER_CONTRACT": "0.97",
+            "GW_ENDPOINT": "rapi/GetNovix",
+            "CS_LOG_PATH": "/tmp/nx_trades.csv",
+            "CS_GW_READY_ET": "16:15:31",
+            "CS_GSHEET_TAB": "NovixTrades",
+        },
+    },
     "dualside": {
         "orchestrator": "scripts/trade/DualSide/orchestrator.py",
         "post_steps": [
@@ -899,7 +921,7 @@ def lambda_handler(event, context):
         print(f"WARNING: no token content from {cfg['token_ssm_path']}")
 
     # Schwab token keeper reads SCHWAB_TOKEN_JSON env var to auto-seed
-    if account in ("schwab", "ic-long-morning", "morning-check", "butterfly", "dualside"):
+    if account in ("schwab", "ic-long-morning", "morning-check", "butterfly", "dualside", "novix"):
         env["SCHWAB_TOKEN_JSON"] = token_content
     elif account == "manual":
         # Manual needs both Schwab + TT tokens
