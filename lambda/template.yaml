@@ -131,12 +131,12 @@ Resources:
         RoleArn: !GetAtt SchedulerRole.Arn
         Input: '{"account": "butterfly"}'
 
-  # ---------- Novix (4:15 PM ET, Schwab) ----------
-  NovixSchedule:
+  # ---------- Novix (4:15 PM ET, TT) ----------
+  NovixTtIraSchedule:
     Type: AWS::Scheduler::Schedule
     Properties:
-      Name: gamma-nx-schwab
-      Description: "Novix signal strategy (Schwab)"
+      Name: gamma-nx-tt-ira
+      Description: "Novix signal strategy TT IRA (5WT20360)"
       State: ENABLED
       ScheduleExpression: "cron(15 16 ? * MON-FRI *)"
       ScheduleExpressionTimezone: "America/New_York"
@@ -145,7 +145,22 @@ Resources:
       Target:
         Arn: !GetAtt TradingFunction.Arn
         RoleArn: !GetAtt SchedulerRole.Arn
-        Input: '{"account": "novix"}'
+        Input: '{"account": "novix-tt-ira"}'
+
+  NovixTtIndividualSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: gamma-nx-tt-individual
+      Description: "Novix signal strategy TT Individual (5WT09219)"
+      State: ENABLED
+      ScheduleExpression: "cron(15 16 ? * MON-FRI *)"
+      ScheduleExpressionTimezone: "America/New_York"
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt TradingFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"account": "novix-tt-individual"}'
 
   # ---------- DualSide (4:05 PM ET, Schwab only) ----------
   DualSideSchedule:
