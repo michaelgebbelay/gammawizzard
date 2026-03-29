@@ -846,21 +846,24 @@ def _handle_cs_refresh(event, t0):
 
 
 def _handle_daily_pnl(event, t0):
-    """Pull Schwab orders, compute P&L, send email.
+    """Pull Schwab + TT orders, compute P&L, send email with trade summary.
 
     Event payload: {"account": "daily-pnl", "dry_run": true/false,
                     "report_date": "YYYY-MM-DD"}
-    Needs SSM: Schwab creds (orders) + SMTP creds (email).
+    Needs SSM: Schwab creds (orders) + TT creds (orders) + SMTP creds (email).
     """
     dry_run = event.get("dry_run", False)
     report_date = event.get("report_date")
     print(f"=== daily-pnl | dry_run={dry_run} | report_date={report_date or 'auto'} ===")
 
-    # Fetch SSM params
+    # Fetch SSM params (Schwab + TT + SMTP)
     ssm_paths = {
         "SCHWAB_APP_KEY": "/gamma/schwab/app_key",
         "SCHWAB_APP_SECRET": "/gamma/schwab/app_secret",
         "_schwab_token": "/gamma/schwab/token_json",
+        "_tt_token": "/gamma/tt/token_json",
+        "TT_CLIENT_ID": "/gamma/tt/client_id",
+        "TT_CLIENT_SECRET": "/gamma/tt/client_secret",
         "SMTP_USER": "/gamma/shared/smtp_user",
         "SMTP_PASS": "/gamma/shared/smtp_pass",
     }
@@ -881,6 +884,17 @@ def _handle_daily_pnl(event, t0):
         with open(token_path, "w") as f:
             f.write(token_content)
         os.environ["SCHWAB_TOKEN_PATH"] = token_path
+
+    # Seed TT token + creds
+    tt_token = params.get("/gamma/tt/token_json", "")
+    if tt_token:
+        tt_token_path = "/tmp/tt_token.json"
+        with open(tt_token_path, "w") as f:
+            f.write(tt_token)
+        os.environ["TT_TOKEN_PATH"] = tt_token_path
+        os.environ["TT_TOKEN_JSON"] = tt_token
+    os.environ["TT_CLIENT_ID"] = params.get("/gamma/tt/client_id", "")
+    os.environ["TT_CLIENT_SECRET"] = params.get("/gamma/tt/client_secret", "")
 
     # Run P&L email
     try:

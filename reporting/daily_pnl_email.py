@@ -25,6 +25,10 @@ from datetime import datetime, date, timedelta
 from email.message import EmailMessage
 from typing import Any
 
+import re
+import sys
+from pathlib import Path
+
 from reporting.broker_pnl import (
     ET,
     API_TAG,
@@ -34,6 +38,7 @@ from reporting.broker_pnl import (
     load_orders_from_file,
     load_settlements,
     parse_filled_orders,
+    parse_osi,
 )
 
 
@@ -164,6 +169,401 @@ def _recent_business_days(report_date: date, count: int = 5) -> list[date]:
     return list(reversed(days))
 
 
+# ---------------------------------------------------------------------------
+# Today's Trade Summary (Schwab + TastyTrade)
+# ---------------------------------------------------------------------------
+
+TT_ACCOUNTS = {
+    "5WT20360": "TT-IRA",
+    "5WT09219": "TT-Indv",
+}
+
+
+def _load_tt_orders_for_date(report_date: date) -> list[dict]:
+    """Pull today's orders from both TastyTrade accounts.
+
+    Returns a list of normalised order dicts with an 'account_label' field.
+    Fails silently per-account so Schwab email still sends if TT is down.
+    """
+    tt_orders: list[dict] = []
+
+    repo_root = Path(__file__).resolve().parent.parent
+    tt_script = repo_root / "TT" / "Script"
+    if not tt_script.is_dir():
+        print("[trade_summary] TT/Script not found — skipping TT orders")
+        return tt_orders
+
+    if str(tt_script) not in sys.path:
+        sys.path.insert(0, str(tt_script))
+
+    try:
+        from tt_client import request as tt_request
+    except Exception as e:
+        print(f"[trade_summary] cannot import tt_client: {e}")
+        return tt_orders
+
+    for acct_num, label in TT_ACCOUNTS.items():
+        try:
+            os.environ["TT_ACCOUNT_NUMBER"] = acct_num
+            resp = tt_request("GET", f"/accounts/{acct_num}/orders")
+            data = resp.json()
+            items = data.get("data", {}).get("items", data) if isinstance(data, dict) else data
+            if not isinstance(items, list):
+                items = []
+
+            for order in items:
+                # TT uses kebab-case
+                status = order.get("status", "")
+                entered = order.get("received-at", order.get("created-at", ""))
+
+                # Filter to today
+                if entered:
+                    try:
+                        dt_utc = datetime.fromisoformat(
+                            entered.replace("Z", "+00:00").replace("+0000", "+00:00")
+                        )
+                        dt_et = dt_utc.astimezone(ET)
+                        if dt_et.date() != report_date:
+                            continue
+                    except Exception:
+                        continue
+                else:
+                    continue
+
+                # Parse legs
+                legs = order.get("legs", [])
+                strikes = set()
+                leg_details = []
+                for leg in legs:
+                    sym = leg.get("symbol", "")
+                    action = leg.get("action", "")
+                    qty = leg.get("quantity", 0)
+                    # Try OSI parse
+                    expiry, opt_type, strike = parse_osi(sym)
+                    if strike:
+                        strikes.add(strike)
+                    leg_details.append({
+                        "action": action,
+                        "qty": qty,
+                        "strike": strike,
+                        "option_type": opt_type,
+                        "expiry": expiry,
+                    })
+
+                sorted_strikes = sorted(strikes) if strikes else []
+                width = sorted_strikes[-1] - sorted_strikes[0] if len(sorted_strikes) >= 2 else 0
+
+                filled_qty = order.get("filled-quantity", order.get("filledQuantity", 0))
+                total_qty = order.get("size", sum(l.get("quantity", 0) for l in legs))
+                price_effect = order.get("price-effect", "")
+                price = order.get("price", 0)
+
+                tt_orders.append({
+                    "broker": "tt",
+                    "account_label": label,
+                    "account_number": acct_num,
+                    "status": status,
+                    "dt_et": dt_et,
+                    "filled_qty": int(filled_qty) if filled_qty else 0,
+                    "total_qty": int(total_qty) if total_qty else 0,
+                    "price": float(price) if price else 0,
+                    "price_effect": price_effect,
+                    "strikes": sorted_strikes,
+                    "width": width,
+                    "legs": leg_details,
+                    "num_strikes": len(sorted_strikes),
+                })
+
+            print(f"[trade_summary] TT {label}: {len([o for o in tt_orders if o['account_label'] == label])} orders today")
+        except Exception as e:
+            print(f"[trade_summary] TT {label} ERROR: {e}")
+
+    return tt_orders
+
+
+def _classify_signal(order: dict, legs: list) -> str:
+    """Determine signal type: IC_LONG, IC_SHORT, RR_LONG_PUT, RR_LONG_CALL, BF_BUY, BF_SELL."""
+    instructions = set()
+    put_legs = []
+    call_legs = []
+
+    for leg in legs:
+        action = leg.get("instruction", leg.get("action", ""))
+        instructions.add(action.upper() if action else "")
+        opt_type = leg.get("option_type", "")
+        if opt_type == "PUT":
+            put_legs.append((action.upper(), leg.get("strike", 0)))
+        elif opt_type == "CALL":
+            call_legs.append((action.upper(), leg.get("strike", 0)))
+
+    # Butterfly (3 strikes)
+    num_strikes = order.get("num_strikes", len(set(l.get("strike", 0) for l in legs if l.get("strike"))))
+    if num_strikes == 3:
+        # Net debit = BUY, net credit = SELL
+        price_effect = order.get("price_effect", order.get("order_type", ""))
+        if "CREDIT" in str(price_effect).upper():
+            return "BF_SELL"
+        return "BF_BUY"
+
+    # Vertical / IC / RR (2 strikes)
+    has_buy_open = any("BUY" in i and "OPEN" in i for i in instructions)
+    has_sell_open = any("SELL" in i and "OPEN" in i for i in instructions)
+
+    # Determine direction per side: in a vertical spread both BUY/SELL exist.
+    # For puts: buying the higher-strike put = debit (long put spread).
+    # For calls: buying the lower-strike call = debit (long call spread).
+    def _side_is_long(side_legs: list, option_type: str) -> bool:
+        if len(side_legs) < 2:
+            return any("BUY" in a for a, _ in side_legs)
+        sorted_by_strike = sorted(side_legs, key=lambda x: x[1])
+        if option_type == "PUT":
+            # Higher-strike put is more expensive; BUY it = debit = long
+            higher = sorted_by_strike[-1]
+            return "BUY" in higher[0]
+        else:
+            # Lower-strike call is more expensive; BUY it = debit = long
+            lower = sorted_by_strike[0]
+            return "BUY" in lower[0]
+
+    put_long = _side_is_long(put_legs, "PUT") if put_legs else None
+    call_long = _side_is_long(call_legs, "CALL") if call_legs else None
+
+    if put_legs and call_legs:
+        # IC or RR (has both put and call sides)
+        if put_long and call_long:
+            return "IC_LONG"
+        if not put_long and not call_long:
+            return "IC_SHORT"
+        if put_long and not call_long:
+            return "RR_LONG_PUT"
+        if not put_long and call_long:
+            return "RR_LONG_CALL"
+    elif put_legs:
+        # Single-side vertical: both BUY/SELL legs exist. Use order type for direction.
+        order_type = order.get("order_type", order.get("price_effect", ""))
+        if "CREDIT" in str(order_type).upper():
+            return "PUT_CREDIT"
+        return "PUT_DEBIT"
+    elif call_legs:
+        order_type = order.get("order_type", order.get("price_effect", ""))
+        if "CREDIT" in str(order_type).upper():
+            return "CALL_CREDIT"
+        return "CALL_DEBIT"
+
+    # Fallback: use order type
+    order_type = order.get("order_type", order.get("price_effect", ""))
+    if "CREDIT" in str(order_type).upper():
+        return "SHORT"
+    return "LONG"
+
+
+def _fill_status_str(status: str, filled_qty: int, total_qty: int) -> str:
+    status_upper = status.upper()
+    if status_upper == "FILLED":
+        if total_qty > 0 and filled_qty < total_qty:
+            return f"PARTIAL ({filled_qty}/{total_qty})"
+        return "FILLED"
+    if status_upper in ("CANCELLED", "CANCELED"):
+        return "CANCELED"
+    if status_upper == "REJECTED":
+        return "REJECTED"
+    if status_upper == "EXPIRED":
+        return "EXPIRED"
+    if status_upper in ("WORKING", "LIVE", "RECEIVED"):
+        return "WORKING"
+    return status_upper or "UNKNOWN"
+
+
+def _strikes_str(strikes: list, legs: list) -> str:
+    if not strikes:
+        return "—"
+    if len(strikes) == 3:
+        return "/".join(f"{s:.0f}" for s in strikes)
+    if len(strikes) == 2:
+        # Show as put side / call side
+        return f"{strikes[0]:.0f}/{strikes[1]:.0f}"
+    return "/".join(f"{s:.0f}" for s in strikes)
+
+
+def _build_today_trades_section(
+    raw_schwab_orders: list[dict],
+    tt_orders: list[dict],
+    report_date: date,
+) -> str:
+    """Build the 'Today's Trades' section for the email."""
+    lines = [
+        "Today's Trades",
+        f"{'Account':<10} {'Strategy':<16} {'Signal':<14} {'Strikes':<20} "
+        f"{'Fill':>8} {'Price':>8} {'$/Ct':>8} {'Status':<10}",
+        f"{'-' * 10} {'-' * 16} {'-' * 14} {'-' * 20} "
+        f"{'-' * 8} {'-' * 8} {'-' * 8} {'-' * 10}",
+    ]
+
+    trade_count = 0
+    schwab_strategies_seen: set[str] = set()
+    tt_strategies_seen: set[str] = set()
+
+    # --- Schwab orders ---
+    for order in raw_schwab_orders:
+        entered = order.get("enteredTime", order.get("closeTime", ""))
+        if entered:
+            try:
+                dt_utc = datetime.fromisoformat(entered.replace("+0000", "+00:00"))
+                dt_et = dt_utc.astimezone(ET)
+                if dt_et.date() != report_date:
+                    continue
+            except Exception:
+                continue
+        else:
+            continue
+
+        # Only show opening orders (not closes)
+        legs_raw = order.get("orderLegCollection", [])
+        instructions = set(l.get("instruction", "") for l in legs_raw)
+        if all("CLOSE" in i for i in instructions if i):
+            continue
+
+        status = order.get("status", "")
+        strategy = classify_order(order)
+        if strategy in ("manual", "butterfly_manual"):
+            continue
+
+        # Parse legs for signal classification
+        parsed_legs = []
+        strikes = set()
+        for leg in legs_raw:
+            inst = leg.get("instrument", {})
+            expiry, opt_type, strike = parse_osi(inst.get("symbol", ""))
+            if strike:
+                strikes.add(strike)
+            parsed_legs.append({
+                "instruction": leg.get("instruction", ""),
+                "option_type": opt_type,
+                "strike": strike,
+                "expiry": expiry,
+            })
+
+        sorted_strikes = sorted(strikes)
+        norm_order = {
+            "order_type": order.get("orderType", ""),
+            "num_strikes": len(sorted_strikes),
+            "price_effect": order.get("orderType", ""),
+        }
+        signal = _classify_signal(norm_order, parsed_legs)
+        filled_qty = int(order.get("filledQuantity", 0))
+        total_qty = max(filled_qty, max((l.get("quantity", 0) for l in legs_raw), default=0))
+        fill_str = _fill_status_str(status, filled_qty, total_qty)
+        price = order.get("price", 0)
+        price_str = f"${price:.2f}" if price else "—"
+        dollar_str = f"${price * 100:.0f}" if price else "—"
+
+        strategy_label = {
+            "constantstable": "ConstantStable",
+            "cs_morning": "CS Morning",
+            "dualside": "DualSide",
+            "butterfly": "Butterfly",
+        }.get(strategy, strategy)
+
+        # Build fail reason for non-FILLED orders
+        reason = ""
+        status_upper = status.upper()
+        if status_upper == "REJECTED":
+            reason = order.get("statusDescription", "") or "broker rejected"
+        elif status_upper in ("CANCELED", "CANCELLED"):
+            cancel_qty = order.get("cancelledQuantity", order.get("canceledQuantity", 0))
+            reason = f"canceled ({cancel_qty} qty)" if cancel_qty else "canceled by system"
+        elif status_upper == "EXPIRED":
+            reason = "order expired unfilled"
+        elif status_upper in ("WORKING", "QUEUED", "PENDING_ACTIVATION"):
+            reason = "still working (not yet filled)"
+
+        suffix = f" [{reason}]" if reason else ""
+
+        lines.append(
+            f"{'Schwab':<10} {strategy_label:<16} {signal:<14} "
+            f"{_strikes_str(sorted_strikes, parsed_legs):<20} "
+            f"{filled_qty:>8} {price_str:>8} {dollar_str:>8} {fill_str}{suffix}"
+        )
+        trade_count += 1
+        schwab_strategies_seen.add(strategy)
+
+    # --- TT orders ---
+    for order in tt_orders:
+        # Only show opening orders
+        legs = order.get("legs", [])
+        actions = set(l.get("action", "").upper() for l in legs)
+        if all("CLOSE" in a for a in actions if a):
+            continue
+
+        status = order.get("status", "")
+        signal = _classify_signal(order, legs)
+        filled_qty = order["filled_qty"]
+        total_qty = order["total_qty"]
+        fill_str = _fill_status_str(status, filled_qty, total_qty)
+        price = order["price"]
+        price_str = f"${price:.2f}" if price else "—"
+        dollar_str = f"${price * 100:.0f}" if price else "—"
+
+        # Classify strategy by width
+        width = order["width"]
+        if width == 10:
+            strategy_label = "DualSide"
+        elif order["num_strikes"] == 3:
+            strategy_label = "Butterfly"
+        else:
+            strategy_label = "ConstantStable"
+
+        # Fail reason for TT
+        reason = ""
+        status_upper = status.upper()
+        if status_upper == "REJECTED":
+            reason = "broker rejected"
+        elif status_upper in ("CANCELLED", "CANCELED"):
+            reason = "canceled"
+        elif status_upper == "EXPIRED":
+            reason = "order expired unfilled"
+        elif status_upper in ("LIVE", "RECEIVED"):
+            reason = "still working (not yet filled)"
+
+        suffix = f" [{reason}]" if reason else ""
+
+        lines.append(
+            f"{order['account_label']:<10} {strategy_label:<16} {signal:<14} "
+            f"{_strikes_str(order['strikes'], legs):<20} "
+            f"{filled_qty:>8} {price_str:>8} {dollar_str:>8} {fill_str}{suffix}"
+        )
+        trade_count += 1
+        tt_strategies_seen.add(order["account_label"])
+
+    if trade_count == 0:
+        lines.append("No automated trades today.")
+
+    # --- Missing strategies check ---
+    # On weekdays, flag strategies with no orders at all
+    if report_date.weekday() < 5:
+        missing = []
+        if "constantstable" not in schwab_strategies_seen:
+            missing.append("Schwab CS — no order found")
+        if "TT-IRA" not in tt_strategies_seen:
+            missing.append("TT-IRA CS — no order found")
+        if "TT-Indv" not in tt_strategies_seen:
+            missing.append("TT-Indv CS — no order found")
+        # DualSide and Butterfly run on Schwab only
+        if "dualside" not in schwab_strategies_seen:
+            missing.append("Schwab DualSide — no order found")
+        # Butterfly runs daily but may legitimately SKIP
+        if missing:
+            lines.append("")
+            lines.append("Missing (no orders seen at broker):")
+            for m in missing:
+                lines.append(f"  ! {m}")
+            lines.append("  Check: Lambda logs, token expiry, buying power, dry-run flags")
+
+    lines.append(f"Legend: Price=per-share, $/Ct=per-contract | Source: Broker APIs")
+    lines.append("")
+    return "\n".join(lines)
+
+
 EMAIL_GROUPS = (
     {
         "key": "constantstable",
@@ -186,7 +586,11 @@ EMAIL_GROUPS = (
 )
 
 
-def _build_email(positions: list[dict], report_date: date) -> tuple[str, str]:
+def _build_email(
+    positions: list[dict],
+    report_date: date,
+    today_trades_section: str = "",
+) -> tuple[str, str]:
     """Build the portfolio-health email.
 
     Returns (subject, body).
@@ -244,10 +648,14 @@ def _build_email(positions: list[dict], report_date: date) -> tuple[str, str]:
                     break
 
     lines = [
-        f"Gamma Portfolio Pulse (Schwab) — {as_of_str}",
+        f"Gamma Portfolio Pulse — {as_of_str}",
         f"{'=' * 50}",
         "",
     ]
+
+    if today_trades_section:
+        lines.append(today_trades_section)
+        lines.append("")
 
     lines.append("Portfolio")
     lines.append(f"{'Window':<10} {'Trades':>7} {'Win%':>6} {'P&L':>12} {'Avg/Trade':>12}")
@@ -605,8 +1013,21 @@ def run_daily_pnl_email(
           f"({sum(1 for p in auto if p['exit_method'] in ('EXPIRED','CLOSED_EARLY'))} settled, "
           f"{sum(1 for p in auto if p['exit_method'] == 'OPEN')} open)")
 
+    # Today's trade summary (Schwab + TT)
+    tt_orders: list[dict] = []
+    try:
+        tt_orders = _load_tt_orders_for_date(report_date)
+    except Exception as e:
+        print(f"[daily_pnl] TT order load ERROR (non-fatal): {e}")
+
+    today_trades_section = _build_today_trades_section(
+        raw_schwab_orders=raw_orders,
+        tt_orders=tt_orders,
+        report_date=report_date,
+    )
+
     # Build and send email
-    subject, body = _build_email(auto, report_date)
+    subject, body = _build_email(auto, report_date, today_trades_section=today_trades_section)
     result = send_pnl_email(subject, body, dry_run=dry_run)
     result["source"] = source
     result["positions"] = len(auto)
