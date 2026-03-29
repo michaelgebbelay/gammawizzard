@@ -695,6 +695,9 @@ def _handle_sim_collect(event):
             for exp_key in raw.get(side, {}):
                 exp_date_str = exp_key.split(":")[0]
                 all_exp_dates.add(exp_date_str)
+        # Skip today's expiration (0DTE) — these contracts are near-worthless
+        # at close and break SE computation.  1st remaining exp = 1DTE = close5.json.
+        all_exp_dates.discard(today_str)
         sorted_exps = sorted(all_exp_dates)
         # Map each expiration date to its ordinal DTE (1-based)
         exp_to_dte = {exp: i + 1 for i, exp in enumerate(sorted_exps)}
