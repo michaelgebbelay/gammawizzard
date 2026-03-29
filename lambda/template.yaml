@@ -36,6 +36,7 @@ Resources:
           GAMMA_EVENT_BUCKET: !Ref SimCacheBucket
           GAMMA_EVENT_PREFIX: reporting/events
           CS_IC_LONG_FILTER: "1"
+          WARMUP_CONTAINERS: "5"
       Policies:
         # Read all /gamma/* params
         - SSMParameterReadPolicy:
@@ -45,6 +46,11 @@ Resources:
             - Effect: Allow
               Action: ssm:PutParameter
               Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/gamma/*/token_json"
+        # Self-invoke for multi-container warmup
+        - Statement:
+            - Effect: Allow
+              Action: lambda:InvokeFunction
+              Resource: !GetAtt TradingFunction.Arn
         # S3 access for sim chain cache
         - S3CrudPolicy:
             BucketName: !Ref SimCacheBucket
@@ -89,8 +95,8 @@ Resources:
     Type: AWS::Scheduler::Schedule
     Properties:
       Name: gamma-cs-tt-ira
-      Description: "ConstantStable TT IRA (5WT20360)"
-      State: ENABLED
+      Description: "ConstantStable TT IRA (5WT20360) — DISABLED, switched to Novix"
+      State: DISABLED
       ScheduleExpression: !Ref ScheduleTime
       ScheduleExpressionTimezone: "America/New_York"
       FlexibleTimeWindow:
@@ -151,8 +157,8 @@ Resources:
     Type: AWS::Scheduler::Schedule
     Properties:
       Name: gamma-nx-tt-individual
-      Description: "Novix signal strategy TT Individual (5WT09219)"
-      State: ENABLED
+      Description: "Novix signal strategy TT Individual (5WT09219) — DISABLED, staying with CS"
+      State: DISABLED
       ScheduleExpression: "cron(13 16 ? * MON-FRI *)"
       ScheduleExpressionTimezone: "America/New_York"
       FlexibleTimeWindow:
@@ -215,8 +221,8 @@ Resources:
     Type: AWS::Scheduler::Schedule
     Properties:
       Name: gamma-cs-ic-long-morning-tt-ira
-      Description: "IC_LONG deferred morning entry — TT IRA (5WT20360)"
-      State: ENABLED
+      Description: "IC_LONG deferred morning entry — TT IRA (5WT20360) — DISABLED, switched to Novix"
+      State: DISABLED
       ScheduleExpression: "cron(35 9 ? * MON-FRI *)"
       ScheduleExpressionTimezone: "America/New_York"
       FlexibleTimeWindow:
@@ -273,6 +279,38 @@ Resources:
         Arn: !GetAtt TradingFunction.Arn
         RoleArn: !GetAtt SchedulerRole.Arn
         Input: '{"account": "daily-pnl"}'
+
+  # ---------- CS Reporting Refresh (5:00 PM ET, after all trades settle) ----------
+  CsRefreshSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: gamma-cs-refresh
+      Description: "CS full reporting refresh: signal + tracking + summary + performance + charts"
+      State: ENABLED
+      ScheduleExpression: "cron(0 17 ? * MON-FRI *)"
+      ScheduleExpressionTimezone: "America/New_York"
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt TradingFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"account": "cs-refresh"}'
+
+  # ---------- CS Morning Retry (9:00 AM ET, catch overnight fill updates) ----------
+  CsRefreshMorningSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: gamma-cs-refresh-morning
+      Description: "CS morning reporting retry: pick up any missed fills from prior day"
+      State: ENABLED
+      ScheduleExpression: "cron(0 9 ? * MON-FRI *)"
+      ScheduleExpressionTimezone: "America/New_York"
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt TradingFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"account": "cs-refresh"}'
 
   # ---------- S3 Bucket for Sim Chain Cache ----------
   SimCacheBucket:

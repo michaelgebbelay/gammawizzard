@@ -795,6 +795,56 @@ def _handle_sim_collect(event):
 # ---------------------------------------------------------------------------
 
 
+def _handle_cs_refresh(event, t0):
+    """Run cs_refresh_all.py as a standalone post-close reporting job.
+
+    Event payload: {"account": "cs-refresh", "skip": "gw_signal,chart_data"}
+    The script loads its own SSM params via --from-ssm.
+    """
+    skip = event.get("skip", "")
+    print(f"=== cs-refresh | skip={skip or 'none'} ===")
+
+    script = os.path.join(TASK_ROOT, "scripts/data/cs_refresh_all.py")
+    cmd = [sys.executable, script, "--from-ssm"]
+    if skip:
+        cmd += ["--skip", skip]
+
+    env = dict(os.environ)
+    env["PYTHONUNBUFFERED"] = "1"
+
+    try:
+        result = subprocess.run(
+            cmd,
+            env=env,
+            cwd=TASK_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        for line in (result.stdout or "").rstrip().split("\n"):
+            print(line)
+        if result.stderr:
+            for line in result.stderr.rstrip().split("\n"):
+                print(f"ERR: {line}")
+        rc = result.returncode
+    except subprocess.TimeoutExpired:
+        rc = 124
+        print("CS_REFRESH: TIMEOUT after 300s")
+    except Exception as e:
+        rc = 1
+        print(f"CS_REFRESH: ERROR: {e}")
+
+    duration = round(time.time() - t0, 1)
+    status = "ok" if rc == 0 else "error"
+    print(f"=== DONE cs-refresh | status={status} | {duration}s ===")
+    return {
+        "status": status,
+        "account": "cs-refresh",
+        "returncode": rc,
+        "duration_s": duration,
+    }
+
+
 def _handle_daily_pnl(event, t0):
     """Pull Schwab orders, compute P&L, send email.
 
@@ -873,10 +923,35 @@ def lambda_handler(event, context):
         )
     ).strip().lower() in ("1", "true", "yes", "y", "on")
 
-    # Warm-up ping — just loads the container, no work done
+    # Warm-up ping — pre-warm containers for parallel trade invocations.
+    # The first warmup invocation spawns additional async self-invocations
+    # so that Lambda provisions enough containers for all concurrent accounts.
     if account == "warmup":
-        print("WARMUP ping — container is warm")
-        return {"status": "ok", "account": "warmup", "duration_s": 0}
+        depth = event.get("warmup_depth", 0)
+        # Count how many concurrent trade schedules fire at the same time
+        # (schwab + tt-ira + tt-individual = 3, plus novix variants)
+        target_containers = int(os.environ.get("WARMUP_CONTAINERS", "5"))
+        if depth == 0 and target_containers > 1:
+            # Spawn (N-1) additional invocations to force parallel containers
+            fn_name = context.function_name if context else os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "")
+            if fn_name:
+                lam = boto3.client("lambda")
+                for i in range(1, target_containers):
+                    try:
+                        lam.invoke(
+                            FunctionName=fn_name,
+                            InvocationType="Event",  # async, non-blocking
+                            Payload=json.dumps({"account": "warmup", "warmup_depth": i}).encode(),
+                        )
+                    except Exception as e:
+                        print(f"WARMUP spawn {i} failed: {e}")
+                print(f"WARMUP: spawned {target_containers - 1} additional containers")
+        print(f"WARMUP ping — container is warm (depth={depth})")
+        # Hold the container alive briefly so Lambda doesn't reclaim it
+        # before the sibling warmups finish initializing
+        if depth == 0:
+            time.sleep(3)
+        return {"status": "ok", "account": "warmup", "depth": depth, "duration_s": round(time.time() - t0, 1)}
 
     # Sim chain collection — separate flow (no subprocess, writes to S3)
     if account == "sim-collect":
@@ -885,6 +960,10 @@ def lambda_handler(event, context):
     # Daily P&L email — pulls Schwab orders, computes P&L, sends email
     if account == "daily-pnl":
         return _handle_daily_pnl(event, t0)
+
+    # CS reporting refresh — runs full pipeline independently of trading accounts
+    if account == "cs-refresh":
+        return _handle_cs_refresh(event, t0)
 
     # Safety switch: keep ConstantStable disabled on Schwab while TT stays active.
     if account == "schwab" and disable_schwab_cs:
