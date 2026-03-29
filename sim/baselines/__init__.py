@@ -1,11 +1,14 @@
-"""Baseline (mechanical) trading bots for benchmarking."""
+"""Baseline (mechanical) trading bots for benchmarking (v14)."""
 
 from sim.baselines.hold_cash import HoldCash
-from sim.baselines.mechanical_ic import MechanicalIC
-from sim.baselines.random_entry import RandomEntry
-from sim.baselines.regime_bot import RegimeBot
+from sim.baselines.narrow_ic import NarrowIC
+from sim.baselines.wide_ic import WideIC
+from sim.baselines.directional_put import DirectionalPut
+from sim.baselines.iron_fly import IronFly
 
-ALL_BASELINES = [MechanicalIC, RandomEntry, HoldCash, RegimeBot]
+ALL_BASELINES = [NarrowIC, WideIC, DirectionalPut, IronFly, HoldCash]
 
-__all__ = ["BaseBaseline", "MechanicalIC", "RandomEntry", "HoldCash", "RegimeBot",
-           "ALL_BASELINES"]
+__all__ = [
+    "BaseBaseline", "HoldCash", "NarrowIC", "WideIC",
+    "DirectionalPut", "IronFly", "ALL_BASELINES",
+]

@@ -320,6 +320,15 @@ def _spread_intrinsic(strikes: list[float], option_types: list[str],
         else:
             return max(0, settlement - low_s) - max(0, settlement - high_s)
 
+    if len(strikes) == 1:
+        # Single leg (naked option)
+        strike = strikes[0]
+        otype = option_types[0] if option_types else "PUT"
+        if otype == "PUT":
+            return max(0, strike - settlement)
+        else:
+            return max(0, settlement - strike)
+
     return 0.0
 
 
@@ -334,7 +343,9 @@ def build_positions(
         as_of = datetime.now(ET).date()
 
     auto_strategies = ("constantstable", "dualside", "cs_morning", "butterfly")
-    opens = [t for t in trades if t["strategy"] in auto_strategies and t["is_opening"]]
+    manual_strategies = ("manual", "butterfly_manual")
+    all_strategies = auto_strategies + manual_strategies
+    opens = [t for t in trades if t["strategy"] in all_strategies and t["is_opening"]]
     closes = [t for t in trades if t["is_closing"]]
 
     # Index closes by (strikes_tuple, expiries_tuple, option_types_tuple) for matching
@@ -434,9 +445,12 @@ STRATEGY_LABELS = {
     "dualside": "DualSide",
     "cs_morning": "CS Morning",
     "butterfly": "Butterfly Tuesday",
+    "manual": "Discretionary",
+    "butterfly_manual": "Discretionary Butterfly",
 }
 
-STRATEGY_ORDER = ("constantstable", "dualside", "cs_morning", "butterfly")
+STRATEGY_ORDER = ("constantstable", "dualside", "cs_morning", "butterfly",
+                  "manual", "butterfly_manual")
 
 
 def _fmt(val: float) -> str:

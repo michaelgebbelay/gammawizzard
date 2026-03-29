@@ -513,40 +513,26 @@ def load_feature_pack(trading_date: date, phase: str) -> Optional[FeaturePack]:
 # ---------------------------------------------------------------------------
 
 def format_feature_pack(fp: FeaturePack) -> str:
-    """Format FeaturePack as concise text for agent context window."""
+    """Format FeaturePack as concise text for agent context window.
+
+    Layout: headline signals first (IV premium, VIX1D), then EM, skew, flow.
+    """
     lines = []
 
-    # Spot context
-    if fp.prev_close > 0:
-        lines.append(f"Gap: {fp.gap_pts:+.2f}pts ({fp.gap_pct:+.2f}%)")
-    if fp.day_range_pts > 0:
-        range_line = f"Day Range: {fp.day_range_pts:.2f}pts"
-        # Only show range position at close (full day data)
-        if fp.range_is_full_day and fp.range_position_pct is not None:
-            range_line += f"  |  Close Pos: {fp.range_position_pct:.0%}"
-        lines.append(range_line)
-
-    # Expected move
-    if fp.atm_straddle_mid > 0:
-        em_pct = fp.atm_straddle_mid / fp.spot * 100 if fp.spot > 0 else 0
-        lines.append(
-            f"EM (straddle): +/-{fp.atm_straddle_mid:.2f}pts ({em_pct:.2f}%)"
-        )
-        lines.append(
-            f"  0.5 EM: {fp.em_0p5_dn_strike:.0f} / {fp.em_0p5_up_strike:.0f}"
-            f"  |  1.0 EM: {fp.em_1p0_dn_strike:.0f} / {fp.em_1p0_up_strike:.0f}"
-        )
-
-    # IV
-    iv_parts = []
+    # --- HEADLINE: Vol Premium Assessment (the key edge signal) ---
+    vol_headline_parts = []
     if fp.iv_atm > 0:
-        iv_parts.append(f"ATM IV: {fp.iv_atm:.1f}%")
+        vol_headline_parts.append(f"ATM IV: {fp.iv_atm:.1f}%")
     if fp.vix_1d is not None:
-        iv_parts.append(f"VIX1D: {fp.vix_1d * 100:.1f}%")
-    if iv_parts:
-        lines.append("  |  ".join(iv_parts))
+        vix1d_pct = fp.vix_1d * 100
+        vol_headline_parts.append(f"VIX1D: {vix1d_pct:.1f}%")
+        if fp.iv_atm > 0:
+            iv_premium = fp.iv_atm - vix1d_pct
+            vol_headline_parts.append(f"IV-VIX1D spread: {iv_premium:+.1f}%")
+    if vol_headline_parts:
+        lines.append("  |  ".join(vol_headline_parts))
 
-    # Realized vol
+    # --- Realized Vol (IV vs RV = implied vol premium) ---
     rv_parts = []
     if fp.rv is not None:
         rv_parts.append(f"RV: {fp.rv * 100:.2f}%")
@@ -557,9 +543,34 @@ def format_feature_pack(fp: FeaturePack) -> str:
     if fp.rv20 is not None:
         rv_parts.append(f"RV20: {fp.rv20 * 100:.2f}%")
     if rv_parts:
-        lines.append("  |  ".join(rv_parts))
+        rv_line = "  |  ".join(rv_parts)
+        # Add IV-RV spread if we have both
+        if fp.iv_atm > 0 and fp.rv is not None:
+            iv_rv_spread = fp.iv_atm - fp.rv * 100
+            rv_line += f"  →  IV-RV spread: {iv_rv_spread:+.1f}%"
+        lines.append(rv_line)
 
-    # Skew
+    # --- Expected Move ---
+    if fp.atm_straddle_mid > 0:
+        em_pct = fp.atm_straddle_mid / fp.spot * 100 if fp.spot > 0 else 0
+        lines.append(
+            f"EM (straddle): +/-{fp.atm_straddle_mid:.2f}pts ({em_pct:.2f}%)"
+        )
+        lines.append(
+            f"  0.5 EM: {fp.em_0p5_dn_strike:.0f} / {fp.em_0p5_up_strike:.0f}"
+            f"  |  1.0 EM: {fp.em_1p0_dn_strike:.0f} / {fp.em_1p0_up_strike:.0f}"
+        )
+
+    # --- Spot context ---
+    if fp.prev_close > 0:
+        lines.append(f"Gap: {fp.gap_pts:+.2f}pts ({fp.gap_pct:+.2f}%)")
+    if fp.day_range_pts > 0:
+        range_line = f"Day Range: {fp.day_range_pts:.2f}pts"
+        if fp.range_is_full_day and fp.range_position_pct is not None:
+            range_line += f"  |  Close Pos: {fp.range_position_pct:.0%}"
+        lines.append(range_line)
+
+    # --- Skew ---
     skew_parts = []
     if fp.risk_reversal_25d != 0:
         skew_parts.append(f"25d RR: {fp.risk_reversal_25d:+.2f}")
@@ -570,13 +581,21 @@ def format_feature_pack(fp: FeaturePack) -> str:
     if skew_parts:
         lines.append("  |  ".join(skew_parts))
 
-    # Term structure
+    # --- Term structure ---
     if fp.iv_term is not None:
         lines.append(f"IV Term (1DTE-0DTE): {fp.iv_term:+.2f}")
     if fp.em_term is not None:
         lines.append(f"EM Term (1DTE-0DTE): {fp.em_term:+.2f}pts")
 
-    # OI walls
+    # --- Flow (OI walls, GEX, ratios) ---
+    flow_parts = []
+    if fp.put_call_volume_ratio > 0:
+        flow_parts.append(f"P/C Vol: {fp.put_call_volume_ratio:.2f}")
+    if fp.put_call_oi_ratio > 0:
+        flow_parts.append(f"P/C OI: {fp.put_call_oi_ratio:.2f}")
+    if flow_parts:
+        lines.append("  |  ".join(flow_parts))
+
     wall_parts = []
     if fp.oi_walls_puts:
         top = fp.oi_walls_puts[0]
@@ -589,14 +608,5 @@ def format_feature_pack(fp: FeaturePack) -> str:
         wall_parts.append(f"GEX Peak: {top[0]:.0f}")
     if wall_parts:
         lines.append("  |  ".join(wall_parts))
-
-    # Ratios
-    ratio_parts = []
-    if fp.put_call_oi_ratio > 0:
-        ratio_parts.append(f"P/C OI: {fp.put_call_oi_ratio:.2f}")
-    if fp.put_call_volume_ratio > 0:
-        ratio_parts.append(f"P/C Vol: {fp.put_call_volume_ratio:.2f}")
-    if ratio_parts:
-        lines.append("  |  ".join(ratio_parts))
 
     return "\n".join(lines) if lines else "No features (skeleton chain)."

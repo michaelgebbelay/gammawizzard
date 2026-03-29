@@ -81,20 +81,29 @@ def load_from_cache(trading_date: Union[str, date],
 
     raw_chain = wrapper.get("chain", {})
     vix = wrapper.get("vix", 0.0)
+    vix1d = wrapper.get("vix1d", 0.0)
 
-    # Inject VIX into raw chain for parser consumption
+    # Inject VIX/VIX1D into raw chain for parser consumption
     raw_chain["_vix"] = vix
+    raw_chain["_vix1d"] = vix1d
     return raw_chain
 
 
 def has_complete_day(trading_date: Union[str, date],
-                     require_close5: bool = True) -> bool:
-    """Check if all required phases are cached for a given date.
+                     require_close5: bool = True,
+                     backtest: bool = False) -> bool:
+    """Check if required phases are cached for a given date.
 
     Args:
         trading_date: Date to check.
-        require_close5: If True, close5 must also be present (v13 dual-window).
+        require_close5: If True, close5 must also be present.
+        backtest: If True, only require close5 (or close as fallback).
+                  Used for CBOE historical data which only has one snapshot.
     """
+    if backtest:
+        # For backtest mode, just need close5 or close
+        return (cache_path(trading_date, "close5").exists()
+                or cache_path(trading_date, "close").exists())
     phases = ["open", "mid", "close"]
     if require_close5:
         phases.append("close5")
@@ -120,7 +129,8 @@ def list_cached_dates() -> List[date]:
 
 
 def find_contiguous_windows(min_length: int = 80,
-                            require_close5: bool = True) -> List[List[str]]:
+                            require_close5: bool = True,
+                            backtest: bool = False) -> List[List[str]]:
     """Find all contiguous windows of complete trading days.
 
     A window is contiguous if each day follows the previous trading day
@@ -129,13 +139,15 @@ def find_contiguous_windows(min_length: int = 80,
     Args:
         min_length: Minimum number of contiguous days.
         require_close5: If True, close5 must be cached for each day.
+        backtest: If True, only require close5 (or close) per day.
 
     Returns:
         List of contiguous date windows (as ISO strings), sorted by
         length (longest first).
     """
     complete_dates = [d for d in list_cached_dates()
-                      if has_complete_day(d, require_close5=require_close5)]
+                      if has_complete_day(d, require_close5=require_close5,
+                                          backtest=backtest)]
     if not complete_dates:
         return []
 

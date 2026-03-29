@@ -280,6 +280,22 @@ Resources:
         RoleArn: !GetAtt SchedulerRole.Arn
         Input: '{"account": "daily-pnl"}'
 
+  # ---------- Weekly P&L Report (Saturday 9:00 AM ET) ----------
+  WeeklyPnlSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: gamma-weekly-pnl
+      Description: "Weekly P&L report: Schwab expired positions + discretionary, emailed Saturday morning"
+      State: ENABLED
+      ScheduleExpression: "cron(0 9 ? * SAT *)"
+      ScheduleExpressionTimezone: "America/New_York"
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt TradingFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"account": "weekly-pnl"}'
+
   # ---------- CS Reporting Refresh (5:00 PM ET, after all trades settle) ----------
   CsRefreshSchedule:
     Type: AWS::Scheduler::Schedule

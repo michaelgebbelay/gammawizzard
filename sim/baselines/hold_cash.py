@@ -11,18 +11,15 @@ from sim.baselines.base_baseline import BaseBaseline
 
 
 class HoldCash(BaseBaseline):
-    """Bot 3: Never trades. Earns risk-free rate on full balance.
+    """Never trades. Earns risk-free rate on full balance.
 
     Acts as the zero-skill benchmark. If an agent can't beat this,
     they're destroying value through trading costs and bad selection.
-
-    Interest accrual is handled by Account.accrue_risk_free() in the
-    orchestrator — this bot simply returns None every session.
     """
 
     def __init__(self, agent_id: str = "bot-hold-cash"):
         super().__init__(agent_id)
 
     def decide(self, chain: ChainSnapshot, account: Account,
-               session_id: int, track: str) -> Optional[Order]:
+               session_id: int) -> Optional[Order]:
         return None

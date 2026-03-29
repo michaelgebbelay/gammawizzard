@@ -75,7 +75,7 @@ except Exception as e:
 
 TAG = "CS_TT_CLOSE"
 CLOSE_TAB = "CS_TT_Close"
-CLOSE_HEADERS = ["expiry", "account", "status", "close_net"]
+CLOSE_HEADERS = ["expiry", "account", "status", "close_net", "close_qty", "close_scope"]
 
 TT_ACCOUNT_LABELS = {
     "5WT09219": "tt-individual",
@@ -180,8 +180,8 @@ def _osi_expiry_iso(sym: str):
 def fetch_filled_close_orders(acct_num: str, days_back: int = 7) -> dict:
     """Fetch filled close orders from TT for the last N days.
 
-    Returns: {expiry_iso: close_net}
-      close_net: positive = credit received, negative = debit paid (SPX points)
+    Returns: {expiry_iso: {"close_net": float, "close_qty": int, "close_scope": str}}
+      close_scope: "full_ic" when close has both PUT+CALL legs, else "partial"
     """
     start = (date.today() - timedelta(days=days_back)).isoformat()
     j = _tt_get_json(
@@ -218,20 +218,44 @@ def fetch_filled_close_orders(acct_num: str, days_back: int = 7) -> dict:
 
         # close_net: positive = credit received, negative = debit paid
         close_net = price if price_effect == "credit" else -price
+        close_qty = int(safe_float(order.get("size"), 0) or 0)
 
-        # Extract expiry from leg symbols
+        # Extract expiry from leg symbols and classify close scope
         expiry_iso = None
+        has_put = False
+        has_call = False
         for leg in legs:
             sym = (leg.get("symbol") or "").strip()
             if sym:
+                s = re.sub(r"\s+", "", sym.upper())
+                if re.search(r"\d{6}P\d+", s):
+                    has_put = True
+                if re.search(r"\d{6}C\d+", s):
+                    has_call = True
                 exp = _osi_expiry_iso(sym)
                 if exp:
                     expiry_iso = exp
-                    break
+        close_scope = "full_ic" if (has_put and has_call and len(legs) >= 4) else "partial"
+        ts = int(safe_float(order.get("updated-at"), 0) or 0)
 
-        if expiry_iso and expiry_iso not in result:
-            result[expiry_iso] = close_net
-            log(f"closed {expiry_iso}: net={close_net:+.2f} ({price_effect})")
+        if not expiry_iso:
+            continue
+
+        cur = result.get(expiry_iso)
+        cand = {
+            "close_net": close_net,
+            "close_qty": close_qty,
+            "close_scope": close_scope,
+            "_ts": ts,
+        }
+        # Prefer full IC closes; otherwise keep latest for the expiry.
+        if (
+            cur is None
+            or (cur.get("close_scope") != "full_ic" and close_scope == "full_ic")
+            or (cur.get("close_scope") == close_scope and ts > int(cur.get("_ts", 0)))
+        ):
+            result[expiry_iso] = cand
+            log(f"closed {expiry_iso}: net={close_net:+.2f} qty={close_qty} scope={close_scope} ({price_effect})")
 
     return result
 
@@ -241,7 +265,10 @@ def fetch_filled_close_orders(acct_num: str, days_back: int = 7) -> dict:
 # ---------------------------------------------------------------------------
 
 def fetch_schwab_close_fills(days_back: int = 7) -> dict:
-    """Fetch filled close orders from Schwab. Returns {expiry_iso: close_net}."""
+    """Fetch filled close orders from Schwab.
+
+    Returns: {expiry_iso: {"close_net": float, "close_qty": int, "close_scope": str}}
+    """
     if _schwab_client_fn is None:
         return {}
 
@@ -307,19 +334,46 @@ def fetch_schwab_close_fills(days_back: int = 7) -> dict:
         else:
             close_net = -price
 
-        # Extract expiry from leg symbols
+        # Extract expiry from leg symbols and classify close scope
         expiry_iso = None
+        has_put = False
+        has_call = False
+        leg_qtys = []
         for leg in legs:
             sym = (leg.get("instrument", {}).get("symbol") or "").strip()
             if sym:
+                s = re.sub(r"\s+", "", sym.upper())
+                if re.search(r"\d{6}P\d+", s):
+                    has_put = True
+                if re.search(r"\d{6}C\d+", s):
+                    has_call = True
                 exp = _osi_expiry_iso(sym)
                 if exp:
                     expiry_iso = exp
-                    break
+            q = safe_float(leg.get("quantity"))
+            if q is not None and q > 0:
+                leg_qtys.append(int(q))
+        close_qty = min(leg_qtys) if leg_qtys else 0
+        close_scope = "full_ic" if (has_put and has_call and len(legs) >= 4) else "partial"
+        entered = str(order.get("enteredTime") or "")
+        ts = int(datetime.fromisoformat(entered.replace("Z", "+00:00")).timestamp()) if entered else 0
 
-        if expiry_iso and expiry_iso not in result:
-            result[expiry_iso] = close_net
-            log(f"schwab closed {expiry_iso}: net={close_net:+.2f}")
+        if not expiry_iso:
+            continue
+        cur = result.get(expiry_iso)
+        cand = {
+            "close_net": close_net,
+            "close_qty": close_qty,
+            "close_scope": close_scope,
+            "_ts": ts,
+        }
+        if (
+            cur is None
+            or (cur.get("close_scope") != "full_ic" and close_scope == "full_ic")
+            or (cur.get("close_scope") == close_scope and ts > int(cur.get("_ts", 0)))
+        ):
+            result[expiry_iso] = cand
+            log(f"schwab closed {expiry_iso}: net={close_net:+.2f} qty={close_qty} scope={close_scope}")
 
     return result
 
@@ -338,7 +392,7 @@ def _migrate_old_format(svc, sid, close_tab, existing):
     migrated = [CLOSE_HEADERS]
     for row in existing[1:]:
         if len(row) >= 3:
-            migrated.append([row[0], "tt-individual", row[1], row[2]])
+            migrated.append([row[0], "tt-individual", row[1], row[2], "", ""])
 
     svc.spreadsheets().values().clear(
         spreadsheetId=sid, range=close_tab
@@ -377,6 +431,7 @@ def main() -> int:
         return skip("no TT accounts and no Schwab client available")
 
     close_tab = (os.environ.get("CS_TT_CLOSE_TAB") or CLOSE_TAB).strip()
+    close_days_back = int(os.environ.get("CS_CLOSE_DAYS_BACK", "30"))
 
     try:
         # --- Fetch close fills from all accounts ---
@@ -386,7 +441,7 @@ def main() -> int:
         if has_tt:
             for acct_num, label in tt_accounts:
                 try:
-                    filled = fetch_filled_close_orders(acct_num)
+                    filled = fetch_filled_close_orders(acct_num, close_days_back)
                     for expiry, close_net in filled.items():
                         all_filled[(expiry, label)] = close_net
                     log(f"{label} ({acct_num}): {len(filled)} close(s)")
@@ -396,7 +451,7 @@ def main() -> int:
         # Schwab
         if has_schwab:
             try:
-                sw_filled = fetch_schwab_close_fills()
+                sw_filled = fetch_schwab_close_fills(close_days_back)
                 for expiry, close_net in sw_filled.items():
                     all_filled[(expiry, "schwab")] = close_net
                 log(f"schwab: {len(sw_filled)} close(s)")
@@ -412,7 +467,7 @@ def main() -> int:
         svc, sid = sheets_client()
         ensure_sheet_tab(svc, sid, close_tab)
 
-        existing = get_values(svc, sid, f"{close_tab}!A1:D")
+        existing = get_values(svc, sid, f"{close_tab}!A1:F")
         last_col = col_letter(len(CLOSE_HEADERS) - 1)
 
         # Migrate old 3-column format if needed
@@ -439,8 +494,11 @@ def main() -> int:
         # Upsert rows
         updates = []
         appends = []
-        for (expiry, account), close_net in all_filled.items():
-            values = [expiry, account, "closed", str(round(close_net, 4))]
+        for (expiry, account), info in all_filled.items():
+            close_net = safe_float(info.get("close_net"), 0) if isinstance(info, dict) else safe_float(info, 0)
+            close_qty = int(safe_float(info.get("close_qty"), 0) or 0) if isinstance(info, dict) else 0
+            close_scope = (info.get("close_scope") or "") if isinstance(info, dict) else ""
+            values = [expiry, account, "closed", str(round(close_net or 0.0, 4)), str(close_qty), close_scope]
             key = (expiry, account)
             if key in existing_keys:
                 rnum = existing_keys[key]

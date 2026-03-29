@@ -25,6 +25,18 @@ from zoneinfo import ZoneInfo
 
 import boto3
 
+# ── Event reporting (best-effort, never blocks trading) ──
+_ew = None
+try:
+    # Add repo root to path so reporting package is importable
+    _repo_root = str(Path(__file__).resolve().parent.parent.parent.parent)
+    if _repo_root not in sys.path:
+        sys.path.insert(0, _repo_root)
+    from reporting.events import EventWriter
+    _EVENTS_AVAILABLE = True
+except ImportError:
+    _EVENTS_AVAILABLE = False
+
 
 ROOT = Path(__file__).resolve().parent
 PLACE_PATH = ROOT / "place.py"
@@ -110,19 +122,54 @@ def write_plan(plan: dict) -> None:
         print(f"BF_DAILY WARN: write plan failed: {e}")
 
 
+def _init_events(today: date):
+    """Initialize EventWriter for this run. Returns None on failure."""
+    global _ew
+    if not _EVENTS_AVAILABLE:
+        return None
+    try:
+        _ew = EventWriter(strategy="butterfly", account="schwab", trade_date=today)
+        return _ew
+    except Exception as e:
+        print(f"BF_DAILY WARN: EventWriter init failed: {e}")
+        return None
+
+
+def _emit(method: str, **kwargs):
+    """Best-effort event emission. Never raises."""
+    if _ew is None:
+        return
+    try:
+        getattr(_ew, method)(**kwargs)
+    except Exception as e:
+        print(f"BF_DAILY WARN: event emit failed ({method}): {e}")
+
+
 def main() -> int:
     strategy = _load_strategy()
     now_et = _now_et()
     today = _today_et()
     dry_run = _truthy(os.environ.get("BF_DRY_RUN", "1"))
 
+    ew = _init_events(today)
+
     # Weekend guard
     if today.weekday() >= 5:
+        _emit("strategy_run", signal="SKIP", config="", reason="WEEKEND")
+        _emit("skip", reason="WEEKEND", signal="SKIP")
+        if ew:
+            try: ew.close()
+            except Exception: pass
         print(f"BF_DAILY WAIT: today={today} is weekend")
         return 0
 
     # Time guard
     if now_et.time() < CHECK_TIME_ET:
+        _emit("strategy_run", signal="SKIP", config="", reason="BEFORE_CHECK_TIME")
+        _emit("skip", reason="BEFORE_CHECK_TIME", signal="SKIP")
+        if ew:
+            try: ew.close()
+            except Exception: pass
         print(
             f"BF_DAILY WAIT: now_et={now_et.strftime('%Y-%m-%d %H:%M:%S %Z')} "
             f"check_time=16:01 ET"
@@ -133,6 +180,11 @@ def main() -> int:
 
     # Skip if already evaluated today
     if state.get("last_evaluated_date") == today.isoformat():
+        _emit("strategy_run", signal="SKIP", config="", reason="ALREADY_EVALUATED")
+        _emit("skip", reason="ALREADY_EVALUATED", signal="SKIP")
+        if ew:
+            try: ew.close()
+            except Exception: pass
         print(f"BF_DAILY SKIP: already evaluated today={today}")
         return 0
 
@@ -149,6 +201,16 @@ def main() -> int:
         if not dry_run:
             save_state(state)
         write_plan(plan)
+        _emit("strategy_run", signal="SKIP", config=plan.get("config", ""),
+              reason=plan["reason"], spot=float(plan.get("spot") or 0),
+              vix=float(plan.get("vix") or 0), vix1d=float(plan.get("vix1d") or 0),
+              filters={"se_today": plan.get("se_today"), "se_5d_avg": plan.get("se_5d_avg")})
+        _emit("skip", reason=plan["reason"], signal="SKIP")
+        if ew:
+            try:
+                ew.close()
+            except Exception:
+                pass
         print(
             f"BF_DAILY SKIP: reason={plan['reason']} vix1d={plan.get('vix1d')} "
             f"se_today={plan.get('se_today')} se_5d={plan.get('se_5d_avg')}"
@@ -157,6 +219,14 @@ def main() -> int:
 
     if plan["status"] != "OK":
         write_plan(plan)
+        _emit("strategy_run", signal=plan.get("signal", "ERROR"),
+              config=plan.get("config", ""), reason=plan["reason"])
+        _emit("error", message=plan["reason"], stage="strategy_evaluation")
+        if ew:
+            try:
+                ew.close()
+            except Exception:
+                pass
         print(f"BF_DAILY ERROR: {plan['reason']}")
         return 1
 
@@ -168,6 +238,16 @@ def main() -> int:
         if not dry_run:
             save_state(state)
         write_plan(plan)
+        _emit("strategy_run", signal=plan["signal"], config=plan.get("config", ""),
+              reason=f"DUP_EXPIRY:{plan['expiry_date']}",
+              spot=float(plan.get("spot") or 0), vix=float(plan.get("vix") or 0),
+              vix1d=float(plan.get("vix1d") or 0))
+        _emit("skip", reason=f"DUP_EXPIRY:{plan['expiry_date']}", signal=plan["signal"])
+        if ew:
+            try:
+                ew.close()
+            except Exception:
+                pass
         print(
             f"BF_DAILY SKIP: duplicate expiry {plan['expiry_date']} "
             f"signal={plan['signal']} dte={plan.get('target_dte')}"
@@ -197,10 +277,31 @@ def main() -> int:
         }
     )
 
+    # Emit strategy_run + trade_intent before placement
+    bf_opt_type = "PUT" if plan.get("flipped_to_puts") else "CALL"
+    _emit("strategy_run", signal=plan["signal"], config=plan.get("config", ""),
+          reason="OK", spot=float(plan.get("spot") or 0),
+          vix=float(plan.get("vix") or 0), vix1d=float(plan.get("vix1d") or 0),
+          filters={"se_today": plan.get("se_today"), "se_5d_avg": plan.get("se_5d_avg")},
+          extra={"expiry_date": plan["expiry_date"], "target_dte": plan.get("target_dte"),
+                 "flipped_to_puts": plan.get("flipped_to_puts", False)})
+    _emit("trade_intent", side=plan["order_side"], direction="LONG" if plan["order_side"] == "DEBIT" else "SHORT",
+          legs=[
+              {"osi": plan["lower_osi"], "strike": plan["lower_strike"], "option_type": bf_opt_type,
+               "action": "BUY_TO_OPEN" if plan["order_side"] == "DEBIT" else "SELL_TO_OPEN", "qty": 1},
+              {"osi": plan["center_osi"], "strike": plan["center_strike"], "option_type": bf_opt_type,
+               "action": "SELL_TO_OPEN" if plan["order_side"] == "DEBIT" else "BUY_TO_OPEN", "qty": 2},
+              {"osi": plan["upper_osi"], "strike": plan["upper_strike"], "option_type": bf_opt_type,
+               "action": "BUY_TO_OPEN" if plan["order_side"] == "DEBIT" else "SELL_TO_OPEN", "qty": 1},
+          ],
+          target_qty=1, limit_price=float(plan.get("package_mid") or 0),
+          extra={"package_bid": plan.get("package_bid"), "package_ask": plan.get("package_ask")})
+
+    flip_tag = " [FLIPPED→PUT]" if plan.get("flipped_to_puts") else ""
     print(
         "BF_DAILY PLAN: "
         f"{plan['config']} {plan['order_side']} dte={plan.get('target_dte')} "
-        f"{plan['lower_strike']}/{plan['center_strike']}/{plan['upper_strike']} "
+        f"{plan['lower_strike']}/{plan['center_strike']}/{plan['upper_strike']}{flip_tag} "
         f"spot={plan['spot']} vix={plan['vix']} vix1d={plan['vix1d']} "
         f"pkg={plan['package_bid']}/{plan['package_ask']} mid={plan['package_mid']} "
         f"se_today={plan.get('se_today')} se_5d={plan.get('se_5d_avg')}"
@@ -216,6 +317,12 @@ def main() -> int:
         plan["reason"] = f"place.py rc={proc.returncode}"
         plan["result"] = {"error": True, "rc": proc.returncode}
         write_plan(plan)
+        _emit("error", message=f"place.py rc={proc.returncode}", stage="placement")
+        if ew:
+            try:
+                ew.close()
+            except Exception:
+                pass
         print(f"BF_DAILY ERROR: place.py returned {proc.returncode}")
         return proc.returncode
 
@@ -227,7 +334,25 @@ def main() -> int:
     plan["result"] = result
     write_plan(plan)
 
+    # Emit order + fill events from placement result
+    for oid in (result.get("order_ids") or []):
+        _emit("order_submitted", order_id=str(oid), legs=[], limit_price=float(result.get("last_price") or 0))
+    filled = result.get("filled_qty", 0)
+    if filled and filled > 0:
+        _emit("fill", order_id=str((result.get("order_ids") or [""])[0]),
+              fill_qty=filled, fill_price=float(result.get("last_price") or 0),
+              legs=[
+                  {"osi": plan["lower_osi"], "strike": plan["lower_strike"], "option_type": bf_opt_type, "qty": 1},
+                  {"osi": plan["center_osi"], "strike": plan["center_strike"], "option_type": bf_opt_type, "qty": 2},
+                  {"osi": plan["upper_osi"], "strike": plan["upper_strike"], "option_type": bf_opt_type, "qty": 1},
+              ])
+
     if dry_run:
+        if ew:
+            try:
+                ew.close()
+            except Exception:
+                pass
         print(
             f"BF_DAILY DRY_RUN: would hold until {plan['expiry_date']}"
         )
@@ -237,11 +362,15 @@ def main() -> int:
     state["last_trade_date"] = plan["trade_date"]
     state["last_expiration_date"] = plan["expiry_date"]
     state["last_action"] = result.get("reason", "PLACED")
-    filled = result.get("filled_qty", 0)
     if filled and filled > 0 and plan["expiry_date"] not in open_expiries:
         open_expiries.append(plan["expiry_date"])
     state["open_expiries"] = open_expiries
     save_state(state)
+    if ew:
+        try:
+            ew.close()
+        except Exception:
+            pass
     print(
         f"BF_DAILY DONE: reason={state['last_action']} "
         f"expiry={plan['expiry_date']}"

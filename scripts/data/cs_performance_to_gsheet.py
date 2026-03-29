@@ -32,6 +32,7 @@ Env:
 import os
 import sys
 from collections import defaultdict
+from datetime import date, timedelta
 
 # --- path setup ---
 def _add_scripts_root():
@@ -69,6 +70,7 @@ ACCOUNTS = [
     {"name": "Schwab",          "pnl_col": 8},
     {"name": "TT IRA",          "pnl_col": 12},
     {"name": "TT Individual",   "pnl_col": 16},
+    {"name": "Schwab Adjusted", "pnl_col": 20},
 ]
 
 SPX_MULTIPLIER = 100  # 1 SPX point = $100
@@ -81,7 +83,8 @@ COLOR_GW   = {"red": 0.851, "green": 0.918, "blue": 0.827}
 COLOR_SCHW = {"red": 0.788, "green": 0.855, "blue": 0.973}
 COLOR_IRA  = {"red": 0.851, "green": 0.918, "blue": 0.827}
 COLOR_IND  = {"red": 1.0,   "green": 0.949, "blue": 0.800}
-ACCOUNT_COLORS = [COLOR_GW, COLOR_SCHW, COLOR_IRA, COLOR_IND]
+COLOR_SWADJ= {"red": 0.788, "green": 0.855, "blue": 0.973}
+ACCOUNT_COLORS = [COLOR_GW, COLOR_SCHW, COLOR_IRA, COLOR_IND, COLOR_SWADJ]
 
 # Layout row offsets (0-indexed)
 YEAR_ROW = 2       # Row 3: year sub-header
@@ -92,6 +95,8 @@ STATS1_HEADER = 17 # Row 18: Leo + Schwab stats header
 STATS1_DATA = 18   # Row 19-22: stats data
 STATS2_HEADER = 25 # Row 26: TT IRA + TT Individual stats header
 STATS2_DATA = 26   # Row 27-30: stats data
+STATS3_HEADER = 33 # Row 34: Schwab Adjusted stats
+STATS3_DATA = 34   # Row 35+
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +130,7 @@ def read_summary_data(svc, spreadsheet_id: str, summary_tab: str) -> list:
     Data comes newest-first from CS_Summary.
     """
     all_rows = get_values(svc, spreadsheet_id,
-                          f"{summary_tab}!A{SUMMARY_DATA_START_ROW}:Q")
+                          f"{summary_tab}!A{SUMMARY_DATA_START_ROW}:U")
     result = []
     for row in all_rows:
         if not row or not (row[0] if row else "").strip():
@@ -215,6 +220,83 @@ def compute_rolling_stats(data: list, acct_idx: int, n: int) -> dict:
     }
 
 
+def compute_window_stats(data: list, acct_idx: int, window_label: str,
+                         ref_date: date = None) -> dict | None:
+    """Compute stats for a business-day or calendar window.
+
+    window_label: '5D', '10D', '20D', 'MTD', 'YTD'
+    ref_date: reference date (default: today)
+
+    Data is newest-first from CS_Summary.  Only settled rows (P&L not None)
+    whose *trade date* falls within the window are included.
+
+    Returns dict with total_pnl, edge, max_dd, factor, win_rate, trade_count
+    or None if no settled trades in window.
+    """
+    if ref_date is None:
+        ref_date = date.today()
+
+    if window_label == "MTD":
+        start = ref_date.replace(day=1)
+    elif window_label == "YTD":
+        start = ref_date.replace(month=1, day=1)
+    elif window_label.endswith("D"):
+        n_bdays = int(window_label[:-1])
+        # Walk backwards n business days from ref_date
+        count = 0
+        d = ref_date
+        while count < n_bdays:
+            d -= timedelta(days=1)
+            if d.weekday() < 5:  # Mon-Fri
+                count += 1
+        start = d
+    else:
+        return None
+
+    start_str = start.isoformat()
+    ref_str = ref_date.isoformat()
+
+    trades = []
+    for row in data:
+        ds = row["date"]
+        if ds < start_str or ds > ref_str:
+            continue
+        pnl_points = row["pnl"].get(acct_idx)
+        if pnl_points is not None:
+            trades.append(pnl_points * SPX_MULTIPLIER)
+
+    if not trades:
+        return None
+
+    total_pnl = sum(trades)
+    num = len(trades)
+    edge = total_pnl / num / SPX_MULTIPLIER
+
+    cum = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    for pnl in trades:
+        cum += pnl
+        if cum > peak:
+            peak = cum
+        dd = peak - cum
+        if dd > max_dd:
+            max_dd = dd
+
+    factor = (total_pnl / max_dd) if max_dd > 0.01 else 0.0
+    wins = sum(1 for p in trades if p > 0)
+    win_rate = wins / num
+
+    return {
+        "total_pnl": round(total_pnl, 2),
+        "edge": round(edge, 2),
+        "max_dd": round(max_dd, 2),
+        "factor": round(factor, 2),
+        "win_rate": round(win_rate, 4),
+        "trade_count": num,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Stats block helper
 # ---------------------------------------------------------------------------
@@ -251,6 +333,109 @@ def _stats_block(name_left, stats_left_10, stats_left_20,
         rows.append([label, lv10, lv20, "", label, rv10, rv20])
 
     rows.append([])  # blank separator
+    return rows
+
+
+def _window_block(data: list, ref_date: date = None) -> list:
+    """Build a business-day window performance block for all accounts.
+
+    Layout (one table):
+      header: ["Window", acct1, acct2, ..., "Total"]
+      sub-header: ["", "$", "$", ..., "$"]
+      5D row, 10D row, 20D row, MTD row, YTD row
+      blank separator
+
+    Each cell = total P&L dollars for that window.
+    Below the dollar table: edge ($/trade) table.
+    """
+    windows = ["5D", "10D", "20D", "MTD", "YTD"]
+    acct_names = [a["name"] for a in ACCOUNTS] + ["Total"]
+
+    rows = []
+    rows.append(["Business-Day Windows (Settled P&L)"])
+    rows.append([])
+
+    # --- Dollar P&L table ---
+    header = ["Window P&L"] + acct_names
+    rows.append(header)
+
+    for wl in windows:
+        row = [wl]
+        total = 0.0
+        has_any = False
+        for i in range(len(ACCOUNTS)):
+            ws = compute_window_stats(data, i, wl, ref_date)
+            if ws:
+                row.append(round(ws["total_pnl"], 0))
+                total += ws["total_pnl"]
+                has_any = True
+            else:
+                row.append("")
+        row.append(round(total, 0) if has_any else "")
+        rows.append(row)
+
+    rows.append([])
+
+    # --- Edge ($/trade) table ---
+    header2 = ["Window Edge"] + acct_names
+    rows.append(header2)
+
+    for wl in windows:
+        row = [wl]
+        totals_pnl = 0.0
+        totals_n = 0
+        for i in range(len(ACCOUNTS)):
+            ws = compute_window_stats(data, i, wl, ref_date)
+            if ws:
+                row.append(round(ws["edge"], 2))
+                totals_pnl += ws["total_pnl"]
+                totals_n += ws["trade_count"]
+            else:
+                row.append("")
+        # Total edge = weighted average
+        if totals_n > 0:
+            row.append(round(totals_pnl / totals_n / SPX_MULTIPLIER, 2))
+        else:
+            row.append("")
+        rows.append(row)
+
+    rows.append([])
+
+    # --- Win rate table ---
+    header3 = ["Window Win%"] + acct_names
+    rows.append(header3)
+
+    for wl in windows:
+        row = [wl]
+        for i in range(len(ACCOUNTS)):
+            ws = compute_window_stats(data, i, wl, ref_date)
+            if ws:
+                row.append(f"{ws['win_rate']:.0%}")
+            else:
+                row.append("")
+        row.append("")  # no total win rate
+        rows.append(row)
+
+    rows.append([])
+
+    # --- Trade count table ---
+    header4 = ["Window Trades"] + acct_names
+    rows.append(header4)
+
+    for wl in windows:
+        row = [wl]
+        total_n = 0
+        for i in range(len(ACCOUNTS)):
+            ws = compute_window_stats(data, i, wl, ref_date)
+            if ws:
+                row.append(ws["trade_count"])
+                total_n += ws["trade_count"]
+            else:
+                row.append("")
+        row.append(total_n if total_n > 0 else "")
+        rows.append(row)
+
+    rows.append([])
     return rows
 
 
@@ -330,7 +515,10 @@ def build_performance_grid(data: list) -> tuple:
     # Row 17: blank
     grid.append([])
 
-    # Rows 18-23: Leo + Schwab stats (side by side)
+    # Business-day window rollups (5D/10D/20D/MTD/YTD)
+    grid.extend(_window_block(data))
+
+    # Rolling trade stats: Leo + Schwab (side by side)
     grid.extend(_stats_block(
         ACCOUNTS[0]["name"], all_stats[0][0], all_stats[0][1],
         ACCOUNTS[1]["name"], all_stats[1][0], all_stats[1][1],
@@ -345,18 +533,37 @@ def build_performance_grid(data: list) -> tuple:
         ACCOUNTS[3]["name"], all_stats[3][0], all_stats[3][1],
     ))
 
-    return grid, years
+    # Row 33+: Schwab Adjusted stats (left block only)
+    grid.append([])
+    grid.extend(_stats_block(
+        ACCOUNTS[4]["name"], all_stats[4][0], all_stats[4][1],
+        "", None, None,
+    ))
+
+    # Record where each section starts (0-indexed row) for formatting
+    meta = {
+        "years": years,
+        "stats_headers": [],  # filled below
+    }
+
+    # Find stats block headers by scanning for account names in col A
+    stats_names = {ACCOUNTS[0]["name"], ACCOUNTS[2]["name"], ACCOUNTS[4]["name"]}
+    for i, row in enumerate(grid):
+        if row and row[0] in stats_names:
+            meta["stats_headers"].append(i)
+
+    return grid, meta
 
 
 # ---------------------------------------------------------------------------
 # Formatting
 # ---------------------------------------------------------------------------
 
-def apply_formatting(svc, spreadsheet_id: str, sheet_id: int, years: list):
+def apply_formatting(svc, spreadsheet_id: str, sheet_id: int, meta: dict):
     """Apply background colors, bold text, and currency formats."""
     requests = []
     num_accts = len(ACCOUNTS)
-    total_col = num_accts + 2  # A + 4 accounts + Total = 6 cols (0..5), end=6
+    total_col = num_accts + 2  # A + 5 accounts + Total = 7 cols (0..6), end=7
 
     # Title: bold 12pt
     requests.append({
@@ -416,11 +623,16 @@ def apply_formatting(svc, spreadsheet_id: str, sheet_id: int, years: list):
         }
     })
 
-    # Stats formatting (two pairs)
-    for header_row, color_left, color_right in [
-        (STATS1_HEADER, COLOR_GW, COLOR_SCHW),
-        (STATS2_HEADER, COLOR_IRA, COLOR_IND),
-    ]:
+    # Stats formatting — use dynamic positions from meta
+    color_pairs = [
+        (COLOR_GW, COLOR_SCHW),
+        (COLOR_IRA, COLOR_IND),
+        (COLOR_SWADJ, COLOR_SWADJ),
+    ]
+    for idx, header_row in enumerate(meta.get("stats_headers", [])):
+        if idx >= len(color_pairs):
+            break
+        color_left, color_right = color_pairs[idx]
         # Left stats header: bold + color (cols A-C)
         requests.append({
             "repeatCell": {
@@ -507,7 +719,7 @@ def main() -> int:
 
         log(f"read {len(data)} summary rows")
 
-        grid, years = build_performance_grid(data)
+        grid, meta = build_performance_grid(data)
 
         sheet_id = ensure_sheet_tab(svc, spreadsheet_id, perf_tab)
 
@@ -526,7 +738,7 @@ def main() -> int:
             body={"values": grid},
         ).execute()
 
-        apply_formatting(svc, spreadsheet_id, sheet_id, years)
+        apply_formatting(svc, spreadsheet_id, sheet_id, meta)
 
         # Log settled trade counts
         for i, acct in enumerate(ACCOUNTS):

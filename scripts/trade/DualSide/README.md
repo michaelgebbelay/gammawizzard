@@ -2,7 +2,17 @@
 
 SPX dual-side vertical spread strategy with vol-regime filters.
 
+Active live execution path: `scripts/trade/DualSide/run.sh` ->
+`scripts/trade/DualSide/orchestrator.py`.
+The package under `sim/live/dualside_10w` is a frozen historical snapshot kept
+for research/replay compatibility, not the active live trader.
+
 ## Changelog
+
+### v1.3.1 (2026-03-20) — Remove BPC Cap
+
+**Change:**
+1. **Removed the bull_put_credit position cap.**
 
 ### v1.1.0 (2026-03-19) — Regime-Follow + 5-Wide
 
@@ -114,7 +124,6 @@ Uses the same ladder placer as ConstantStable (`place.py`):
 ### Guards
 - **TOPUP**: Only places `target - open_spreads` contracts (default ON)
 - **NO_CLOSE**: Skips if placing would net/close existing positions (default ON)
-- **BPC CAP**: Skip new bull_put_credit if >= 3 already open (counts both $5 and legacy $10 widths)
 
 ## Sizing
 Currently fixed at 1 contract per side. Configurable via code (`qty` in `main()`).
@@ -124,7 +133,7 @@ Currently fixed at 1 contract per side. Configurable via code (`qty` in `main()`
 > These results are from v1.0.0 (10-wide, 50-delta always bullish).
 > v1.1.0 has not been backtested yet.
 
-### Cap3 (production: bull_put_credit capped at 3 open)
+### Historical Cap3 Snapshot
 
 | Metric | Value |
 |--------|-------|

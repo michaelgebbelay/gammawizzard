@@ -1,4 +1,4 @@
-"""Registry of all 6 AI trading agents with their configurations."""
+"""Registry of AI trading agents (v14: 2 Opus + 2 GPT-4o)."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ def get_agent_configs() -> dict:
 
 
 def get_agent_ids() -> list[str]:
-    """Return all agent IDs in seat order."""
+    """Return all agent IDs."""
     return list(AGENTS.keys())
 
 
@@ -20,6 +20,11 @@ def get_model_for_agent(agent_id: str) -> str:
     return AGENTS[agent_id]["model"]
 
 
-def get_personality_for_agent(agent_id: str) -> str:
-    """Look up the personality seed for an agent."""
-    return AGENTS[agent_id]["seed"]
+def get_provider_for_agent(agent_id: str) -> str:
+    """Look up the provider for an agent."""
+    return AGENTS[agent_id]["provider"]
+
+
+def is_trained(agent_id: str) -> bool:
+    """Check if an agent has the trained playbook."""
+    return AGENTS[agent_id].get("trained", False)

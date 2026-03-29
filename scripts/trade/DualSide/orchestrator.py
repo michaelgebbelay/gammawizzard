@@ -2,7 +2,7 @@
 """
 DualSide Strategy — SPX vertical orchestrator (Schwab)
 
-v1.3.0 — 2026-03-20 skip-bear on call side
+v1.3.1 — 2026-03-20 remove BPC cap
 
 Call side now only trades on bull-regime days.  On bear days the put side
 is already running bear_put_debit; adding a bull BPC at 50-delta creates
@@ -93,7 +93,7 @@ def _emit(method: str, **kwargs):
     except Exception as e:
         print(f"DS_RUN WARN: event emit failed ({method}): {e}")
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 # ── config ──
 CS_UNIT_DOLLARS = float(os.environ.get("DS_UNIT_DOLLARS", os.environ.get("CS_UNIT_DOLLARS", "10000")))
@@ -122,10 +122,6 @@ PLACER_SCRIPT = os.path.join(os.path.dirname(__file__), "place.py")
 # Guard
 DS_GUARD_NO_CLOSE = (os.environ.get("CS_GUARD_NO_CLOSE", "1") or "1").strip().lower() in ("1", "true", "yes")
 DS_TOPUP = (os.environ.get("CS_TOPUP", "1") or "1").strip().lower() in ("1", "true", "yes")
-
-# Bull put credit position cap: skip new BPC if >= MAX_OPEN_BPC already open
-MAX_OPEN_BPC = 3
-
 
 # ═══════════════════════════════════════════════════════════════
 # Schwab API helpers
@@ -552,35 +548,6 @@ def would_close_guard(v, pos):
     return buy_leg_pos < -1e-9 or sell_leg_pos > 1e-9
 
 
-def count_open_bpc(pos):
-    """Count open bull_put_credit spreads from broker positions.
-
-    A bull_put_credit is a short put with a matching long put WIDTH points lower.
-    We count distinct short-put legs that have a paired long put.
-    """
-    # Group by (expiration, put_call) → key is (ymd, cp, strike_padded)
-    short_puts = []  # (exp, strike) where qty < 0 and type=P
-    long_puts = set()  # (exp, strike) where qty > 0 and type=P
-    for (ymd, cp, strike_str), qty in pos.items():
-        if cp != "P":
-            continue
-        try:
-            strike = int(strike_str) / 1000.0
-        except (ValueError, TypeError):
-            continue
-        if qty < -1e-9:
-            short_puts.append((ymd, strike, abs(qty)))
-        elif qty > 1e-9:
-            long_puts.add((ymd, strike))
-
-    count = 0
-    for ymd, strike, qty in short_puts:
-        # Check for a matching long put at current or legacy width
-        if (ymd, strike - PUT_WIDTH) in long_puts or (ymd, strike - 10) in long_puts:
-            count += int(qty + 0.5)
-    return count
-
-
 # ═══════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════
@@ -775,7 +742,7 @@ def main():
             contracts5 = chain5["contracts"]
             print(f"DS_RUN 5DTE: spot={spot5:.2f} exp={exp5} contracts={len(contracts5)}")
 
-            # 50-delta — bull_put_credit on bull days only (v1.3.0)
+            # 50-delta — bull_put_credit on bull days only (v1.3.1)
             call_p = find_by_delta(contracts5, "P", 0.50)
             if call_p:
                 short_strike = call_p["strike"]
@@ -816,21 +783,15 @@ def main():
 
     # ── Position guard + topup ──
     pos = None
-    open_bpc_count = 0
     try:
         pos = positions_map(c, acct_hash)
-        open_bpc_count = count_open_bpc(pos)
-        print(f"DS_RUN POSITIONS: loaded {len(pos)} legs, open BPC={open_bpc_count}")
+        print(f"DS_RUN POSITIONS: loaded {len(pos)} legs")
     except Exception as e:
         print(f"DS_RUN POSITIONS SKIP: fetch failed ({e}) — skipping ALL trades.")
         return 0
 
     def finalize(v):
         if not v:
-            return None
-        # BPC cap: skip any new bull_put_credit (put-side or call-side helper) if at cap
-        if v["side"] == "CREDIT" and v["kind"] == "PUT" and open_bpc_count >= MAX_OPEN_BPC:
-            print(f"DS_RUN BPC_CAP_SKIP {v['name']}: open={open_bpc_count} >= cap={MAX_OPEN_BPC}")
             return None
         target = int(v["target_qty"])
         open_qty = 0

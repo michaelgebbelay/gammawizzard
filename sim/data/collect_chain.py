@@ -183,12 +183,15 @@ def _log_chain_diagnostics(snapshot) -> None:
 
 
 def collect_schwab(phase: str) -> bool:
-    """Fetch and cache the SPX chain from Schwab (legacy fallback)."""
+    """Fetch and cache the SPX chain from Schwab."""
     from scripts.schwab_token_keeper import schwab_client
     from sim.data.chain_snapshot import parse_schwab_chain
+    from sim.data.features import enrich, save_feature_pack
+    from sim.data.gw_client import fetch_gw_data, save_gw_data
     from datetime import timedelta
 
     today = date.today()
+    today_str = today.isoformat()
     log.info("Collecting SPX chain via Schwab: date=%s, phase=%s", today, phase)
 
     path = cache_path(today, phase)
@@ -239,6 +242,8 @@ def collect_schwab(phase: str) -> bool:
             log.error("No contracts after PM-settled filter!")
             return False
 
+        _log_chain_diagnostics(snapshot)
+
         log.info(
             "Chain stats: %d contracts, %d strikes, SPX=%.2f, VIX=%.2f",
             len(snapshot.contracts), len(snapshot.strikes),
@@ -247,6 +252,27 @@ def collect_schwab(phase: str) -> bool:
 
         saved_path = save_to_cache(today, phase, raw, vix)
         log.info("Saved to: %s", saved_path)
+
+        # Fetch GW data (VIX1D + RV) — non-fatal if unavailable
+        gw_data = None
+        try:
+            gw_data = fetch_gw_data(today_str)
+            if gw_data:
+                save_gw_data(today_str, phase, gw_data)
+                log.info("GW data: VIX1D=%s, RV=%s, RV5=%s",
+                         gw_data.get("vix_1d"), gw_data.get("rv"),
+                         gw_data.get("rv5"))
+            else:
+                log.warning("GW data unavailable for %s (non-fatal)", today_str)
+        except Exception as e:
+            log.warning("GW fetch failed (non-fatal): %s", e)
+
+        # Compute + persist FeaturePack alongside snapshot
+        prev_close = raw.get("spx_prev_close", 0.0)
+        fp = enrich(snapshot, prev_close=prev_close, gw_data=gw_data)
+        fp_path = save_feature_pack(today, phase, fp)
+        log.info("FeaturePack saved to: %s (EM=%.1f, ATM IV=%.1f%%)",
+                 fp_path, fp.atm_straddle_mid, fp.iv_atm)
 
         cached = list_cached_dates()
         complete = [d for d in cached if has_complete_day(d)]

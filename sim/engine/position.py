@@ -16,7 +16,6 @@ class SpreadPosition:
 
     position_id: str
     agent_id: str
-    track: str
     session_opened: int           # session ID when opened
     structure: StructureType
     side: Side
@@ -25,15 +24,15 @@ class SpreadPosition:
     entry_price: float            # credit received or debit paid
     commission: float             # entry commission
     width: float                  # spread width in points
-    window: str = ""              # "open" or "close5"
-    dte_at_entry: int = 0         # 0 for 0DTE (same-day settle), 1 for 1DTE (next-day)
+    window: str = "close5"        # v14: always "close5" (1DTE)
+    dte_at_entry: int = 1         # v14: always 1DTE
     expiration: str = ""          # ISO date of the expiration being traded
 
     # Settlement fields — filled when position expires
     session_settled: Optional[int] = None
     settlement_price: Optional[float] = None   # SPX close at expiration
     settlement_value: Optional[float] = None   # intrinsic value of spread
-    settlement_source: str = ""                # "official_close" | "close5_mark" | etc.
+    settlement_source: str = ""                # "official_close" | etc.
     realized_pnl: Optional[float] = None
 
     @property
@@ -45,13 +44,12 @@ class SpreadPosition:
         return self.session_settled is not None
 
     @classmethod
-    def from_filled_order(cls, order: Order, session_id: int, track: str,
+    def from_filled_order(cls, order: Order, session_id: int,
                           fill_price: float, commission: float) -> "SpreadPosition":
         """Create a position from a filled order."""
         return cls(
             position_id=str(uuid.uuid4())[:8],
             agent_id=order.agent_id,
-            track=track,
             session_opened=session_id,
             structure=order.structure,
             side=order.side,
@@ -60,8 +58,8 @@ class SpreadPosition:
             entry_price=fill_price,
             commission=commission,
             width=order.width,
-            window=order.window,
-            dte_at_entry=order.dte_at_entry,
+            window=order.window or "close5",
+            dte_at_entry=order.dte_at_entry or 1,
             expiration=order.expiration,
         )
 

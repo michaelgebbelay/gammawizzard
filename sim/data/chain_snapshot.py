@@ -46,6 +46,7 @@ class ChainSnapshot:
     contracts: Dict[str, OptionContract] = field(default_factory=dict)  # keyed by symbol
     expirations: List[date] = field(default_factory=list)
     strikes: List[float] = field(default_factory=list)
+    vix1d: float = 0.0              # CBOE VIX1D (1-day implied vol), percentage
     # OHLC context (populated by TT fetcher)
     spx_open: float = 0.0
     spx_high: float = 0.0
@@ -243,6 +244,102 @@ def parse_schwab_chain(raw: dict, phase: str, vix: float = 0.0) -> ChainSnapshot
         contracts=contracts,
         expirations=sorted(expirations_set),
         strikes=sorted(strikes_set),
+    )
+
+
+def parse_cboe_chain(raw: dict) -> ChainSnapshot:
+    """Parse CBOE EOD Summary format into a ChainSnapshot.
+
+    The raw dict is pre-processed by ingest_cboe.py into:
+    {
+        "_source": "cboe",
+        "_vix": 16.5,
+        "_phase": "close5",
+        "_underlying_price": 5870.25,
+        "_quote_date": "2025-06-15",
+        "_spx_open": 0, "_spx_high": 0, "_spx_low": 0, "_spx_prev_close": 0,
+        "contracts": [
+            {"strike": 5800, "option_type": "P", "expiration": "2025-06-16",
+             "bid": 2.50, "ask": 3.00, "delta": -0.12, "gamma": 0.003,
+             "theta": -1.5, "vega": 0.8, "implied_vol": 0.15,
+             "open_interest": 5000, "volume": 1200, "last": 2.75},
+            ...
+        ]
+    }
+    """
+    phase = raw.get("_phase", "close5")
+    vix = _safe_float(raw.get("_vix", 0.0))
+    underlying = _safe_float(raw.get("_underlying_price", 0.0))
+    quote_date_str = raw.get("_quote_date", "")
+
+    contracts: Dict[str, OptionContract] = {}
+    expirations_set: set[date] = set()
+    strikes_set: set[float] = set()
+
+    for c in raw.get("contracts", []):
+        strike = _safe_float(c.get("strike"))
+        option_type = c.get("option_type", "C")  # "C" or "P"
+        exp_str = c.get("expiration", "")
+        if not exp_str or strike <= 0:
+            continue
+
+        exp_date = date.fromisoformat(exp_str)
+        expirations_set.add(exp_date)
+        strikes_set.add(strike)
+
+        bid = _safe_float(c.get("bid"))
+        ask = _safe_float(c.get("ask"))
+        last = _safe_float(c.get("last"))
+        mark = (bid + ask) / 2.0 if bid > 0 and ask > 0 else last
+
+        # Build a synthetic symbol for dict keying
+        sym = f"SPXW_{exp_str}_{strike:.0f}_{option_type}"
+
+        dte = (exp_date - date.fromisoformat(quote_date_str)).days if quote_date_str else 1
+        itm = (option_type == "C" and strike < underlying) or \
+              (option_type == "P" and strike > underlying)
+
+        oc = OptionContract(
+            symbol=sym,
+            strike=strike,
+            expiration=exp_date,
+            put_call=option_type,
+            bid=bid,
+            ask=ask,
+            last=last,
+            mark=mark,
+            volume=_safe_int(c.get("volume")),
+            open_interest=_safe_int(c.get("open_interest")),
+            implied_vol=_safe_float(c.get("implied_vol")),
+            delta=_safe_float(c.get("delta")),
+            gamma=_safe_float(c.get("gamma")),
+            theta=_safe_float(c.get("theta")),
+            vega=_safe_float(c.get("vega")),
+            rho=_safe_float(c.get("rho")),
+            days_to_exp=max(0, dte),
+            in_the_money=itm,
+        )
+        contracts[sym] = oc
+
+    try:
+        ts = datetime.fromisoformat(f"{quote_date_str}T15:45:00") if quote_date_str else datetime.utcnow()
+    except ValueError:
+        ts = datetime.utcnow()
+
+    return ChainSnapshot(
+        timestamp=ts,
+        phase=phase,
+        underlying_price=underlying,
+        underlying_symbol="$SPX",
+        vix=vix,
+        vix1d=_safe_float(raw.get("_vix1d", 0.0)),
+        contracts=contracts,
+        expirations=sorted(expirations_set),
+        strikes=sorted(strikes_set),
+        spx_open=_safe_float(raw.get("_spx_open", 0.0)),
+        spx_high=_safe_float(raw.get("_spx_high", 0.0)),
+        spx_low=_safe_float(raw.get("_spx_low", 0.0)),
+        spx_prev_close=_safe_float(raw.get("_spx_prev_close", 0.0)),
     )
 
 

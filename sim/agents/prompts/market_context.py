@@ -1,4 +1,4 @@
-"""Compress chain data into concise text for agent context window."""
+"""Compress chain data into concise text for agent context window (v14)."""
 
 from __future__ import annotations
 
@@ -17,51 +17,32 @@ logger = logging.getLogger(__name__)
 def format_chain_context(chain: ChainSnapshot,
                          window: int = CHAIN_ATM_WINDOW,
                          prev_close: float = 0.0,
-                         feature_pack: Optional[FeaturePack] = None,
-                         replay: bool = False) -> str:
-    """Compress option chain into ATM±window strikes for agent consumption.
-
-    Args:
-        chain: The chain snapshot.
-        window: Number of strikes above/below ATM to include.
-        prev_close: Previous SPX close for gap calculation.
-        feature_pack: Pre-computed FeaturePack. If None and not replay, computes on the fly.
-        replay: If True, require a pre-computed feature_pack. Raises if missing.
-    """
+                         feature_pack: Optional[FeaturePack] = None) -> str:
+    """Compress option chain into ATM±window strikes for agent consumption."""
     atm = chain.atm_strike()
     expiration = chain.expirations[0] if chain.expirations else None
 
-    # Replay mode: persisted features required, never recompute
     if feature_pack is None:
-        if replay:
-            raise ValueError(
-                "replay=True but no persisted FeaturePack provided. "
-                "Session data may be incomplete — mark invalid."
-            )
-        # Live / ad-hoc: compute on the fly
         pc = prev_close if prev_close > 0 else chain.spx_prev_close
         feature_pack = enrich(chain, prev_close=pc)
 
     features_text = format_feature_pack(feature_pack)
 
-    # Filter strikes within window of ATM
     nearby = [s for s in chain.strikes if abs(s - atm) <= window * 5]
     nearby.sort()
 
     lines = [
         f"SPX: {chain.underlying_price:.2f}  |  VIX: {chain.vix:.1f}  |  "
-        f"ATM: {atm:.0f}  |  Phase: {chain.phase}  |  "
+        f"ATM: {atm:.0f}  |  "
         f"Exp: {expiration}  |  Expected Move: +/-{chain.expected_move(expiration):.2f}",
     ]
 
-    # Add OHLC line if available
     if chain.spx_open > 0:
         lines.append(
             f"Open: {chain.spx_open:.2f}  |  High: {chain.spx_high:.2f}  |  "
             f"Low: {chain.spx_low:.2f}  |  Prev Close: {chain.spx_prev_close:.2f}"
         )
 
-    # Add derived features
     if features_text and "No features" not in features_text:
         lines.append("")
         lines.append(features_text)
@@ -95,15 +76,16 @@ def format_chain_context(chain: ChainSnapshot,
 def format_account_context(account: Account) -> str:
     """Format account state for agent consumption."""
     d = account.to_dict()
-    return (
+    lines = [
         f"Balance: ${d['balance']:,.2f}  |  "
         f"BP Available: ${d['buying_power_available']:,.2f}  |  "
-        f"BP Used: ${d['buying_power_used']:,.2f}\n"
+        f"BP Used: ${d['buying_power_used']:,.2f}",
         f"Open Positions: {d['open_positions']}  |  "
         f"Realized P&L: ${d['realized_pnl']:+,.2f}  |  "
         f"Commissions: ${d['total_commissions']:,.2f}  |  "
-        f"Return: {d['return_pct']:+.2f}%"
-    )
+        f"Return: {d['return_pct']:+.2f}%",
+    ]
+    return "\n".join(lines)
 
 
 def format_positions_context(positions: List[SpreadPosition]) -> str:
@@ -116,15 +98,17 @@ def format_positions_context(positions: List[SpreadPosition]) -> str:
         strikes = sorted(set(l.strike for l in pos.legs))
         strike_str = "/".join(f"{s:.0f}" for s in strikes)
         lines.append(
-            f"  {pos.structure.value} {strike_str} | "
+            f"  {pos.structure.value} {strike_str} ({pos.width:.0f}w) | "
             f"{pos.side.value} @ {pos.entry_price:.2f} | "
             f"qty={pos.quantity} | opened session {pos.session_opened}"
         )
     return "\n".join(lines)
 
 
-def format_memory_context(memory: Optional[dict]) -> str:
-    """Format agent's prior session memory."""
+def format_memory_text(memory: Optional[dict]) -> str:
+    """Format agent's accumulated memory for prompt injection."""
     if not memory:
         return "No prior session memory."
-    return f"Prior session summary:\n{memory.get('cumulative_summary', memory.get('summary', ''))}"
+    from sim.agents.memory import format_memory
+    text = format_memory(memory)
+    return text if text else "No prior session memory."

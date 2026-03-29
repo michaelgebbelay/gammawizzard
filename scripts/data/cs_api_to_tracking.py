@@ -785,14 +785,14 @@ def upsert_rows(svc, sid, tab, rows, header):
         if key in existing_map:
             rnum = existing_map[key]
             rng = f"{tab}!A{rnum}:{last_col}{rnum}"
-            # Merge: keep existing non-empty values, fill in blanks from API
+            # Merge: prefer fresh non-empty API values so bad/stale historical
+            # rows can be corrected; fall back to existing when API value is blank.
             old_row = existing_data[key]
             merged = []
             for i, h in enumerate(header):
                 new_val = values[i]
                 old_val = (old_row[i] if i < len(old_row) else "").strip()
-                # Keep old value if it's non-empty; use new if old is empty
-                merged.append(old_val if old_val else new_val)
+                merged.append(new_val if new_val else old_val)
             updates.append((rng, merged))
         else:
             appends.append(values)

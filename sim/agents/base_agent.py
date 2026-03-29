@@ -1,4 +1,4 @@
-"""Abstract interface for AI trading agents."""
+"""Abstract interface for AI trading agents (v14)."""
 
 from __future__ import annotations
 
@@ -11,33 +11,26 @@ from sim.engine.order import Order
 
 
 class BaseAgent(ABC):
-    """Base class for all AI trading agents (Claude-powered)."""
+    """Base class for all AI trading agents (Claude and GPT)."""
 
-    def __init__(self, agent_id: str, model: str, personality_seed: str):
+    def __init__(self, agent_id: str, model: str, trained: bool = False):
         self.agent_id = agent_id
         self.model = model
-        self.personality_seed = personality_seed
+        self.trained = trained
 
     @abstractmethod
     def decide(self, chain: ChainSnapshot, account: Account,
-               session_id: int, track: str,
-               judge_brief: str = "",
-               memory: Optional[dict] = None,
-               window: str = "open",
-               dte: int = 0) -> tuple[Optional[Order], str]:
-        """Make a trading decision for one window.
+               session_id: int,
+               memory: Optional[dict] = None) -> tuple[Optional[Order], str]:
+        """Make a trading decision for this session.
 
         Args:
-            chain: Chain snapshot for this decision window.
+            chain: Chain snapshot (1DTE, close5 phase).
             account: Current account state.
             session_id: Current session number.
-            track: Experimental track name.
-            judge_brief: Pre-market brief (adaptive/frozen tracks).
-            memory: Prior session memory (adaptive track only).
-            window: "open" (0DTE) or "close5" (1DTE).
-            dte: Days to expiration (0 or 1).
+            memory: Accumulated memory dict from prior sessions.
 
         Returns:
-            Tuple of (Order or None, raw_response_text).
+            Tuple of (Order or None for hold, raw_response_text).
         """
         ...

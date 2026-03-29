@@ -1,5 +1,13 @@
 # Leo IC_LONG Regime Filter
 
+> Status note (2026-03): this document describes the original trail-move /
+> anchor-distance research and the first production version of the filter.
+> The live code has since moved to the newer L1 regime rule in
+> `scripts/trade/ConstantStable/ic_long_filter.py`, which switches
+> `IC_LONG -> RR_SHORT` when `VIX/RV10 >= 1.95` and `RV5/RV20 <= 1.10`.
+> The legacy skip filters described below remain useful research context, but
+> they are not the current live trading rule.
+
 ## Problem
 
 IC_LONG trades (buying both put and call verticals) have been consistently losing in early 2026. Jan-Feb 2026: 16 trades, 25% WR, -$1,323. Every regime indicator (EM2d, VIX1D, VV ratio) looks identical to profitable years — the standard filters don't explain it.
@@ -189,7 +197,6 @@ IF trail5_move_pct < anchor_pct AND structure == IC_LONG:
 | `CS_IC_LONG_TRAIL_DAYS` | `5` | Trailing window for avg move % |
 | `CS_MOVE_STATE_S3_BUCKET` | `gamma-sim-cache` | S3 bucket for state files |
 | `CS_IC_DECISION_S3_KEY` | `cadence/cs_ic_long_decision.json` | S3 key for decision |
-| `GW_PROFIT_ENDPOINT` | `rapi/GetLeoProfit` | GW endpoint for Profit signal (Strategy C) |
 
 ### Fail-safe behavior
 
@@ -197,7 +204,6 @@ IF trail5_move_pct < anchor_pct AND structure == IC_LONG:
 - If insufficient move history (<3 days) → ALLOW
 - If S3 decision file missing or stale (wrong date) → ALLOW
 - Filter only affects IC_LONG — all other structures always trade
-- If Profit endpoint fails → SKIP (fall back to Strategy B)
 
 ## Data Sources
 

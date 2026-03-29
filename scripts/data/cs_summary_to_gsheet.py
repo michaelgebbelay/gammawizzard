@@ -24,6 +24,7 @@ Env:
   CS_TRACKING_TAB              - source tab (default "CS_Tracking")
   CS_GW_SIGNAL_TAB             - GW signal tab (default "GW_Signal")
   CS_SUMMARY_TAB               - target tab (default "CS_Summary")
+  SW_RAW_TAB                   - Schwab raw source tab (default "sw_txn_raw")
   CS_TT_CLOSE_TAB              - TT close status tab (default "CS_TT_Close")
   CS_GSHEET_STRICT             - "1" to fail hard on errors
 """
@@ -68,10 +69,12 @@ SECTION_HEADER = [
     "schwab", "", "", "",
     "TT IRA", "", "", "",
     "TT IND", "", "", "",
+    "schwab - adjusted", "", "", "",
 ]
 
 COLUMN_HEADER = [
     "Expiry",
+    "QTY", "price put", "price call", "P&L",
     "QTY", "price put", "price call", "P&L",
     "QTY", "price put", "price call", "P&L",
     "QTY", "price put", "price call", "P&L",
@@ -116,6 +119,7 @@ COLOR_GW   = {"red": 0.851, "green": 0.918, "blue": 0.827}  # light green
 COLOR_SCHW = {"red": 0.788, "green": 0.855, "blue": 0.973}  # light blue
 COLOR_IRA  = {"red": 0.851, "green": 0.918, "blue": 0.827}  # light green
 COLOR_IND  = {"red": 1.0,   "green": 0.949, "blue": 0.800}  # light yellow
+COLOR_SWADJ = {"red": 0.788, "green": 0.855, "blue": 0.973}  # light blue
 
 
 def apply_formatting(svc, spreadsheet_id: str, sheet_id: int, num_data_rows: int):
@@ -131,6 +135,7 @@ def apply_formatting(svc, spreadsheet_id: str, sheet_id: int, num_data_rows: int
         (5, 9, COLOR_SCHW),  # F:I
         (9, 13, COLOR_IRA),  # J:M
         (13, 17, COLOR_IND), # N:Q
+        (17, 21, COLOR_SWADJ), # R:U
     ]:
         requests.append({
             "repeatCell": {
@@ -153,6 +158,7 @@ def apply_formatting(svc, spreadsheet_id: str, sheet_id: int, num_data_rows: int
         (6, 9),   # G:I  (Schwab price put, price call, P&L)
         (10, 13), # K:M  (TT IRA price put, price call, P&L)
         (14, 17), # O:Q  (TT IND price put, price call, P&L)
+        (18, 21), # S:U  (Schwab adjusted price put, price call, P&L)
     ]:
         requests.append({
             "repeatCell": {
@@ -322,13 +328,15 @@ def read_gw_signal(svc, spreadsheet_id: str, tab: str) -> dict:
 
 
 def read_tt_close_status(svc, spreadsheet_id: str, tab: str) -> dict:
-    """Read CS_TT_Close tab. Returns {(expiry, account): close_net}.
+    """Read CS_TT_Close tab.
+
+    Returns {(expiry, account): {"close_net": float, "close_qty": int, "close_scope": str}}.
 
     Supports both old 3-column format (assumed tt-individual) and
-    new 4-column format with account column.
+    new account-aware format.
     """
     try:
-        all_rows = get_values(svc, spreadsheet_id, f"{tab}!A1:D")
+        all_rows = get_values(svc, spreadsheet_id, f"{tab}!A1:F")
         if len(all_rows) < 2:
             return {}
         header = all_rows[0]
@@ -344,8 +352,14 @@ def read_tt_close_status(svc, spreadsheet_id: str, tab: str) -> dict:
                     account = (row[1] or "").strip()
                     status = (row[2] or "").strip()
                     close_net = safe_float(row[3])
+                    close_qty = int(safe_float(row[4], 0) or 0) if len(row) >= 5 else 0
+                    close_scope = (row[5] or "").strip() if len(row) >= 6 else ""
                     if expiry and status == "closed" and close_net is not None:
-                        result[(expiry, account)] = close_net
+                        result[(expiry, account)] = {
+                            "close_net": close_net,
+                            "close_qty": close_qty,
+                            "close_scope": close_scope,
+                        }
             else:
                 # Legacy 3-column format (assumed tt-individual)
                 if len(row) >= 3:
@@ -353,11 +367,85 @@ def read_tt_close_status(svc, spreadsheet_id: str, tab: str) -> dict:
                     status = (row[1] or "").strip()
                     close_net = safe_float(row[2])
                     if expiry and status == "closed" and close_net is not None:
-                        result[(expiry, "tt-individual")] = close_net
+                        result[(expiry, "tt-individual")] = {
+                            "close_net": close_net,
+                            "close_qty": 0,
+                            "close_scope": "legacy",
+                        }
 
         if result:
             log(f"read {len(result)} close entries")
         return result
+    except Exception as e:
+        log(f"WARN — could not read {tab}: {e}")
+        return {}
+
+
+def read_schwab_adjusted_points(svc, spreadsheet_id: str, tab: str) -> dict:
+    """Read sw_txn_raw and build {expiry: points} for SPX trades.
+
+    - Includes all SPX/SPXW trade cashflows (type=TRADE)
+    - Excludes transfer-like rows by description keywords
+    - De-dupes exact duplicate rows from ingestion retries
+    - Uses net_amount when present (already cost-inclusive), falls back to amount
+    - Converts dollars to SPX points (/$100)
+    """
+    try:
+        all_rows = get_values(svc, spreadsheet_id, f"{tab}!A1:R")
+        if len(all_rows) < 2:
+            return {}
+        h = all_rows[0]
+        idx = {c: h.index(c) for c in h}
+        need = ["type", "description", "symbol", "underlying", "exp_primary", "amount", "net_amount", "ledger_id", "ts"]
+        if any(c not in idx for c in need):
+            return {}
+
+        seen = set()
+        by_expiry_dollars = defaultdict(float)
+        for row in all_rows[1:]:
+            r = row + [""] * (len(h) - len(row))
+            typ = (r[idx["type"]] or "").strip().upper()
+            if typ != "TRADE":
+                continue
+
+            underlying = (r[idx["underlying"]] or "").strip().upper()
+            symbol = (r[idx["symbol"]] or "").strip().upper()
+            if underlying != "SPX" and "SPXW" not in symbol and "SPX" not in symbol:
+                continue
+
+            desc = (r[idx["description"]] or "").strip().lower()
+            if any(k in desc for k in ("transfer", "wire", "journal", "ach", "sweep")):
+                continue
+
+            expiry = (r[idx["exp_primary"]] or "").strip()
+            if not expiry:
+                continue
+
+            # sw_txn_raw can contain duplicated records; de-dupe exact transaction rows.
+            dedup_key = (
+                (r[idx["ledger_id"]] or "").strip(),
+                (r[idx["ts"]] or "").strip(),
+                typ,
+                symbol,
+                str(r[idx["amount"]] or "").strip(),
+                str(r[idx["net_amount"]] or "").strip(),
+                desc,
+            )
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
+
+            net = safe_float(r[idx["net_amount"]])
+            amt = safe_float(r[idx["amount"]])
+            dollars = net if net is not None else (amt if amt is not None else None)
+            if dollars is None:
+                continue
+            by_expiry_dollars[expiry] += dollars
+
+        out = {e: round(v / 100.0, 2) for e, v in by_expiry_dollars.items()}
+        if out:
+            log(f"read schwab-adjusted points for {len(out)} expiries from {tab}")
+        return out
     except Exception as e:
         log(f"WARN — could not read {tab}: {e}")
         return {}
@@ -368,13 +456,14 @@ def read_tt_close_status(svc, spreadsheet_id: str, tab: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def compute_daily_detail(rows: list[dict], gw_signal: dict,
-                         settlements: dict, tt_close: dict = None) -> list[tuple]:
+                         settlements: dict, tt_close: dict = None,
+                         sw_adjusted_points: dict = None) -> list[tuple]:
     """Build pivot: one row per expiry with GW + 3 accounts side by side.
 
-    Returns list of (expiry, gw_group, [schwab_group, ira_group, ind_group])
+    Returns list of (expiry, gw_group, [schwab_group, ira_group, ind_group], schwab_adjusted_group)
     where each group is [qty_str, price_put, price_call, pnl].
 
-    tt_close: {(expiry, account): close_net} from CS_TT_Close tab.
+    tt_close: {(expiry, account): {close_net, close_qty, close_scope}} from CS_TT_Close tab.
               When an expiry is present, uses close-based P&L
               instead of settlement-based P&L.
     """
@@ -440,22 +529,55 @@ def compute_daily_detail(rows: list[dict], gw_signal: dict,
                 price_call = signed_price(r.get("call_fill_price", ""), c_side)
 
                 cost = COST_POINTS.get(acct_name, 0.0)
+                # Keep TT IRA / TT IND comparable: when both exist for an expiry,
+                # use TT IRA strikes as the reference frame for P&L intrinsic.
+                strike_src = r
+                ira_row = accts.get("tt-ira")
+                # Leo reference frame: when TT IRA exists for the expiry, use its
+                # strikes for TT IND and Schwab intrinsic/P&L math so non-Leo
+                # Schwab positions do not distort the report.
+                if acct_name in ("tt-ira", "tt-individual", "schwab") and ira_row:
+                    strike_src = ira_row
+                put_strikes = (strike_src.get("put_strikes") or "").strip()
+                call_strikes = (strike_src.get("call_strikes") or "").strip()
 
                 # Use close-based P&L if order filled early (any account)
-                if (tt_close and (expiry, acct_name) in tt_close
-                        and (put_qty > 0 or call_qty > 0)):
-                    close_net = tt_close[(expiry, acct_name)]
-                    sp = safe_float(price_put) or 0.0
-                    sc = safe_float(price_call) or 0.0
-                    # 2× cost: commissions on both open + close trades
-                    max_qty = max(put_qty, call_qty)
-                    pnl = str(round((sp + sc + close_net - 2 * cost) * max_qty, 2))
+                if (acct_name != "schwab"
+                        and tt_close and (expiry, acct_name) in tt_close
+                        and (put_qty > 0 and call_qty > 0)):
+                    close_info = tt_close[(expiry, acct_name)] or {}
+                    close_net = safe_float(close_info.get("close_net"))
+                    close_qty = int(safe_float(close_info.get("close_qty"), 0) or 0)
+                    close_scope = (close_info.get("close_scope") or "").strip().lower()
+                    open_pairs = min(put_qty, call_qty)
+
+                    # Use close-based P&L only when we have a full-IC close.
+                    use_close = (
+                        close_net is not None
+                        and open_pairs > 0
+                        and close_scope == "full_ic"
+                    )
+                    if use_close:
+                        sp = safe_float(price_put) or 0.0
+                        sc = safe_float(price_call) or 0.0
+                        # qty for close-based P&L: paired contracts only
+                        qty_for_close = open_pairs
+                        if close_qty > 0:
+                            qty_for_close = min(open_pairs, close_qty)
+                        # 2× cost: commissions on both open + close trades
+                        pnl = str(round((sp + sc + close_net - 2 * cost) * qty_for_close, 2))
+                    else:
+                        pnl = compute_pnl_for_group(
+                            safe_float(price_put), safe_float(price_call),
+                            p_side, c_side,
+                            put_strikes, call_strikes,
+                            settlement, cost, put_qty, call_qty,
+                        )
                 else:
                     pnl = compute_pnl_for_group(
                         safe_float(price_put), safe_float(price_call),
                         p_side, c_side,
-                        (r.get("put_strikes") or "").strip(),
-                        (r.get("call_strikes") or "").strip(),
+                        put_strikes, call_strikes,
                         settlement, cost, put_qty, call_qty,
                     )
             else:
@@ -465,7 +587,11 @@ def compute_daily_detail(rows: list[dict], gw_signal: dict,
                 pnl = ""
             account_groups.append([qty_str, price_put, price_call, pnl])
 
-        result.append((expiry, gw_group, account_groups))
+        # Schwab adjusted: all SPX trade cashflows for the expiry (points).
+        adj_pts = (sw_adjusted_points or {}).get(expiry)
+        sw_adj_group = ["1", "", "", str(adj_pts) if adj_pts is not None else ""]
+
+        result.append((expiry, gw_group, account_groups, sw_adj_group))
 
     return result
 
@@ -491,6 +617,7 @@ def main() -> int:
     gw_signal_tab = (os.environ.get("CS_GW_SIGNAL_TAB") or "GW_Signal").strip()
     summary_tab = (os.environ.get("CS_SUMMARY_TAB") or "CS_Summary").strip()
     tt_close_tab = (os.environ.get("CS_TT_CLOSE_TAB") or "CS_TT_Close").strip()
+    sw_raw_tab = (os.environ.get("SW_RAW_TAB") or "sw_txn_raw").strip()
 
     try:
         svc, spreadsheet_id = sheets_client()
@@ -542,8 +669,11 @@ def main() -> int:
         # Read TT Individual close status (for early-close P&L)
         tt_close = read_tt_close_status(svc, spreadsheet_id, tt_close_tab)
 
+        # Read Schwab adjusted (all SPX trade cashflow points)
+        sw_adjusted_points = read_schwab_adjusted_points(svc, spreadsheet_id, sw_raw_tab)
+
         # Compute daily detail with P&L
-        daily_rows = compute_daily_detail(rows, gw_signal, settlements, tt_close)
+        daily_rows = compute_daily_detail(rows, gw_signal, settlements, tt_close, sw_adjusted_points)
         if not daily_rows:
             return skip("no daily data")
 
@@ -552,9 +682,9 @@ def main() -> int:
 
         # Write section + column headers (rows 9-10)
         header_updates = [
-            {"range": f"{summary_tab}!A{SECTION_HEADER_ROW}:Q{SECTION_HEADER_ROW}",
+            {"range": f"{summary_tab}!A{SECTION_HEADER_ROW}:U{SECTION_HEADER_ROW}",
              "values": [SECTION_HEADER]},
-            {"range": f"{summary_tab}!A{COLUMN_HEADER_ROW}:Q{COLUMN_HEADER_ROW}",
+            {"range": f"{summary_tab}!A{COLUMN_HEADER_ROW}:U{COLUMN_HEADER_ROW}",
              "values": [COLUMN_HEADER]},
         ]
 
@@ -564,12 +694,13 @@ def main() -> int:
             spreadsheetId=spreadsheet_id,
             body={"ranges": [
                 f"{summary_tab}!A{DATA_START_ROW}:Q{clear_to}",
+                f"{summary_tab}!R{DATA_START_ROW}:U{clear_to}",
             ]},
         ).execute()
 
         # Build data updates — each group now includes P&L (no separate formula pass)
         data_updates = []
-        for i, (expiry, gw_group, account_groups) in enumerate(daily_rows):
+        for i, (expiry, gw_group, account_groups, sw_adj_group) in enumerate(daily_rows):
             rnum = DATA_START_ROW + i
             # A:E = expiry + GW (qty, price put, price call, P&L)
             data_updates.append({
@@ -591,6 +722,11 @@ def main() -> int:
                 "range": f"{summary_tab}!N{rnum}:Q{rnum}",
                 "values": [account_groups[2]],
             })
+            # R:U = Schwab adjusted (all SPX, net points)
+            data_updates.append({
+                "range": f"{summary_tab}!R{rnum}:U{rnum}",
+                "values": [sw_adj_group],
+            })
 
         # Write headers + data in one batch (RAW so dates stay as strings)
         all_updates = header_updates + data_updates
@@ -603,7 +739,7 @@ def main() -> int:
         apply_formatting(svc, spreadsheet_id, sheet_id, len(daily_rows))
 
         # Count expiries with settlement-based P&L
-        settled = sum(1 for expiry, _, _ in daily_rows
+        settled = sum(1 for expiry, _, _, _ in daily_rows
                       if settlements.get(expiry))
         log(f"wrote {len(daily_rows)} rows to {summary_tab} "
             f"({settled} with settlement P&L)")

@@ -23,14 +23,13 @@ class BaseBaseline(ABC):
 
     @abstractmethod
     def decide(self, chain: ChainSnapshot, account: Account,
-               session_id: int, track: str) -> Optional[Order]:
+               session_id: int) -> Optional[Order]:
         """Decide whether to trade this session.
 
         Args:
-            chain: The OPEN chain snapshot for this session.
+            chain: The chain snapshot for this session.
             account: The bot's current account state.
             session_id: Current session number.
-            track: Experimental track name.
 
         Returns:
             An Order to submit, or None to hold cash.

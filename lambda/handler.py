@@ -920,6 +920,109 @@ def _handle_daily_pnl(event, t0):
     }
 
 
+def _handle_weekly_pnl(event, t0):
+    """Generate Schwab weekly P&L report and send via email.
+
+    Event payload: {"account": "weekly-pnl", "dry_run": true/false,
+                    "week_start": "YYYY-MM-DD", "week_end": "YYYY-MM-DD"}
+    Needs SSM: Schwab creds (orders + SPX prices) + SMTP creds (email).
+    """
+    dry_run = event.get("dry_run", False)
+    week_start = event.get("week_start")
+    week_end = event.get("week_end")
+    print(f"=== weekly-pnl | dry_run={dry_run} | start={week_start or 'auto'} | end={week_end or 'auto'} ===")
+
+    # Fetch SSM params (Schwab + SMTP)
+    ssm_paths = {
+        "SCHWAB_APP_KEY": "/gamma/schwab/app_key",
+        "SCHWAB_APP_SECRET": "/gamma/schwab/app_secret",
+        "_schwab_token": "/gamma/schwab/token_json",
+        "SMTP_USER": "/gamma/shared/smtp_user",
+        "SMTP_PASS": "/gamma/shared/smtp_pass",
+    }
+    all_paths = list(set(ssm_paths.values()))
+    params = get_ssm_params(all_paths)
+    print(f"Fetched {len(params)}/{len(all_paths)} SSM params")
+
+    # Set env vars
+    os.environ["SCHWAB_APP_KEY"] = params.get("/gamma/schwab/app_key", "")
+    os.environ["SCHWAB_APP_SECRET"] = params.get("/gamma/schwab/app_secret", "")
+    os.environ["SMTP_USER"] = params.get("/gamma/shared/smtp_user", "")
+    os.environ["SMTP_PASS"] = params.get("/gamma/shared/smtp_pass", "")
+
+    # Seed Schwab token
+    token_content = params.get("/gamma/schwab/token_json", "")
+    if token_content:
+        token_path = "/tmp/schwab_token.json"
+        with open(token_path, "w") as f:
+            f.write(token_content)
+        os.environ["SCHWAB_TOKEN_PATH"] = token_path
+
+    # Run weekly P&L report
+    try:
+        from reporting.weekly_pnl import run
+        import io
+        import sys as _sys
+
+        # Capture stdout for email body
+        buf = io.StringIO()
+        old_stdout = _sys.stdout
+        _sys.stdout = buf
+        try:
+            run(week_start=week_start, week_end=week_end)
+        finally:
+            _sys.stdout = old_stdout
+        report_text = buf.getvalue()
+        print(report_text)
+
+        # Send via email (if not dry run)
+        if not dry_run:
+            from datetime import date as _date
+            today = _date.today()
+            subject = f"[Gamma] Weekly P&L — {week_start or 'this week'}"
+            smtp_user = os.environ.get("SMTP_USER", "")
+            smtp_pass = os.environ.get("SMTP_PASS", "")
+            smtp_to = os.environ.get("SMTP_TO", "") or smtp_user
+            if smtp_user and smtp_pass:
+                import smtplib
+                from email.message import EmailMessage
+                msg = EmailMessage()
+                msg["From"] = smtp_user
+                msg["To"] = smtp_to
+                msg["Subject"] = subject
+                msg.set_content(report_text)
+                with smtplib.SMTP(
+                    os.environ.get("SMTP_HOST", "smtp.gmail.com"),
+                    int(os.environ.get("SMTP_PORT", "587")),
+                    timeout=20,
+                ) as s:
+                    s.starttls()
+                    s.login(smtp_user, smtp_pass)
+                    s.send_message(msg)
+                print(f"Weekly P&L email sent to {smtp_to}")
+                result = {"sent": True, "to": smtp_to}
+            else:
+                print("SMTP creds not set — skipping email")
+                result = {"sent": False, "reason": "no SMTP creds"}
+        else:
+            result = {"sent": False, "dry_run": True}
+
+    except Exception as e:
+        print(f"weekly-pnl ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        result = {"error": str(e)}
+
+    duration = round(time.time() - t0, 1)
+    print(f"=== DONE weekly-pnl | {duration}s ===")
+    return {
+        "status": "ok" if "error" not in result else "error",
+        "account": "weekly-pnl",
+        "result": result,
+        "duration_s": duration,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Lambda entry point
 # ---------------------------------------------------------------------------
@@ -974,6 +1077,10 @@ def lambda_handler(event, context):
     # Daily P&L email — pulls Schwab orders, computes P&L, sends email
     if account == "daily-pnl":
         return _handle_daily_pnl(event, t0)
+
+    # Weekly P&L report — Saturday morning summary email
+    if account == "weekly-pnl":
+        return _handle_weekly_pnl(event, t0)
 
     # CS reporting refresh — runs full pipeline independently of trading accounts
     if account == "cs-refresh":

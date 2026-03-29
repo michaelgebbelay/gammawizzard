@@ -347,12 +347,18 @@ def regime_filter_decision(
 
 
 def _check_position_conflicts(
-    expiry: date, lower: float, center: float, upper: float
+    expiry: date, lower: float, center: float, upper: float,
+    side: str = "",
 ) -> Optional[str]:
     """Check if any butterfly strike already has an open Schwab position.
 
-    Builds the 3 target OSI keys and checks only those against the account
+    Builds the target OSI keys and checks only those against the account
     positions (single API call). Skips positions on other expiries entirely.
+
+    Args:
+        side: "C" to check calls only, "P" to check puts only,
+              "" to check both (original behavior).
+
     Returns a conflict description if overlap found, None if clear.
     """
     try:
@@ -366,13 +372,13 @@ def _check_position_conflicts(
         if not acct_hash:
             return None
 
-        # Build the 3 OSI keys we care about (calls on this expiry)
         exp_ymd = expiry.strftime("%y%m%d")
         target_osis = set()
+        sides = [side.upper()] if side.upper() in ("C", "P") else ["C", "P"]
         for strike in (lower, center, upper):
             mills = int(round(strike * 1000))
-            target_osis.add(f"SPXW  {exp_ymd}C{mills:08d}")
-            target_osis.add(f"SPXW  {exp_ymd}P{mills:08d}")
+            for s in sides:
+                target_osis.add(f"SPXW  {exp_ymd}{s}{mills:08d}")
 
         url = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}"
         resp = c.session.get(url, params={"fields": "positions"}, timeout=20)
@@ -473,15 +479,15 @@ def nearest_put_delta_contract(
     )
 
 
-def butterfly_nbbo_from_chain(chain: ChainSnapshot, exp: date, lower: float, center: float, upper: float) -> tuple[float, float, float]:
-    lower_call = chain.get_contract(lower, "C", exp)
-    center_call = chain.get_contract(center, "C", exp)
-    upper_call = chain.get_contract(upper, "C", exp)
-    if lower_call is None or center_call is None or upper_call is None:
-        raise RuntimeError("Missing butterfly call legs in chain")
+def butterfly_nbbo_from_chain(chain: ChainSnapshot, exp: date, lower: float, center: float, upper: float, option_type: str = "C") -> tuple[float, float, float]:
+    lower_leg = chain.get_contract(lower, option_type, exp)
+    center_leg = chain.get_contract(center, option_type, exp)
+    upper_leg = chain.get_contract(upper, option_type, exp)
+    if lower_leg is None or center_leg is None or upper_leg is None:
+        raise RuntimeError(f"Missing butterfly {option_type} legs in chain")
 
-    bid = lower_call.bid + upper_call.bid - 2.0 * center_call.ask
-    ask = lower_call.ask + upper_call.ask - 2.0 * center_call.bid
+    bid = lower_leg.bid + upper_leg.bid - 2.0 * center_leg.ask
+    ask = lower_leg.ask + upper_leg.ask - 2.0 * center_leg.bid
     bid = round(max(0.0, bid), 2)
     ask = round(max(bid, ask), 2)
     mid = round((bid + ask) / 2.0, 2)
@@ -795,16 +801,47 @@ def build_trade_plan(trade_day: date) -> dict:
 
     order_side = "DEBIT" if signal == "BUY" else "CREDIT"
 
-    # Position guard: skip if any butterfly strike overlaps an existing position
-    # on the same expiry (prevents accidental close of DualSide/CS legs)
-    conflict = _check_position_conflicts(exp, lower, center, upper)
-    if conflict:
-        return {
-            "status": "SKIP",
-            "reason": f"POSITION_CONFLICT:{conflict}",
-            "signal": signal,
-            "vix1d": vix1d_points,
-        }
+    # Position guard: check call side first; if conflict, flip to put side
+    call_conflict = _check_position_conflicts(exp, lower, center, upper, side="C")
+    use_puts = False
+    if call_conflict:
+        put_conflict = _check_position_conflicts(exp, lower, center, upper, side="P")
+        if put_conflict:
+            return {
+                "status": "SKIP",
+                "reason": f"POSITION_CONFLICT_BOTH:C={call_conflict}/P={put_conflict}",
+                "signal": signal,
+                "vix1d": vix1d_points,
+            }
+        # Flip to put side — same strikes, different option type
+        lower_put_leg = chain.get_contract(lower, "P", exp)
+        center_put_leg = chain.get_contract(center, "P", exp)
+        upper_put_leg = chain.get_contract(upper, "P", exp)
+        if lower_put_leg is None or center_put_leg is None or upper_put_leg is None:
+            return {"status": "ERROR", "reason": "PUT_LEG_MISSING_FOR_FLIP"}
+        for leg_name, contract in (
+            ("lower", lower_put_leg), ("center", center_put_leg), ("upper", upper_put_leg),
+        ):
+            if contract.ask - contract.bid > max_leg_spread:
+                return {
+                    "status": "ERROR",
+                    "reason": f"PUT_FLIP_LEG_SPREAD_TOO_WIDE:{leg_name}:{contract.ask - contract.bid:.2f}",
+                }
+        try:
+            bid, ask, mid = butterfly_nbbo_from_chain(chain, exp, lower, center, upper, option_type="P")
+        except Exception as exc:
+            return {"status": "ERROR", "reason": f"PUT_FLIP_NBBO_FAIL:{type(exc).__name__}:{exc}"}
+        use_puts = True
+        print(f"BF_GUARD FLIP: call conflict {call_conflict} → using PUT side")
+
+    if use_puts:
+        leg_lower_osi = to_osi(lower_put_leg.symbol)
+        leg_center_osi = to_osi(center_put_leg.symbol)
+        leg_upper_osi = to_osi(upper_put_leg.symbol)
+    else:
+        leg_lower_osi = to_osi(lower_call.symbol)
+        leg_center_osi = to_osi(center_call.symbol)
+        leg_upper_osi = to_osi(upper_call.symbol)
 
     return {
         "status": "OK",
@@ -826,9 +863,10 @@ def build_trade_plan(trade_day: date) -> dict:
         "package_bid": bid,
         "package_ask": ask,
         "package_mid": mid,
-        "lower_osi": to_osi(lower_call.symbol),
-        "center_osi": to_osi(center_call.symbol),
-        "upper_osi": to_osi(upper_call.symbol),
+        "lower_osi": leg_lower_osi,
+        "center_osi": leg_center_osi,
+        "upper_osi": leg_upper_osi,
+        "flipped_to_puts": use_puts,
         "se_today": round(se_today, 4) if se_today is not None else None,
         "se_5d_avg": round(se_5d, 4) if se_5d is not None else None,
         "pdv_sigma_ann": pdv_info.get("pdv_sigma_ann"),

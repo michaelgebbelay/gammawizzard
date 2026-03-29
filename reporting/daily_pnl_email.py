@@ -564,6 +564,352 @@ def _build_today_trades_section(
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Discretionary P&L (net position method)
+# ---------------------------------------------------------------------------
+
+def _load_spx_spot(for_date: date | None = None) -> float | None:
+    """Pull SPX price from Schwab.
+
+    If for_date is today or None, uses the live quote API.
+    If for_date is a past date, uses price history to get that day's close.
+    """
+    try:
+        repo_root = Path(__file__).resolve().parent.parent
+        scripts_dir = repo_root / "scripts"
+        if str(scripts_dir) not in sys.path:
+            sys.path.insert(0, str(scripts_dir))
+        from schwab_token_keeper import schwab_client
+        from schwab.client import Client
+
+        c = schwab_client()
+
+        # Always pull price history (covers both current and past dates)
+        resp = c.get_price_history(
+            "$SPX",
+            period_type=Client.PriceHistory.PeriodType.MONTH,
+            period=Client.PriceHistory.Period.THREE_MONTHS,
+            frequency_type=Client.PriceHistory.FrequencyType.DAILY,
+            frequency=Client.PriceHistory.Frequency.DAILY,
+        )
+        resp.raise_for_status()
+        candles = resp.json().get("candles", [])
+
+        if candles:
+            # Build date->close map
+            closes: dict[str, float] = {}
+            for candle in candles:
+                ts = candle.get("datetime", 0)
+                dt = datetime.fromtimestamp(ts / 1000)
+                closes[dt.strftime("%Y-%m-%d")] = candle["close"]
+
+            # If specific date requested, return that date's close
+            if for_date:
+                target = for_date.isoformat()
+                if target in closes:
+                    print(f"  [settlement] SPX close for {target}: {closes[target]}")
+                    return closes[target]
+                # Fall through to latest if date not found
+
+            # Default: return latest candle
+            return float(candles[-1]["close"])
+
+        # Fallback: live quote (works for today only)
+        resp = c.get_quote("$SPX")
+        resp.raise_for_status()
+        data = resp.json()
+        for sym_data in data.values():
+            quote = sym_data.get("quote", sym_data) if isinstance(sym_data, dict) else {}
+            price = quote.get("lastPrice") or quote.get("closePrice") or quote.get("mark")
+            if price:
+                return float(price)
+    except Exception as e:
+        print(f"  [warn] Could not fetch SPX: {e}")
+    return None
+
+
+def _net_position_pnl_for_expiry(
+    orders: list[dict],
+    expiry_str: str,
+    spx_close: float,
+) -> float:
+    """Compute P&L via net position method for a single expiry across given orders."""
+    cash = 0.0
+    legs: dict[tuple, int] = defaultdict(int)  # (strike, otype) -> net_qty
+
+    for o in orders:
+        if o.get("status") != "FILLED":
+            continue
+        order_legs = o.get("orderLegCollection", [])
+        order_type = o.get("orderType", "")
+        price = o.get("price", 0)
+        filled_qty = int(o.get("filledQuantity", 0))
+
+        # Check all legs share this expiry
+        leg_expiries = set()
+        for leg in order_legs:
+            inst = leg.get("instrument", {})
+            e, _, _ = parse_osi(inst.get("symbol", "").strip())
+            if e:
+                leg_expiries.add(e)
+        if len(leg_expiries) != 1 or list(leg_expiries)[0] != expiry_str:
+            continue
+
+        # Net qty
+        for leg in order_legs:
+            inst = leg.get("instrument", {})
+            _, otype, strike = parse_osi(inst.get("symbol", "").strip())
+            if not strike:
+                continue
+            instruction = leg.get("instruction", "")
+            qty = int(leg.get("quantity", 0))
+            signed = qty if "BUY" in instruction else -qty
+            legs[(strike, otype)] += signed
+
+        # Cash flow
+        if order_type == "NET_CREDIT":
+            cash += price * filled_qty * 100
+        elif order_type == "NET_DEBIT":
+            cash -= price * filled_qty * 100
+        elif order_type == "LIMIT":
+            for leg in order_legs:
+                instruction = leg.get("instruction", "")
+                if "SELL" in instruction:
+                    cash += price * filled_qty * 100
+                else:
+                    cash -= price * filled_qty * 100
+                break
+
+    # Settlement value
+    settle = 0.0
+    for (strike, otype), nq in legs.items():
+        if nq == 0:
+            continue
+        if otype == "PUT":
+            intrinsic = max(0, strike - spx_close)
+        else:
+            intrinsic = max(0, spx_close - strike)
+        settle += intrinsic * nq * 100
+
+    return cash + settle
+
+
+def _compute_discretionary_pnl(
+    raw_orders: list[dict],
+    report_date: date,
+    spx_spot: float | None,
+) -> dict:
+    """Compute discretionary P&L for positions expiring today.
+
+    Separates:
+      - Pure discretionary: manual opens + their closes (net position method)
+      - Auto adjustments: manual closes of automated positions (shown separately)
+
+    A manual close-only order is an "auto adjustment" if its strikes overlap
+    with API-tagged orders at the same expiry.
+    """
+    report_str = report_date.isoformat()
+
+    # Build auto net positions for this expiry to detect adjustments
+    auto_net: dict[tuple[float, str], int] = defaultdict(int)
+    for o in raw_orders:
+        if o.get("status") != "FILLED":
+            continue
+        if o.get("tag") != API_TAG:
+            continue
+        for leg in o.get("orderLegCollection", []):
+            inst = leg.get("instrument", {})
+            e, otype, strike = parse_osi(inst.get("symbol", "").strip())
+            if e == report_str and strike:
+                instruction = leg.get("instruction", "")
+                qty = int(leg.get("quantity", 0))
+                signed = qty if "BUY" in instruction else -qty
+                auto_net[(strike, otype)] += signed
+
+    def _is_auto_adjustment(leg_details: list[dict]) -> bool:
+        """A manual close-only order is an auto adjustment if every leg
+        reduces (moves toward zero) the corresponding auto net position."""
+        if not all("CLOSE" in ld["action"] for ld in leg_details if ld["action"]):
+            return False
+        for ld in leg_details:
+            key = (ld["strike"], ld["type"])
+            auto_qty = auto_net.get(key, 0)
+            if auto_qty == 0:
+                return False  # no auto position at this strike → not an adjustment
+            qty = 1  # direction matters, not magnitude
+            signed = qty if "BUY" in ld["action"] else -qty
+            # Reducing means: auto is positive and we're adding negative, or vice versa
+            if auto_qty > 0 and signed >= 0:
+                return False
+            if auto_qty < 0 and signed <= 0:
+                return False
+        return True
+
+    # Classify manual orders into pure discretionary vs auto adjustments
+    disc_orders: list[dict] = []        # pure discretionary (include in P&L)
+    adjustment_orders: list[dict] = []   # manual closes of auto positions
+    discretionary_trades: list[dict] = []
+
+    for o in raw_orders:
+        if o.get("status") != "FILLED":
+            continue
+        if o.get("tag") == API_TAG:
+            continue
+
+        legs = o.get("orderLegCollection", [])
+        order_type = o.get("orderType", "")
+        price = o.get("price", 0)
+        filled_qty = int(o.get("filledQuantity", 0))
+
+        leg_expiries = set()
+        leg_details = []
+        for leg in legs:
+            inst = leg.get("instrument", {})
+            e, option_type, strike = parse_osi(inst.get("symbol", "").strip())
+            if e:
+                leg_expiries.add(e)
+            if strike:
+                instruction = leg.get("instruction", "")
+                leg_details.append({"strike": strike, "type": option_type, "action": instruction})
+
+        if len(leg_expiries) != 1:
+            continue
+        exp = list(leg_expiries)[0]
+        if exp != report_str:
+            continue
+
+        is_auto_adjustment = _is_auto_adjustment(leg_details)
+
+        if is_auto_adjustment:
+            adjustment_orders.append(o)
+        else:
+            disc_orders.append(o)
+
+        # Build display record
+        dt_et = None
+        stamp = o.get("closeTime") or o.get("enteredTime") or ""
+        if stamp:
+            try:
+                dt_utc = datetime.fromisoformat(stamp.replace("+0000", "+00:00"))
+                dt_et = dt_utc.astimezone(ET)
+            except Exception:
+                pass
+
+        strikes = sorted(set(ld["strike"] for ld in leg_details))
+        n_strikes = len(strikes)
+        if n_strikes == 3:
+            structure = "Butterfly"
+        elif n_strikes == 2:
+            structure = "Vertical"
+        elif n_strikes == 1:
+            structure = "Single Leg"
+        else:
+            structure = f"{n_strikes}-leg"
+
+        discretionary_trades.append({
+            "time": dt_et.strftime("%H:%M") if dt_et else "—",
+            "structure": structure,
+            "strikes": strikes,
+            "premium": price * filled_qty * 100,
+            "order_type": order_type,
+            "qty": filled_qty,
+            "is_adjustment": is_auto_adjustment,
+        })
+
+    # Pure discretionary count (exclude adjustments)
+    pure_disc_count = sum(1 for t in discretionary_trades if not t.get("is_adjustment"))
+
+    result = {
+        "total_pnl": 0.0,
+        "trade_count": len(discretionary_trades),
+        "pure_disc_count": pure_disc_count,
+        "adjustment_count": len(adjustment_orders),
+        "expiry_details": [],
+        "spx_spot": spx_spot,
+        "trades": discretionary_trades,
+    }
+
+    if not spx_spot or not discretionary_trades:
+        return result
+
+    # Pure discretionary P&L: net position method on manual-only orders
+    # (excluding auto adjustments)
+    disc_pnl = _net_position_pnl_for_expiry(disc_orders, report_str, spx_spot)
+
+    # Auto adjustment P&L: computed via subtraction
+    # total(all orders) - auto(API only) - disc(pure manual) = adjustment impact
+    if adjustment_orders:
+        total_pnl = _net_position_pnl_for_expiry(raw_orders, report_str, spx_spot)
+        auto_pnl = _net_position_pnl_for_expiry(
+            [o for o in raw_orders if o.get("tag") == API_TAG], report_str, spx_spot,
+        )
+        adj_pnl = total_pnl - auto_pnl - disc_pnl
+    else:
+        adj_pnl = 0.0
+
+    result["total_pnl"] = disc_pnl
+    result["adjustment_pnl"] = adj_pnl
+    result["expiry_details"].append({
+        "expiry": report_str,
+        "disc_pnl": disc_pnl,
+        "adj_pnl": adj_pnl,
+    })
+
+    return result
+
+
+def _build_discretionary_section(disc_result: dict, report_date: date) -> str:
+    """Build the discretionary P&L text section for the daily email."""
+    lines = [
+        "Discretionary Trades (Schwab)",
+        f"Expiring {report_date.isoformat()} | SPX Spot: "
+        + (f"${disc_result['spx_spot']:,.2f}" if disc_result["spx_spot"] else "N/A"),
+    ]
+
+    trades = disc_result["trades"]
+    if not trades:
+        lines.append("No discretionary trades expiring today.")
+        lines.append("")
+        return "\n".join(lines)
+
+    lines.append(
+        f"{'Time':<6} {'Structure':<12} {'Strikes':<20} {'Type':<12} "
+        f"{'Qty':>4} {'Premium':>10}"
+    )
+    lines.append(
+        f"{'-' * 6} {'-' * 12} {'-' * 20} {'-' * 12} {'-' * 4} {'-' * 10}"
+    )
+
+    for t in sorted(trades, key=lambda x: x["time"]):
+        strikes_str = "/".join(f"{s:.0f}" for s in t["strikes"]) if t["strikes"] else "—"
+        premium_str = _fmt(t["premium"])
+        order_label = t["order_type"].replace("NET_", "").title() if t["order_type"] else "—"
+        adj_tag = " [adj]" if t.get("is_adjustment") else ""
+        lines.append(
+            f"{t['time']:<6} {t['structure']:<12} {strikes_str:<20} {order_label:<12} "
+            f"{t['qty']:>4} {premium_str:>10}{adj_tag}"
+        )
+
+    # P&L summary
+    details = disc_result["expiry_details"]
+    if details:
+        lines.append("")
+        d = details[0]
+        lines.append(f"Discretionary P&L: {_fmt(d['disc_pnl'])}")
+        adj_count = disc_result.get("adjustment_count", 0)
+        if adj_count > 0:
+            lines.append(
+                f"Auto adjustments ({adj_count} order(s), marked [adj]): "
+                f"{_fmt(d.get('adj_pnl', 0))}"
+            )
+        lines.append(f"Discretionary total: {_fmt(disc_result['total_pnl'])}")
+    elif trades:
+        lines.append("(Settlement P&L pending — SPX spot not available)")
+
+    lines.append("")
+    return "\n".join(lines)
+
+
 EMAIL_GROUPS = (
     {
         "key": "constantstable",
@@ -590,6 +936,8 @@ def _build_email(
     positions: list[dict],
     report_date: date,
     today_trades_section: str = "",
+    discretionary_section: str = "",
+    discretionary_pnl: float = 0.0,
 ) -> tuple[str, str]:
     """Build the portfolio-health email.
 
@@ -720,6 +1068,22 @@ def _build_email(
     lines.append(f"- Current streak: {portfolio_streak}")
     lines.append(f"- MTD drawdown: current {_fmt(-current_dd_mtd)} | max {_fmt(-max_dd_mtd)}")
     lines.append(f"- YTD drawdown: current {_fmt(-current_dd_ytd)} | max {_fmt(-max_dd_ytd)}")
+
+    # Discretionary section
+    if discretionary_section:
+        lines.append("")
+        lines.append("=" * 50)
+        lines.append(discretionary_section)
+
+        # Combined bottom line
+        today_auto = sum(
+            float(p["pnl"] or 0) for p in _window_positions(settled, report_date, report_date)
+        )
+        combined = today_auto + discretionary_pnl
+        lines.append("Combined (Auto + Discretionary)")
+        lines.append(f"  Today auto:         {_fmt(today_auto)}")
+        lines.append(f"  Today discretionary: {_fmt(discretionary_pnl)}")
+        lines.append(f"  Combined total:      {_fmt(combined)}")
 
     lines.append("")
     lines.append("— Gamma Reporting (automated)")
@@ -1026,8 +1390,29 @@ def run_daily_pnl_email(
         report_date=report_date,
     )
 
+    # Discretionary P&L (net position method, SPX spot for today's expiry)
+    disc_section = ""
+    disc_pnl = 0.0
+    try:
+        spx_spot = _load_spx_spot(for_date=report_date)
+        print(f"[daily_pnl] SPX spot for {report_date}: {spx_spot}")
+        disc_result = _compute_discretionary_pnl(raw_orders, report_date, spx_spot)
+        disc_pnl = disc_result["total_pnl"]
+        if disc_result["trade_count"] > 0:
+            disc_section = _build_discretionary_section(disc_result, report_date)
+            print(f"[daily_pnl] Discretionary: {disc_result['trade_count']} trades, P&L: {disc_pnl:+,.0f}")
+        else:
+            print("[daily_pnl] No discretionary trades expiring today")
+    except Exception as e:
+        print(f"[daily_pnl] Discretionary section ERROR (non-fatal): {e}")
+
     # Build and send email
-    subject, body = _build_email(auto, report_date, today_trades_section=today_trades_section)
+    subject, body = _build_email(
+        auto, report_date,
+        today_trades_section=today_trades_section,
+        discretionary_section=disc_section,
+        discretionary_pnl=disc_pnl,
+    )
     result = send_pnl_email(subject, body, dry_run=dry_run)
     result["source"] = source
     result["positions"] = len(auto)

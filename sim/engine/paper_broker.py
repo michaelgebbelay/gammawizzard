@@ -7,7 +7,6 @@ import random
 from dataclasses import dataclass
 from typing import Optional
 
-from sim.config import MAX_ORDERS_PER_WINDOW
 from sim.data.chain_snapshot import ChainSnapshot
 from sim.engine.account import Account
 from sim.engine.commissions import calculate_commission
@@ -37,14 +36,14 @@ class PaperBroker:
         self.base_seed = rng_seed
         self.rng = random.Random(rng_seed)
 
-    def _window_rng(self, session_id: int, window: str, agent_id: str) -> random.Random:
-        """Create a deterministic RNG for a specific (session, window, agent) triple."""
-        key = f"{self.base_seed}:{session_id}:{window}:{agent_id}"
+    def _session_rng(self, session_id: int, agent_id: str) -> random.Random:
+        """Create a deterministic RNG for a specific (session, agent) pair."""
+        key = f"{self.base_seed}:{session_id}:{agent_id}"
         seed = int(hashlib.sha256(key.encode()).hexdigest()[:16], 16)
         return random.Random(seed)
 
     def submit_order(self, order: Order, account: Account,
-                     chain: ChainSnapshot, track: str,
+                     chain: ChainSnapshot,
                      session_id: int,
                      intraday_move_pts: float = 0.0) -> FillResult:
         """Attempt to fill an order.
@@ -60,29 +59,12 @@ class PaperBroker:
             order: The order to fill.
             account: The agent's account.
             chain: Current chain snapshot.
-            track: Experimental track ("adaptive", "frozen", "clean").
             session_id: Current session ID.
             intraday_move_pts: SPX move since open (for slippage calculation).
 
         Returns:
             FillResult with fill details or rejection reason.
         """
-        # 0. One order per participant per window
-        if order.window:
-            window_fills = sum(
-                1 for p in account.open_positions
-                if p.is_open and p.window == order.window
-                and p.session_opened == session_id
-            )
-            if window_fills >= MAX_ORDERS_PER_WINDOW:
-                order.status = OrderStatus.REJECTED
-                order.rejection_reason = (
-                    f"Already filled {window_fills} order(s) in {order.window} window "
-                    f"(max {MAX_ORDERS_PER_WINDOW})"
-                )
-                return FillResult(order=order, filled=False,
-                                  rejection_reason=order.rejection_reason)
-
         # 1. Compute spread NBBO
         expiration = chain.expirations[0] if chain.expirations else None
         bid, ask, mid = spread_nbbo(order.legs, chain, expiration)
@@ -93,17 +75,15 @@ class PaperBroker:
             return FillResult(order=order, filled=False,
                               rejection_reason=order.rejection_reason)
 
-        # 2. Compute slippage (deterministic per session/window/agent)
-        rng = self._window_rng(session_id, order.window or "", order.agent_id) if order.window else self.rng
+        # 2. Compute slippage (deterministic per session/agent)
+        rng = self._session_rng(session_id, order.agent_id)
         slippage = compute_slippage(chain.vix, intraday_move_pts, rng)
 
         # 3. Determine fill price
         if order.side == Side.CREDIT:
-            # Credit: we sell the spread. Natural fill = bid. With slippage, worse = less credit.
             executable_price = bid
             fill_price = max(0.01, executable_price - slippage)
         else:
-            # Debit: we buy the spread. Natural fill = ask. With slippage, worse = more debit.
             executable_price = ask
             fill_price = executable_price + slippage
 
@@ -143,7 +123,7 @@ class PaperBroker:
         commission = calculate_commission(order)
 
         position = SpreadPosition.from_filled_order(
-            order, session_id, track, fill_price, commission
+            order, session_id, fill_price, commission
         )
 
         # 6. Update account

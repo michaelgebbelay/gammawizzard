@@ -2,10 +2,10 @@
 import os, sys
 from schwab.auth import client_from_login_flow
 
-APP_KEY = "wtdRgK6ENV2R2NQ0aAcBAc9Ux8Vihb4hQiTnymAlS23FDgwS"
-APP_SECRET = "Y4JhG3N18mlZTnGRXifVZFfCc7mg51k3bOZZiQj9pC3Y79wZ1EH2eOXiT1tETBIn"
-CALLBACK_URL = "https://127.0.0.1:8182"
-TOKEN_PATH  = os.environ.get("SCHWAB_TOKEN_PATH", "Token/schwab_token.json")
+APP_KEY      = os.environ.get("SCHWAB_APP_KEY", "wtdRgK6ENV2R2NQ0aAcBAc9Ux8Vihb4hQiTnymAlS23FDgwS")
+APP_SECRET   = os.environ.get("SCHWAB_APP_SECRET", "Y4JhG3N18mlZTnGRXifVZFfCc7mg51k3bOZZiQj9pC3Y79wZ1EH2eOXiT1tETBIn")
+CALLBACK_URL = os.environ.get("SCHWAB_REDIRECT_URI", "https://127.0.0.1:8182")
+TOKEN_PATH   = os.environ.get("SCHWAB_TOKEN_PATH", "Token/schwab_token.json")
 
 def die(msg):
     print("ERROR:", msg, file=sys.stderr)
@@ -22,8 +22,9 @@ def main():
         client_from_login_flow(
             api_key=APP_KEY,
             app_secret=APP_SECRET,
-            callback_url=CALLBACK_URL,   # <-- correct kwarg
+            callback_url=CALLBACK_URL,
             token_path=TOKEN_PATH,
+            interactive=False,
         )
     except Exception as e:
         msg = str(e)

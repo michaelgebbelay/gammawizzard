@@ -1,77 +1,46 @@
-"""Financial and judge dual leaderboards."""
+"""Financial leaderboard (v14 — no tracks, no judge)."""
 
 from __future__ import annotations
 
 import sqlite3
-from typing import List
 
-from sim.persistence.queries import get_leaderboard
+from sim.persistence.queries import get_hard_metrics
 
 
-def financial_leaderboard(conn: sqlite3.Connection, track: str) -> str:
-    """Generate financial leaderboard as formatted text."""
-    rows = get_leaderboard(conn, track)
+def hard_metrics_leaderboard(conn: sqlite3.Connection) -> str:
+    """Primary leaderboard: ranked by hard financial metrics only.
+
+    Shows: Balance, P&L, Return, Max DD, MAR, Sharpe, PF, Win%, W/L, Trades.
+    """
+    rows = get_hard_metrics(conn)
     if not rows:
-        return f"No data for track: {track}"
+        return "No simulation data yet."
 
     lines = [
-        f"=== Financial Leaderboard — Track: {track} ===",
-        f"{'Rank':>4}  {'Agent':<22} {'Balance':>12} {'Total P&L':>12} "
-        f"{'Commissions':>12} {'Sessions':>8}",
-        f"{'─'*4}  {'─'*22} {'─'*12} {'─'*12} {'─'*12} {'─'*8}",
+        "=== Leaderboard ===",
+        f"{'Rank':>4}  {'Agent':<16} {'Balance':>12} {'P&L':>10} "
+        f"{'Return':>8} {'Max DD':>8} {'MAR':>6} {'Sharpe':>7} "
+        f"{'PF':>6} {'Win%':>6} {'W/L':>7} {'Trades':>6}",
+        f"{'─'*4}  {'─'*16} {'─'*12} {'─'*10} "
+        f"{'─'*8} {'─'*8} {'─'*6} {'─'*7} "
+        f"{'─'*6} {'─'*6} {'─'*7} {'─'*6}",
     ]
 
-    for i, row in enumerate(rows, 1):
+    for i, r in enumerate(rows, 1):
+        mar_str = f"{r['mar_ratio']:.2f}" if r['mar_ratio'] < 1000 else "inf"
+        pf_str = f"{r['profit_factor']:.2f}" if r['profit_factor'] < 1000 else "inf"
         lines.append(
-            f"{i:>4}  {row['agent_id']:<22} "
-            f"${row['final_balance']:>11,.2f} "
-            f"${row['total_pnl']:>+11,.2f} "
-            f"${row['total_commissions']:>11,.2f} "
-            f"{row['sessions_played']:>8}"
-        )
-
-    return "\n".join(lines)
-
-
-def judge_leaderboard(conn: sqlite3.Connection, track: str) -> str:
-    """Generate judge scorecard leaderboard."""
-    cur = conn.execute(
-        """SELECT agent_id,
-                  AVG(total_score) as avg_score,
-                  AVG(structure_selection_score) as avg_structure,
-                  AVG(strike_placement_score) as avg_strike,
-                  AVG(risk_sizing_score) as avg_risk,
-                  AVG(portfolio_exposure_score) as avg_exposure,
-                  AVG(pnl_score) as avg_pnl,
-                  COUNT(*) as sessions_scored
-           FROM scorecards
-           WHERE track=?
-           GROUP BY agent_id
-           ORDER BY avg_score DESC""",
-        (track,),
-    )
-    rows = [dict(r) for r in cur.fetchall()]
-
-    if not rows:
-        return f"No scorecard data for track: {track}"
-
-    lines = [
-        f"=== Judge Leaderboard — Track: {track} ===",
-        f"{'Rank':>4}  {'Agent':<22} {'Avg Score':>10} {'Structure':>10} "
-        f"{'Strikes':>10} {'Sizing':>10} {'Exposure':>10} {'P&L':>10} {'Sessions':>8}",
-        f"{'─'*4}  {'─'*22} {'─'*10} {'─'*10} {'─'*10} {'─'*10} {'─'*10} {'─'*10} {'─'*8}",
-    ]
-
-    for i, row in enumerate(rows, 1):
-        lines.append(
-            f"{i:>4}  {row['agent_id']:<22} "
-            f"{row['avg_score']:>10.2f} "
-            f"{row['avg_structure']:>10.2f} "
-            f"{row['avg_strike']:>10.2f} "
-            f"{row['avg_risk']:>10.2f} "
-            f"{row['avg_exposure']:>10.2f} "
-            f"{row['avg_pnl']:>10.2f} "
-            f"{row['sessions_scored']:>8}"
+            f"{i:>4}  {r['agent_id']:<16} "
+            f"${r['final_balance']:>11,.2f} "
+            f"${r['total_pnl']:>+9,.2f} "
+            f"{r['return_pct']:>+7.2f}% "
+            f"{r['max_drawdown_pct']:>7.2f}% "
+            f"{mar_str:>6} "
+            f"{r['sharpe']:>7.2f} "
+            f"{pf_str:>6} "
+            f"{r['win_rate']:>5.0%} "
+            f"{r['wins']:>3}/{r['losses']:<3} "
+            f"{r['trades']:>6}"
         )
 
     return "\n".join(lines)
