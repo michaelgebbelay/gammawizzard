@@ -20,7 +20,10 @@ import math
 import os
 from typing import Optional
 
-import numpy as np
+
+def _dot(a: list[float], b: list[float]) -> float:
+    """Dot product (stdlib replacement for np.dot — Lambda has no numpy)."""
+    return sum(x * y for x, y in zip(a, b))
 
 DT = 1.0 / 252.0
 PDV_LOOKBACK = 1000
@@ -39,11 +42,11 @@ Z_VALUE = 0.60
 SKIP_THRESHOLD = 0.0
 
 
-def _tspl_weights(lookback: int, alpha: float, delta: float) -> np.ndarray:
-    lags = np.arange(lookback, 0, -1, dtype=float) * DT
-    raw = (lags + delta) ** (-alpha)
-    Z = raw.sum() * DT
-    return raw / Z
+def _tspl_weights(lookback: int, alpha: float, delta: float) -> list[float]:
+    lags = [i * DT for i in range(lookback, 0, -1)]
+    raw = [(l + delta) ** (-alpha) for l in lags]
+    Z = sum(raw) * DT
+    return [r / Z for r in raw]
 
 
 def _compute_pdv_sigma(closes: list[float]) -> Optional[float]:
@@ -54,8 +57,7 @@ def _compute_pdv_sigma(closes: list[float]) -> Optional[float]:
     if len(closes) < PDV_LOOKBACK + 2:
         return None
 
-    arr = np.array(closes, dtype=float)
-    returns = np.diff(arr) / arr[:-1]
+    returns = [(closes[i + 1] - closes[i]) / closes[i] for i in range(len(closes) - 1)]
 
     if len(returns) < PDV_LOOKBACK:
         return None
@@ -64,8 +66,9 @@ def _compute_pdv_sigma(closes: list[float]) -> Optional[float]:
     w2 = _tspl_weights(PDV_LOOKBACK, A2, D2)
 
     window = returns[-PDV_LOOKBACK:]
-    R1 = np.dot(w1, window)
-    R2 = np.dot(w2, window ** 2)
+    R1 = _dot(w1, window)
+    window_sq = [r * r for r in window]
+    R2 = _dot(w2, window_sq)
     Sigma = math.sqrt(max(R2, 1e-16))
 
     pdv_iv_ann = B0 + B1 * R1 + B2 * Sigma  # annualized
@@ -78,15 +81,16 @@ def _compute_short_r1(closes: list[float], window: int = SHORT_R1_WINDOW) -> flo
     if len(closes) < window + 2:
         return 0.0
 
-    arr = np.array(closes, dtype=float)
-    returns = np.diff(arr) / arr[:-1]
+    returns = [(closes[i + 1] - closes[i]) / closes[i] for i in range(len(closes) - 1)]
 
     if len(returns) < window:
         return 0.0
 
-    weights = np.exp(np.linspace(-2, 0, window))
-    weights /= weights.sum()
-    return float(np.dot(weights, returns[-window:]))
+    step = 2.0 / (window - 1) if window > 1 else 0.0
+    weights = [math.exp(-2.0 + i * step) for i in range(window)]
+    w_sum = sum(weights)
+    weights = [w / w_sum for w in weights]
+    return _dot(weights, returns[-window:])
 
 
 def _fetch_spx_closes() -> list[float]:
