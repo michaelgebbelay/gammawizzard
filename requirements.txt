@@ -7,3 +7,8 @@ websockets
 google-api-python-client
 google-auth
 google-auth-httplib2
+
+# Reporting pipeline
+duckdb>=1.0
+pandas
+numpy

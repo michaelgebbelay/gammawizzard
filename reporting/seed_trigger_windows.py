@@ -36,8 +36,8 @@ WINDOWS = [
     ("constantstable", "schwab", range(5), "09:30", "10:00", "cs_morning_trigger"),
 
     # Novix — 16:15 ET Mon-Fri, allow 16:10–16:45
-    ("novix", "tt-ira", range(5), "16:10", "16:45", "nx_daily_trigger"),
-    ("novix", "tt-individual", range(5), "16:10", "16:45", "nx_daily_trigger"),
+    ("novix", "novix-tt-ira", range(5), "16:10", "16:45", "nx_daily_trigger"),
+    ("novix", "novix-tt-individual", range(5), "16:10", "16:45", "nx_daily_trigger"),
 ]
 
 
