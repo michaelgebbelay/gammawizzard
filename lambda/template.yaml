@@ -127,7 +127,7 @@ Resources:
     Properties:
       Name: gamma-bf-daily
       Description: "Hybrid butterfly: 4DTE BUY / 3DTE SELL with vol filter"
-      State: ENABLED
+      State: DISABLED
       ScheduleExpression: "cron(1 16 ? * MON-FRI *)"
       ScheduleExpressionTimezone: "America/New_York"
       FlexibleTimeWindow:
