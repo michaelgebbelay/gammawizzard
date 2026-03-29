@@ -173,10 +173,24 @@ def _recent_business_days(report_date: date, count: int = 5) -> list[date]:
 # Today's Trade Summary (Schwab + TastyTrade)
 # ---------------------------------------------------------------------------
 
+# TT account labels and their currently-active strategy (from template.yaml).
+# Update these when the schedule changes.
 TT_ACCOUNTS = {
-    "5WT20360": "TT-IRA",
-    "5WT09219": "TT-Indv",
+    "5WT20360": {"label": "TT-IRA", "strategy": "Novix"},       # CS disabled, Novix enabled
+    "5WT09219": {"label": "TT-Indv", "strategy": "ConstantStable"},  # CS enabled, Novix disabled
 }
+
+# Expected ENABLED schedules for the missing-strategies check (weekdays).
+# Each entry: (account_display, strategy_key_in_schwab_strategies_seen_or_tt_label)
+EXPECTED_SCHWAB = [
+    ("Schwab CS", "constantstable"),
+    ("Schwab DualSide", "dualside"),
+    # Butterfly runs daily but may legitimately SKIP — not flagged as missing
+]
+EXPECTED_TT = [
+    ("TT-IRA Novix", "TT-IRA"),
+    ("TT-Indv CS", "TT-Indv"),
+]
 
 
 def _load_tt_orders_for_date(report_date: date) -> list[dict]:
@@ -202,7 +216,9 @@ def _load_tt_orders_for_date(report_date: date) -> list[dict]:
         print(f"[trade_summary] cannot import tt_client: {e}")
         return tt_orders
 
-    for acct_num, label in TT_ACCOUNTS.items():
+    for acct_num, acct_info in TT_ACCOUNTS.items():
+        label = acct_info["label"]
+        default_strategy = acct_info["strategy"]
         try:
             os.environ["TT_ACCOUNT_NUMBER"] = acct_num
             resp = tt_request("GET", f"/accounts/{acct_num}/orders")
@@ -262,6 +278,7 @@ def _load_tt_orders_for_date(report_date: date) -> list[dict]:
                     "broker": "tt",
                     "account_label": label,
                     "account_number": acct_num,
+                    "default_strategy": default_strategy,
                     "status": status,
                     "dt_et": dt_et,
                     "filled_qty": int(filled_qty) if filled_qty else 0,
@@ -504,14 +521,15 @@ def _build_today_trades_section(
         price_str = f"${price:.2f}" if price else "—"
         dollar_str = f"${price * 100:.0f}" if price else "—"
 
-        # Classify strategy by width
+        # Classify strategy: use account's default_strategy (from schedule),
+        # but override for structures that are unambiguous regardless of account.
         width = order["width"]
         if width == 10:
             strategy_label = "DualSide"
         elif order["num_strikes"] == 3:
             strategy_label = "Butterfly"
         else:
-            strategy_label = "ConstantStable"
+            strategy_label = order.get("default_strategy", "ConstantStable")
 
         # Fail reason for TT
         reason = ""
@@ -539,19 +557,15 @@ def _build_today_trades_section(
         lines.append("No automated trades today.")
 
     # --- Missing strategies check ---
-    # On weekdays, flag strategies with no orders at all
+    # On weekdays, flag expected strategies with no orders at all.
     if report_date.weekday() < 5:
         missing = []
-        if "constantstable" not in schwab_strategies_seen:
-            missing.append("Schwab CS — no order found")
-        if "TT-IRA" not in tt_strategies_seen:
-            missing.append("TT-IRA CS — no order found")
-        if "TT-Indv" not in tt_strategies_seen:
-            missing.append("TT-Indv CS — no order found")
-        # DualSide and Butterfly run on Schwab only
-        if "dualside" not in schwab_strategies_seen:
-            missing.append("Schwab DualSide — no order found")
-        # Butterfly runs daily but may legitimately SKIP
+        for display, key in EXPECTED_SCHWAB:
+            if key not in schwab_strategies_seen:
+                missing.append(f"{display} — no order found")
+        for display, key in EXPECTED_TT:
+            if key not in tt_strategies_seen:
+                missing.append(f"{display} — no order found")
         if missing:
             lines.append("")
             lines.append("Missing (no orders seen at broker):")
