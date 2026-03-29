@@ -46,11 +46,11 @@ Resources:
             - Effect: Allow
               Action: ssm:PutParameter
               Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/gamma/*/token_json"
-        # Self-invoke for multi-container warmup
+        # Self-invoke for multi-container warmup (use Sub to avoid circular ref)
         - Statement:
             - Effect: Allow
               Action: lambda:InvokeFunction
-              Resource: !GetAtt TradingFunction.Arn
+              Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:*"
         # S3 access for sim chain cache
         - S3CrudPolicy:
             BucketName: !Ref SimCacheBucket
