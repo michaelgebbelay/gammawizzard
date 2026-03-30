@@ -47,6 +47,7 @@ from reporting.broker_pnl import (
 # ---------------------------------------------------------------------------
 
 def _fmt(val: float) -> str:
+    val = val + 0.0  # normalise -0.0 → 0.0
     if val >= 0:
         return f"+${val:,.0f}"
     return f"-${abs(val):,.0f}"
@@ -410,13 +411,19 @@ def _build_today_trades_section(
     """Build the 'Today's Trades' section for the email."""
     lines = [
         "Today's Trades",
-        f"{'Account':<10} {'Strategy':<16} {'Signal':<14} {'Strikes':<20} "
-        f"{'Fill':>8} {'Price':>8} {'$/Ct':>8} {'Status':<10}",
-        f"{'-' * 10} {'-' * 16} {'-' * 14} {'-' * 20} "
-        f"{'-' * 8} {'-' * 8} {'-' * 8} {'-' * 10}",
+        f"{'Account':<10} {'Strategy':<16} {'Signal':<7} Outcome",
+        f"{'-' * 10} {'-' * 16} {'-' * 7} {'-' * 45}",
     ]
 
-    trade_count = 0
+    STRATEGY_LABELS = {
+        "constantstable": "ConstantStable",
+        "cs_morning": "CS Morning",
+        "dualside": "DualSide",
+        "butterfly": "Butterfly",
+    }
+
+    # ---- Collect orders by (account, strategy) ----
+    groups: dict[tuple[str, str], list[dict]] = defaultdict(list)
     schwab_strategies_seen: set[str] = set()
     tt_strategies_seen: set[str] = set()
 
@@ -434,18 +441,17 @@ def _build_today_trades_section(
         else:
             continue
 
-        # Only show opening orders (not closes)
         legs_raw = order.get("orderLegCollection", [])
         instructions = set(l.get("instruction", "") for l in legs_raw)
         if all("CLOSE" in i for i in instructions if i):
             continue
 
-        status = order.get("status", "")
         strategy = classify_order(order)
         if strategy in ("manual", "butterfly_manual"):
             continue
 
-        # Parse legs for signal classification
+        schwab_strategies_seen.add(strategy)
+
         parsed_legs = []
         strikes = set()
         for leg in legs_raw:
@@ -467,115 +473,138 @@ def _build_today_trades_section(
             "price_effect": order.get("orderType", ""),
         }
         signal = _classify_signal(norm_order, parsed_legs)
+        status = order.get("status", "").upper()
         filled_qty = int(order.get("filledQuantity", 0))
         total_qty = max(filled_qty, max((l.get("quantity", 0) for l in legs_raw), default=0))
-        fill_str = _fill_status_str(status, filled_qty, total_qty)
         price = order.get("price", 0)
-        price_str = f"${price:.2f}" if price else "—"
-        dollar_str = f"${price * 100:.0f}" if price else "—"
 
-        strategy_label = {
-            "constantstable": "ConstantStable",
-            "cs_morning": "CS Morning",
-            "dualside": "DualSide",
-            "butterfly": "Butterfly",
-        }.get(strategy, strategy)
-
-        # Build fail reason for non-FILLED orders
-        reason = ""
-        status_upper = status.upper()
-        if status_upper == "REJECTED":
-            reason = order.get("statusDescription", "") or "broker rejected"
-        elif status_upper in ("CANCELED", "CANCELLED"):
-            cancel_qty = order.get("cancelledQuantity", order.get("canceledQuantity", 0))
-            reason = f"canceled ({cancel_qty} qty)" if cancel_qty else "canceled by system"
-        elif status_upper == "EXPIRED":
-            reason = "order expired unfilled"
-        elif status_upper in ("WORKING", "QUEUED", "PENDING_ACTIVATION"):
-            reason = "still working (not yet filled)"
-
-        suffix = f" [{reason}]" if reason else ""
-
-        lines.append(
-            f"{'Schwab':<10} {strategy_label:<16} {signal:<14} "
-            f"{_strikes_str(sorted_strikes, parsed_legs):<20} "
-            f"{filled_qty:>8} {price_str:>8} {dollar_str:>8} {fill_str}{suffix}"
-        )
-        trade_count += 1
-        schwab_strategies_seen.add(strategy)
+        groups[("Schwab", strategy)].append({
+            "status": status, "signal": signal, "strikes": sorted_strikes,
+            "price": price, "filled_qty": filled_qty, "total_qty": total_qty,
+        })
 
     # --- TT orders ---
     for order in tt_orders:
-        # Only show opening orders
         legs = order.get("legs", [])
         actions = set(l.get("action", "").upper() for l in legs)
         if all("CLOSE" in a for a in actions if a):
             continue
 
-        status = order.get("status", "")
-        signal = _classify_signal(order, legs)
-        filled_qty = order["filled_qty"]
-        total_qty = order["total_qty"]
-        fill_str = _fill_status_str(status, filled_qty, total_qty)
-        price = order["price"]
-        price_str = f"${price:.2f}" if price else "—"
-        dollar_str = f"${price * 100:.0f}" if price else "—"
-
-        # Classify strategy: use account's default_strategy (from schedule),
-        # but override for structures that are unambiguous regardless of account.
+        acct_label = order["account_label"]
         width = order["width"]
         if width == 10:
-            strategy_label = "DualSide"
+            tt_strategy = "dualside"
         elif order["num_strikes"] == 3:
-            strategy_label = "Butterfly"
+            tt_strategy = "butterfly"
         else:
-            strategy_label = order.get("default_strategy", "ConstantStable")
+            tt_strategy = "constantstable"
 
-        # Fail reason for TT
-        reason = ""
-        status_upper = status.upper()
-        if status_upper == "REJECTED":
-            reason = "broker rejected"
-        elif status_upper in ("CANCELLED", "CANCELED"):
-            reason = "canceled"
-        elif status_upper == "EXPIRED":
-            reason = "order expired unfilled"
-        elif status_upper in ("LIVE", "RECEIVED"):
-            reason = "still working (not yet filled)"
+        tt_strategies_seen.add(acct_label)
 
-        suffix = f" [{reason}]" if reason else ""
+        signal = _classify_signal(order, legs)
+        status = order.get("status", "").upper()
 
-        lines.append(
-            f"{order['account_label']:<10} {strategy_label:<16} {signal:<14} "
-            f"{_strikes_str(order['strikes'], legs):<20} "
-            f"{filled_qty:>8} {price_str:>8} {dollar_str:>8} {fill_str}{suffix}"
-        )
+        groups[(acct_label, tt_strategy)].append({
+            "status": status, "signal": signal, "strikes": order["strikes"],
+            "price": order["price"], "filled_qty": order["filled_qty"],
+            "total_qty": order["total_qty"],
+        })
+
+    # ---- Render one row per (account, strategy) ----
+    trade_count = 0
+    html_rows: list[dict] = []
+    for (acct, strat) in sorted(groups.keys()):
+        order_list = groups[(acct, strat)]
+        strategy_label = STRATEGY_LABELS.get(strat, strat)
+
+        filled = [o for o in order_list if o["status"] == "FILLED"]
+        working = [o for o in order_list if o["status"] in ("WORKING", "LIVE", "RECEIVED", "QUEUED", "PENDING_ACTIVATION")]
+        rejected = [o for o in order_list if o["status"] == "REJECTED"]
+        partials = [o for o in order_list if o["filled_qty"] > 0 and o["status"] != "FILLED"]
+
+        # Signal direction from the final outcome (filled first, then best remaining)
+        ref = filled or working or partials or order_list
+        ref_sig = ref[-1]["signal"] if ref else ""
+        if "DEBIT" in ref_sig or ref_sig in ("IC_LONG", "BF_BUY"):
+            signal_dir = "BUY"
+        elif "CREDIT" in ref_sig or ref_sig in ("IC_SHORT", "BF_SELL"):
+            signal_dir = "SELL"
+        else:
+            signal_dir = ref_sig or "—"
+
+        if filled:
+            parts = []
+            for f in filled:
+                sig = f["signal"]
+                if "PUT" in sig:
+                    pfx = "P"
+                elif "CALL" in sig:
+                    pfx = "C"
+                elif "IC" in sig or "RR" in sig:
+                    pfx = "IC"
+                elif "BF" in sig:
+                    pfx = "BF"
+                else:
+                    pfx = ""
+                sk = "/".join(f"{s:.0f}" for s in f["strikes"])
+                parts.append(f"{pfx}{sk} {f['filled_qty']}x@${f['price']:.2f}")
+            outcome = "FILLED  " + "  ".join(parts)
+            outcome_type = "filled"
+            detail = "  ".join(parts)
+        elif working:
+            w = working[-1]
+            sk = "/".join(f"{s:.0f}" for s in w["strikes"])
+            outcome = f"WORKING  {sk} @${w['price']:.2f}"
+            outcome_type = "working"
+            detail = f"{sk} @${w['price']:.2f}"
+        elif partials:
+            p = partials[-1]
+            outcome = f"PARTIAL  {p['filled_qty']}/{p['total_qty']} filled"
+            outcome_type = "nofill"
+            detail = f"{p['filled_qty']}/{p['total_qty']} filled"
+        elif rejected:
+            outcome = "REJECTED"
+            outcome_type = "nofill"
+            detail = "rejected"
+        else:
+            outcome = f"NOT FILLED  ({len(order_list)} attempts)"
+            outcome_type = "nofill"
+            detail = f"{len(order_list)} attempts"
+
+        lines.append(f"{acct:<10} {strategy_label:<16} {signal_dir:<7} {outcome}")
+        html_rows.append({
+            "account": acct, "strategy": strategy_label,
+            "signal": signal_dir, "outcome_type": outcome_type, "detail": detail,
+        })
         trade_count += 1
-        tt_strategies_seen.add(order["account_label"])
+
+    # --- Missing strategies (no orders at all) ---
+    if report_date.weekday() < 5:
+        for display, key in EXPECTED_SCHWAB:
+            if key not in schwab_strategies_seen:
+                strategy_label = STRATEGY_LABELS.get(key, key)
+                lines.append(f"{'Schwab':<10} {strategy_label:<16} {'—':<7} NO ORDER")
+                html_rows.append({
+                    "account": "Schwab", "strategy": strategy_label,
+                    "signal": "—", "outcome_type": "noorder", "detail": "",
+                })
+                trade_count += 1
+        for display, key in EXPECTED_TT:
+            if key not in tt_strategies_seen:
+                lines.append(f"{key:<10} {'—':<16} {'—':<7} NO ORDER")
+                html_rows.append({
+                    "account": key, "strategy": "—",
+                    "signal": "—", "outcome_type": "noorder", "detail": "",
+                })
+                trade_count += 1
 
     if trade_count == 0:
         lines.append("No automated trades today.")
 
-    # --- Missing strategies check ---
-    # On weekdays, flag expected strategies with no orders at all.
-    if report_date.weekday() < 5:
-        missing = []
-        for display, key in EXPECTED_SCHWAB:
-            if key not in schwab_strategies_seen:
-                missing.append(f"{display} — no order found")
-        for display, key in EXPECTED_TT:
-            if key not in tt_strategies_seen:
-                missing.append(f"{display} — no order found")
-        if missing:
-            lines.append("")
-            lines.append("Missing (no orders seen at broker):")
-            for m in missing:
-                lines.append(f"  ! {m}")
-            lines.append("  Check: Lambda logs, token expiry, buying power, dry-run flags")
-
     lines.append(f"Legend: Price=per-share, $/Ct=per-contract | Source: Broker APIs")
     lines.append("")
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    return text, {"rows": html_rows}
 
 
 # ---------------------------------------------------------------------------
@@ -966,6 +995,8 @@ def _build_email(
     mtd_positions = _window_positions(settled, _first_of_month(report_date), report_date)
     ytd_positions = _window_positions(settled, _first_of_year(report_date), report_date)
 
+    today_positions = _window_positions(settled, report_date, report_date)
+    today_stats = _stats(today_positions)
     five_day_stats = _stats(five_day_positions)
     mtd_stats = _stats(mtd_positions)
     ytd_stats = _stats(ytd_positions)
@@ -996,7 +1027,7 @@ def _build_email(
     portfolio_streak = _current_streak(settled)
 
     subject = (
-        f"[Gamma] Health: 5D {_fmt(five_day_stats['pnl'])} | "
+        f"[Gamma] Today {_fmt(today_stats['pnl'])} | "
         f"MTD {_fmt(mtd_stats['pnl'])} | YTD {_fmt(ytd_stats['pnl'])} — {as_of_str}"
     )
 
@@ -1023,6 +1054,7 @@ def _build_email(
     lines.append(f"{'Window':<10} {'Trades':>7} {'Win%':>6} {'P&L':>12} {'Avg/Trade':>12}")
     lines.append(f"{'-' * 10} {'-' * 7} {'-' * 6} {'-' * 12} {'-' * 12}")
     for label, stat in (
+        ("Today", today_stats),
         ("5D", five_day_stats),
         ("MTD", mtd_stats),
         ("YTD", ytd_stats),
@@ -1103,6 +1135,303 @@ def _build_email(
     lines.append("— Gamma Reporting (automated)")
 
     return subject, "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# HTML email builder
+# ---------------------------------------------------------------------------
+
+_CSS = """\
+body { font-family: -apple-system, 'Segoe UI', Roboto, Helvetica, sans-serif;
+       background: #f4f5f7; margin: 0; padding: 20px; color: #1a1a2e; }
+.container { max-width: 640px; margin: 0 auto; background: #ffffff;
+             border-radius: 12px; overflow: hidden;
+             box-shadow: 0 2px 8px rgba(0,0,0,.08); }
+.header { background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+          color: #ffffff; padding: 24px 28px 18px; }
+.header h1 { margin: 0 0 4px; font-size: 20px; font-weight: 600; letter-spacing: .3px; }
+.header .date { font-size: 13px; color: #a0aec0; }
+.section { padding: 20px 28px 12px; }
+.section h2 { font-size: 14px; text-transform: uppercase; letter-spacing: 1px;
+              color: #718096; margin: 0 0 12px; font-weight: 600; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th { text-align: left; padding: 6px 8px; color: #718096; font-weight: 500;
+     font-size: 11px; text-transform: uppercase; letter-spacing: .5px;
+     border-bottom: 2px solid #e2e8f0; }
+td { padding: 7px 8px; border-bottom: 1px solid #f0f0f5; }
+tr:last-child td { border-bottom: none; }
+.right { text-align: right; }
+.mono { font-family: 'SF Mono', Menlo, monospace; font-size: 12px; }
+.green { color: #38a169; font-weight: 600; }
+.red { color: #e53e3e; font-weight: 600; }
+.muted { color: #a0aec0; }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 4px;
+         font-size: 11px; font-weight: 600; }
+.badge-filled { background: #c6f6d5; color: #276749; }
+.badge-nofill { background: #fed7d7; color: #9b2c2c; }
+.badge-noorder { background: #fefcbf; color: #975a16; }
+.badge-working { background: #bee3f8; color: #2a4365; }
+.card-row { display: flex; gap: 12px; margin-bottom: 12px; }
+.card { flex: 1; background: #f7fafc; border-radius: 8px; padding: 14px 16px; text-align: center; }
+.card .label { font-size: 11px; text-transform: uppercase; letter-spacing: .5px; color: #718096; margin-bottom: 4px; }
+.card .value { font-size: 20px; font-weight: 700; }
+.divider { border: none; border-top: 1px solid #e2e8f0; margin: 0; }
+.footer { padding: 16px 28px; text-align: center; font-size: 11px; color: #a0aec0; }
+"""
+
+
+def _html_pnl(val: float) -> str:
+    cls = "green" if val >= 0 else "red"
+    sign = "+" if val >= 0 else "-"
+    return f'<span class="{cls} mono">{sign}${abs(val):,.0f}</span>'
+
+
+def _html_pnl_plain(val: float) -> str:
+    cls = "green" if val >= 0 else "red"
+    return f'<span class="{cls}">{_fmt(val)}</span>'
+
+
+def _build_email_html(
+    positions: list[dict],
+    report_date: date,
+    today_trades_data: dict,
+    discretionary_section_data: dict | None = None,
+    discretionary_pnl: float = 0.0,
+) -> str:
+    """Build the HTML email body."""
+    settled = _settled_positions(positions)
+    recent_days = _recent_business_days(report_date, count=5)
+    five_day_start = recent_days[0]
+    five_day_end = recent_days[-1]
+    five_day_positions = _window_positions(settled, five_day_start, five_day_end)
+    mtd_positions = _window_positions(settled, _first_of_month(report_date), report_date)
+    ytd_positions = _window_positions(settled, _first_of_year(report_date), report_date)
+    today_positions = _window_positions(settled, report_date, report_date)
+    today_stats = _stats(today_positions)
+    five_day_stats = _stats(five_day_positions)
+    mtd_stats = _stats(mtd_positions)
+    ytd_stats = _stats(ytd_positions)
+
+    # --- KPI cards ---
+    def _kpi_card(label: str, stats: dict) -> str:
+        return (
+            f'<div style="flex:1;background:#f7fafc;border-radius:8px;padding:14px 16px;text-align:center;">'
+            f'<div style="font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:#718096;margin-bottom:4px;">{label}</div>'
+            f'<div style="font-size:20px;font-weight:700;">{_html_pnl(stats["pnl"])}</div>'
+            f'<div style="font-size:11px;color:#718096;">{stats["trades"]} trades &middot; {stats["win_rate"]} WR</div></div>'
+        )
+
+    cards_html = (
+        '<div style="display:flex;gap:12px;margin-bottom:12px;">'
+        + _kpi_card("Today", today_stats)
+        + _kpi_card("5-Day", five_day_stats)
+        + _kpi_card("MTD", mtd_stats)
+        + _kpi_card("YTD", ytd_stats)
+        + '</div>'
+    )
+
+    # --- Today's Trades ---
+    trades_rows = ""
+    for row in today_trades_data.get("rows", []):
+        if row["outcome_type"] == "filled":
+            badge = '<span class="badge badge-filled">FILLED</span>'
+        elif row["outcome_type"] == "working":
+            badge = '<span class="badge badge-working">WORKING</span>'
+        elif row["outcome_type"] == "noorder":
+            badge = '<span class="badge badge-noorder">NO ORDER</span>'
+        else:
+            badge = '<span class="badge badge-nofill">NOT FILLED</span>'
+        trades_rows += (
+            f'<tr><td>{row["account"]}</td><td>{row["strategy"]}</td>'
+            f'<td>{row["signal"]}</td><td>{badge}</td>'
+            f'<td class="mono" style="font-size:12px;">{row["detail"]}</td></tr>'
+        )
+
+    trades_html = (
+        '<table><tr><th>Account</th><th>Strategy</th><th>Signal</th>'
+        '<th>Status</th><th>Detail</th></tr>'
+        f'{trades_rows}</table>'
+    ) if trades_rows else '<p class="muted">No automated trades today.</p>'
+
+    # --- Last 5 Sessions ---
+    recent_map: dict[tuple[date, str], float] = defaultdict(float)
+    for p in settled:
+        settled_day = _settle_date(p)
+        if settled_day in recent_days:
+            for group in EMAIL_GROUPS:
+                if p["strategy"] in group["members"]:
+                    recent_map[(settled_day, group["key"])] += float(p["pnl"] or 0)
+                    break
+
+    session_rows = ""
+    for day in recent_days:
+        cs = recent_map[(day, "constantstable")]
+        ds = recent_map[(day, "dualside")]
+        bf = recent_map[(day, "butterfly")]
+        total = cs + ds + bf
+        session_rows += (
+            f'<tr><td class="mono">{day.strftime("%m/%d")}</td>'
+            f'<td class="right">{_html_pnl_plain(cs)}</td>'
+            f'<td class="right">{_html_pnl_plain(ds)}</td>'
+            f'<td class="right">{_html_pnl_plain(bf)}</td>'
+            f'<td class="right" style="font-weight:600;">{_html_pnl_plain(total)}</td></tr>'
+        )
+
+    sessions_html = (
+        '<table><tr><th>Date</th><th class="right">CS</th><th class="right">DS</th>'
+        '<th class="right">BF</th><th class="right">Total</th></tr>'
+        f'{session_rows}</table>'
+    )
+
+    # --- Strategy Contribution ---
+    strat_rows_data = []
+    for group in EMAIL_GROUPS:
+        members = set(group["members"])
+        strat_ytd = [p for p in ytd_positions if p["strategy"] in members]
+        strat_mtd = [p for p in mtd_positions if p["strategy"] in members]
+        strat_5d = [p for p in five_day_positions if p["strategy"] in members]
+        strat_all = [p for p in settled if p["strategy"] in members]
+        if not strat_ytd and not strat_mtd and not strat_5d:
+            continue
+        ytd_s = _stats(strat_ytd)
+        strat_rows_data.append({
+            "label": group["label"],
+            "five_day_pnl": float(sum(p["pnl"] or 0 for p in strat_5d)),
+            "mtd_pnl": float(sum(p["pnl"] or 0 for p in strat_mtd)),
+            "ytd_pnl": float(sum(p["pnl"] or 0 for p in strat_ytd)),
+            "trades_ytd": ytd_s["trades"],
+            "wr_ytd": ytd_s["win_rate"],
+            "streak": _current_streak(strat_all),
+        })
+    strat_rows_data.sort(key=lambda r: r["ytd_pnl"], reverse=True)
+
+    strat_rows_html = ""
+    for r in strat_rows_data:
+        strat_rows_html += (
+            f'<tr><td style="font-weight:500;">{r["label"]}</td>'
+            f'<td class="right">{_html_pnl_plain(r["five_day_pnl"])}</td>'
+            f'<td class="right">{_html_pnl_plain(r["mtd_pnl"])}</td>'
+            f'<td class="right">{_html_pnl_plain(r["ytd_pnl"])}</td>'
+            f'<td class="right">{r["trades_ytd"]}</td>'
+            f'<td class="right">{r["wr_ytd"]}</td>'
+            f'<td class="right">{r["streak"]}</td></tr>'
+        )
+
+    strat_html = (
+        '<table><tr><th>Strategy</th><th class="right">5D</th><th class="right">MTD</th>'
+        '<th class="right">YTD</th><th class="right">Trades</th><th class="right">Win%</th>'
+        '<th class="right">Streak</th></tr>'
+        f'{strat_rows_html}</table>'
+    )
+
+    # --- Risk State ---
+    current_dd_ytd, max_dd_ytd = _drawdown_stats(settled, _first_of_year(report_date), report_date)
+    current_dd_mtd, max_dd_mtd = _drawdown_stats(settled, _first_of_month(report_date), report_date)
+    portfolio_streak = _current_streak(settled)
+
+    risk_html = (
+        f'<table style="font-size:13px;">'
+        f'<tr><td style="padding:4px 8px;color:#718096;">Streak</td><td style="padding:4px 8px;font-weight:600;">{portfolio_streak}</td></tr>'
+        f'<tr><td style="padding:4px 8px;color:#718096;">MTD Drawdown</td>'
+        f'<td style="padding:4px 8px;">{_html_pnl_plain(-current_dd_mtd)} (max {_html_pnl_plain(-max_dd_mtd)})</td></tr>'
+        f'<tr><td style="padding:4px 8px;color:#718096;">YTD Drawdown</td>'
+        f'<td style="padding:4px 8px;">{_html_pnl_plain(-current_dd_ytd)} (max {_html_pnl_plain(-max_dd_ytd)})</td></tr>'
+        f'</table>'
+    )
+
+    # --- Discretionary ---
+    disc_html = ""
+    if discretionary_section_data and discretionary_section_data.get("trade_count", 0) > 0:
+        trades_list = discretionary_section_data.get("trades", [])
+        spx = discretionary_section_data.get("spx_spot")
+        disc_trade_rows = ""
+        for t in sorted(trades_list, key=lambda x: x["time"]):
+            strikes_str = "/".join(f"{s:.0f}" for s in t["strikes"]) if t["strikes"] else "—"
+            adj_tag = ' <span style="color:#a0aec0;font-size:10px;">[adj]</span>' if t.get("is_adjustment") else ""
+            disc_trade_rows += (
+                f'<tr><td class="mono">{t["time"]}</td><td>{t["structure"]}{adj_tag}</td>'
+                f'<td class="mono">{strikes_str}</td>'
+                f'<td class="right">{_html_pnl_plain(t["premium"])}</td></tr>'
+            )
+
+        d_pnl = discretionary_section_data.get("total_pnl", 0)
+        disc_html = (
+            f'<div class="section"><hr class="divider" style="margin-bottom:16px;">'
+            f'<h2>Discretionary Trades</h2>'
+            f'<p style="font-size:12px;color:#718096;margin:0 0 10px;">SPX: ${spx:,.2f}</p>'
+            f'<table><tr><th>Time</th><th>Structure</th><th>Strikes</th><th class="right">Premium</th></tr>'
+            f'{disc_trade_rows}</table>'
+            f'<div style="margin-top:12px;font-size:14px;font-weight:600;">Disc P&L: {_html_pnl_plain(d_pnl)}</div>'
+            f'</div>'
+        )
+
+    # --- Combined bottom line ---
+    combined_html = ""
+    if disc_html:
+        today_auto = sum(
+            float(p["pnl"] or 0) for p in _window_positions(settled, report_date, report_date)
+        )
+        combined = today_auto + discretionary_pnl
+        combined_html = (
+            f'<div class="section">'
+            f'<h2>Combined</h2>'
+            f'<table style="font-size:14px;">'
+            f'<tr><td>Auto</td><td class="right" style="font-weight:600;">{_html_pnl_plain(today_auto)}</td></tr>'
+            f'<tr><td>Discretionary</td><td class="right" style="font-weight:600;">{_html_pnl_plain(discretionary_pnl)}</td></tr>'
+            f'<tr style="border-top:2px solid #e2e8f0;"><td style="font-weight:700;">Total</td>'
+            f'<td class="right" style="font-weight:700;font-size:16px;">{_html_pnl_plain(combined)}</td></tr>'
+            f'</table></div>'
+        )
+
+    html = f"""\
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>{_CSS}</style></head><body>
+<div class="container">
+  <div class="header">
+    <h1>Gamma Portfolio Pulse</h1>
+    <div class="date">{report_date.strftime('%A, %B %d, %Y')}</div>
+  </div>
+
+  <div class="section">
+    <h2>Performance</h2>
+    {cards_html}
+  </div>
+
+  <div class="section">
+    <h2>Today's Trades</h2>
+    {trades_html}
+  </div>
+
+  <hr class="divider">
+
+  <div class="section">
+    <h2>Last 5 Sessions</h2>
+    {sessions_html}
+  </div>
+
+  <hr class="divider">
+
+  <div class="section">
+    <h2>Strategy Breakdown</h2>
+    {strat_html}
+  </div>
+
+  <hr class="divider">
+
+  <div class="section">
+    <h2>Risk</h2>
+    {risk_html}
+  </div>
+
+  {disc_html}
+  {combined_html}
+
+  <div class="footer">Gamma Reporting &middot; automated</div>
+</div>
+</body></html>"""
+
+    return html
 
 
 def _order_dt_et(order: dict) -> datetime | None:
@@ -1292,8 +1621,9 @@ def _send_email(
     subject: str,
     body: str,
     dry_run: bool = False,
+    html_body: str | None = None,
 ) -> dict:
-    """Send a plain-text email via SMTP.
+    """Send an email via SMTP (HTML with plain-text fallback).
 
     Uses same SMTP env vars as scripts/notify/smtp_notify.py:
     SMTP_USER, SMTP_PASS, SMTP_TO, SMTP_HOST, SMTP_PORT.
@@ -1319,6 +1649,8 @@ def _send_email(
     msg["To"] = smtp_to
     msg["Subject"] = subject
     msg.set_content(body)
+    if html_body:
+        msg.add_alternative(html_body, subtype="html")
 
     with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as s:
         s.starttls()
@@ -1329,8 +1661,8 @@ def _send_email(
     return {"sent": True, "to": smtp_to, "subject": subject}
 
 
-def send_pnl_email(subject: str, body: str, dry_run: bool = False) -> dict:
-    return _send_email(subject, body, dry_run=dry_run)
+def send_pnl_email(subject: str, body: str, dry_run: bool = False, html_body: str | None = None) -> dict:
+    return _send_email(subject, body, dry_run=dry_run, html_body=html_body)
 
 
 def send_behavior_email_if_needed(
@@ -1398,7 +1730,7 @@ def run_daily_pnl_email(
     except Exception as e:
         print(f"[daily_pnl] TT order load ERROR (non-fatal): {e}")
 
-    today_trades_section = _build_today_trades_section(
+    today_trades_section, today_trades_data = _build_today_trades_section(
         raw_schwab_orders=raw_orders,
         tt_orders=tt_orders,
         report_date=report_date,
@@ -1407,6 +1739,7 @@ def run_daily_pnl_email(
     # Discretionary P&L (net position method, SPX spot for today's expiry)
     disc_section = ""
     disc_pnl = 0.0
+    disc_result_data: dict | None = None
     try:
         spx_spot = _load_spx_spot(for_date=report_date)
         print(f"[daily_pnl] SPX spot for {report_date}: {spx_spot}")
@@ -1414,20 +1747,30 @@ def run_daily_pnl_email(
         disc_pnl = disc_result["total_pnl"]
         if disc_result["trade_count"] > 0:
             disc_section = _build_discretionary_section(disc_result, report_date)
+            disc_result_data = disc_result
             print(f"[daily_pnl] Discretionary: {disc_result['trade_count']} trades, P&L: {disc_pnl:+,.0f}")
         else:
             print("[daily_pnl] No discretionary trades expiring today")
     except Exception as e:
         print(f"[daily_pnl] Discretionary section ERROR (non-fatal): {e}")
 
-    # Build and send email
+    # Build plain-text email (fallback)
     subject, body = _build_email(
         auto, report_date,
         today_trades_section=today_trades_section,
         discretionary_section=disc_section,
         discretionary_pnl=disc_pnl,
     )
-    result = send_pnl_email(subject, body, dry_run=dry_run)
+
+    # Build HTML email
+    html_body = _build_email_html(
+        auto, report_date,
+        today_trades_data=today_trades_data,
+        discretionary_section_data=disc_result_data,
+        discretionary_pnl=disc_pnl,
+    )
+
+    result = _send_email(subject, body, dry_run=dry_run, html_body=html_body)
     result["source"] = source
     result["positions"] = len(auto)
     result["behavior_email"] = send_behavior_email_if_needed(
