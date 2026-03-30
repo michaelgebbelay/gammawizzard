@@ -35,7 +35,6 @@ Resources:
           SIM_CACHE_BUCKET: !Ref SimCacheBucket
           GAMMA_EVENT_BUCKET: !Ref SimCacheBucket
           GAMMA_EVENT_PREFIX: reporting/events
-          CS_IC_LONG_FILTER: "1"
           WARMUP_CONTAINERS: "5"
       Policies:
         # Read all /gamma/* params
@@ -183,70 +182,6 @@ Resources:
         Arn: !GetAtt TradingFunction.Arn
         RoleArn: !GetAtt SchedulerRole.Arn
         Input: '{"account": "dualside"}'
-
-  # ---------- IC_LONG Filter Pre-check (4:01 PM ET) ----------
-  IcLongFilterSchedule:
-    Type: AWS::Scheduler::Schedule
-    Properties:
-      Name: gamma-cs-ic-long-filter
-      Description: "IC_LONG regime filter: compute go/no-go before trade execution"
-      State: ENABLED
-      ScheduleExpression: "cron(1 16 ? * MON-FRI *)"
-      ScheduleExpressionTimezone: "America/New_York"
-      FlexibleTimeWindow:
-        Mode: "OFF"
-      Target:
-        Arn: !GetAtt TradingFunction.Arn
-        RoleArn: !GetAtt SchedulerRole.Arn
-        Input: '{"account": "ic-long-filter"}'
-
-  # ---------- IC_LONG Deferred Morning Entry (9:35 AM ET) ----------
-  IcLongMorningSchedule:
-    Type: AWS::Scheduler::Schedule
-    Properties:
-      Name: gamma-cs-ic-long-morning
-      Description: "IC_LONG deferred morning entry with price filters"
-      State: ENABLED
-      ScheduleExpression: "cron(35 9 ? * MON-FRI *)"
-      ScheduleExpressionTimezone: "America/New_York"
-      FlexibleTimeWindow:
-        Mode: "OFF"
-      Target:
-        Arn: !GetAtt TradingFunction.Arn
-        RoleArn: !GetAtt SchedulerRole.Arn
-        Input: '{"account": "ic-long-morning"}'
-
-  # ---------- IC_LONG Deferred Morning Entry — TT IRA (9:35 AM ET) ----------
-  IcLongMorningTtIraSchedule:
-    Type: AWS::Scheduler::Schedule
-    Properties:
-      Name: gamma-cs-ic-long-morning-tt-ira
-      Description: "IC_LONG deferred morning entry — TT IRA (5WT20360) — DISABLED, switched to Novix"
-      State: DISABLED
-      ScheduleExpression: "cron(35 9 ? * MON-FRI *)"
-      ScheduleExpressionTimezone: "America/New_York"
-      FlexibleTimeWindow:
-        Mode: "OFF"
-      Target:
-        Arn: !GetAtt TradingFunction.Arn
-        RoleArn: !GetAtt SchedulerRole.Arn
-        Input: '{"account": "ic-long-morning-tt-ira"}'
-
-  # ---------- IC_LONG Deferred Morning Entry — TT Individual (9:35 AM ET) ----------
-  IcLongMorningTtIndividualSchedule:
-    Type: AWS::Scheduler::Schedule
-    Properties:
-      Name: gamma-cs-ic-long-morning-tt-individual
-      Description: "IC_LONG deferred morning entry — TT Individual (5WT09219)"
-      State: ENABLED
-      ScheduleExpression: "cron(35 9 ? * MON-FRI *)"
-      ScheduleExpressionTimezone: "America/New_York"
-      FlexibleTimeWindow:
-        Mode: "OFF"
-      Target:
-        Arn: !GetAtt TradingFunction.Arn
-        RoleArn: !GetAtt SchedulerRole.Arn
-        Input: '{"account": "ic-long-morning-tt-individual"}'
 
   # ---------- Morning Check Schedule ----------
   MorningCheckSchedule:

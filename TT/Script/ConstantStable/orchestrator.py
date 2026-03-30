@@ -74,7 +74,6 @@ CS_VIX_BREAKS = os.environ.get("CS_VIX_BREAKS", "0.089,0.111,0.131,0.158,0.192,0
 CS_VIX_MULTS = os.environ.get("CS_VIX_MULTS", "1,1,1,2,3,4,6")
 CS_RR_CREDIT_RATIOS = os.environ.get("CS_RR_CREDIT_RATIOS", "")
 CS_IC_SHORT_MULTS = os.environ.get("CS_IC_SHORT_MULTS", "")
-CS_IC_LONG_MULTS = os.environ.get("CS_IC_LONG_MULTS", "")
 
 # --- NO-CLOSE guard config ---
 CS_GUARD_NO_CLOSE = (os.environ.get("CS_GUARD_NO_CLOSE", "1") or "1").strip().lower() in ("1", "true", "yes", "y")
@@ -93,18 +92,6 @@ CS_BUNDLE_4LEG = (os.environ.get("CS_BUNDLE_4LEG", "1") or "1").strip().lower() 
 CS_BUNDLE_REQUIRE_EQUAL_QTY = (os.environ.get("CS_BUNDLE_REQUIRE_EQUAL_QTY", "1") or "1").strip().lower() in ("1", "true", "yes", "y")
 CS_BUNDLE_FALLBACK = (os.environ.get("CS_BUNDLE_FALLBACK", "1") or "1").strip().lower() in ("1", "true", "yes", "y")
 CS_PAIR_ALTERNATE = (os.environ.get("CS_PAIR_ALTERNATE", "1") or "1").strip().lower() in ("1", "true", "yes", "y")
-
-# --- IC_LONG regime filter config ---
-# Skip IC_LONG when trailing 5-day avg |SPX move|% < nearest anchor distance%.
-# Decision is pre-computed by ic_long_filter.py and written to S3.
-CS_IC_LONG_FILTER = (os.environ.get("CS_IC_LONG_FILTER", "0") or "0").strip().lower() in ("1", "true", "yes", "y")
-CS_MOVE_STATE_S3_BUCKET = (
-    os.environ.get("CS_MOVE_STATE_S3_BUCKET")
-    or os.environ.get("SIM_CACHE_BUCKET", "")
-).strip()
-CS_IC_DECISION_S3_KEY = os.environ.get(
-    "CS_IC_DECISION_S3_KEY", "cadence/cs_ic_long_decision.json"
-)
 
 # --- Signal readiness config ---
 CS_GW_READY_ET = os.environ.get("CS_GW_READY_ET", "").strip()
@@ -460,61 +447,6 @@ def would_close_guard(v: Dict[str, Any], pos: Dict[Tuple[str, str, str], float])
     return False
 
 
-# ---------- IC_LONG filter (reads pre-computed decision from S3) ----------
-
-def _read_ic_long_decision(today_str: str) -> Tuple[bool, bool, str]:
-    """Read the pre-computed IC_LONG decision from S3.
-
-    Returns (skip, switch_to_rr_short, reason).
-    The decision is written by ic_long_filter.py which runs at 4:01 PM ET,
-    before the orchestrators execute at 4:13 PM ET.
-    """
-    if not CS_IC_LONG_FILTER:
-        return False, False, ""
-    bucket = CS_MOVE_STATE_S3_BUCKET
-    if not bucket:
-        print("CS_VERT_RUN IC_FILTER: no S3 bucket, allowing trade")
-        return False, False, ""
-    try:
-        import boto3
-        s3 = boto3.client("s3")
-        obj = s3.get_object(Bucket=bucket, Key=CS_IC_DECISION_S3_KEY)
-        decision = json.loads(obj["Body"].read().decode("utf-8"))
-    except Exception as e:
-        print(f"CS_VERT_RUN IC_FILTER: cannot read decision ({e}), allowing trade")
-        return False, False, ""
-
-    if decision.get("date") != today_str:
-        print(
-            f"CS_VERT_RUN IC_FILTER: stale decision "
-            f"(file={decision.get('date')}, today={today_str}), allowing trade"
-        )
-        return False, False, ""
-
-    skip = decision.get("ic_long_skip", False)
-    switch = decision.get("switch_to_rr_short", False)
-    reason = decision.get("reason", "")
-    regime_reason = decision.get("regime_reason", "")
-    trail = decision.get("trail_move_pct")
-    anchor = decision.get("anchor_pct")
-    vix_rv10 = decision.get("vix_rv10_ratio")
-    rv5_rv20 = decision.get("rv5_rv20_ratio")
-
-    # Switch supersedes skip
-    if switch:
-        skip = False
-
-    display_reason = regime_reason if switch else reason
-    print(
-        f"CS_VERT_RUN IC_FILTER: skip={'SKIP' if skip else 'no'} "
-        f"switch={'RR_SHORT' if switch else 'no'} "
-        f"trail={trail} anchor={anchor} "
-        f"VIX/RV10={vix_rv10} RV5/RV20={rv5_rv20} "
-        f"reason={display_reason}"
-    )
-    return skip, switch, display_reason
-
-
 # ---------- main ----------
 
 def main():
@@ -685,32 +617,11 @@ def main():
         print("CS_VERT_RUN SKIP: no verticals to trade (LeftGo/RightGo zero or vix_mult=0).")
         return 0
 
-    # --- Regime rule: IC_LONG → RR_SHORT switch ---
-    regime_switched = False
-    is_ic_long_candidate = (v_put and v_call
-                            and v_put["side"] == "DEBIT" and v_call["side"] == "DEBIT")
-    if is_ic_long_candidate:
-        skip_ic, switch_rr, regime_reason = _read_ic_long_decision(date.today().isoformat())
-        if skip_ic:
-            print(f"CS_VERT_RUN IC_LONG_SKIP: {regime_reason}")
-            return 0
-        if switch_rr:
-            regime_switched = True
-            print(f"CS_VERT_RUN REGIME_SWITCH: IC_LONG → RR_SHORT | {regime_reason}")
-            # Flip call side: DEBIT → CREDIT (CALL_LONG → CALL_SHORT)
-            # Put side stays DEBIT (PUT_LONG) — result is RR_SHORT
-            # RR_SHORT = buy put spread + sell call spread (bearish)
-            v_call = {
-                "name": "CALL_SHORT", "kind": "CALL", "side": "CREDIT", "direction": "SHORT",
-                "short_osi": call_low_osi, "long_osi": call_high_osi,
-                "go": right_go, "strength": call_strength, "target_qty": v_call["target_qty"],
-            }
-
     # Structure-based sizing adjustments
     if v_put and v_call:
         base_mults = parse_csv_floats(CS_VIX_MULTS)
 
-        if v_put["side"] != v_call["side"] and CS_RR_CREDIT_RATIOS and not regime_switched:
+        if v_put["side"] != v_call["side"] and CS_RR_CREDIT_RATIOS:
             # RR: per-bucket credit ratio for the credit side
             ratios = parse_csv_floats(CS_RR_CREDIT_RATIOS)
             if len(ratios) == len(base_mults):
@@ -722,18 +633,15 @@ def main():
                         print(f"CS_VERT_RUN RR_CREDIT_ADJ: {v['name']} target {full_target} → {credit_target} (ratio={ratio} bucket={bucket} mult={vix_mult})")
                         v["target_qty"] = credit_target
 
-        elif v_put["side"] == v_call["side"]:
-            # IC: separate multiplier arrays for Short IC vs Long IC
-            ic_mults_csv = CS_IC_SHORT_MULTS if v_put["side"] == "CREDIT" else CS_IC_LONG_MULTS
-            ic_label = "IC_SHORT" if v_put["side"] == "CREDIT" else "IC_LONG"
-            if ic_mults_csv:
-                ic_mults = parse_csv_floats(ic_mults_csv)
-                if len(ic_mults) == len(base_mults):
-                    ic_mult = int(ic_mults[bucket - 1])
-                    ic_target = max(1, units * ic_mult)
-                    for v in (v_put, v_call):
-                        print(f"CS_VERT_RUN {ic_label}_SIZE: {v['name']} target {v['target_qty']} → {ic_target} (ic_mult={ic_mult} bucket={bucket})")
-                        v["target_qty"] = ic_target
+        elif v_put["side"] == v_call["side"] and v_put["side"] == "CREDIT" and CS_IC_SHORT_MULTS:
+            # IC_SHORT: separate multiplier array
+            ic_mults = parse_csv_floats(CS_IC_SHORT_MULTS)
+            if len(ic_mults) == len(base_mults):
+                ic_mult = int(ic_mults[bucket - 1])
+                ic_target = max(1, units * ic_mult)
+                for v in (v_put, v_call):
+                    print(f"CS_VERT_RUN IC_SHORT_SIZE: {v['name']} target {v['target_qty']} → {ic_target} (ic_mult={ic_mult} bucket={bucket})")
+                    v["target_qty"] = ic_target
 
     # Apply TOPUP + GUARD to determine send_qty
     def finalize(v: Dict[str, Any]) -> Dict[str, Any] | None:
@@ -781,63 +689,6 @@ def main():
     if not v_put_f and not v_call_f:
         print("CS_VERT_RUN SKIP: nothing to place after TOPUP/GUARD.")
         return 0
-
-    # --- IC_LONG deferred morning entry ---
-    # If IC_LONG (both sides DEBIT) and NOT regime-switched to RR_SHORT,
-    # save the plan to S3 and skip evening placement.  A morning Lambda
-    # trigger (9:35 AM ET next day) will read the plan, fetch fresh quotes,
-    # and place with price filters ($2.20 max total, $0.40 min per side).
-    CS_IC_LONG_DEFER = os.environ.get("CS_IC_LONG_DEFER", "1").strip() in ("1", "true", "yes")
-    CS_IC_DEFER_S3_KEY = os.environ.get("CS_IC_DEFER_S3_KEY", "cadence/cs_ic_long_deferred.json")
-
-    is_ic_long_final = (v_put_f and v_call_f
-                        and v_put_f["side"] == "DEBIT" and v_call_f["side"] == "DEBIT"
-                        and not regime_switched)
-    if CS_IC_LONG_DEFER and is_ic_long_final:
-        defer_plan = {
-            "trade_date": trade_date,
-            "execute_date": tdate_iso,
-            "inner_put": inner_put,
-            "inner_call": inner_call,
-            "p_low": p_low, "p_high": p_high,
-            "c_low": c_low, "c_high": c_high,
-            "exp6": exp6,
-            "put_low_osi": put_low_osi, "put_high_osi": put_high_osi,
-            "call_low_osi": call_low_osi, "call_high_osi": call_high_osi,
-            "put_credit_close": gw_put_price,
-            "call_credit_close": gw_call_price,
-            "put_qty": v_put_f["send_qty"],
-            "call_qty": v_call_f["send_qty"],
-            "put_strength": v_put_f["strength"],
-            "call_strength": v_call_f["strength"],
-            "put_go": v_put_f.get("go"),
-            "call_go": v_call_f.get("go"),
-            "vol_field": field_used, "vol_value": vol_val,
-            "vol_bucket": bucket, "vol_mult": vix_mult,
-            "units": units, "unit_dollars": CS_UNIT_DOLLARS,
-            "status": "pending",
-            "saved_utc": datetime.now(timezone.utc).isoformat(),
-        }
-        bucket_name = CS_MOVE_STATE_S3_BUCKET
-        if bucket_name:
-            try:
-                import boto3
-                s3 = boto3.client("s3")
-                s3.put_object(
-                    Bucket=bucket_name,
-                    Key=CS_IC_DEFER_S3_KEY,
-                    Body=json.dumps(defer_plan, indent=2),
-                    ContentType="application/json",
-                )
-                print(f"CS_VERT_RUN IC_LONG_DEFERRED: saved plan to s3://{bucket_name}/{CS_IC_DEFER_S3_KEY}")
-                print(f"  strikes: put {p_low}/{p_high}  call {c_low}/{c_high}  exp={tdate_iso}")
-                print(f"  close prices: put={gw_put_price} call={gw_call_price}")
-                print(f"  qty: put={v_put_f['send_qty']} call={v_call_f['send_qty']}")
-                return 0
-            except Exception as e:
-                print(f"CS_VERT_RUN IC_LONG_DEFER WARN: S3 write failed ({e}), placing at close instead")
-        else:
-            print("CS_VERT_RUN IC_LONG_DEFER WARN: no S3 bucket, placing at close instead")
 
     qty_rule = "VIX_BUCKET_TOPUP" if CS_TOPUP else "VIX_BUCKET"
 

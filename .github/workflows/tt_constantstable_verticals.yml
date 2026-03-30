@@ -31,7 +31,6 @@ jobs:
       CS_VIX_BREAKS: "0.1636779,0.3276571,0.3702533,0.4514141"
       CS_VIX_MULTS:  "1,1,1,1,1"
       CS_RR_CREDIT_RATIOS: "0.50,0.6667,0.75,1.00,1.00"
-      CS_IC_LONG_FILTER: "1"
 
       # Logging
       CS_LOG_PATH: "logs/constantstable_vertical_trades.csv"
