@@ -2,14 +2,19 @@
 """
 DualSide Strategy — SPX vertical orchestrator (Schwab)
 
-v1.3.1 — 2026-03-20 remove BPC cap
+v1.4.0 — 2026-03-30 VIX1D-based position scaling
 
-Call side now only trades on bull-regime days.  On bear days the put side
-is already running bear_put_debit; adding a bull BPC at 50-delta creates
-a long iron-condor that loses when SPX lands in the gap between the two
-spreads.  Backtest (2023-06 → 2026-03): skip-bear is the best combined
-variant at $60,916 vs $59,192 for always-bull — fewer trades, higher avg,
-same WR.
+Added CS-style position scaling using VIX1D Gentle curve.
+  units = floor(equity / DS_UNIT_DOLLARS)
+  credit_qty = units * credit_mult(VIX1D)
+  bear_qty   = units * bear_mult(VIX1D)
+
+Gentle curve (backtest: Sharpe 2.83, DD -20% vs flat's -18%):
+  VIX1D breaks: 8.9, 11.1, 13.1, 15.8, 19.2, 25.3
+  Credit mults: 1, 1, 1, 1, 2, 3, 4  (no scaling below VIX1D 15.8)
+  Bear mults:   1, 1, 1, 1, 1, 2, 2  (flat until VIX1D 19.2, max 2x)
+
+v1.3.1 — 2026-03-20 remove BPC cap
 
 Put side (25-delta): 6DTE 10-wide em0.75 direction switch
   If iv_minus_vix >= -0.0502 AND rr25 <= -0.9976: bull_put_credit
@@ -93,12 +98,19 @@ def _emit(method: str, **kwargs):
     except Exception as e:
         print(f"DS_RUN WARN: event emit failed ({method}): {e}")
 
-__version__ = "1.3.1"
+__version__ = "1.4.0"
 
 # ── config ──
-CS_UNIT_DOLLARS = float(os.environ.get("DS_UNIT_DOLLARS", os.environ.get("CS_UNIT_DOLLARS", "10000")))
+DS_UNIT_DOLLARS = float(os.environ.get("DS_UNIT_DOLLARS", os.environ.get("CS_UNIT_DOLLARS", "15000")))
 DS_LOG_PATH = os.environ.get("DS_LOG_PATH", "/tmp/logs/dualside_trades.csv")
 DS_DRY_RUN = (os.environ.get("DS_DRY_RUN", os.environ.get("VERT_DRY_RUN", "false")) or "false").strip().lower() in ("1", "true", "yes")
+
+# VIX1D-based position scaling (Gentle curve from backtest: Sharpe 2.83, DD -20%)
+# Credit mults: no scaling below VIX1D 15.8, then 2x/3x/4x
+# Bear debit mults: no scaling below VIX1D 19.2, then 2x max
+DS_VIX1D_BREAKS = os.environ.get("DS_VIX1D_BREAKS", "8.9,11.1,13.1,15.8,19.2,25.3")
+DS_CREDIT_MULTS = os.environ.get("DS_CREDIT_MULTS", "1,1,1,1,2,3,4")
+DS_BEAR_MULTS = os.environ.get("DS_BEAR_MULTS", "1,1,1,1,1,2,2")
 
 # Strategy parameters
 PUT_WIDTH = 10
@@ -122,6 +134,30 @@ PLACER_SCRIPT = os.path.join(os.path.dirname(__file__), "place.py")
 # Guard
 DS_GUARD_NO_CLOSE = (os.environ.get("CS_GUARD_NO_CLOSE", "1") or "1").strip().lower() in ("1", "true", "yes")
 DS_TOPUP = (os.environ.get("CS_TOPUP", "1") or "1").strip().lower() in ("1", "true", "yes")
+
+
+def _parse_csv_floats(csv_str: str):
+    return [float(x.strip()) for x in csv_str.split(",") if x.strip()]
+
+
+def ds_vix1d_bucket(vix1d_val, is_credit: bool):
+    """Return (bucket_number, multiplier) based on VIX1D and trade direction.
+
+    Uses the Gentle curve from backtest (Sharpe 2.83, DD -20%):
+    - Credits scale at higher VIX1D (more premium to collect)
+    - Bear debits stay flat until VIX1D > 19.2, then modest 2x
+    """
+    breaks = _parse_csv_floats(DS_VIX1D_BREAKS)
+    mults = _parse_csv_floats(DS_CREDIT_MULTS if is_credit else DS_BEAR_MULTS)
+    if len(mults) != len(breaks) + 1:
+        return (1, 1)  # safe fallback
+    if vix1d_val is None:
+        mid = len(mults) // 2
+        return (mid + 1, int(mults[mid]))
+    for i, b in enumerate(breaks):
+        if vix1d_val < b:
+            return (i + 1, int(mults[i]))
+    return (len(mults), int(mults[-1]))
 
 # ═══════════════════════════════════════════════════════════════
 # Schwab API helpers
@@ -573,9 +609,12 @@ def main():
 
     print(f"DS_RUN EQUITY: {oc_val} (src={oc_src}, acct={acct_num})")
 
-    # Fixed 1 contract to start
-    qty = 1
-    print(f"DS_RUN QTY: {qty}")
+    # Equity-based units (same convention as CS: floor(equity / unit_dollars))
+    if oc_val is None or oc_val <= 0:
+        ds_units = 1
+    else:
+        ds_units = max(1, int(oc_val // DS_UNIT_DOLLARS))
+    print(f"DS_RUN UNITS: {ds_units} (DS_UNIT_DOLLARS={DS_UNIT_DOLLARS}, oc_val={oc_val})")
 
     # ── Fetch market data ──
     # VIX quote
@@ -675,6 +714,22 @@ def main():
     print(f"DS_RUN EM: {em:.2f} em075={em075:.2f} target_put_strike={target_put_strike:.0f}")
     print(f"DS_RUN DIRECTION: {direction} (is_bull={is_bull})")
 
+    # ── VIX1D-based position scaling ──
+    # Put side: credit or debit depends on regime
+    put_is_credit = is_bull
+    put_bucket, put_mult = ds_vix1d_bucket(vix1d, is_credit=put_is_credit)
+    qty_put = max(1, ds_units * put_mult)
+
+    # Call side: always credit (bull_put_credit_50d)
+    call_bucket, call_mult = ds_vix1d_bucket(vix1d, is_credit=True)
+    qty_call = max(1, ds_units * call_mult)
+
+    # Fall back to VIX if VIX1D unavailable
+    vol_used = f"VIX1D={vix1d}" if vix1d is not None else f"VIX={vix} (VIX1D unavailable)"
+    print(f"DS_RUN SIZING: {vol_used}")
+    print(f"DS_RUN SIZING PUT:  bucket={put_bucket} mult={put_mult} units={ds_units} qty={qty_put} ({'credit' if put_is_credit else 'debit'})")
+    print(f"DS_RUN SIZING CALL: bucket={call_bucket} mult={call_mult} units={ds_units} qty={qty_call} (credit)")
+
     # ── Build put vertical ──
     v_put = None
     put_skip_reason = None
@@ -696,7 +751,7 @@ def main():
                     "name": "PUT_CREDIT", "kind": "PUT", "side": "CREDIT", "direction": "SHORT",
                     "short_osi": short_osi, "long_osi": long_osi,
                     "short_strike": short_strike, "long_strike": long_strike,
-                    "target_qty": qty, "strength": 1.0,
+                    "target_qty": qty_put, "strength": 1.0,
                 }
             else:
                 # Bear put debit: buy higher put, sell lower put
@@ -709,7 +764,7 @@ def main():
                     "name": "PUT_DEBIT", "kind": "PUT", "side": "DEBIT", "direction": "LONG",
                     "short_osi": short_osi, "long_osi": long_osi,
                     "short_strike": short_strike, "long_strike": long_strike,
-                    "target_qty": qty, "strength": 1.0,
+                    "target_qty": qty_put, "strength": 1.0,
                 }
         else:
             put_skip_reason = "no put contract near target strike"
@@ -754,7 +809,7 @@ def main():
                     "name": "CALL_HELPER_BPC", "kind": "PUT", "side": "CREDIT", "direction": "LONG",
                     "short_osi": short_osi, "long_osi": long_osi,
                     "short_strike": short_strike, "long_strike": long_strike,
-                    "target_qty": qty, "strength": 1.0,
+                    "target_qty": qty_call, "strength": 1.0,
                 }
             else:
                 call_skip_reason = "no 50-delta put found"
