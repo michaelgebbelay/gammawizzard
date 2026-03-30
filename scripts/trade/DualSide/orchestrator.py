@@ -903,7 +903,7 @@ def main():
             "VERT_TRADE_DATE":   date.today().isoformat(),
             "VERT_TDATE":        v.get("expiration", ""),
             "VERT_GW_PRICE":     "",
-            "VERT_UNIT_DOLLARS": str(CS_UNIT_DOLLARS),
+            "VERT_UNIT_DOLLARS": str(DS_UNIT_DOLLARS),
             "VERT_OC":           str(oc_val or 0),
             "VERT_UNITS":        "1",
             "VERT_VOL_FIELD":    "VIX",
