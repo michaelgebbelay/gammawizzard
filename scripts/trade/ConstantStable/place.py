@@ -1494,7 +1494,8 @@ def main():
                 acct_hash=acct_hash,
                 v1=v1,
                 v2=v2,
-                qty=remaining,
+                qty1=remaining,
+                qty2=remaining,
             )
 
             def log_fallback(v, r):
