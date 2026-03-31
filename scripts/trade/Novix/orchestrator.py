@@ -315,7 +315,7 @@ def extract_trade(j):
                 if t:
                     return t
     if isinstance(j, list):
-        for it in reversed(j):
+        for it in j:
             t = extract_trade(it)
             if t:
                 return t
