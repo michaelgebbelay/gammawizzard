@@ -420,6 +420,7 @@ def _build_today_trades_section(
         "cs_morning": "CS Morning",
         "dualside": "DualSide",
         "butterfly": "Butterfly",
+        "novix": "Novix",
     }
 
     # ---- Collect orders by (account, strategy) ----
@@ -497,7 +498,7 @@ def _build_today_trades_section(
         elif order["num_strikes"] == 3:
             tt_strategy = "butterfly"
         else:
-            tt_strategy = "constantstable"
+            tt_strategy = order.get("default_strategy", "ConstantStable").lower()
 
         tt_strategies_seen.add(acct_label)
 
