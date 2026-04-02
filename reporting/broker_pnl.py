@@ -21,6 +21,7 @@ import json
 import os
 import re
 import sys
+import time
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -591,8 +592,8 @@ def load_orders_from_db() -> list[dict]:
         return []
 
 
-def load_orders_from_schwab(lookback_days: int = 30) -> list[dict]:
-    """Pull orders directly from Schwab API."""
+def load_orders_from_schwab(lookback_days: int = 30, max_retries: int = 3) -> list[dict]:
+    """Pull orders directly from Schwab API (with retry on timeout)."""
     repo_root = Path(__file__).resolve().parent.parent
     scripts_dir = repo_root / "scripts"
     if str(scripts_dir) not in sys.path:
@@ -609,6 +610,13 @@ def load_orders_from_schwab(lookback_days: int = 30) -> list[dict]:
         app_secret = os.environ["SCHWAB_APP_SECRET"]
         c = schwab.auth.client_from_token_file(token_path, app_key, app_secret)
 
+    # Extend httpx timeout to 60s (default is 5s)
+    try:
+        import httpx
+        c.session.timeout = httpx.Timeout(60.0)
+    except Exception:
+        pass
+
     resp = c.get_account_numbers()
     resp.raise_for_status()
     acct_hash = resp.json()[0]["hashValue"]
@@ -616,13 +624,24 @@ def load_orders_from_schwab(lookback_days: int = 30) -> list[dict]:
     since = datetime.combine(
         date.today() - timedelta(days=lookback_days), datetime.min.time()
     )
-    resp = c.get_orders_for_account(
-        acct_hash,
-        from_entered_datetime=since,
-        to_entered_datetime=datetime.now(),
-    )
-    resp.raise_for_status()
-    return resp.json() or []
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = c.get_orders_for_account(
+                acct_hash,
+                from_entered_datetime=since,
+                to_entered_datetime=datetime.now(),
+            )
+            resp.raise_for_status()
+            return resp.json() or []
+        except Exception as exc:
+            is_timeout = "timeout" in str(exc).lower() or "timed out" in str(exc).lower()
+            if is_timeout and attempt < max_retries:
+                wait = 5 * attempt
+                print(f"[schwab] Timeout on attempt {attempt}/{max_retries}, retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                raise
 
 
 # ---------------------------------------------------------------------------
