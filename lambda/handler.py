@@ -260,7 +260,7 @@ COMMON_ENV = {
     "CS_VOL_FIELD": "VixOne",
     "CS_VIX_BREAKS": "0.1636779,0.3276571,0.3702533,0.4514141",
     "CS_VIX_MULTS": "1,1,1,1,1",
-    "CS_RR_CREDIT_RATIOS": "0.50,0.6667,0.75,1.00,1.00",
+    "CS_RR_CREDIT_RATIOS": "",
     "CS_IC_SHORT_MULTS": "",
     "CS_LOG_PATH": "/tmp/cs_trades.csv",
     "CS_GUARD_NO_CLOSE": "1",
