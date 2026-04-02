@@ -1027,8 +1027,9 @@ def _build_email(
     current_dd_mtd, max_dd_mtd = _drawdown_stats(settled, _first_of_month(report_date), report_date)
     portfolio_streak = _current_streak(settled)
 
+    today_combined = today_stats['pnl'] + discretionary_pnl
     subject = (
-        f"[Gamma] Today {_fmt(today_stats['pnl'])} | "
+        f"[Gamma] Today {_fmt(today_combined)} | "
         f"MTD {_fmt(mtd_stats['pnl'])} | YTD {_fmt(ytd_stats['pnl'])} — {as_of_str}"
     )
 
@@ -1054,8 +1055,12 @@ def _build_email(
     lines.append("Portfolio")
     lines.append(f"{'Window':<10} {'Trades':>7} {'Win%':>6} {'P&L':>12} {'Avg/Trade':>12}")
     lines.append(f"{'-' * 10} {'-' * 7} {'-' * 6} {'-' * 12} {'-' * 12}")
+    today_combined_stats_plain = {
+        **today_stats,
+        "pnl": today_stats["pnl"] + discretionary_pnl,
+    }
     for label, stat in (
-        ("Today", today_stats),
+        ("Today", today_combined_stats_plain),
         ("5D", five_day_stats),
         ("MTD", mtd_stats),
         ("YTD", ytd_stats),
@@ -1222,9 +1227,13 @@ def _build_email_html(
             f'<div style="font-size:11px;color:#718096;">{stats["trades"]} trades &middot; {stats["win_rate"]} WR</div></div>'
         )
 
+    today_combined_stats = {
+        **today_stats,
+        "pnl": today_stats["pnl"] + discretionary_pnl,
+    }
     cards_html = (
         '<div style="display:flex;gap:12px;margin-bottom:12px;">'
-        + _kpi_card("Today", today_stats)
+        + _kpi_card("Today", today_combined_stats)
         + _kpi_card("5-Day", five_day_stats)
         + _kpi_card("MTD", mtd_stats)
         + _kpi_card("YTD", ytd_stats)
