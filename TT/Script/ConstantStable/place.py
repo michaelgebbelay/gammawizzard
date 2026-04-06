@@ -1117,10 +1117,10 @@ def place_two_verticals_simul(
     s1 = {"v": v1, "qty_total": qty1, "total_filled": 0, "cur_qty": qty1, "cur_filled": 0, "oid": "", "done": False, "order_ids": []}
     s2 = {"v": v2, "qty_total": qty2, "total_filled": 0, "cur_qty": qty2, "cur_filled": 0, "oid": "", "done": False, "order_ids": []}
 
-    s1["oid"] = submit_one(v1, p1, qty, f"{v1['name']}:MID@{p1:.2f}x{qty}")
+    s1["oid"] = submit_one(v1, p1, qty1, f"{v1['name']}:MID@{p1:.2f}x{qty1}")
     if s1["oid"]:
         s1["order_ids"].append(s1["oid"])
-    s2["oid"] = submit_one(v2, p2, qty, f"{v2['name']}:MID@{p2:.2f}x{qty}")
+    s2["oid"] = submit_one(v2, p2, qty2, f"{v2['name']}:MID@{p2:.2f}x{qty2}")
     if s2["oid"]:
         s2["order_ids"].append(s2["oid"])
 
@@ -1690,7 +1690,8 @@ def main():
                 acct_hash=acct_hash,
                 v1=v1,
                 v2=v2,
-                qty=remaining,
+                qty1=remaining,
+                qty2=remaining,
             )
 
             def log_fallback(v, r):
