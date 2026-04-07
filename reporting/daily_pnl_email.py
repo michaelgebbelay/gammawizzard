@@ -418,8 +418,8 @@ def _build_today_trades_section(
     """Build the 'Today's Trades' section for the email."""
     lines = [
         "Today's Trades",
-        f"{'Account':<10} {'Strategy':<16} {'Type':<10} {'Status':<10} {'Puts':>5} {'Calls':>5}",
-        f"{'-' * 10} {'-' * 16} {'-' * 10} {'-' * 10} {'-' * 5} {'-' * 5}",
+        f"{'Account':<10} {'Strategy':<16} {'Type':<10} {'Puts':>5} {'Calls':>5}",
+        f"{'-' * 10} {'-' * 16} {'-' * 10} {'-' * 5} {'-' * 5}",
     ]
 
     STRATEGY_LABELS = {
@@ -559,30 +559,26 @@ def _build_today_trades_section(
         else:
             trade_type = "—"
 
+        # Signed quantities: +N for long (debit), -N for short (credit)
         put_qty = sum(o["filled_qty"] for o in put_orders)
         call_qty = sum(o["filled_qty"] for o in call_orders)
-        put_str = str(put_qty) if put_qty > 0 else "—"
-        call_str = str(call_qty) if call_qty > 0 else "—"
+        put_is_long = any("LONG" in o["signal"] or "DEBIT" in o["signal"] for o in put_orders) if put_orders else True
+        call_is_long = any("LONG" in o["signal"] or "DEBIT" in o["signal"] for o in call_orders) if call_orders else True
+        put_str = f"{'+' if put_is_long else '-'}{put_qty}" if put_qty > 0 else "—"
+        call_str = f"{'+' if call_is_long else '-'}{call_qty}" if call_qty > 0 else "—"
 
-        # Status
         if filled:
-            status_str = "FILLED"
             outcome_type = "filled"
         elif working:
-            status_str = "WORKING"
             outcome_type = "working"
         elif partials:
-            p = partials[-1]
-            status_str = f"PARTIAL"
             outcome_type = "nofill"
         elif rejected:
-            status_str = "REJECTED"
             outcome_type = "nofill"
         else:
-            status_str = "NO FILL"
             outcome_type = "nofill"
 
-        lines.append(f"{acct:<10} {strategy_label:<16} {trade_type:<10} {status_str:<10} {put_str:>5} {call_str:>5}")
+        lines.append(f"{acct:<10} {strategy_label:<16} {trade_type:<10} {put_str:>5} {call_str:>5}")
         html_rows.append({
             "account": acct, "strategy": strategy_label,
             "trade_type": trade_type, "outcome_type": outcome_type,
@@ -595,25 +591,25 @@ def _build_today_trades_section(
         for display, key in EXPECTED_SCHWAB:
             if key not in schwab_strategies_seen:
                 strategy_label = STRATEGY_LABELS.get(key, key)
-                lines.append(f"{'Schwab':<10} {strategy_label:<16} {'—':<10} {'NO ORDER':<10} {'—':>5} {'—':>5}")
+                lines.append(f"{'Schwab':<10} {strategy_label:<16} {'NO ORDER':<10} {'—':>5} {'—':>5}")
                 html_rows.append({
                     "account": "Schwab", "strategy": strategy_label,
-                    "trade_type": "—", "outcome_type": "noorder", "puts": "—", "calls": "—",
+                    "trade_type": "NO ORDER", "outcome_type": "noorder", "puts": "—", "calls": "—",
                 })
                 trade_count += 1
         for display, key in EXPECTED_TT:
             if key not in tt_strategies_seen:
-                lines.append(f"{key:<10} {'—':<16} {'—':<10} {'NO ORDER':<10} {'—':>5} {'—':>5}")
+                lines.append(f"{key:<10} {'—':<16} {'NO ORDER':<10} {'—':>5} {'—':>5}")
                 html_rows.append({
                     "account": key, "strategy": "—",
-                    "trade_type": "—", "outcome_type": "noorder", "puts": "—", "calls": "—",
+                    "trade_type": "NO ORDER", "outcome_type": "noorder", "puts": "—", "calls": "—",
                 })
                 trade_count += 1
 
     if trade_count == 0:
         lines.append("No automated trades today.")
 
-    lines.append(f"Legend: Price=per-share, $/Ct=per-contract | Source: Broker APIs")
+    lines.append(f"Legend: +N=long(debit) -N=short(credit) | Source: Broker APIs")
     lines.append("")
     text = "\n".join(lines)
     return text, {"rows": html_rows}
@@ -1254,24 +1250,16 @@ def _build_email_html(
     # --- Today's Trades ---
     trades_rows = ""
     for row in today_trades_data.get("rows", []):
-        if row["outcome_type"] == "filled":
-            badge = '<span class="badge badge-filled">FILLED</span>'
-        elif row["outcome_type"] == "working":
-            badge = '<span class="badge badge-working">WORKING</span>'
-        elif row["outcome_type"] == "noorder":
-            badge = '<span class="badge badge-noorder">NO ORDER</span>'
-        else:
-            badge = '<span class="badge badge-nofill">NOT FILLED</span>'
         trades_rows += (
             f'<tr><td>{row["account"]}</td><td>{row["strategy"]}</td>'
-            f'<td>{row.get("trade_type", row.get("signal", ""))}</td><td>{badge}</td>'
+            f'<td>{row.get("trade_type", "")}</td>'
             f'<td class="right">{row.get("puts", "")}</td>'
             f'<td class="right">{row.get("calls", "")}</td></tr>'
         )
 
     trades_html = (
         '<table><tr><th>Account</th><th>Strategy</th><th>Type</th>'
-        '<th>Status</th><th class="right">Puts</th><th class="right">Calls</th></tr>'
+        '<th class="right">Puts</th><th class="right">Calls</th></tr>'
         f'{trades_rows}</table>'
     ) if trades_rows else '<p class="muted">No automated trades today.</p>'
 
