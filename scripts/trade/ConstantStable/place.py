@@ -1126,6 +1126,18 @@ def place_two_verticals_alternating(
             else:
                 s1["danger"] = s1["danger"] or (o is o1)
                 s2["danger"] = s2["danger"] or (o is o2)
+                # Poll order status after failed cancel to detect fills
+                for _retry in range(6):
+                    res = get_status(c, acct_hash, o["oid"]) or {}
+                    s_final = status_upper(res)
+                    fq = extract_filled_quantity(res)
+                    if s_final == "FILLED" and fq <= 0:
+                        fq = o["cur_qty"]
+                    if fq > o["cur_filled"]:
+                        o["cur_filled"] = fq
+                    if s_final in FINAL_STATUSES:
+                        break
+                    time.sleep(min(4.0, 0.6 * (2 ** _retry)) + random.uniform(0.0, 0.2))
 
         s1["filled"] += int(o1["cur_filled"])
         s2["filled"] += int(o2["cur_filled"])
