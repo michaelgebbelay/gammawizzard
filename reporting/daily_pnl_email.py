@@ -270,8 +270,15 @@ def _load_tt_orders_for_date(report_date: date) -> list[dict]:
                 sorted_strikes = sorted(strikes) if strikes else []
                 width = sorted_strikes[-1] - sorted_strikes[0] if len(sorted_strikes) >= 2 else 0
 
-                filled_qty = order.get("filled-quantity", order.get("filledQuantity", 0))
+                # TT does not populate filled-quantity on the order; use size when Filled
+                raw_filled = order.get("filled-quantity") or order.get("filledQuantity")
                 total_qty = order.get("size", sum(l.get("quantity", 0) for l in legs))
+                if raw_filled is not None:
+                    filled_qty = int(raw_filled)
+                elif status.lower() == "filled":
+                    filled_qty = int(total_qty) if total_qty else 0
+                else:
+                    filled_qty = 0
                 price_effect = order.get("price-effect", "")
                 price = order.get("price", 0)
 
@@ -282,7 +289,7 @@ def _load_tt_orders_for_date(report_date: date) -> list[dict]:
                     "default_strategy": default_strategy,
                     "status": status,
                     "dt_et": dt_et,
-                    "filled_qty": int(filled_qty) if filled_qty else 0,
+                    "filled_qty": filled_qty,
                     "total_qty": int(total_qty) if total_qty else 0,
                     "price": float(price) if price else 0,
                     "price_effect": price_effect,
