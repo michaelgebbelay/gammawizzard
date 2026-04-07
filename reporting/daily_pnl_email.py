@@ -578,11 +578,28 @@ def _build_today_trades_section(
         else:
             outcome_type = "nofill"
 
+        # Anomaly detection
+        notes: list[str] = []
+        # For paired strategies (IC/RR), puts and calls should match
+        if trade_type in ("IC Long", "IC Short", "RR Long", "RR Short"):
+            if put_qty != call_qty:
+                over_side = "calls" if call_qty > put_qty else "puts"
+                notes.append(f"expected {min(put_qty,call_qty)} {over_side}, got {max(put_qty,call_qty)} — likely duplicate fill (cancel failed)")
+        # Duplicate orders on same side (same strikes, multiple fills)
+        for side_label, side_orders in [("put", put_orders), ("call", call_orders)]:
+            if len(side_orders) > 1:
+                strike_sets = [tuple(o["strikes"]) for o in side_orders]
+                if len(set(strike_sets)) < len(strike_sets):
+                    notes.append(f"duplicate {side_label} orders on same strikes")
+        # No fill
+        if outcome_type == "nofill" and not rejected:
+            notes.append(f"{len(order_list)} order(s) attempted, none filled")
+
         lines.append(f"{acct:<10} {strategy_label:<16} {trade_type:<10} {put_str:>5} {call_str:>5}")
         html_rows.append({
             "account": acct, "strategy": strategy_label,
             "trade_type": trade_type, "outcome_type": outcome_type,
-            "puts": put_str, "calls": call_str,
+            "puts": put_str, "calls": call_str, "notes": notes,
         })
         trade_count += 1
 
@@ -610,6 +627,14 @@ def _build_today_trades_section(
         lines.append("No automated trades today.")
 
     lines.append(f"Legend: +N=long(debit) -N=short(credit) | Source: Broker APIs")
+
+    # Render anomaly notes
+    all_notes = [(r["account"], r["strategy"], n) for r in html_rows for n in r.get("notes", [])]
+    if all_notes:
+        lines.append("")
+        for acct_n, strat_n, note in all_notes:
+            lines.append(f"  * {acct_n} {strat_n}: {note}")
+
     lines.append("")
     text = "\n".join(lines)
     return text, {"rows": html_rows}
@@ -1257,10 +1282,20 @@ def _build_email_html(
             f'<td class="right">{row.get("calls", "")}</td></tr>'
         )
 
+    # Anomaly notes for HTML
+    all_notes_html = []
+    for row in today_trades_data.get("rows", []):
+        for note in row.get("notes", []):
+            all_notes_html.append(
+                f'<div style="color:#e53e3e;font-size:12px;margin:2px 0;">'
+                f'* {row["account"]} {row["strategy"]}: {note}</div>'
+            )
+    notes_block = "".join(all_notes_html)
+
     trades_html = (
         '<table><tr><th>Account</th><th>Strategy</th><th>Type</th>'
         '<th class="right">Puts</th><th class="right">Calls</th></tr>'
-        f'{trades_rows}</table>'
+        f'{trades_rows}</table>{notes_block}'
     ) if trades_rows else '<p class="muted">No automated trades today.</p>'
 
     # --- Last 5 Sessions ---
