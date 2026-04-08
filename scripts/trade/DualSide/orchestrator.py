@@ -2,33 +2,28 @@
 """
 DualSide Strategy — SPX vertical orchestrator (Schwab)
 
-v1.4.0 — 2026-03-30 VIX1D-based position scaling
+v1.5.0 — 2026-04-08 Fixed 1x sizing, call side always on
 
-Added CS-style position scaling using VIX1D Gentle curve.
-  units = floor(equity / DS_UNIT_DOLLARS)
-  credit_qty = units * credit_mult(VIX1D)
-  bear_qty   = units * bear_mult(VIX1D)
+Drawdown protection changes:
+  - Position scaling DISABLED — fixed 1 contract per side
+  - Call-side bear-regime skip REMOVED — call always trades bull_put_credit
+    Restores v1.0 hedge behavior: on bear days the call-side bull credit
+    offsets bear put debit losses during extended rallies.
 
-Gentle curve (backtest: Sharpe 2.83, DD -20% vs flat's -18%):
-  VIX1D breaks: 8.9, 11.1, 13.1, 15.8, 19.2, 25.3
-  Credit mults: 1, 1, 1, 1, 2, 3, 4  (no scaling below VIX1D 15.8)
-  Bear mults:   1, 1, 1, 1, 1, 2, 2  (flat until VIX1D 19.2, max 2x)
-
-v1.3.1 — 2026-03-20 remove BPC cap
+v1.4.0 — 2026-03-30 VIX1D-based position scaling (DISABLED in v1.5.0)
+v1.3.1 — 2026-03-20 remove BPC cap, skip call on bear (REVERTED in v1.5.0)
 
 Put side (25-delta): 6DTE 10-wide em0.75 direction switch
   If iv_minus_vix >= -0.0502 AND rr25 <= -0.9976: bull_put_credit
   Else: bear_put_debit
 
-Call side (50-delta): 5DTE 10-wide 50-delta, bull_put_credit on BULL days only
-  Skipped on bear-regime days.
+Call side (50-delta): 5DTE 10-wide 50-delta, bull_put_credit ALWAYS
 
 Filters:
   1. VIX1D veto: skip ALL when 10.0 <= VIX1D < 11.5
   2. VIX < 10: skip call side
   3. RV5/RV20 0.70-0.85: skip bullish legs (bull_put_credit on either side)
      Bear_put_debit always trades.
-  4. Bear regime: skip call side (avoid long IC)
 
 Delegates placement to scripts/trade/DualSide/place.py (same as ConstantStable placer).
 """
@@ -98,7 +93,7 @@ def _emit(method: str, **kwargs):
     except Exception as e:
         print(f"DS_RUN WARN: event emit failed ({method}): {e}")
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 # ── config ──
 DS_UNIT_DOLLARS = float(os.environ.get("DS_UNIT_DOLLARS", os.environ.get("CS_UNIT_DOLLARS", "15000")))
@@ -714,15 +709,12 @@ def main():
     print(f"DS_RUN EM: {em:.2f} em075={em075:.2f} target_put_strike={target_put_strike:.0f}")
     print(f"DS_RUN DIRECTION: {direction} (is_bull={is_bull})")
 
-    # ── VIX1D-based position scaling ──
-    # Put side: credit or debit depends on regime
+    # ── Position sizing: fixed 1x (scaling disabled to limit drawdown) ──
+    qty_put = 1
+    qty_call = 1
     put_is_credit = is_bull
-    put_bucket, put_mult = ds_vix1d_bucket(vix1d, is_credit=put_is_credit)
-    qty_put = max(1, ds_units * put_mult)
-
-    # Call side: always credit (bull_put_credit_50d)
-    call_bucket, call_mult = ds_vix1d_bucket(vix1d, is_credit=True)
-    qty_call = max(1, ds_units * call_mult)
+    put_bucket, put_mult = 1, 1
+    call_bucket, call_mult = 1, 1
 
     # Fall back to VIX if VIX1D unavailable
     vol_used = f"VIX1D={vix1d}" if vix1d is not None else f"VIX={vix} (VIX1D unavailable)"
@@ -779,11 +771,10 @@ def main():
     v_call = None
     call_skip_reason = None
 
-    # Filter 4: skip call on bear regime (avoid long IC)
-    if not is_bull:
-        call_skip_reason = "BEAR_REGIME (call side skipped)"
+    # Filter 4: REMOVED — call side now always trades (v1.0 behavior restored)
+    # Bull call credit provides hedge during extended bear regime streaks.
     # Filter 2: VIX < 10 skips call
-    elif vix is not None and vix < VIX_CALL_SKIP:
+    if vix is not None and vix < VIX_CALL_SKIP:
         call_skip_reason = f"VIX<{VIX_CALL_SKIP} ({vix:.2f})"
     elif rv_in_band:
         call_skip_reason = "RV_BAND (bull_put_credit skipped)"
