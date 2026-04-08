@@ -535,12 +535,22 @@ def _build_today_trades_section(
         signals = [o["signal"] for o in ref]
         put_orders = [o for o in ref if "PUT" in o["signal"]]
         call_orders = [o for o in ref if "CALL" in o["signal"]]
-        has_put = len(put_orders) > 0
-        has_call = len(call_orders) > 0
+        # Handle bundled IC/RR orders (single 4-leg order with IC_LONG/IC_SHORT/RR_* signal)
+        ic_rr_orders = [o for o in ref if o["signal"] in ("IC_LONG", "IC_SHORT", "RR_LONG_PUT", "RR_LONG_CALL")]
+        has_put = len(put_orders) > 0 or len(ic_rr_orders) > 0
+        has_call = len(call_orders) > 0 or len(ic_rr_orders) > 0
 
         # Trade type label
         if any(s.startswith("BF") for s in signals):
             trade_type = "BF Buy" if any(s == "BF_BUY" for s in signals) else "BF Sell"
+        elif any(s == "IC_LONG" for s in signals):
+            trade_type = "IC Long"
+        elif any(s == "IC_SHORT" for s in signals):
+            trade_type = "IC Short"
+        elif any(s == "RR_LONG_CALL" for s in signals):
+            trade_type = "RR Long"
+        elif any(s == "RR_LONG_PUT" for s in signals):
+            trade_type = "RR Short"
         elif has_put and has_call:
             put_is_long = any("LONG" in o["signal"] or "DEBIT" in o["signal"] for o in put_orders)
             call_is_long = any("LONG" in o["signal"] or "DEBIT" in o["signal"] for o in call_orders)
@@ -560,10 +570,21 @@ def _build_today_trades_section(
             trade_type = "—"
 
         # Signed quantities: +N for long (debit), -N for short (credit)
+        # For bundled IC/RR orders, both sides have the same qty
         put_qty = sum(o["filled_qty"] for o in put_orders)
         call_qty = sum(o["filled_qty"] for o in call_orders)
-        put_is_long = any("LONG" in o["signal"] or "DEBIT" in o["signal"] for o in put_orders) if put_orders else True
-        call_is_long = any("LONG" in o["signal"] or "DEBIT" in o["signal"] for o in call_orders) if call_orders else True
+        for o in ic_rr_orders:
+            put_qty += o["filled_qty"]
+            call_qty += o["filled_qty"]
+
+        # Determine direction per side
+        if ic_rr_orders:
+            sig = ic_rr_orders[0]["signal"]
+            put_is_long = sig in ("IC_LONG", "RR_LONG_PUT")
+            call_is_long = sig in ("IC_LONG", "RR_LONG_CALL")
+        else:
+            put_is_long = any("LONG" in o["signal"] or "DEBIT" in o["signal"] for o in put_orders) if put_orders else True
+            call_is_long = any("LONG" in o["signal"] or "DEBIT" in o["signal"] for o in call_orders) if call_orders else True
         put_str = f"{'+' if put_is_long else '-'}{put_qty}" if put_qty > 0 else "—"
         call_str = f"{'+' if call_is_long else '-'}{call_qty}" if call_qty > 0 else "—"
 
