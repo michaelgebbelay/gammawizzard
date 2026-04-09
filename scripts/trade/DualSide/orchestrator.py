@@ -2,28 +2,34 @@
 """
 DualSide Strategy — SPX vertical orchestrator (Schwab)
 
-v1.5.0 — 2026-04-08 Fixed 1x sizing, call side always on
+v1.6.0 — 2026-04-09 BPD pain filter (prior-day move + VIX1D)
 
-Drawdown protection changes:
-  - Position scaling DISABLED — fixed 1 contract per side
-  - Call-side bear-regime skip REMOVED — call always trades bull_put_credit
-    Restores v1.0 hedge behavior: on bear days the call-side bull credit
-    offsets bear put debit losses during extended rallies.
+Skip BPD when prior-day SPX move > +0.5% AND VIX1D >= 16.
+This is the "rally + elevated vol" zone where BPD averages -$172/trade.
+Backtest: cuts 21 worst trades, adds +$3,605 vs no filter.
 
-v1.4.0 — 2026-03-30 VIX1D-based position scaling (DISABLED in v1.5.0)
-v1.3.1 — 2026-03-20 remove BPC cap, skip call on bear (REVERTED in v1.5.0)
+Reverted from v1.5.0:
+  - VIX1D position scaling RESTORED (Gentle curve)
+  - Call-side bear-regime skip RESTORED (no call helper on bear days)
+
+v1.4.0 — 2026-03-30 VIX1D-based position scaling
+v1.3.1 — 2026-03-20 remove BPC cap, skip call on bear
 
 Put side (25-delta): 6DTE 10-wide em0.75 direction switch
   If iv_minus_vix >= -0.0502 AND rr25 <= -0.9976: bull_put_credit
   Else: bear_put_debit
 
-Call side (50-delta): 5DTE 10-wide 50-delta, bull_put_credit ALWAYS
+Call side (50-delta): 5DTE 10-wide 50-delta, bull_put_credit on BULL days only
+  Skipped on bear-regime days.
 
 Filters:
   1. VIX1D veto: skip ALL when 10.0 <= VIX1D < 11.5
   2. VIX < 10: skip call side
   3. RV5/RV20 0.70-0.85: skip bullish legs (bull_put_credit on either side)
      Bear_put_debit always trades.
+  4. Bear regime: skip call side (avoid long IC)
+  5. BPD pain filter: skip bear_put_debit when prior-day SPX move > +0.5%
+     AND VIX1D >= 16.
 
 Delegates placement to scripts/trade/DualSide/place.py (same as ConstantStable placer).
 """
@@ -93,7 +99,7 @@ def _emit(method: str, **kwargs):
     except Exception as e:
         print(f"DS_RUN WARN: event emit failed ({method}): {e}")
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 # ── config ──
 DS_UNIT_DOLLARS = float(os.environ.get("DS_UNIT_DOLLARS", os.environ.get("CS_UNIT_DOLLARS", "15000")))
@@ -122,6 +128,10 @@ VIX1D_VETO_HI = 11.5
 VIX_CALL_SKIP = 10.0
 RV_BAND_LO = 0.70
 RV_BAND_HI = 0.85
+
+# BPD pain filter: skip bear_put_debit when prior-day rally + elevated vol1d
+BPD_SKIP_MOVE_PCT = 0.5
+BPD_SKIP_VIX1D = 16.0
 
 # Placement
 PLACER_SCRIPT = os.path.join(os.path.dirname(__file__), "place.py")
@@ -404,6 +414,32 @@ def find_by_delta(contracts, opt_type, target_delta):
     if not filtered:
         return None
     return min(filtered, key=lambda c: abs(abs(c["delta"]) - target_delta))
+
+
+def prior_day_pct_move(candles, current_spot: float) -> Optional[float]:
+    """Compute % move from prior trading day's close to current spot.
+
+    Excludes any candle dated today (intraday bar may not be final).
+    Returns percent move (e.g., +1.5 = +1.5%).
+    """
+    if not candles or current_spot <= 0:
+        return None
+    today_str = date.today().isoformat()
+    prior_close = None
+    for c in reversed(candles):
+        ts = c.get("datetime")
+        if not ts:
+            continue
+        try:
+            d_str = datetime.fromtimestamp(ts / 1000).date().isoformat()
+        except Exception:
+            continue
+        if d_str < today_str:
+            prior_close = c.get("close")
+            break
+    if not prior_close or prior_close <= 0:
+        return None
+    return (current_spot - float(prior_close)) / float(prior_close) * 100.0
 
 
 def compute_rv(candles, window: int) -> Optional[float]:
@@ -709,12 +745,15 @@ def main():
     print(f"DS_RUN EM: {em:.2f} em075={em075:.2f} target_put_strike={target_put_strike:.0f}")
     print(f"DS_RUN DIRECTION: {direction} (is_bull={is_bull})")
 
-    # ── Position sizing: fixed 1x (scaling disabled to limit drawdown) ──
-    qty_put = 1
-    qty_call = 1
+    # ── VIX1D-based position scaling ──
+    # Put side: credit or debit depends on regime
     put_is_credit = is_bull
-    put_bucket, put_mult = 1, 1
-    call_bucket, call_mult = 1, 1
+    put_bucket, put_mult = ds_vix1d_bucket(vix1d, is_credit=put_is_credit)
+    qty_put = max(1, ds_units * put_mult)
+
+    # Call side: always credit (bull_put_credit_50d)
+    call_bucket, call_mult = ds_vix1d_bucket(vix1d, is_credit=True)
+    qty_call = max(1, ds_units * call_mult)
 
     # Fall back to VIX if VIX1D unavailable
     vol_used = f"VIX1D={vix1d}" if vix1d is not None else f"VIX={vix} (VIX1D unavailable)"
@@ -722,12 +761,28 @@ def main():
     print(f"DS_RUN SIZING PUT:  bucket={put_bucket} mult={put_mult} units={ds_units} qty={qty_put} ({'credit' if put_is_credit else 'debit'})")
     print(f"DS_RUN SIZING CALL: bucket={call_bucket} mult={call_mult} units={ds_units} qty={qty_call} (credit)")
 
+    # ── BPD pain filter: prior-day rally + elevated VIX1D ──
+    pct_move_1d = prior_day_pct_move(candles, spot)
+    bpd_pain_skip = (
+        not is_bull
+        and pct_move_1d is not None
+        and vix1d is not None
+        and pct_move_1d > BPD_SKIP_MOVE_PCT
+        and vix1d >= BPD_SKIP_VIX1D
+    )
+    if pct_move_1d is not None:
+        print(f"DS_RUN PRIOR_DAY_MOVE: {pct_move_1d:+.2f}%  VIX1D={vix1d}")
+    if bpd_pain_skip:
+        print(f"DS_RUN BPD_PAIN_SKIP: move {pct_move_1d:+.2f}% > +{BPD_SKIP_MOVE_PCT}% AND VIX1D {vix1d} >= {BPD_SKIP_VIX1D}")
+
     # ── Build put vertical ──
     v_put = None
     put_skip_reason = None
 
     if is_bull and rv_in_band:
         put_skip_reason = "RV_BAND (bull_put_credit skipped)"
+    elif bpd_pain_skip:
+        put_skip_reason = f"BPD_PAIN_FILTER (move {pct_move_1d:+.2f}% > +{BPD_SKIP_MOVE_PCT}%, VIX1D {vix1d} >= {BPD_SKIP_VIX1D})"
     else:
         put_c = find_strike_near(contracts6, "P", target_put_strike)
         if put_c:
@@ -771,10 +826,11 @@ def main():
     v_call = None
     call_skip_reason = None
 
-    # Filter 4: REMOVED — call side now always trades (v1.0 behavior restored)
-    # Bull call credit provides hedge during extended bear regime streaks.
+    # Filter 4: skip call on bear regime (avoid long IC)
+    if not is_bull:
+        call_skip_reason = "BEAR_REGIME (call side skipped)"
     # Filter 2: VIX < 10 skips call
-    if vix is not None and vix < VIX_CALL_SKIP:
+    elif vix is not None and vix < VIX_CALL_SKIP:
         call_skip_reason = f"VIX<{VIX_CALL_SKIP} ({vix:.2f})"
     elif rv_in_band:
         call_skip_reason = "RV_BAND (bull_put_credit skipped)"
