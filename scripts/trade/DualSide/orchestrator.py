@@ -679,6 +679,7 @@ def main():
 
     # ── RV5/RV20 for filter ──
     rv_ratio = None
+    candles = []
     try:
         candles = get_spx_price_history(c, days=40)
         rv5 = compute_rv(candles, 5)
