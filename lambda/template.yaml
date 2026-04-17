@@ -35,7 +35,7 @@ Resources:
           SIM_CACHE_BUCKET: !Ref SimCacheBucket
           GAMMA_EVENT_BUCKET: !Ref SimCacheBucket
           GAMMA_EVENT_PREFIX: reporting/events
-          WARMUP_CONTAINERS: "5"
+          WARMUP_CONTAINERS: "3"
       Policies:
         # Read all /gamma/* params
         - SSMParameterReadPolicy:
@@ -94,8 +94,8 @@ Resources:
     Type: AWS::Scheduler::Schedule
     Properties:
       Name: gamma-cs-tt-ira
-      Description: "ConstantStable TT IRA (5WT20360) — DISABLED, switched to Novix"
-      State: DISABLED
+      Description: "ConstantStable TT IRA (5WT20360)"
+      State: ENABLED
       ScheduleExpression: !Ref ScheduleTime
       ScheduleExpressionTimezone: "America/New_York"
       FlexibleTimeWindow:
@@ -135,37 +135,6 @@ Resources:
         Arn: !GetAtt TradingFunction.Arn
         RoleArn: !GetAtt SchedulerRole.Arn
         Input: '{"account": "butterfly"}'
-
-  # ---------- Novix (4:13 PM ET, TT) ----------
-  NovixTtIraSchedule:
-    Type: AWS::Scheduler::Schedule
-    Properties:
-      Name: gamma-nx-tt-ira
-      Description: "Novix signal strategy TT IRA (5WT20360)"
-      State: ENABLED
-      ScheduleExpression: "cron(13 16 ? * MON-FRI *)"
-      ScheduleExpressionTimezone: "America/New_York"
-      FlexibleTimeWindow:
-        Mode: "OFF"
-      Target:
-        Arn: !GetAtt TradingFunction.Arn
-        RoleArn: !GetAtt SchedulerRole.Arn
-        Input: '{"account": "novix-tt-ira"}'
-
-  NovixTtIndividualSchedule:
-    Type: AWS::Scheduler::Schedule
-    Properties:
-      Name: gamma-nx-tt-individual
-      Description: "Novix signal strategy TT Individual (5WT09219) — DISABLED, staying with CS"
-      State: DISABLED
-      ScheduleExpression: "cron(13 16 ? * MON-FRI *)"
-      ScheduleExpressionTimezone: "America/New_York"
-      FlexibleTimeWindow:
-        Mode: "OFF"
-      Target:
-        Arn: !GetAtt TradingFunction.Arn
-        RoleArn: !GetAtt SchedulerRole.Arn
-        Input: '{"account": "novix-tt-individual"}'
 
   # ---------- DualSide (4:05 PM ET, Schwab only) ----------
   DualSideSchedule:

@@ -158,60 +158,6 @@ ACCOUNTS = {
             "RECONCILE_CHECKS": "BF_Trades:trade_date:status:signal",
         },
     },
-    "novix-tt-ira": {
-        "orchestrator": "TT/Script/Novix/orchestrator.py",
-        "post_steps": [
-            "TT/data/cs_trades_to_gsheet.py",
-        ],
-        "token_ssm_path": "/gamma/tt/token_json",
-        "token_file": "/tmp/tt_token.json",
-        "env_from_ssm": {
-            "TT_CLIENT_ID": "/gamma/tt/client_id",
-            "TT_CLIENT_SECRET": "/gamma/tt/client_secret",
-            "SCHWAB_APP_KEY": "/gamma/schwab/app_key",
-            "SCHWAB_APP_SECRET": "/gamma/schwab/app_secret",
-        },
-        "static_env": {
-            "TT_ACCOUNT_NUMBER": "5WT20360",
-            "TT_TOKEN_PATH": "/tmp/tt_token.json",
-            "TT_QUOTE_TOKEN_PATH": "/tmp/tt_quote_token.json",
-            "SCHWAB_TOKEN_PATH": "/tmp/schwab_token.json",
-            "CS_UNIT_DOLLARS": "15000",
-            "CS_ACCOUNT_LABEL": "novix-tt-ira",
-            "CS_COST_PER_CONTRACT": "1.72",
-            "GW_ENDPOINT": "rapi/GetNovix",
-            "CS_LOG_PATH": "/tmp/nx_ira_trades.csv",
-            "CS_GW_READY_ET": "16:13:30",
-            "CS_GSHEET_TAB": "NovixTrades_IRA",
-        },
-    },
-    "novix-tt-individual": {
-        "orchestrator": "TT/Script/Novix/orchestrator.py",
-        "post_steps": [
-            "TT/data/cs_trades_to_gsheet.py",
-        ],
-        "token_ssm_path": "/gamma/tt/token_json",
-        "token_file": "/tmp/tt_token.json",
-        "env_from_ssm": {
-            "TT_CLIENT_ID": "/gamma/tt/client_id",
-            "TT_CLIENT_SECRET": "/gamma/tt/client_secret",
-            "SCHWAB_APP_KEY": "/gamma/schwab/app_key",
-            "SCHWAB_APP_SECRET": "/gamma/schwab/app_secret",
-        },
-        "static_env": {
-            "TT_ACCOUNT_NUMBER": "5WT09219",
-            "TT_TOKEN_PATH": "/tmp/tt_token.json",
-            "TT_QUOTE_TOKEN_PATH": "/tmp/tt_quote_token.json",
-            "SCHWAB_TOKEN_PATH": "/tmp/schwab_token.json",
-            "CS_UNIT_DOLLARS": "15000",
-            "CS_ACCOUNT_LABEL": "novix-tt-individual",
-            "CS_COST_PER_CONTRACT": "1.72",
-            "GW_ENDPOINT": "rapi/GetNovix",
-            "CS_LOG_PATH": "/tmp/nx_ind_trades.csv",
-            "CS_GW_READY_ET": "16:13:30",
-            "CS_GSHEET_TAB": "NovixTrades_Individual",
-        },
-    },
     "dualside": {
         "orchestrator": "scripts/trade/DualSide/orchestrator.py",
         "post_steps": [
@@ -960,7 +906,7 @@ def lambda_handler(event, context):
     if account == "warmup":
         depth = event.get("warmup_depth", 0)
         # Count how many concurrent trade schedules fire at the same time
-        # (schwab + tt-ira + tt-individual = 3, plus novix variants)
+        # (schwab + tt-ira + tt-individual = 3)
         target_containers = int(os.environ.get("WARMUP_CONTAINERS", "5"))
         if depth == 0 and target_containers > 1:
             # Spawn (N-1) additional invocations to force parallel containers
@@ -1085,7 +1031,7 @@ def lambda_handler(event, context):
             seed_file("/tmp/schwab_token.json", sw_token)
             env["SCHWAB_TOKEN_JSON"] = sw_token
 
-    _is_tt_account = account.startswith("tt-") or account.startswith("novix-tt-")
+    _is_tt_account = account.startswith("tt-")
     token_hash = file_hash(cfg["token_file"])
     tt_token_hash = file_hash("/tmp/tt_token.json") if account == "manual" else None
     schwab_hash = file_hash("/tmp/schwab_token.json") if _is_tt_account else None
