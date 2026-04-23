@@ -1,3 +1,9 @@
+---
+name: data-refresh
+description: Post-trade data refresh pipeline — Google Sheets sync, reconciliation, reporting. Use when the user asks to refresh data, sync sheets, or run the post-trade pipeline.
+disable-model-invocation: true
+---
+
 # Post-Trade Data Refresh Pipeline
 
 Skill for understanding and operating the CS (ConstantStable) reporting pipeline that refreshes Google Sheets after each trading day.

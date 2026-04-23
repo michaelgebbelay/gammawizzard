@@ -257,6 +257,8 @@ def _load_tt_orders_for_date(report_date: date) -> list[dict]:
                     qty = leg.get("quantity", 0)
                     # Try OSI parse
                     expiry, opt_type, strike = parse_osi(sym)
+                    if not opt_type:
+                        print(f"[trade_summary] TT {label}: parse_osi MISS sym={sym!r}")
                     if strike:
                         strikes.add(strike)
                     leg_details.append({

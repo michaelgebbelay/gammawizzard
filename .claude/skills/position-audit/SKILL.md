@@ -1,3 +1,8 @@
+---
+name: position-audit
+description: Audit open/closed positions, reconcile broker data, trace trades end-to-end, query the DuckDB portfolio store across Schwab and TastyTrade.
+---
+
 # Skill: Position Audit
 
 Audit open/closed positions, reconcile broker data, trace trades end-to-end, and query the canonical DuckDB portfolio store across Schwab and TastyTrade accounts.

@@ -1,6 +1,7 @@
 ---
 name: deploy
 description: Deploy the Lambda trading infrastructure via GitHub Actions. Use when the user asks to deploy, update schedules, push infrastructure changes, or validate the SAM template.
+disable-model-invocation: true
 ---
 
 # Deploy Skill

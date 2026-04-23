@@ -1,3 +1,8 @@
+---
+name: health-check
+description: Monitor and diagnose Gamma trading system health — scheduled jobs, alerts, drawdown, account integrations.
+---
+
 # Health Check Skill
 
 Monitor and diagnose the Gamma trading system's health across all scheduled jobs, alert pipelines, and account integrations.
@@ -45,13 +50,13 @@ Sends via `scripts/notify/smtp_notify.py` subprocess. Subject format: `[Gamma] A
 - **Last 5 sessions grid:** CS / DS / BF / Total columns per day.
 - **Strategy breakdown:** YTD P&L, trade count, win rate, current streak per strategy group.
 - **Drawdown stats:** Current and max drawdown for both MTD and YTD windows (realized P&L based).
-- **Today's trade summary:** Lists all Schwab and TastyTrade orders placed today with signal type (IC_LONG, IC_SHORT, RR_LONG_PUT, BF_BUY, etc.), fill status, strikes, and width.
+- **Today's trade summary:** Table with Account, Strategy, Type (IC Long, IC Short, RR Long, RR Short, Bear Put, etc.), and signed Puts/Calls columns (+N=long/debit, -N=short/credit). Anomaly notes appended below the table flagging qty mismatches (e.g. duplicate fills from failed cancels) and other issues.
 - **Discretionary P&L:** Separately computed P&L for manual/non-automated trades, with auto-adjustment detection (identifies when a manual order modifies an automated position).
 - **Missing strategies check:** Flags if expected daily schedules (Schwab CS, Schwab DualSide, TT-IRA Novix, TT-Indv CS) had no fills.
 
 ### Email format
 
-- Subject: `[Gamma] Health: 5D +$X | MTD +$X | YTD +$X -- YYYY-MM-DD`
+- Subject: `[Gamma] Today +$X | MTD +$X | YTD +$X — YYYY-MM-DD` (Today includes auto + discretionary P&L combined).
 - Separate behavior-check email sent only when anomalies detected.
 
 ### Data sources

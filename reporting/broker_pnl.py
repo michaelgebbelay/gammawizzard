@@ -42,14 +42,19 @@ SPX_MULTIPLIER = 100
 # ---------------------------------------------------------------------------
 
 def parse_osi(symbol: str) -> tuple[str | None, str | None, float | None]:
-    """Parse SPXW  260319P06535000 or SPX   260320P06520000 → (expiry, option_type, strike)."""
-    m = re.match(r"(?:SPXW|SPX)\s+(\d{6})([PC])(\d{8})", symbol)
+    """Parse SPXW  260319P06535000 or SPX   260320P06520000 → (expiry, option_type, strike).
+
+    Schwab uses 8-digit strikes (06535000 = $6535.000), TT uses shorter
+    formats (e.g. 06535).  Accept 4-8 digits and right-pad with zeros to
+    normalise to the 8-digit convention before dividing by 1000.
+    """
+    m = re.match(r"(?:SPXW|SPX)\s+(\d{6})([PC])(\d{4,8})", symbol)
     if not m:
         return None, None, None
     raw_date, pc, raw_strike = m.groups()
     yy, mm, dd = raw_date[:2], raw_date[2:4], raw_date[4:6]
     expiry = f"20{yy}-{mm}-{dd}"
-    strike = int(raw_strike) / 1000
+    strike = int(raw_strike.ljust(8, "0")) / 1000
     option_type = "PUT" if pc == "P" else "CALL"
     return expiry, option_type, strike
 

@@ -1,3 +1,9 @@
+---
+name: tt-ops
+description: TastyTrade broker operations — token management, account status, strategy orchestrators, broker sync, troubleshooting.
+disable-model-invocation: true
+---
+
 # TastyTrade Operations
 
 Reference for all TastyTrade broker integration: accounts, API client, token management, strategies, streaming, sync, and troubleshooting.
@@ -325,6 +331,7 @@ CLI: `python reporting/broker_sync_tt.py --lookback 14 --account 5WT20360`
 - **Symptom**: KeyError on TT API response fields
 - **Cause**: TT API returns kebab-case (`cash-balance`, `net-liquidating-value`, `filled-quantity`) while Python code typically uses snake_case
 - **Fix**: Always use the `_get(obj, "kebab-key", "snake_key", "camelKey")` pattern from broker_sync_tt.py, or handle both variants
+- **NOTE**: TT API does **not** populate `filled-quantity` on filled orders — it's always null. Use `size` field when `status == "Filled"`.
 
 ### DXLink Quote Token Expiry
 - **Symptom**: WebSocket connection fails or returns no quotes
@@ -336,6 +343,12 @@ CLI: `python reporting/broker_sync_tt.py --lookback 14 --account 5WT20360`
 - **Debugging**: Check trade CSV at `CS_LOG_PATH`, look for REJECTED/CANCELED statuses
 - **Common causes**: Insufficient buying power, position limits, market closed
 - **Ladder behavior**: Placer tries up to `VERT_MAX_LADDER=3` rungs, widening price each time
+
+### BUNDLE4 Fallback Bug (fixed 2026-04-06)
+- **Symptom**: Novix IC trades (both sides SHORT) → BUNDLE4 at mid → NO_FILL → fallback crashes with rc=1
+- **Root cause**: `place_two_verticals_simul()` expects `qty1, qty2` but BUNDLE4 fallback in `place.py:1688` passed `qty=remaining` (wrong kwarg). Also `submit_one()` at lines 1120/1123 used undefined `qty` instead of `qty1`/`qty2`.
+- **Fix**: Changed to `qty1=remaining, qty2=remaining` and fixed `submit_one` refs.
+- **When it triggers**: Only when both signal sides are SHORT (CREDIT+CREDIT → BUNDLE4 mode). Mixed directions use PAIR_ALT and are unaffected.
 
 ---
 
