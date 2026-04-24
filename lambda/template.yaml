@@ -80,7 +80,7 @@ Resources:
     Properties:
       Name: gamma-cs-schwab
       Description: "ConstantStable Schwab account"
-      State: ENABLED
+      State: DISABLED
       ScheduleExpression: !Ref ScheduleTime
       ScheduleExpressionTimezone: "America/New_York"
       FlexibleTimeWindow:
@@ -142,7 +142,7 @@ Resources:
     Properties:
       Name: gamma-ds-schwab
       Description: "DualSide 6DTE/5DTE vertical strategy (Schwab)"
-      State: ENABLED
+      State: DISABLED
       ScheduleExpression: "cron(5 16 ? * MON-FRI *)"
       ScheduleExpressionTimezone: "America/New_York"
       FlexibleTimeWindow:
@@ -158,7 +158,7 @@ Resources:
     Properties:
       Name: gamma-cs-morning-check
       Description: "Morning equity/drawdown check with email alert"
-      State: ENABLED
+      State: DISABLED
       ScheduleExpression: "cron(35 9 ? * MON-FRI *)"
       ScheduleExpressionTimezone: "America/New_York"
       FlexibleTimeWindow:
@@ -206,7 +206,7 @@ Resources:
     Properties:
       Name: gamma-cs-refresh
       Description: "CS full reporting refresh: signal + tracking + summary + performance + charts"
-      State: ENABLED
+      State: DISABLED
       ScheduleExpression: "cron(0 17 ? * MON-FRI *)"
       ScheduleExpressionTimezone: "America/New_York"
       FlexibleTimeWindow:
@@ -222,7 +222,7 @@ Resources:
     Properties:
       Name: gamma-cs-refresh-morning
       Description: "CS morning reporting retry: pick up any missed fills from prior day"
-      State: ENABLED
+      State: DISABLED
       ScheduleExpression: "cron(0 9 ? * MON-FRI *)"
       ScheduleExpressionTimezone: "America/New_York"
       FlexibleTimeWindow:
@@ -249,7 +249,7 @@ Resources:
     Properties:
       Name: gamma-sim-collect-open
       Description: "Sim: collect SPX 0DTE chain at market open"
-      State: ENABLED
+      State: DISABLED
       ScheduleExpression: "cron(31 9 ? * MON-FRI *)"
       ScheduleExpressionTimezone: "America/New_York"
       FlexibleTimeWindow:
@@ -264,7 +264,7 @@ Resources:
     Properties:
       Name: gamma-sim-collect-mid
       Description: "Sim: collect SPX chain at midday"
-      State: ENABLED
+      State: DISABLED
       ScheduleExpression: "cron(0 12 ? * MON-FRI *)"
       ScheduleExpressionTimezone: "America/New_York"
       FlexibleTimeWindow:
@@ -279,7 +279,7 @@ Resources:
     Properties:
       Name: gamma-sim-collect-close
       Description: "Sim: collect SPX chain at market close"
-      State: ENABLED
+      State: DISABLED
       ScheduleExpression: "cron(0 16 ? * MON-FRI *)"
       ScheduleExpressionTimezone: "America/New_York"
       FlexibleTimeWindow:
@@ -294,7 +294,7 @@ Resources:
     Properties:
       Name: gamma-sim-collect-close5
       Description: "Sim: collect SPX 1DTE chain at close+5"
-      State: ENABLED
+      State: DISABLED
       ScheduleExpression: "cron(5 16 ? * MON-FRI *)"
       ScheduleExpressionTimezone: "America/New_York"
       FlexibleTimeWindow:

@@ -60,23 +60,17 @@ ACCOUNTS = {
             "scripts/data/cs_backfill_20260211.py",
             "scripts/data/cs_summary_to_gsheet.py",
             "scripts/data/cs_performance_to_gsheet.py",
-            "TT/Script/ConstantStable/edge_guard.py",
         ],
         "token_ssm_path": "/gamma/tt/token_json",
         "token_file": "/tmp/tt_token.json",
         "env_from_ssm": {
-            # TT credentials
             "TT_CLIENT_ID": "/gamma/tt/client_id",
             "TT_CLIENT_SECRET": "/gamma/tt/client_secret",
-            # Schwab creds (needed by edge guard / data scripts)
-            "SCHWAB_APP_KEY": "/gamma/schwab/app_key",
-            "SCHWAB_APP_SECRET": "/gamma/schwab/app_secret",
         },
         "static_env": {
             "TT_ACCOUNT_NUMBER": "5WT20360",
             "TT_TOKEN_PATH": "/tmp/tt_token.json",
             "TT_QUOTE_TOKEN_PATH": "/tmp/tt_quote_token.json",
-            "SCHWAB_TOKEN_PATH": "/tmp/schwab_token.json",
             "CS_UNIT_DOLLARS": "20000",
             "CS_ACCOUNT_LABEL": "tt-ira",
             "CS_COST_PER_CONTRACT": "1.72",
@@ -93,22 +87,18 @@ ACCOUNTS = {
             "scripts/data/cs_summary_to_gsheet.py",
             "scripts/data/cs_performance_to_gsheet.py",
             "TT/Script/ConstantStable/close_orders.py",
-            "TT/Script/ConstantStable/edge_guard.py",
         ],
         "token_ssm_path": "/gamma/tt/token_json",
         "token_file": "/tmp/tt_token.json",
         "env_from_ssm": {
             "TT_CLIENT_ID": "/gamma/tt/client_id",
             "TT_CLIENT_SECRET": "/gamma/tt/client_secret",
-            "SCHWAB_APP_KEY": "/gamma/schwab/app_key",
-            "SCHWAB_APP_SECRET": "/gamma/schwab/app_secret",
         },
         "static_env": {
             "TT_ACCOUNT_NUMBER": "5WT09219",
             "TT_TOKEN_PATH": "/tmp/tt_token.json",
             "TT_QUOTE_TOKEN_PATH": "/tmp/tt_quote_token.json",
-            "SCHWAB_TOKEN_PATH": "/tmp/schwab_token.json",
-            "CS_UNIT_DOLLARS": "20000",
+            "CS_UNIT_DOLLARS": "3000",
             "CS_ACCOUNT_LABEL": "tt-individual",
             "CS_COST_PER_CONTRACT": "1.72",
             "CS_VIX_MULTS": "1,1,1,1,1",
@@ -971,11 +961,6 @@ def lambda_handler(event, context):
     ssm_names.update(SHARED_SSM)                    # env_var -> ssm_path
     ssm_names["_token"] = cfg["token_ssm_path"]     # primary token
 
-    # For TT accounts, also fetch Schwab token (edge guard / quotes need it)
-    _needs_schwab_token = account.startswith("tt-")
-    if _needs_schwab_token:
-        ssm_names["_schwab_token"] = "/gamma/schwab/token_json"
-
     # Manual account needs both Schwab (primary) + TT token
     if account == "manual":
         ssm_names["_tt_token"] = "/gamma/tt/token_json"
@@ -1025,16 +1010,9 @@ def lambda_handler(event, context):
     else:
         # TT: set token content as env var (orchestrator passes to placer)
         env["TT_TOKEN_JSON"] = token_content
-        # Also seed Schwab token for edge guard
-        sw_token = params.get("/gamma/schwab/token_json", "")
-        if sw_token:
-            seed_file("/tmp/schwab_token.json", sw_token)
-            env["SCHWAB_TOKEN_JSON"] = sw_token
 
-    _is_tt_account = account.startswith("tt-")
     token_hash = file_hash(cfg["token_file"])
     tt_token_hash = file_hash("/tmp/tt_token.json") if account == "manual" else None
-    schwab_hash = file_hash("/tmp/schwab_token.json") if _is_tt_account else None
 
     # Ensure /tmp writability for logs
     os.makedirs("/tmp/logs", exist_ok=True)
@@ -1110,14 +1088,6 @@ def lambda_handler(event, context):
         persist_token_if_changed(cfg["token_ssm_path"], cfg["token_file"], token_hash)
     except Exception as e:
         print(f"ERROR persisting token: {e}")
-
-    if _is_tt_account and schwab_hash:
-        try:
-            persist_token_if_changed(
-                "/gamma/schwab/token_json", "/tmp/schwab_token.json", schwab_hash
-            )
-        except Exception as e:
-            print(f"ERROR persisting schwab token: {e}")
 
     if account == "manual" and tt_token_hash:
         try:
