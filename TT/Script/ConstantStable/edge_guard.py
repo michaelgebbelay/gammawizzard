@@ -3,13 +3,15 @@
 ConstantStable - Equity logger + edge guard (Google Sheets + GitHub Actions outputs)
 
 Writes one row per run into a Google Sheet tab (default: ConstantStableState).
-Computes daily/run P&L based on Schwab liquidationValue and adjusts for transfers.
+Computes daily/run P&L based on TastyTrade net-liquidating-value and adjusts
+for money-movement transactions.
 Optionally pauses trading when edge is likely gone (sequential test on returns).
 
-Required env (for Schwab):
-  SCHWAB_APP_KEY
-  SCHWAB_APP_SECRET
-  SCHWAB_TOKEN_JSON
+Required env (for TastyTrade):
+  TT_ACCOUNT_NUMBER
+  TT_CLIENT_ID
+  TT_CLIENT_SECRET
+  TT_TOKEN_JSON  (or token loaded by tt_token_keeper)
 
 Optional env (for Google Sheets logging):
   GSHEET_ID
@@ -52,7 +54,7 @@ def _add_scripts_root():
 
 
 _add_scripts_root()
-from schwab_token_keeper import schwab_client
+from tt_client import request as tt_request
 
 ET = ZoneInfo("America/New_York")
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -85,86 +87,39 @@ def fint(key: str, default=None):
     except Exception:
         return default
 
-# ---------------- Schwab equity ----------------
-def opening_cash_for_account(c):
+# ---------------- TastyTrade equity + transfers ----------------
+def tt_account_number() -> str:
+    return (os.environ.get("TT_ACCOUNT_NUMBER") or "").strip()
+
+
+def opening_cash_for_account():
     """
-    Returns (equity_value, source_key, acct_number) preferring liquidationValue and ignoring 0/neg.
+    Returns (equity_value, source_key, acct_number) preferring net-liquidating-value.
+    Ignores 0/negative values.
     """
-    r = c.get_accounts()
-    r.raise_for_status()
-    data = r.json()
-    arr = data if isinstance(data, list) else [data]
+    acct_num = tt_account_number()
+    if not acct_num:
+        return None, "no_acct", ""
 
-    acct_num = ""
-    try:
-        rr = c.get_account_numbers()
-        rr.raise_for_status()
-        acct_num = str((rr.json() or [{}])[0].get("accountNumber") or "")
-    except Exception:
-        pass
-
-    def hunt(a):
-        acct_id=None; init={}; curr={}
-        stack=[a]
-        while stack:
-            x=stack.pop()
-            if isinstance(x,dict):
-                if acct_id is None and x.get("accountNumber"):
-                    acct_id=str(x["accountNumber"])
-                if "initialBalances" in x and isinstance(x["initialBalances"], dict):
-                    init=x["initialBalances"]
-                if "currentBalances" in x and isinstance(x["currentBalances"], dict):
-                    curr=x["currentBalances"]
-                for v in x.values():
-                    if isinstance(v,(dict,list)):
-                        stack.append(v)
-            elif isinstance(x,list):
-                stack.extend(x)
-        return acct_id, init, curr
-
-    chosen=None
-    chosen_num=""
-    for a in arr:
-        aid, init, curr = hunt(a)
-        if acct_num and aid == acct_num:
-            chosen=(init,curr); chosen_num=aid; break
-        if chosen is None:
-            chosen=(init,curr); chosen_num=aid or ""
-
-    if not chosen:
-        return None, "none", chosen_num
-
-    init, curr = chosen
+    j = tt_request("GET", f"/accounts/{acct_num}/balances").json()
+    src = (j.get("data") if isinstance(j, dict) else {}) or {}
     keys = [
-        "liquidationValue",
-        "cashAvailableForTrading",
-        "cashBalance",
-        "availableFundsNonMarginableTrade",
-        "buyingPowerNonMarginableTrade",
-        "optionBuyingPower",
-        "buyingPower",
+        "net-liquidating-value",
+        "cash-balance",
+        "cash-available-to-withdraw",
+        "equity-buying-power",
+        "derivative-buying-power",
     ]
-    def pick(src):
-        for k in keys:
-            v = (src or {}).get(k)
-            if isinstance(v,(int,float)):
-                fv = float(v)
-                if fv > 0:
-                    return fv, k
-        return None
+    for k in keys:
+        v = src.get(k)
+        try:
+            fv = float(v)
+            if fv > 0:
+                return fv, k, acct_num
+        except Exception:
+            continue
+    return None, "none", acct_num
 
-    for src in (init, curr):
-        got = pick(src)
-        if got:
-            return got[0], got[1], chosen_num
-    return None, "none", chosen_num
-
-def get_account_hash(c):
-    r = c.get_account_numbers()
-    r.raise_for_status()
-    arr = r.json() or []
-    info = arr[0] if arr else {}
-    return str(info.get("hashValue") or info.get("hashvalue") or "")
 
 def safe_float(x, default=None):
     try:
@@ -174,49 +129,49 @@ def safe_float(x, default=None):
     except Exception:
         return default
 
-def list_transactions(c, acct_hash: str, t0: datetime, t1: datetime):
-    r = c.get_transactions(acct_hash, start_date=t0, end_date=t1)
-    if getattr(r, "status_code", None) == 204:
-        return []
-    r.raise_for_status()
-    j = r.json()
-    return j if isinstance(j, list) else []
+
+def list_transactions(acct_num: str, t0: datetime, t1: datetime):
+    """List TT transactions in window [t0, t1]. Returns list of dicts."""
+    out: list = []
+    page = 1
+    while True:
+        params = {
+            "start-at": t0.isoformat(),
+            "end-at": t1.isoformat(),
+            "per-page": 200,
+            "page-offset": page - 1,
+        }
+        try:
+            r = tt_request("GET", f"/accounts/{acct_num}/transactions", params=params)
+        except Exception:
+            return out
+        j = r.json() if r is not None else {}
+        items = ((j.get("data") or {}).get("items") or []) if isinstance(j, dict) else []
+        if not items:
+            break
+        out.extend(items)
+        pagination = (j.get("pagination") or {}) if isinstance(j, dict) else {}
+        total_pages = int(pagination.get("total-pages") or 1)
+        if page >= total_pages:
+            break
+        page += 1
+    return out
+
 
 def is_transfer_txn(txn: dict) -> bool:
-    ttype = str(txn.get("type") or txn.get("transactionType") or "").upper()
-    subtype = str(txn.get("subType") or "").upper()
-    desc = str(txn.get("description") or "").upper()
-    text = " ".join([ttype, subtype, desc])
+    """A TT 'Money Movement' is a deposit/withdrawal/transfer.
+    Trade-related transactions never have type=Money Movement, so this is unambiguous."""
+    ttype = str(txn.get("transaction-type") or "").upper()
+    return ttype == "MONEY MOVEMENT"
 
-    exclude = ("DIVIDEND", "INTEREST", "TRADE", "OPTION", "BUY", "SELL", "EXERCISE", "ASSIGNMENT")
-    if any(x in text for x in exclude):
-        return False
 
-    include = ("TRANSFER", "WIRE", "ACH", "EFT", "DEPOSIT", "WITHDRAW", "JOURNAL", "CONTRIBUTION", "DISTRIBUTION")
-    if any(x in text for x in include):
-        return True
-
-    if txn.get("orderId"):
-        return False
-
-    items = txn.get("transferItems") or []
-    if items:
-        for it in items:
-            ins = it.get("instrument") or {}
-            asset = str(ins.get("assetType") or "").upper()
-            if asset == "OPTION":
-                return False
-        return True
-
-    return False
-
-def net_transfers_between(c, acct_hash: str, t0: datetime, t1: datetime) -> float:
-    txns = list_transactions(c, acct_hash, t0, t1)
+def net_transfers_between(acct_num: str, t0: datetime, t1: datetime) -> float:
+    txns = list_transactions(acct_num, t0, t1)
     total = 0.0
     for t in txns:
         if not is_transfer_txn(t):
             continue
-        amt = safe_float(t.get("netAmount"))
+        amt = safe_float(t.get("net-value"))
         if amt is None:
             continue
         total += amt
@@ -301,14 +256,12 @@ def main():
 
     # 1) Get equity
     try:
-        c = schwab_client()
-        eq, src, acct = opening_cash_for_account(c)
-        acct_hash = get_account_hash(c)
+        eq, src, acct = opening_cash_for_account()
     except Exception as e:
-        # If Schwab fails, trading probably fails too; be explicit
-        print(f"CS_EDGE_GUARD ERROR: Schwab init/equity failed: {e}")
+        # If TT fails, trading probably fails too; be explicit
+        print(f"CS_EDGE_GUARD ERROR: TT init/equity failed: {e}")
         goutput("can_trade","0")
-        goutput("reason","SCHWAB_FAIL")
+        goutput("reason","TT_FAIL")
         return 1
 
     if eq is None or eq <= 0:
@@ -412,9 +365,9 @@ def main():
     t1 = ts_utc
 
     transfer_net = 0.0
-    if acct_hash:
+    if acct:
         try:
-            transfer_net = net_transfers_between(c, acct_hash, t0, t1)
+            transfer_net = net_transfers_between(acct, t0, t1)
         except Exception as e:
             print(f"CS_EDGE_GUARD WARN: transfer lookup failed: {str(e)[:200]}")
 

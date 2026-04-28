@@ -206,7 +206,7 @@ Resources:
     Properties:
       Name: gamma-cs-refresh
       Description: "CS full reporting refresh: signal + tracking + summary + performance + charts"
-      State: DISABLED
+      State: ENABLED
       ScheduleExpression: "cron(0 17 ? * MON-FRI *)"
       ScheduleExpressionTimezone: "America/New_York"
       FlexibleTimeWindow:
@@ -222,7 +222,7 @@ Resources:
     Properties:
       Name: gamma-cs-refresh-morning
       Description: "CS morning reporting retry: pick up any missed fills from prior day"
-      State: DISABLED
+      State: ENABLED
       ScheduleExpression: "cron(0 9 ? * MON-FRI *)"
       ScheduleExpressionTimezone: "America/New_York"
       FlexibleTimeWindow:
