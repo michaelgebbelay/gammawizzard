@@ -94,7 +94,7 @@ Resources:
     Type: AWS::Scheduler::Schedule
     Properties:
       Name: gamma-cs-tt-ira
-      Description: "ConstantStable TT IRA (5WT20360)"
+      Description: "TT IRA (5WT20360) — now running LeoProfit"
       State: ENABLED
       ScheduleExpression: !Ref ScheduleTime
       ScheduleExpressionTimezone: "America/New_York"
@@ -103,7 +103,7 @@ Resources:
       Target:
         Arn: !GetAtt TradingFunction.Arn
         RoleArn: !GetAtt SchedulerRole.Arn
-        Input: '{"account": "tt-ira"}'
+        Input: '{"account": "tt-ira-leo"}'
 
   TtIndividualSchedule:
     Type: AWS::Scheduler::Schedule
