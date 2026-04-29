@@ -95,11 +95,9 @@ ACCOUNTS = {
             "TT_QUOTE_TOKEN_PATH": "/tmp/tt_quote_token.json",
             "CS_ACCOUNT_LABEL": "tt-ira-leo",
             "CS_STATE_TAB": "LeoProfitState",
-            "LEO_FIXED_QTY": "2",
+            "LEO_FIXED_QTY": "1",
             "LEO_CALL_MULT": "2",
             "LEO_CREDIT_SPREAD_WIDTH": "20",
-            "LEO_MAX_LADDER": "1",
-            "LEO_STEP_WAIT": "4",
         },
     },
     "tt-individual": {
