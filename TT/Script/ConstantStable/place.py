@@ -632,7 +632,7 @@ def post_with_retry(c, url, payload, tag="", tries=5):
                 print(f"WARN: place failed — HTTP_429 — backoff {wait:.2f}s [{tag}]")
                 time.sleep(wait)
                 continue
-            last = f"HTTP_{resp.status_code}:{(resp.text or '')[:200]}" if resp is not None else "HTTP_unknown"
+            last = f"HTTP_{resp.status_code}:{(resp.text or '')[:2000]}" if resp is not None else "HTTP_unknown"
             time.sleep(min(6.0, 0.45 * (2 ** i)))
             continue
     raise RuntimeError(f"POST_FAIL({tag}) {last or 'unknown'}")
