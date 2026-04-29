@@ -98,6 +98,8 @@ ACCOUNTS = {
             "LEO_FIXED_QTY": "2",
             "LEO_CALL_MULT": "2",
             "LEO_CREDIT_SPREAD_WIDTH": "20",
+            "LEO_MAX_LADDER": "1",
+            "LEO_STEP_WAIT": "4",
         },
     },
     "tt-individual": {
