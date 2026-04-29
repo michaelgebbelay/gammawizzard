@@ -158,8 +158,9 @@ def main():
           f"qty={qty} call_mult={call_mult} dry_run={dry_run}")
     print(f"LEO PLACE LEGS: {legs}")
 
-    # ---- Cancel any stale working orders before placing ----
-    if not dry_run:
+    # ---- Optional preflight cancel (off by default; TT /orders/live can return
+    # filled/expired orders that all FAIL to cancel and burn the Lambda budget). ----
+    if not dry_run and truthy(os.environ.get("LEO_PREFLIGHT_CANCEL", "false")):
         try:
             cancel_all_working_orders(acct)
         except Exception as e:
