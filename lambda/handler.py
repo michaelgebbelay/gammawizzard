@@ -78,6 +78,28 @@ ACCOUNTS = {
             "CS_VIX_MULTS": "1,1,1,1,1",
         },
     },
+    "tt-ira-leo": {
+        "orchestrator": "TT/Script/LeoProfit/orchestrator.py",
+        "post_steps": [
+            "TT/Script/ConstantStable/edge_guard.py",
+        ],
+        "token_ssm_path": "/gamma/tt/token_json",
+        "token_file": "/tmp/tt_token.json",
+        "env_from_ssm": {
+            "TT_CLIENT_ID": "/gamma/tt/client_id",
+            "TT_CLIENT_SECRET": "/gamma/tt/client_secret",
+        },
+        "static_env": {
+            "TT_ACCOUNT_NUMBER": "5WT20360",
+            "TT_TOKEN_PATH": "/tmp/tt_token.json",
+            "TT_QUOTE_TOKEN_PATH": "/tmp/tt_quote_token.json",
+            "CS_ACCOUNT_LABEL": "tt-ira-leo",
+            "CS_STATE_TAB": "LeoProfitState",
+            "LEO_FIXED_QTY": "2",
+            "LEO_CALL_MULT": "2",
+            "LEO_CREDIT_SPREAD_WIDTH": "20",
+        },
+    },
     "tt-individual": {
         "orchestrator": "TT/Script/ConstantStable/orchestrator.py",
         "post_steps": [
