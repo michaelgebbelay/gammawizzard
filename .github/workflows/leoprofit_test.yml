@@ -1,0 +1,41 @@
+name: LeoProfit Test Invoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (no real orders)"
+        type: choice
+        options: ["true", "false"]
+        default: "true"
+
+jobs:
+  invoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Invoke tt-ira-leo
+        run: |
+          PAYLOAD=$(printf '{"account": "tt-ira-leo", "dry_run": %s}' "${{ inputs.dry_run }}")
+          echo "Payload: $PAYLOAD"
+          aws lambda invoke \
+            --function-name gamma-trading-TradingFunction-O0rzFPNn3umX \
+            --region us-east-1 \
+            --payload "$PAYLOAD" \
+            --cli-binary-format raw-in-base64-out \
+            --cli-read-timeout 300 \
+            --log-type Tail \
+            --query 'LogResult' \
+            --output text \
+            /tmp/result.json | base64 -d
+          echo
+          echo "=== Response payload ==="
+          cat /tmp/result.json
+          echo
