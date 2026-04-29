@@ -96,8 +96,8 @@ ACCOUNTS = {
             "CS_ACCOUNT_LABEL": "tt-ira-leo",
             "CS_STATE_TAB": "LeoProfitState",
             "LEO_FIXED_QTY": "1",
-            "LEO_CALL_MULT": "2",
-            "LEO_CREDIT_SPREAD_WIDTH": "20",
+            "LEO_CALL_MULT": "1",
+            "LEO_CREDIT_SPREAD_WIDTH": "5",
         },
     },
     "tt-individual": {
