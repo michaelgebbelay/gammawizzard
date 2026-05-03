@@ -1,0 +1,154 @@
+name: Conviction Backtest — Trend-Floor Sweep
+
+# 7-variant trend-quality-floor sweep on the z=3.0 / top-2000 / 1460d
+# Variant D-evolved baseline. Tests whether requiring stronger trend
+# already-in-place (close vs SMA-200, trailing 60d return) lifts edge.
+#
+# Trigger:
+#   gh workflow run conviction_backtest_trend_floor.yml \
+#     -f end_date=2026-04-29
+#   gh run watch
+#
+# Data must be pre-staged at s3://gamma-sim-cache/conviction-backtest-data/
+# (same data set used by conviction_backtest.yml / conviction_backtest_earnings.yml).
+
+on:
+  workflow_dispatch:
+    inputs:
+      end_date:
+        description: "End date (YYYY-MM-DD)"
+        type: string
+        default: "2026-04-29"
+      days:
+        description: "--days"
+        type: string
+        default: "1460"
+      skew_z_min:
+        description: "--skew-z-min"
+        type: string
+        default: "3.0"
+      universe_top_n:
+        description: "--universe-top-n"
+        type: string
+        default: "2000"
+      positions:
+        description: "--positions"
+        type: string
+        default: "2"
+      max_hold_days:
+        description: "--max-hold-days"
+        type: string
+        default: "90"
+      trailing_pct:
+        description: "--trailing-pct"
+        type: string
+        default: "20"
+
+jobs:
+  expand-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      combos: ${{ steps.build.outputs.combos }}
+    steps:
+      - id: build
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          combos = [
+              {"label": "baseline",     "kind": "none",     "value": 0.0},
+              {"label": "above200_10",  "kind": "above200", "value": 0.10},
+              {"label": "above200_15",  "kind": "above200", "value": 0.15},
+              {"label": "above200_20",  "kind": "above200", "value": 0.20},
+              {"label": "ret60_10",     "kind": "ret60",    "value": 0.10},
+              {"label": "ret60_20",     "kind": "ret60",    "value": 0.20},
+              {"label": "ret60_30",     "kind": "ret60",    "value": 0.30},
+          ]
+          print("combos=" + json.dumps(combos))
+          PY
+
+  backtest:
+    needs: expand-matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        combo: ${{ fromJSON(needs.expand-matrix.outputs.combos) }}
+    name: "tf_${{ matrix.combo.label }}"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Sync backtest data from S3
+        run: |
+          mkdir -p scripts/conviction/backtest/data
+          aws s3 sync s3://gamma-sim-cache/conviction-backtest-data/ scripts/conviction/backtest/data/ \
+            --exclude "day_aggs_raw/*" --no-progress
+          ls -lh scripts/conviction/backtest/data/
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            "pandas==3.0.2" \
+            "numpy==2.4.4" \
+            "pyarrow==24.0.0" \
+            "scipy==1.17.1" \
+            "boto3==1.43.1" \
+            "pyyaml==6.0.3" \
+            "requests==2.33.1"
+
+      - name: Run replay
+        id: run
+        run: |
+          set -o pipefail
+          mkdir -p out
+          LOG="out/tf_${{ matrix.combo.label }}.log"
+          EXTRA_FLAGS=""
+          case "${{ matrix.combo.kind }}" in
+            above200) EXTRA_FLAGS="--min-pct-above-200d ${{ matrix.combo.value }}" ;;
+            ret60)    EXTRA_FLAGS="--min-ret-60d ${{ matrix.combo.value }}" ;;
+            none)     EXTRA_FLAGS="" ;;
+          esac
+          python scripts/conviction/backtest/replay.py \
+            --days ${{ inputs.days }} \
+            --source massive \
+            --ignore-themes \
+            --universe-top-n ${{ inputs.universe_top_n }} \
+            --exit-rule trailing_pct \
+            --trailing-pct ${{ inputs.trailing_pct }} \
+            --strategy pathS \
+            --skew-direction bullish \
+            --max-hold-days ${{ inputs.max_hold_days }} \
+            --regime-gate spy \
+            --positions ${{ inputs.positions }} \
+            --skew-z-min ${{ inputs.skew_z_min }} \
+            --end-date ${{ inputs.end_date }} \
+            --run-suffix tf_${{ matrix.combo.label }} \
+            $EXTRA_FLAGS \
+            2>&1 | tee "$LOG"
+
+      - name: Collect results files
+        if: always()
+        run: |
+          if [ -d scripts/conviction/backtest/results ]; then
+            cp -r scripts/conviction/backtest/results out/results || true
+          fi
+          ls -R out || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tf_${{ matrix.combo.label }}
+          path: out/
+          retention-days: 14
