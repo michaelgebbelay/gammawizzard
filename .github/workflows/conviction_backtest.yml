@@ -1,0 +1,156 @@
+name: Conviction Backtest Sweep
+
+# Fans out a (skew_z_min, days) matrix across parallel runners.
+# Each leg pulls the staged parquet data from S3, runs replay.py,
+# and uploads the log + any output CSVs as an artifact.
+#
+# Trigger:
+#   gh workflow run conviction_backtest.yml \
+#     -f z_values=1.5,2.0,2.5,3.0 \
+#     -f days_values=1460,730 \
+#     -f end_date=2026-04-29
+#
+# Data must be pre-staged at s3://gamma-sim-cache/conviction-backtest-data/
+#   aws s3 sync scripts/conviction/backtest/data/ \
+#     s3://gamma-sim-cache/conviction-backtest-data/ --exclude "day_aggs_raw/*"
+
+on:
+  workflow_dispatch:
+    inputs:
+      z_values:
+        description: "Comma-separated skew-z-min values"
+        type: string
+        default: "1.5,2.0,2.5,3.0"
+      days_values:
+        description: "Comma-separated --days values"
+        type: string
+        default: "1460,730"
+      end_date:
+        description: "End date (YYYY-MM-DD)"
+        type: string
+        default: "2026-04-29"
+      strategy:
+        description: "--strategy"
+        type: string
+        default: "pathS"
+      skew_direction:
+        description: "--skew-direction"
+        type: string
+        default: "bullish"
+      universe_top_n:
+        description: "--universe-top-n"
+        type: string
+        default: "2000"
+      positions:
+        description: "--positions"
+        type: string
+        default: "2"
+      max_hold_days:
+        description: "--max-hold-days"
+        type: string
+        default: "90"
+      trailing_pct:
+        description: "--trailing-pct"
+        type: string
+        default: "20"
+
+jobs:
+  expand-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      combos: ${{ steps.build.outputs.combos }}
+    steps:
+      - id: build
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          z_vals = [s.strip() for s in os.environ["Z"].split(",") if s.strip()]
+          d_vals = [s.strip() for s in os.environ["D"].split(",") if s.strip()]
+          combos = [{"z": z, "days": d, "label": "4y" if d == "1460" else ("2y" if d == "730" else f"{d}d")}
+                    for z in z_vals for d in d_vals]
+          print("combos=" + json.dumps(combos))
+          PY
+        env:
+          Z: ${{ inputs.z_values }}
+          D: ${{ inputs.days_values }}
+
+  backtest:
+    needs: expand-matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 350  # max GH Actions allows is 360
+    strategy:
+      fail-fast: false
+      matrix:
+        combo: ${{ fromJSON(needs.expand-matrix.outputs.combos) }}
+    name: "z=${{ matrix.combo.z }} ${{ matrix.combo.label }}"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Sync backtest data from S3
+        run: |
+          mkdir -p scripts/conviction/backtest/data
+          aws s3 sync s3://gamma-sim-cache/conviction-backtest-data/ scripts/conviction/backtest/data/ \
+            --exclude "day_aggs_raw/*" --no-progress
+          ls -lh scripts/conviction/backtest/data/
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            "pandas==3.0.2" \
+            "numpy==2.4.4" \
+            "pyarrow==24.0.0" \
+            "scipy==1.17.1" \
+            "boto3==1.43.1" \
+            "pyyaml==6.0.3" \
+            "requests==2.33.1"
+
+      - name: Run replay
+        id: run
+        run: |
+          set -o pipefail
+          mkdir -p out
+          LOG="out/zmin_${{ matrix.combo.z }}_${{ matrix.combo.label }}.log"
+          python scripts/conviction/backtest/replay.py \
+            --days ${{ matrix.combo.days }} \
+            --source massive \
+            --ignore-themes \
+            --universe-top-n ${{ inputs.universe_top_n }} \
+            --exit-rule trailing_pct \
+            --trailing-pct ${{ inputs.trailing_pct }} \
+            --strategy ${{ inputs.strategy }} \
+            --skew-direction ${{ inputs.skew_direction }} \
+            --max-hold-days ${{ inputs.max_hold_days }} \
+            --regime-gate spy \
+            --positions ${{ inputs.positions }} \
+            --skew-z-min ${{ matrix.combo.z }} \
+            --end-date ${{ inputs.end_date }} \
+            2>&1 | tee "$LOG"
+
+      - name: Collect any results files
+        if: always()
+        run: |
+          # Anything replay.py drops under scripts/conviction/backtest/results/
+          # gets pulled into the artifact alongside the log.
+          if [ -d scripts/conviction/backtest/results ]; then
+            cp -r scripts/conviction/backtest/results out/results || true
+          fi
+          ls -R out || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zmin_${{ matrix.combo.z }}_${{ matrix.combo.label }}
+          path: out/
+          retention-days: 14
