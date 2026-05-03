@@ -1,0 +1,79 @@
+# Curated narrative-theme overlay.
+#
+# yfinance gives us GICS sectors (Technology, Energy, etc.) but those are too
+# broad for cult-stock identification. This file overlays sector classification
+# with finer-grained themes that actually drive the names the user cares about.
+#
+# A ticker can belong to multiple themes — order doesn't matter. Unknown
+# tickers fall back to their yfinance sector only (no theme tags).
+#
+# Edit freely. Add new themes / new tickers as the narrative landscape shifts.
+
+themes:
+  AI_INFRA:
+    description: GPU/chip/networking/power infrastructure for AI buildout
+    tickers: [NVDA, AMD, AVGO, ASML, LRCX, KLAC, AMAT, TSM, MU, MRVL, ARM, SMCI, DELL, ANET, VRT, CRDO, ALAB, PANW, JNPR, CIEN]
+
+  AI_SOFTWARE:
+    description: Software platforms riding the AI demand wave
+    tickers: [PLTR, SNOW, NET, MDB, NOW, CRM, ORCL, ADBE, GOOGL, META, MSFT, IBM]
+
+  CYBERSECURITY:
+    description: Cybersecurity platform consolidation
+    tickers: [CRWD, PANW, ZS, S, OKTA, FTNT, NET, FFIV, CHKP, CYBR, VRNS, RBRK]
+
+  BITCOIN_PROXY:
+    description: Names whose price is heavily driven by BTC and crypto markets
+    tickers: [MSTR, COIN, MARA, RIOT, CLSK, CIFR, HUT, BITF, HOOD, CORZ, IREN, BTBT]
+
+  NUCLEAR_POWER:
+    description: Nuclear / utility-scale power plays riding AI datacenter demand
+    tickers: [CEG, VST, TLN, NEE, SMR, OKLO, BWXT, NNE, LEU, CCJ, UEC]
+
+  DEFENSE:
+    description: Defense / aerospace / drones — geopolitical tailwind
+    tickers: [LMT, RTX, NOC, GD, BA, KTOS, LDOS, AVAV, PLTR, DRS, ESLT, RKLB, ACHR]
+
+  GLP1_OBESITY:
+    description: GLP-1 obesity drug platform
+    tickers: [LLY, NVO, AMGN, VKTX, ALT, RVMD]
+
+  EV_MOBILITY:
+    description: EVs and connected mobility
+    tickers: [TSLA, RIVN, LCID, LI, NIO, XPEV, BYDDY, JOBY, ACHR]
+
+  MEMORY_STORAGE:
+    description: Memory / NAND / storage cycle plays
+    tickers: [SNDK, WDC, MU, STX, NTAP, PSTG, HPE]
+
+  FINTECH:
+    description: Payment networks + neobanks + crypto-fintech
+    tickers: [V, MA, PYPL, AFRM, SOFI, NU, COIN, HOOD, SQ, UPST]
+
+  CULT_RETAIL:
+    description: Retail / restaurants with cult-grade customer pull
+    tickers: [CMG, DECK, LULU, CAVA, COST, SBUX, ELF, BIRK, CELH, FERG]
+
+  STREAMING_MEDIA:
+    description: Streaming + digital media
+    tickers: [NFLX, DIS, SPOT, ROKU, WBD, PARA, NYT]
+
+  GAMING_INTERACTIVE:
+    description: Gaming, betting, interactive entertainment
+    tickers: [DKNG, RBLX, U, EA, TTWO, NTES]
+
+  SEMICONDUCTOR_BROAD:
+    description: Broad semiconductor exposure (catch-all for semis not in AI_INFRA)
+    tickers: [QCOM, INTC, ADI, TXN, MCHP, "ON", NXPI, GFS, SWKS]
+
+  CLOUD_DATA:
+    description: Cloud platforms + observability + data infra
+    tickers: [DDOG, SNOW, MDB, ESTC, CFLT, SPLK, CRWD, NOW]
+
+  COMMERCE_PLATFORMS:
+    description: E-commerce + marketplace platforms
+    tickers: [SHOP, MELI, AMZN, BABA, JD, SE, DASH, ABNB, UBER]
+
+  ASSET_MANAGEMENT_ALTS:
+    description: Alternative asset managers (private credit + private equity)
+    tickers: [BX, KKR, APO, ARES, OWL, CG, BAM, TPG]

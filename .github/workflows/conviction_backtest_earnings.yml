@@ -1,0 +1,156 @@
+name: Conviction Backtest — Earnings Blackout Sweep
+
+# 7-variant earnings-blackout sweep on a single z=3.0 / top-2000 / 1460d
+# Variant D-evolved baseline. Each leg pulls staged parquet data + earnings
+# cache from S3, runs replay.py, and uploads the log + results as artifacts.
+#
+# Trigger:
+#   gh workflow run conviction_backtest_earnings.yml \
+#     -f end_date=2026-04-29
+#   gh run watch
+#
+# Data + earnings cache must be pre-staged at:
+#   s3://gamma-sim-cache/conviction-backtest-data/
+# (run scripts/conviction/backtest/prefetch_earnings_top_n.py locally first,
+#  then aws s3 sync as documented in conviction_backtest.yml)
+
+on:
+  workflow_dispatch:
+    inputs:
+      end_date:
+        description: "End date (YYYY-MM-DD)"
+        type: string
+        default: "2026-04-29"
+      days:
+        description: "--days"
+        type: string
+        default: "1460"
+      skew_z_min:
+        description: "--skew-z-min"
+        type: string
+        default: "3.0"
+      universe_top_n:
+        description: "--universe-top-n"
+        type: string
+        default: "2000"
+      positions:
+        description: "--positions"
+        type: string
+        default: "2"
+      max_hold_days:
+        description: "--max-hold-days"
+        type: string
+        default: "90"
+      trailing_pct:
+        description: "--trailing-pct"
+        type: string
+        default: "20"
+
+jobs:
+  expand-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      combos: ${{ steps.build.outputs.combos }}
+    steps:
+      - id: build
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          combos = [
+              {"label": "none",          "before": 0, "after": 0, "mode": "none"},
+              {"label": "minus3_replace",  "before": 3, "after": 0, "mode": "replace"},
+              {"label": "minus7_replace",  "before": 7, "after": 0, "mode": "replace"},
+              {"label": "minus7p1_replace","before": 7, "after": 1, "mode": "replace"},
+              {"label": "minus3_skip",     "before": 3, "after": 0, "mode": "skip"},
+              {"label": "minus7_skip",     "before": 7, "after": 0, "mode": "skip"},
+              {"label": "minus7p1_skip",   "before": 7, "after": 1, "mode": "skip"},
+          ]
+          print("combos=" + json.dumps(combos))
+          PY
+
+  backtest:
+    needs: expand-matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        combo: ${{ fromJSON(needs.expand-matrix.outputs.combos) }}
+    name: "eb_${{ matrix.combo.label }}"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Sync backtest data + earnings cache from S3
+        run: |
+          mkdir -p scripts/conviction/backtest/data
+          aws s3 sync s3://gamma-sim-cache/conviction-backtest-data/ scripts/conviction/backtest/data/ \
+            --exclude "day_aggs_raw/*" --no-progress
+          ls -lh scripts/conviction/backtest/data/
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            "pandas==3.0.2" \
+            "numpy==2.4.4" \
+            "pyarrow==24.0.0" \
+            "scipy==1.17.1" \
+            "boto3==1.43.1" \
+            "pyyaml==6.0.3" \
+            "requests==2.33.1" \
+            "yfinance==1.3.0" \
+            "lxml==6.1.0"
+
+      - name: Run replay
+        id: run
+        run: |
+          set -o pipefail
+          mkdir -p out
+          LOG="out/eb_${{ matrix.combo.label }}.log"
+          EXTRA_FLAGS=""
+          if [ "${{ matrix.combo.mode }}" != "none" ]; then
+            EXTRA_FLAGS="--earnings-blackout-before ${{ matrix.combo.before }} --earnings-blackout-after ${{ matrix.combo.after }} --earnings-blackout-mode ${{ matrix.combo.mode }}"
+          fi
+          python scripts/conviction/backtest/replay.py \
+            --days ${{ inputs.days }} \
+            --source massive \
+            --ignore-themes \
+            --universe-top-n ${{ inputs.universe_top_n }} \
+            --exit-rule trailing_pct \
+            --trailing-pct ${{ inputs.trailing_pct }} \
+            --strategy pathS \
+            --skew-direction bullish \
+            --max-hold-days ${{ inputs.max_hold_days }} \
+            --regime-gate spy \
+            --positions ${{ inputs.positions }} \
+            --skew-z-min ${{ inputs.skew_z_min }} \
+            --end-date ${{ inputs.end_date }} \
+            --run-suffix eb_${{ matrix.combo.label }} \
+            $EXTRA_FLAGS \
+            2>&1 | tee "$LOG"
+
+      - name: Collect results files
+        if: always()
+        run: |
+          if [ -d scripts/conviction/backtest/results ]; then
+            cp -r scripts/conviction/backtest/results out/results || true
+          fi
+          ls -R out || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eb_${{ matrix.combo.label }}
+          path: out/
+          retention-days: 14

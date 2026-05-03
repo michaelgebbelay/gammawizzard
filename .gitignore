@@ -2,3 +2,15 @@
 .env.local
 .env.*
 TT/Token/tt_token.json
+__pycache__/
+*.pyc
+
+# Conviction backtest runtime artifacts (not source).
+scripts/conviction/cache/
+scripts/conviction/monitor/
+scripts/conviction/reports/
+scripts/conviction/verdicts/
+scripts/conviction/tickers.yaml
+scripts/conviction/backtest/data/
+scripts/conviction/backtest/results/
+scripts/conviction/backtest/options/
