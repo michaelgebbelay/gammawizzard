@@ -723,6 +723,11 @@ def run_replay_multi(
     earnings_blackout_before: int = 0,
     earnings_blackout_after: int = 0,
     earnings_blackout_mode: str = "replace",
+    displacement_enabled: bool = False,
+    displacement_min_hold: int = 20,
+    displacement_max_return: float = 0.0,
+    displacement_z_min: float = 3.0,
+    displacement_max_swaps_per_day: int = 1,
 ) -> dict:
     """Multi-position equal-weight portfolio replay.
 
@@ -825,6 +830,14 @@ def run_replay_multi(
     equity = [initial_capital]
     daily_returns = [0.0]
     trades: list[dict] = []
+
+    # ------ Displacement diagnostic state ------
+    displacement_log: list[dict] = []
+    disp_days_considered = 0
+    disp_candidates_seen = 0
+    disp_swaps = 0
+    disp_no_eligible_current = 0
+    disp_no_eligible_challenger = 0
 
     for i, today in enumerate(trading_days):
         # ---- 1. Mark portfolio to today's close ----
@@ -1005,6 +1018,171 @@ def run_replay_multi(
                 ))
                 held_tickers.add(target)
 
+        # ---- 7. Stale-loser displacement (multi-position) ----
+        # Runs ONLY after normal exits (5) and entries (6). Triggers iff:
+        #   - all slots are full (no naturally empty slot)
+        #   - regime is on (RISK_OFF takes priority and was handled in 4-pre)
+        #   - a fresh non-held challenger meets z >= displacement_z_min today
+        #   - at least one current holding has hold_days >= min_hold AND
+        #     unrealized return so far <= displacement_max_return
+        # Worst-eligible (lowest cur_ret; tiebreak: longer hold_days; second
+        # tiebreak: earlier entry_date) is exited at next_day's open and the
+        # challenger is bought at next_day's open. Both legs pay slip.
+        if (displacement_enabled and next_day is not None
+                and not regime_off_today
+                and len(positions) == n_positions):
+            disp_days_considered += 1
+            swaps_today = 0
+            tried_challengers: set[str] = set()
+            while swaps_today < max(1, int(displacement_max_swaps_per_day)):
+                if len(positions) < n_positions:
+                    break  # a previous swap somehow freed a slot — stop
+                held_set = {p.ticker for p in positions}
+                # Find next-best non-held qualifying challenger using the
+                # same picker as normal entry. tried_challengers excludes
+                # any we already evaluated this day.
+                excluded = held_set | tried_challengers
+                target_c, theme_c, src_c = pick_entry_target(
+                    day_state,
+                    exclude=excluded if excluded else None,
+                    ignore_themes=ignore_themes,
+                    strategy=strategy,
+                )
+                if not target_c or target_c in held_set:
+                    disp_no_eligible_challenger += 1
+                    break
+                tried_challengers.add(target_c)
+                challenger_z = day_state.skew_z_by_ticker.get(target_c)
+                if challenger_z is None:
+                    # No skew_z for this candidate — can't evaluate; skip it.
+                    continue
+                if float(challenger_z) < float(displacement_z_min):
+                    # Picker returned its top, but it doesn't clear the
+                    # displacement-specific z bar. Stop (any further pick
+                    # would have a lower abs-z by construction of the picker).
+                    disp_no_eligible_challenger += 1
+                    break
+                disp_candidates_seen += 1
+
+                # Score current holdings for displacement eligibility.
+                eligible: list[tuple[Position, float, int, float]] = []
+                for p in positions:
+                    if p.ticker == target_c:
+                        continue
+                    hold_days_now = (today - p.entry_date).days
+                    if hold_days_now < int(displacement_min_hold):
+                        continue
+                    c_today = get_close(bars_by_ticker, p.ticker, today)
+                    if c_today is None:
+                        c_today = p.last_known_close
+                    if c_today is None or c_today <= 0 or p.entry_price <= 0:
+                        continue
+                    cur_ret = c_today / p.entry_price - 1.0
+                    if cur_ret > float(displacement_max_return):
+                        continue
+                    eligible.append((p, cur_ret, hold_days_now, c_today))
+
+                if not eligible:
+                    disp_no_eligible_current += 1
+                    break
+
+                # Worst eligible: lowest cur_ret, tiebreak older (longer
+                # hold_days), second tiebreak earlier entry_date for
+                # determinism across re-runs.
+                eligible.sort(key=lambda x: (x[1], -x[2], x[0].entry_date))
+                worst_p, worst_ret, worst_hd, worst_c_today = eligible[0]
+
+                # Price both legs at next_day's open (same convention as
+                # normal exits and entries).
+                exit_open = get_open(bars_by_ticker, worst_p.ticker, next_day)
+                chal_open = get_open(bars_by_ticker, target_c, next_day)
+                if (exit_open is None or chal_open is None
+                        or exit_open <= 0 or chal_open <= 0):
+                    # Can't price the swap; skip this challenger and try the
+                    # next-best non-held name.
+                    continue
+
+                # Snapshot portfolio value before the swap (today's close
+                # for held names, last_known_close otherwise).
+                pv_before = cash
+                for p in positions:
+                    c_t = get_close(bars_by_ticker, p.ticker, today) or p.last_known_close
+                    pv_before += p.shares * c_t
+
+                # Close worst at next_day's open with slippage.
+                exit_price = exit_open * (1.0 - slip)
+                proceeds = worst_p.shares * exit_price
+                cash += proceeds
+                hold_days_at_exit = (next_day - worst_p.entry_date).days
+                exited_slot = positions.index(worst_p)
+                exited_entry_date_str = worst_p.entry_date.strftime("%Y-%m-%d")
+                exited_ticker = worst_p.ticker
+                trades.append({
+                    "entry_date": exited_entry_date_str,
+                    "exit_date": next_day.strftime("%Y-%m-%d"),
+                    "ticker": worst_p.ticker,
+                    "theme": worst_p.theme or "",
+                    "entry_price": round(worst_p.entry_price, 4),
+                    "exit_price": round(exit_price, 4),
+                    "holding_period_days": hold_days_at_exit,
+                    "return_pct": (round(exit_price / worst_p.entry_price - 1.0, 5)
+                                   if worst_p.entry_price else 0.0),
+                    "exit_reason": "DISPLACE_STALE_LOSER",
+                    "entry_source": worst_p.source,
+                })
+                positions.remove(worst_p)
+
+                # Open challenger at next_day's open with slippage. Same
+                # equal-weight cash-allocation rule as normal fills.
+                buy_price = chal_open * (1.0 + slip)
+                empty_slots = n_positions - len(positions)
+                slice_amount = cash / max(1, empty_slots)
+                shares = slice_amount / buy_price
+                cash -= slice_amount
+                positions.append(Position(
+                    ticker=target_c,
+                    shares=shares,
+                    entry_price=buy_price,
+                    entry_date=next_day,
+                    peak_close=chal_open,
+                    source=src_c,
+                    theme=theme_c,
+                    last_known_close=chal_open,
+                ))
+
+                # Snapshot portfolio value after the swap, marked to today's
+                # close for the kept holding and to the challenger's open
+                # for the just-bought position (no close yet on next_day at
+                # this point in the loop).
+                pv_after = cash
+                for p in positions:
+                    if p.ticker == target_c:
+                        pv_after += p.shares * chal_open
+                    else:
+                        c_t = (get_close(bars_by_ticker, p.ticker, today)
+                               or p.last_known_close)
+                        pv_after += p.shares * c_t
+
+                disp_swaps += 1
+                swaps_today += 1
+                challenger_rank = len(tried_challengers)
+                displacement_log.append({
+                    "date": today.strftime("%Y-%m-%d"),
+                    "exited_ticker": exited_ticker,
+                    "exited_slot": exited_slot,
+                    "exited_entry_date": exited_entry_date_str,
+                    "exited_hold_days": worst_hd,
+                    "exited_return_so_far": round(worst_ret, 5),
+                    "challenger_ticker": target_c,
+                    "challenger_rank": challenger_rank,
+                    "challenger_skew_z": round(float(challenger_z), 4),
+                    "challenger_entry_price": round(buy_price, 4),
+                    "exited_exit_price": round(exit_price, 4),
+                    "reason": "DISPLACE_STALE_LOSER",
+                    "portfolio_value_before": round(pv_before, 2),
+                    "portfolio_value_after": round(pv_after, 2),
+                })
+
         held_during_day[i] = [p.ticker for p in positions]
 
         if progress_every and (i % progress_every == 0):
@@ -1043,6 +1221,19 @@ def run_replay_multi(
     trade_df = pd.DataFrame(trades)
     trade_df.to_csv(out_dir / "trade_log.csv", index=False)
 
+    # Always write displacement_log.csv — even when empty — so downstream
+    # tooling can rely on the file existing for every run.
+    disp_log_cols = [
+        "date", "exited_ticker", "exited_slot", "exited_entry_date",
+        "exited_hold_days", "exited_return_so_far",
+        "challenger_ticker", "challenger_rank", "challenger_skew_z",
+        "challenger_entry_price", "exited_exit_price", "reason",
+        "portfolio_value_before", "portfolio_value_after",
+    ]
+    disp_log_df = (pd.DataFrame(displacement_log, columns=disp_log_cols)
+                   if displacement_log else pd.DataFrame(columns=disp_log_cols))
+    disp_log_df.to_csv(out_dir / "displacement_log.csv", index=False)
+
     # Equity curve uses comma-joined active_ticker for display
     active_tickers_per_day = [",".join(ts) if ts else "" for ts in held_during_day[:len(equity)]]
     equity_df = pd.DataFrame({
@@ -1078,6 +1269,53 @@ def run_replay_multi(
     pct_invested = float(np.mean([1.0 if ts else 0.0 for ts in held_during_day]))
     avg_hold = float(np.mean([t["holding_period_days"] for t in trades])) if trades else 0.0
 
+    # Canonical config block — every field the verifier checks must live here.
+    # When adding a new strategy knob, add it here AND update
+    # verify_run_config_match.py CORE_FIELDS at the same time.
+    canonical_config = {
+        "signal": (f"pathS_{PATH_S_CONFIG.get('direction', 'bullish')}_skew_flip"
+                   if strategy == "pathS" else strategy),
+        "skew_z_min": (PATH_S_CONFIG.get("abs_skew_z_min")
+                       if strategy == "pathS" else None),
+        "skew_z_persistence_days": 1,  # baked into load_skew_lookup; captured at lookup build, not run time
+        "universe_top_n": universe_top_n,
+        "ignore_themes": ignore_themes,
+        "dynamic_themes": dynamic_themes,
+        "positions": n_positions,
+        "regime_gate": regime_gate,
+        "exit_rule": exit_rule,
+        "trailing_pct": trailing_pct,
+        "max_hold_days": max_hold_days,
+        "signal_decay_z": locals().get("signal_decay_z"),
+        "signal_decay_days": locals().get("signal_decay_days", 2),
+        "days": lookback_days,
+        "window_start": trading_days[0].strftime("%Y-%m-%d"),
+        "window_end": trading_days[-1].strftime("%Y-%m-%d"),
+        "cost_bps": slippage_bps,
+        "initial_capital": initial_capital,
+        "earnings_blackout_before": (earnings_blackout_before
+                                      if (earnings_blackout_before or earnings_blackout_after)
+                                      else None),
+        "earnings_blackout_after": (earnings_blackout_after
+                                     if (earnings_blackout_before or earnings_blackout_after)
+                                     else None),
+        "earnings_blackout_mode": (earnings_blackout_mode
+                                    if (earnings_blackout_before or earnings_blackout_after)
+                                    else None),
+        "speculative_only": (PATH_S_CONFIG.get("speculative_only", False)
+                             if strategy == "pathS" else False),
+        "trend_floor_pct_above_200d": (PATH_S_CONFIG.get("min_pct_above_200d")
+                                        if strategy == "pathS" else None),
+        "trend_floor_min_ret_60d": (PATH_S_CONFIG.get("min_ret_60d")
+                                     if strategy == "pathS" else None),
+        "displacement_enabled": displacement_enabled,
+        "displacement_min_hold": displacement_min_hold if displacement_enabled else None,
+        "displacement_max_return": displacement_max_return if displacement_enabled else None,
+        "displacement_z_min": displacement_z_min if displacement_enabled else None,
+        "displacement_max_swaps_per_day": (displacement_max_swaps_per_day
+                                            if displacement_enabled else None),
+    }
+
     summary = {
         "run_name": run_name,
         "n_positions": n_positions,
@@ -1086,6 +1324,7 @@ def run_replay_multi(
             "end": trading_days[-1].strftime("%Y-%m-%d"),
             "n_sessions": len(trading_days),
         },
+        "config": canonical_config,
         "params": {
             "slippage_bps": slippage_bps,
             "initial_capital": initial_capital,
@@ -1107,6 +1346,21 @@ def run_replay_multi(
             "n_trades": len(trades),
             "avg_holding_days": round(avg_hold, 1),
             "pct_time_invested": round(pct_invested, 4),
+            "displacement_candidates_seen": disp_candidates_seen,
+            "displacement_days_considered": disp_days_considered,
+            "displacement_swaps": disp_swaps,
+            "displacement_no_eligible_current": disp_no_eligible_current,
+            "displacement_no_eligible_challenger": disp_no_eligible_challenger,
+            "displacement_avg_exited_return_so_far": (
+                round(float(np.mean([r["exited_return_so_far"]
+                                     for r in displacement_log])), 5)
+                if displacement_log else None
+            ),
+            "displacement_avg_exited_hold_days": (
+                round(float(np.mean([r["exited_hold_days"]
+                                     for r in displacement_log])), 1)
+                if displacement_log else None
+            ),
         },
         "benchmarks": {"SPY": _bench_curve("SPY"), "QQQ": _bench_curve("QQQ")},
     }
@@ -1198,6 +1452,10 @@ def run_replay(
     regime_lookup: dict | None = None,
     regime_gate: str = "none",
     run_suffix: str | None = None,
+    displacement_enabled: bool = False,
+    displacement_min_hold: int = 20,
+    displacement_max_return: float = 0.0,
+    displacement_z_min: float = 3.0,
 ) -> dict:
     """End-to-end backtest. Returns a dict of artifacts (also written to disk).
 
@@ -1449,6 +1707,31 @@ def run_replay(
                 else:  # ma_50d (default)
                     should_eject = (f is None) or (f.trend_status in ("WARNING", "BROKEN"))
                     exit_reason_label = None  # use trend_status below
+
+            # Stale-loser displacement: if not already ejecting, check whether
+            # the current position is stale (held >= N days) AND under-water
+            # (return so far <= R) AND a fresh challenger with z >= Z exists.
+            # If so, force an eject — pick_replacement will rotate into the
+            # highest-z non-held candidate (which IS our challenger for pathS).
+            if (not should_eject and displacement_enabled
+                    and entry_date is not None and entry_price is not None
+                    and today_close is not None and today_close > 0):
+                hold_days_now = (today - entry_date).days
+                if hold_days_now >= displacement_min_hold:
+                    cur_ret_so_far = today_close / entry_price - 1.0
+                    if cur_ret_so_far <= displacement_max_return:
+                        # Look for any non-held challenger meeting z threshold today.
+                        has_challenger = False
+                        if day_state.skew_z_by_ticker:
+                            for tkr_c, z_c in day_state.skew_z_by_ticker.items():
+                                if tkr_c == holding or z_c is None:
+                                    continue
+                                if float(z_c) >= displacement_z_min:
+                                    has_challenger = True
+                                    break
+                        if has_challenger:
+                            should_eject = True
+                            exit_reason_label = "DISPLACE_STALE_LOSER"
             # If we're going to keep holding, schedule it for tomorrow.
             if not should_eject and next_day is not None and i + 1 < len(held_during_day):
                 held_during_day[i + 1] = holding
@@ -1600,7 +1883,48 @@ def run_replay(
     pct_invested = float(np.mean([1.0 if h else 0.0 for h in held_during_day]))
     same_theme_rotations = sum(1 for t in trades if t.get("entry_source") == "same_theme")
     cross_theme_rotations = sum(1 for t in trades if t.get("entry_source") == "cross_theme")
+    displacement_count = sum(
+        1 for t in trades if str(t.get("exit_reason", "")).startswith("DISPLACE_")
+    )
     avg_hold = float(np.mean([t["holding_period_days"] for t in trades])) if trades else 0.0
+
+    # Canonical config block — same schema as the single-position branch above.
+    canonical_config = {
+        "signal": (f"pathS_{PATH_S_CONFIG.get('direction', 'bullish')}_skew_flip"
+                   if strategy == "pathS" else strategy),
+        "skew_z_min": (PATH_S_CONFIG.get("abs_skew_z_min")
+                       if strategy == "pathS" else None),
+        "skew_z_persistence_days": 1,
+        "universe_top_n": universe_top_n,
+        "ignore_themes": ignore_themes,
+        "dynamic_themes": dynamic_themes,
+        "positions": 1,
+        "regime_gate": regime_gate,
+        "exit_rule": exit_rule,
+        "trailing_pct": trailing_pct,
+        "max_hold_days": max_hold_days,
+        "signal_decay_z": locals().get("signal_decay_z"),
+        "signal_decay_days": locals().get("signal_decay_days", 2),
+        "days": lookback_days,
+        "window_start": trading_days[0].strftime("%Y-%m-%d"),
+        "window_end": trading_days[-1].strftime("%Y-%m-%d"),
+        "cost_bps": slippage_bps,
+        "initial_capital": initial_capital,
+        "earnings_blackout_before": None,
+        "earnings_blackout_after": None,
+        "earnings_blackout_mode": None,
+        "speculative_only": (PATH_S_CONFIG.get("speculative_only", False)
+                             if strategy == "pathS" else False),
+        "trend_floor_pct_above_200d": (PATH_S_CONFIG.get("min_pct_above_200d")
+                                        if strategy == "pathS" else None),
+        "trend_floor_min_ret_60d": (PATH_S_CONFIG.get("min_ret_60d")
+                                     if strategy == "pathS" else None),
+        "displacement_enabled": displacement_enabled,
+        "displacement_min_hold": displacement_min_hold if displacement_enabled else None,
+        "displacement_max_return": displacement_max_return if displacement_enabled else None,
+        "displacement_z_min": displacement_z_min if displacement_enabled else None,
+        "displacement_max_swaps_per_day": None,  # not applicable to single-position
+    }
 
     summary = {
         "run_name": run_name,
@@ -1609,6 +1933,7 @@ def run_replay(
             "end": trading_days[-1].strftime("%Y-%m-%d"),
             "n_sessions": n_days,
         },
+        "config": canonical_config,
         "params": {
             "slippage_bps": slippage_bps,
             "initial_capital": initial_capital,
@@ -1626,6 +1951,7 @@ def run_replay(
             "pct_time_invested": round(pct_invested, 4),
             "same_theme_rotations": same_theme_rotations,
             "cross_theme_rotations": cross_theme_rotations,
+            "displacements": displacement_count,
         },
         "benchmarks": {
             "SPY": _bench_curve("SPY"),
@@ -1667,6 +1993,7 @@ def _format_report(summary: dict, trade_df: pd.DataFrame) -> str:
         f"- % time invested:              {act['pct_time_invested']*100:.1f}%",
         f"- same-theme rotations:         {act['same_theme_rotations']}",
         f"- cross-theme rotations:        {act['cross_theme_rotations']}",
+        f"- displacements:                {act.get('displacements', 0)}",
         "",
         "## Benchmarks (same window)",
         "",
@@ -1883,6 +2210,28 @@ def main():
     ap.add_argument("--run-suffix", default=None,
                     help="appended to the output dir name (results/<run>_<suffix>). "
                          "Use to keep parameter sweeps from overwriting each other.")
+    ap.add_argument("--displacement-enabled", action="store_true",
+                    help="single-position only: enable stale-loser displacement. "
+                         "When holding a position that's been stale (held >= "
+                         "--displacement-min-hold) AND under-water (return so "
+                         "far <= --displacement-max-return), force a rotation "
+                         "into a fresh challenger if any non-held name has "
+                         "z >= --displacement-z-min today. The replacement is "
+                         "picked by the strategy's normal pick_replacement (for "
+                         "pathS that's the highest-z non-held name).")
+    ap.add_argument("--displacement-min-hold", type=int, default=20,
+                    help="displacement: minimum hold days before displacement "
+                         "can fire. Default 20.")
+    ap.add_argument("--displacement-max-return", type=float, default=0.0,
+                    help="displacement: only fire if current return so far is "
+                         "<= this fraction. Default 0.0 (red positions only).")
+    ap.add_argument("--displacement-z-min", type=float, default=3.0,
+                    help="displacement: only fire if some non-held name has "
+                         "z >= this today. Default 3.0.")
+    ap.add_argument("--displacement-max-swaps-per-day", type=int, default=1,
+                    help="multi-position only: cap on number of displacement "
+                         "swaps that can fire on a single day. Default 1. "
+                         "Single-position runs ignore this (only one slot).")
     args = ap.parse_args()
 
     if args.lookahead_check:
@@ -1954,6 +2303,11 @@ def main():
             earnings_blackout_before=args.earnings_blackout_before,
             earnings_blackout_after=args.earnings_blackout_after,
             earnings_blackout_mode=args.earnings_blackout_mode,
+            displacement_enabled=args.displacement_enabled,
+            displacement_min_hold=args.displacement_min_hold,
+            displacement_max_return=args.displacement_max_return,
+            displacement_z_min=args.displacement_z_min,
+            displacement_max_swaps_per_day=args.displacement_max_swaps_per_day,
         )
         return 0
 
@@ -1979,6 +2333,10 @@ def main():
         regime_lookup=regime_lookup,
         regime_gate=args.regime_gate,
         run_suffix=args.run_suffix,
+        displacement_enabled=args.displacement_enabled,
+        displacement_min_hold=args.displacement_min_hold,
+        displacement_max_return=args.displacement_max_return,
+        displacement_z_min=args.displacement_z_min,
     )
     return 0
 

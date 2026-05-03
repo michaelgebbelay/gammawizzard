@@ -15,10 +15,13 @@ HERE = Path(__file__).resolve().parent
 RESULTS = HERE / "results"
 
 RUNS = [
-    ("baseline",        "2026-05-03_replay_1460d_massive_n2_eb_baseline"),
-    ("eb -7d before",   "2026-05-03_replay_1460d_massive_n2_eb_minus7"),
-    ("eb -3d before",   "2026-05-03_replay_1460d_massive_n2_eb_minus3"),
-    ("eb -7d / +1d",    "2026-05-03_replay_1460d_massive_n2_eb_minus7_plus1"),
+    ("baseline",          "2026-05-03_replay_1460d_massive_n2_eb_none"),
+    ("eb -3d replace",    "2026-05-03_replay_1460d_massive_n2_eb_minus3_replace"),
+    ("eb -3d skip",       "2026-05-03_replay_1460d_massive_n2_eb_minus3_skip"),
+    ("eb -7d replace",    "2026-05-03_replay_1460d_massive_n2_eb_minus7_replace"),
+    ("eb -7d skip",       "2026-05-03_replay_1460d_massive_n2_eb_minus7_skip"),
+    ("eb -7d/+1d replace","2026-05-03_replay_1460d_massive_n2_eb_minus7p1_replace"),
+    ("eb -7d/+1d skip",   "2026-05-03_replay_1460d_massive_n2_eb_minus7p1_skip"),
 ]
 
 
@@ -30,9 +33,32 @@ def _load(path: Path) -> tuple[dict, pd.DataFrame] | tuple[None, None]:
     return summary, trades
 
 
+def _verify_compatible(run_paths: list[Path]) -> None:
+    """Guard: refuse to compare runs whose configs differ on anything other
+    than the earnings-blackout fields. Prevents the prior class of bug where
+    a blackout test from z=1.5/top-500 got compared against the z=3.0/top-2000
+    baseline."""
+    from verify_run_config_match import assert_runs_compatible
+    if len(run_paths) < 2:
+        return
+    baseline = run_paths[0]
+    others = run_paths[1:]
+    assert_runs_compatible(
+        baseline, others,
+        allow=["earnings_blackout_before",
+               "earnings_blackout_after",
+               "earnings_blackout_mode"],
+    )
+
+
 def main():
     rows = []
     trade_dfs: dict[str, pd.DataFrame] = {}
+    # Config-integrity guard: bails out before any table is printed if the
+    # variants don't actually share the candidate baseline config.
+    existing_paths = [RESULTS / r for _, r in RUNS if (RESULTS / r).exists()]
+    if len(existing_paths) >= 2:
+        _verify_compatible(existing_paths)
     for label, run_name in RUNS:
         s, t = _load(RESULTS / run_name)
         if s is None:
