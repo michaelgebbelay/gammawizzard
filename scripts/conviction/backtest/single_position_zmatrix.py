@@ -1440,6 +1440,211 @@ def write_report(out_dir: Path, train_df: pd.DataFrame, top_cells: list[str],
 
 
 # ---------------------------------------------------------------------------
+# Diagnostic OOS-only runner (matched-comparator mode)
+# ---------------------------------------------------------------------------
+
+def _run_diagnostic_oos(diag_ids: list[str], args, out_dir: Path,
+                        train_window: tuple[str, str], oos_window: tuple[str, str],
+                        manifest_path: Path, oos_partial: Path) -> int:
+    """Run a hand-picked list of cells in OOS only. Skips train + selection.
+    Each non-S3 diagnostic cell also gets its matching S3 noise floor (n seeds).
+    Writes diagnostic_oos_results.csv and diagnostic_report.md.
+    """
+    print(f"[zmatrix] === DIAGNOSTIC OOS mode: {len(diag_ids)} cell(s) ===",
+          file=sys.stderr)
+    train_logical = make_cells_logical(split="oos")
+    by_id = {c.cell_id: c for c in train_logical}
+    jobs: list[RunConfig] = []
+    for cid in diag_ids:
+        cfg_t = by_id.get(cid)
+        if cfg_t is None:
+            print(f"[zmatrix] WARNING: unknown cell_id {cid}, skipping", file=sys.stderr)
+            continue
+        jobs.append(RunConfig(
+            cell_id=cfg_t.cell_id, fcode=cfg_t.fcode, scode=cfg_t.scode,
+            xcode=cfg_t.xcode, bcode=cfg_t.bcode, seed=None,
+            trailing_pct=cfg_t.trailing_pct, max_hold_days=cfg_t.max_hold_days,
+            cost_bps=cfg_t.cost_bps, split="oos",
+        ))
+        if cfg_t.scode != "S3":
+            s3_id = f"{cfg_t.fcode}_S3_{cfg_t.xcode}_{cfg_t.bcode}"
+            for k in range(args.random_seeds):
+                jobs.append(RunConfig(
+                    cell_id=f"{s3_id}_seed{k}",
+                    fcode=cfg_t.fcode, scode="S3", xcode=cfg_t.xcode, bcode=cfg_t.bcode,
+                    seed=k,
+                    trailing_pct=cfg_t.trailing_pct, max_hold_days=cfg_t.max_hold_days,
+                    cost_bps=cfg_t.cost_bps, split="oos",
+                ))
+    print(f"[zmatrix] diagnostic OOS jobs: {len(jobs)} "
+          f"(non-S3 + matching S3 noise floors)", file=sys.stderr)
+
+    t0 = time.time()
+    summaries = run_batch(
+        jobs, out_dir, train_window, oos_window,
+        args.workers, args.cell_timeout_seconds, args.heartbeat_seconds,
+        args.skew_path, args.stocks_path, args.universe_top_n,
+        args.cooldown_days, args.force, args.retry_failed,
+        args.fail_fast, manifest_path, oos_partial,
+    )
+    runtime = time.time() - t0
+
+    df = pd.DataFrame(summaries) if summaries else pd.DataFrame()
+    if df.empty:
+        print("[zmatrix] no diagnostic results", file=sys.stderr)
+        return 1
+    non_random = df[df["seed"].isna()].copy()
+    s3_runs = df[df["seed"].notna()].copy()
+    write_atomic_csv(out_dir / "diagnostic_oos_results.csv", non_random)
+    if not s3_runs.empty:
+        write_atomic_csv(out_dir / "diagnostic_oos_s3_runs.csv", s3_runs)
+
+    # S3 aggregation
+    pair_rows = []
+    for _, sel in non_random.iterrows():
+        if sel["selection_rule"] == "S3":
+            continue
+        pair_id = f"{sel['entry_filter']}_S3_{sel['exit_rule']}_{sel['idle_behavior']}"
+        grp = s3_runs[s3_runs["cell_id"].str.startswith(f"{pair_id}_seed")] if not s3_runs.empty else pd.DataFrame()
+        if grp.empty:
+            continue
+        cagrs = grp["CAGR"].astype(float)
+        sharpes = grp["Sharpe"].astype(float)
+        pair_rows.append({
+            "cell_id": sel["cell_id"],
+            "n_trades": int(sel["n_trades"]),
+            "CAGR": float(sel["CAGR"]),
+            "Sharpe": float(sel["Sharpe"]),
+            "max_drawdown": float(sel["max_drawdown"]),
+            "S3_mean_CAGR": float(cagrs.mean()),
+            "S3_median_CAGR": float(cagrs.median()),
+            "S3_min_CAGR": float(cagrs.min()),
+            "S3_max_CAGR": float(cagrs.max()),
+            "S3_std_CAGR": float(cagrs.std()),
+            "S3_mean_Sharpe": float(sharpes.mean()),
+            "S3_median_Sharpe": float(sharpes.median()),
+            "beats_S3_median_Sharpe": float(sel["Sharpe"]) > float(sharpes.median()),
+        })
+    pair_df = pd.DataFrame(pair_rows)
+    if not pair_df.empty:
+        write_atomic_csv(out_dir / "diagnostic_oos_vs_random.csv", pair_df)
+
+    # Per-tail decomposition from each cell's trade log
+    tail_rows = []
+    for _, sel in non_random.iterrows():
+        cell_dir = out_dir / "cells" / "oos" / sel["cell_id"]
+        tl_path = cell_dir / "trade_log.csv"
+        if not tl_path.exists():
+            continue
+        tl = pd.read_csv(tl_path)
+        for tail in ("positive", "negative"):
+            sub = tl[tl["tail_side"] == tail]
+            if sub.empty:
+                tail_rows.append({"cell_id": sel["cell_id"], "tail": tail,
+                                  "n_trades": 0})
+                continue
+            compound = float((1.0 + sub["trade_return"]).prod() - 1.0)
+            tail_rows.append({
+                "cell_id": sel["cell_id"],
+                "tail": tail,
+                "n_trades": int(len(sub)),
+                "compound_return": compound,
+                "avg_return": float(sub["trade_return"].mean()),
+                "median_return": float(sub["trade_return"].median()),
+                "win_rate": float((sub["trade_return"] > 0).mean()),
+                "avg_MFE": float(sub["MFE"].mean()),
+                "avg_MAE": float(sub["MAE"].mean()),
+                "avg_hold_days": float(sub["hold_days"].mean()),
+                "tickers": ",".join(sub["ticker"].tolist()),
+            })
+    tail_df = pd.DataFrame(tail_rows)
+    if not tail_df.empty:
+        write_atomic_csv(out_dir / "diagnostic_tail_decomposition.csv", tail_df)
+
+    # Overlap matrix: which trades show up across cells (by entry_date+ticker)
+    all_trades_map: dict[str, set] = {}
+    for _, sel in non_random.iterrows():
+        tl_path = out_dir / "cells" / "oos" / sel["cell_id"] / "trade_log.csv"
+        if not tl_path.exists():
+            continue
+        tl = pd.read_csv(tl_path)
+        all_trades_map[sel["cell_id"]] = set(
+            (r["entry_date"], r["ticker"]) for _, r in tl.iterrows()
+        )
+    overlap_rows = []
+    cell_ids = list(all_trades_map.keys())
+    for cid in cell_ids:
+        for other in cell_ids:
+            if cid == other:
+                continue
+            shared = all_trades_map[cid] & all_trades_map[other]
+            overlap_rows.append({
+                "cell_a": cid,
+                "cell_b": other,
+                "n_a": len(all_trades_map[cid]),
+                "n_b": len(all_trades_map[other]),
+                "n_shared": len(shared),
+                "shared_keys": ";".join(sorted(f"{d}|{t}" for d, t in shared)),
+            })
+    overlap_df = pd.DataFrame(overlap_rows)
+    if not overlap_df.empty:
+        write_atomic_csv(out_dir / "diagnostic_trade_overlap.csv", overlap_df)
+
+    # Mini report
+    lines = ["# Diagnostic OOS Matched-Comparator Report\n"]
+    lines.append(f"_OOS window: {oos_window[0]} → {oos_window[1]}_\n")
+    lines.append(f"_Cells run: {', '.join(diag_ids)} + matching S3 noise floors._\n")
+
+    lines.append("## Headline\n")
+    cols_brief = ["cell_id", "entry_filter", "selection_rule", "exit_rule",
+                  "idle_behavior", "n_trades", "total_return", "CAGR", "Sharpe",
+                  "max_drawdown", "SPY_total_return_same_period",
+                  "active_return_vs_SPY"]
+    lines.append(fmt_table(non_random, cols_brief))
+
+    lines.append("\n## S3 noise-floor comparison\n")
+    if not pair_df.empty:
+        lines.append(fmt_table(pair_df, [
+            "cell_id", "n_trades", "CAGR", "Sharpe", "max_drawdown",
+            "S3_median_CAGR", "S3_median_Sharpe", "S3_max_Sharpe",
+            "beats_S3_median_Sharpe"]))
+    else:
+        lines.append("_(no S3 noise floor)_")
+
+    lines.append("\n## Tail decomposition (per cell)\n")
+    if not tail_df.empty:
+        lines.append(fmt_table(tail_df, [
+            "cell_id", "tail", "n_trades", "compound_return", "avg_return",
+            "win_rate", "avg_MFE", "avg_MAE", "avg_hold_days", "tickers"]))
+    else:
+        lines.append("_(no tail decomposition)_")
+
+    lines.append("\n## Trade overlap across cells\n")
+    if not overlap_df.empty:
+        lines.append(fmt_table(overlap_df, [
+            "cell_a", "cell_b", "n_a", "n_b", "n_shared", "shared_keys"]))
+
+    lines.append("\n## Interpretation rules\n")
+    lines.append(
+        "- If F3 wins beat both matched F1 and matched F4 in OOS → combined "
+        "U-shape adds real edge.\n"
+        "- If F3 ≈ F1 (matched X/B) → the combined rule is mostly positive-tail "
+        "with altered cooldown/selection timing, not a U-shape edge.\n"
+        "- If F4_S1 (deep negative pick) wins OOS while F4_S2 (shallow pick) "
+        "loses → 'depth of z' matters more than 'tail side', and the F4_S2 "
+        "OOS collapse is about pick quality, not the negative tail itself.\n"
+        "- If overlap is high between F3 and F1 (or F3 and F4) → most F3 "
+        "trades are duplicates of one tail's matched cell, not unique combined "
+        "selections.\n"
+    )
+    lines.append(f"\n_Runtime: {int(runtime)}s_\n")
+    write_atomic(out_dir / "diagnostic_report.md", "\n".join(lines))
+
+    print(f"[zmatrix] DIAGNOSTIC OOS DONE → {out_dir}", file=sys.stderr)
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1471,6 +1676,10 @@ def main() -> int:
                     help="Abort batch on first FAILED / TIMED_OUT cell")
     ap.add_argument("--limit-cells", type=int, default=0,
                     help="Smoke-test mode: only run first N actual jobs (0 = all)")
+    ap.add_argument("--diagnostic-oos-cells", type=str, default="",
+                    help="Comma-separated cell IDs to run OOS-only as matched "
+                         "comparators (skips train + selection). Each non-S3 "
+                         "cell also gets its matching S3 noise-floor (20 seeds).")
     args = ap.parse_args()
 
     out_dir = args.out_dir
@@ -1487,6 +1696,14 @@ def main() -> int:
 
     train_window = (args.train_start, args.train_end)
     oos_window = (args.oos_start, args.oos_end)
+
+    # ------ DIAGNOSTIC OOS-ONLY MODE ------
+    diag_ids = [s.strip() for s in args.diagnostic_oos_cells.split(",") if s.strip()]
+    if diag_ids:
+        return _run_diagnostic_oos(
+            diag_ids, args, out_dir, train_window, oos_window,
+            manifest_path, oos_partial,
+        )
 
     # ------ TRAIN PHASE ------
     print(f"[zmatrix] === TRAIN phase: {train_window[0]} → {train_window[1]} ===",
