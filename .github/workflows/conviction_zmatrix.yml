@@ -1,0 +1,164 @@
+name: Conviction Single-Position Z-Matrix
+
+# Runs scripts/conviction/backtest/single_position_zmatrix.py on a GH-hosted
+# runner. Pulls staged parquet data from S3, runs the parallel matrix, and
+# uploads everything under results/single_position_zmatrix/ as an artifact —
+# even on failure, so partial outputs / manifest are recoverable.
+#
+# Trigger:
+#   gh workflow run conviction_zmatrix.yml
+#   gh workflow run conviction_zmatrix.yml -f workers=4 -f random_seeds=20
+#
+# Data must be pre-staged at:
+#   s3://gamma-sim-cache/conviction-backtest-data/
+
+on:
+  workflow_dispatch:
+    inputs:
+      workers:
+        description: "Parallel cell workers (free runner has 4 vCPU)"
+        type: string
+        default: "4"
+      cell_timeout_seconds:
+        description: "Per-cell wall-clock timeout (seconds)"
+        type: string
+        default: "1800"
+      heartbeat_seconds:
+        description: "Heartbeat print interval (seconds)"
+        type: string
+        default: "60"
+      random_seeds:
+        description: "Deterministic seeds per S3 random-selection cell"
+        type: string
+        default: "20"
+      cooldown_days:
+        description: "Trading days between same-filter events for the same ticker"
+        type: string
+        default: "20"
+      universe_top_n:
+        description: "Top-N tickers by median dollar volume"
+        type: string
+        default: "2000"
+      train_start:
+        description: "Train window start (YYYY-MM-DD)"
+        type: string
+        default: "2022-05-31"
+      train_end:
+        description: "Train window end (YYYY-MM-DD)"
+        type: string
+        default: "2024-12-31"
+      oos_start:
+        description: "OOS window start (YYYY-MM-DD)"
+        type: string
+        default: "2025-01-01"
+      oos_end:
+        description: "OOS window end (YYYY-MM-DD)"
+        type: string
+        default: "2026-04-29"
+      top_n:
+        description: "Top-N train cells to promote to OOS"
+        type: string
+        default: "5"
+      retry_failed:
+        description: "Re-run FAILED / TIMED_OUT cells from prior interrupted run"
+        type: boolean
+        default: false
+      force:
+        description: "Re-run all cells (ignore cached summaries)"
+        type: boolean
+        default: false
+      limit_cells:
+        description: "Smoke test: only run first N actual jobs (0 = all)"
+        type: string
+        default: "0"
+
+jobs:
+  zmatrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Sync backtest data from S3
+        run: |
+          mkdir -p scripts/conviction/backtest/data
+          aws s3 sync s3://gamma-sim-cache/conviction-backtest-data/ \
+            scripts/conviction/backtest/data/ \
+            --exclude "day_aggs_raw/*" --no-progress
+          ls -lh scripts/conviction/backtest/data/
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            "pandas==3.0.2" \
+            "numpy==2.4.4" \
+            "pyarrow==24.0.0" \
+            "scipy==1.17.1" \
+            "boto3==1.43.1" \
+            "pyyaml==6.0.3" \
+            "requests==2.33.1" \
+            "tabulate==0.9.0"
+
+      - name: Run single-position z-matrix
+        id: run
+        run: |
+          set -o pipefail
+          mkdir -p out
+          LOG="out/single_position_zmatrix.log"
+          EXTRA_FLAGS=""
+          if [ "${{ inputs.retry_failed }}" = "true" ]; then
+            EXTRA_FLAGS="$EXTRA_FLAGS --retry-failed"
+          fi
+          if [ "${{ inputs.force }}" = "true" ]; then
+            EXTRA_FLAGS="$EXTRA_FLAGS --force"
+          fi
+          python -u scripts/conviction/backtest/single_position_zmatrix.py \
+            --out-dir scripts/conviction/backtest/results/single_position_zmatrix \
+            --workers ${{ inputs.workers }} \
+            --cell-timeout-seconds ${{ inputs.cell_timeout_seconds }} \
+            --heartbeat-seconds ${{ inputs.heartbeat_seconds }} \
+            --random-seeds ${{ inputs.random_seeds }} \
+            --cooldown-days ${{ inputs.cooldown_days }} \
+            --universe-top-n ${{ inputs.universe_top_n }} \
+            --train-start ${{ inputs.train_start }} \
+            --train-end ${{ inputs.train_end }} \
+            --oos-start ${{ inputs.oos_start }} \
+            --oos-end ${{ inputs.oos_end }} \
+            --top-n ${{ inputs.top_n }} \
+            --limit-cells ${{ inputs.limit_cells }} \
+            $EXTRA_FLAGS \
+            2>&1 | tee "$LOG"
+
+      - name: Collect outputs
+        if: always()
+        run: |
+          if [ -d scripts/conviction/backtest/results/single_position_zmatrix ]; then
+            cp -r scripts/conviction/backtest/results/single_position_zmatrix out/results
+          fi
+          # Manifest tail for the run summary in the GH UI
+          if [ -f scripts/conviction/backtest/results/single_position_zmatrix/manifest.csv ]; then
+            echo "::group::manifest summary"
+            wc -l scripts/conviction/backtest/results/single_position_zmatrix/manifest.csv
+            python -c "import pandas as pd; df = pd.read_csv('scripts/conviction/backtest/results/single_position_zmatrix/manifest.csv', dtype=str, keep_default_na=False); print(df['status'].value_counts())"
+            echo "::endgroup::"
+          fi
+          ls -R out 2>/dev/null | head -200 || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: single_position_zmatrix
+          path: out/
+          retention-days: 14
