@@ -2158,6 +2158,10 @@ def main():
                          "(z < -threshold). Cohort test showed bearish has stronger edge.")
     ap.add_argument("--skew-z-min", type=float, default=1.5,
                     help="Path S |z| threshold (default 1.5)")
+    ap.add_argument("--skew-z-window", type=int, default=60,
+                    help="Path S rolling-z lookback in trading days. Default 60 "
+                         "matches the verdict-memo backtests; 252 matches the live "
+                         "data_refresh.py pipeline. Sweepable via cloud matrix.")
     ap.add_argument("--skew-z-persistence", type=int, default=1,
                     help="number of consecutive days the skew threshold must be "
                          "satisfied before an entry qualifies. Default 1 (today only). "
@@ -2242,6 +2246,7 @@ def main():
     skew_lookup: dict | None = None
     if args.strategy == "pathS":
         skew_lookup = load_skew_lookup(
+            z_window=args.skew_z_window,
             persistence_days=args.skew_z_persistence,
             abs_skew_z_min=args.skew_z_min,
             direction=args.skew_direction,

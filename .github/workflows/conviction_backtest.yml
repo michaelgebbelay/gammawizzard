@@ -1,6 +1,6 @@
 name: Conviction Backtest Sweep
 
-# Fans out a (skew_z_min, days) matrix across parallel runners.
+# Fans out a (skew_z_min, days, z_window) matrix across parallel runners.
 # Each leg pulls the staged parquet data from S3, runs replay.py,
 # and uploads the log + any output CSVs as an artifact.
 #
@@ -8,6 +8,7 @@ name: Conviction Backtest Sweep
 #   gh workflow run conviction_backtest.yml \
 #     -f z_values=1.5,2.0,2.5,3.0 \
 #     -f days_values=1460,730 \
+#     -f z_window_values=60 \
 #     -f end_date=2026-04-29
 #
 # Data must be pre-staged at s3://gamma-sim-cache/conviction-backtest-data/
@@ -25,6 +26,10 @@ on:
         description: "Comma-separated --days values"
         type: string
         default: "1460,730"
+      z_window_values:
+        description: "Comma-separated --skew-z-window values (rolling-z lookback)"
+        type: string
+        default: "60"
       end_date:
         description: "End date (YYYY-MM-DD)"
         type: string
@@ -66,13 +71,22 @@ jobs:
           import json, os
           z_vals = [s.strip() for s in os.environ["Z"].split(",") if s.strip()]
           d_vals = [s.strip() for s in os.environ["D"].split(",") if s.strip()]
-          combos = [{"z": z, "days": d, "label": "4y" if d == "1460" else ("2y" if d == "730" else f"{d}d")}
-                    for z in z_vals for d in d_vals]
+          w_vals = [s.strip() for s in os.environ["W"].split(",") if s.strip()]
+          combos = [
+              {
+                  "z": z,
+                  "days": d,
+                  "zwin": w,
+                  "label": "4y" if d == "1460" else ("2y" if d == "730" else f"{d}d"),
+              }
+              for z in z_vals for d in d_vals for w in w_vals
+          ]
           print("combos=" + json.dumps(combos))
           PY
         env:
           Z: ${{ inputs.z_values }}
           D: ${{ inputs.days_values }}
+          W: ${{ inputs.z_window_values }}
 
   backtest:
     needs: expand-matrix
@@ -82,7 +96,7 @@ jobs:
       fail-fast: false
       matrix:
         combo: ${{ fromJSON(needs.expand-matrix.outputs.combos) }}
-    name: "z=${{ matrix.combo.z }} ${{ matrix.combo.label }}"
+    name: "z=${{ matrix.combo.z }} w=${{ matrix.combo.zwin }} ${{ matrix.combo.label }}"
 
     steps:
       - uses: actions/checkout@v4
@@ -122,7 +136,7 @@ jobs:
         run: |
           set -o pipefail
           mkdir -p out
-          LOG="out/zmin_${{ matrix.combo.z }}_${{ matrix.combo.label }}.log"
+          LOG="out/zmin_${{ matrix.combo.z }}_w${{ matrix.combo.zwin }}_${{ matrix.combo.label }}.log"
           python scripts/conviction/backtest/replay.py \
             --days ${{ matrix.combo.days }} \
             --source massive \
@@ -136,6 +150,7 @@ jobs:
             --regime-gate spy \
             --positions ${{ inputs.positions }} \
             --skew-z-min ${{ matrix.combo.z }} \
+            --skew-z-window ${{ matrix.combo.zwin }} \
             --end-date ${{ inputs.end_date }} \
             2>&1 | tee "$LOG"
 
@@ -152,6 +167,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: zmin_${{ matrix.combo.z }}_${{ matrix.combo.label }}
+          name: zmin_${{ matrix.combo.z }}_w${{ matrix.combo.zwin }}_${{ matrix.combo.label }}
           path: out/
           retention-days: 14
