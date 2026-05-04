@@ -1,0 +1,96 @@
+name: Conviction Z-Score Event Study
+
+# Runs scripts/conviction/backtest/zscore_event_study.py on a GH-hosted runner.
+# Pulls staged parquet data + (optionally) baseline trade logs from S3, runs
+# the study, uploads the entire results/zscore_event_study/ directory.
+#
+# Trigger:
+#   gh workflow run conviction_zscore_event_study.yml
+#   gh workflow run conviction_zscore_event_study.yml -f cooldown_days=20
+#
+# Data must be pre-staged at:
+#   s3://gamma-sim-cache/conviction-backtest-data/        (parquets — already used by other workflows)
+#   s3://gamma-sim-cache/conviction-backtest-trade-logs/  (baseline trade logs for Study D — optional)
+
+on:
+  workflow_dispatch:
+    inputs:
+      cooldown_days:
+        description: "Trading days between same-bucket events for the same ticker"
+        type: string
+        default: "20"
+      z_prod_threshold:
+        description: "Production candidate z threshold (used for rank lookup)"
+        type: string
+        default: "3.0"
+
+jobs:
+  study:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Sync backtest data from S3
+        run: |
+          mkdir -p scripts/conviction/backtest/data
+          aws s3 sync s3://gamma-sim-cache/conviction-backtest-data/ scripts/conviction/backtest/data/ \
+            --exclude "day_aggs_raw/*" --no-progress
+          ls -lh scripts/conviction/backtest/data/
+
+      - name: Sync baseline trade logs from S3 (optional, for Study D)
+        run: |
+          mkdir -p scripts/conviction/backtest/results
+          aws s3 sync s3://gamma-sim-cache/conviction-backtest-trade-logs/ scripts/conviction/backtest/results/ \
+            --no-progress || echo "[trade-logs] none staged — Study D will be skipped"
+          find scripts/conviction/backtest/results -name trade_log.csv | head -20 || true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            "pandas==3.0.2" \
+            "numpy==2.4.4" \
+            "pyarrow==24.0.0" \
+            "scipy==1.17.1" \
+            "boto3==1.43.1" \
+            "pyyaml==6.0.3" \
+            "requests==2.33.1" \
+            "yfinance==0.2.79" \
+            "tabulate==0.9.0"
+
+      - name: Run z-score event study
+        run: |
+          set -o pipefail
+          mkdir -p out
+          LOG="out/zscore_event_study.log"
+          python scripts/conviction/backtest/zscore_event_study.py \
+            --cooldown-days ${{ inputs.cooldown_days }} \
+            --z-prod-threshold ${{ inputs.z_prod_threshold }} \
+            2>&1 | tee "$LOG"
+
+      - name: Collect outputs
+        if: always()
+        run: |
+          if [ -d scripts/conviction/backtest/results/zscore_event_study ]; then
+            cp -r scripts/conviction/backtest/results/zscore_event_study out/zscore_event_study
+          fi
+          ls -R out || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zscore_event_study
+          path: out/
+          retention-days: 14
