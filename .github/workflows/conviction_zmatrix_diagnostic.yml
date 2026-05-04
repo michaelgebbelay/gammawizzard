@@ -1,0 +1,137 @@
+name: Conviction Single-Position Z-Matrix (Diagnostic OOS)
+
+# Runs scripts/conviction/backtest/single_position_zmatrix.py in
+# --diagnostic-oos-cells mode: an OOS-only matched-comparator pass for
+# specified cell IDs (no train/selection). Each non-S3 diagnostic cell
+# also gets its matching S3 noise floor (random_seeds runs).
+#
+# Trigger:
+#   gh workflow run conviction_zmatrix_diagnostic.yml \
+#     -f cells="F1_S1_X2_B1,F4_S1_X2_B1,F3_S1_X2_B1"
+
+on:
+  workflow_dispatch:
+    inputs:
+      cells:
+        description: "Comma-separated cell IDs (e.g. F1_S1_X2_B1,F4_S1_X2_B1)"
+        type: string
+        required: true
+      workers:
+        description: "Parallel cell workers"
+        type: string
+        default: "4"
+      cell_timeout_seconds:
+        type: string
+        default: "1800"
+      heartbeat_seconds:
+        type: string
+        default: "60"
+      random_seeds:
+        description: "Seeds per matching S3 noise-floor cell"
+        type: string
+        default: "20"
+      cooldown_days:
+        type: string
+        default: "20"
+      universe_top_n:
+        type: string
+        default: "2000"
+      train_start:
+        type: string
+        default: "2022-05-31"
+      train_end:
+        type: string
+        default: "2024-12-31"
+      oos_start:
+        type: string
+        default: "2025-01-01"
+      oos_end:
+        type: string
+        default: "2026-04-29"
+      out_dir:
+        description: "Output dir under repo root (separate from main run)"
+        type: string
+        default: "scripts/conviction/backtest/results/single_position_zmatrix_diagnostic"
+      force:
+        description: "Re-run cells even if cached summaries exist"
+        type: boolean
+        default: false
+
+jobs:
+  diagnostic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Sync backtest data from S3
+        run: |
+          mkdir -p scripts/conviction/backtest/data
+          aws s3 sync s3://gamma-sim-cache/conviction-backtest-data/ \
+            scripts/conviction/backtest/data/ \
+            --exclude "day_aggs_raw/*" --no-progress
+          ls -lh scripts/conviction/backtest/data/
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            "pandas==3.0.2" \
+            "numpy==2.4.4" \
+            "pyarrow==24.0.0" \
+            "scipy==1.17.1" \
+            "boto3==1.43.1" \
+            "pyyaml==6.0.3" \
+            "requests==2.33.1" \
+            "tabulate==0.9.0"
+
+      - name: Run diagnostic OOS matched comparators
+        run: |
+          set -o pipefail
+          mkdir -p out
+          LOG="out/diagnostic_oos.log"
+          EXTRA=""
+          if [ "${{ inputs.force }}" = "true" ]; then
+            EXTRA="$EXTRA --force"
+          fi
+          python -u scripts/conviction/backtest/single_position_zmatrix.py \
+            --out-dir "${{ inputs.out_dir }}" \
+            --workers ${{ inputs.workers }} \
+            --cell-timeout-seconds ${{ inputs.cell_timeout_seconds }} \
+            --heartbeat-seconds ${{ inputs.heartbeat_seconds }} \
+            --random-seeds ${{ inputs.random_seeds }} \
+            --cooldown-days ${{ inputs.cooldown_days }} \
+            --universe-top-n ${{ inputs.universe_top_n }} \
+            --train-start ${{ inputs.train_start }} \
+            --train-end ${{ inputs.train_end }} \
+            --oos-start ${{ inputs.oos_start }} \
+            --oos-end ${{ inputs.oos_end }} \
+            --diagnostic-oos-cells "${{ inputs.cells }}" \
+            $EXTRA \
+            2>&1 | tee "$LOG"
+
+      - name: Collect outputs
+        if: always()
+        run: |
+          if [ -d "${{ inputs.out_dir }}" ]; then
+            cp -r "${{ inputs.out_dir }}" out/results
+          fi
+          ls -R out 2>/dev/null | head -200 || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: single_position_zmatrix_diagnostic
+          path: out/
+          retention-days: 14
