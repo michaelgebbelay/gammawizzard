@@ -467,6 +467,32 @@ PATH_S_CONFIG: dict = {
 }
 
 
+# Post-90 continuation exit modes — controls behavior AT and AFTER max-hold day.
+# Triple is (extends, requires_green, rotates):
+#   extends         — when True, max-hold doesn't force exit; positions can continue
+#   requires_green  — when True, only extend if unrealized return > 0
+#   rotates         — when True, exit current and free capital if a fresh z>=3
+#                     candidate exists at day 90+
+# The "no_max_hold_trail20" diagnostic is implemented by passing max_hold_days=None
+# upstream — its row here is just for reporting; extends/rotates aren't consulted.
+EXIT_MODE_TABLE: dict[str, tuple[bool, bool, bool]] = {
+    "baseline":                          (False, False, False),
+    "post90_green_no_candidate_trail10": (True,  True,  True),   # X1 — primary candidate
+    "post90_green_always_trail10":       (True,  True,  False),  # X2 — diagnostic
+    "post90_any_no_candidate_trail10":   (True,  False, True),   # X3 — diagnostic
+    "no_max_hold_trail20":               (False, False, False),  # X4 — set max_hold_days=None too
+}
+
+
+def _resolve_exit_mode(exit_mode: str) -> tuple[bool, bool, bool]:
+    if exit_mode not in EXIT_MODE_TABLE:
+        raise ValueError(
+            f"unknown exit_mode={exit_mode!r}; valid: "
+            + ", ".join(sorted(EXIT_MODE_TABLE.keys()))
+        )
+    return EXIT_MODE_TABLE[exit_mode]
+
+
 def _path_s_skew_flip(
     day_state: DayState,
     *,
@@ -1453,6 +1479,11 @@ def run_replay(
     strategy: str = "pathA",
     skew_lookup: dict | None = None,
     max_hold_days: int | None = None,
+    # Post-90 continuation modes — see EXIT_MODE_TABLE below.
+    # baseline = production rule (forced exit at max-hold day).
+    exit_mode: str = "baseline",
+    post90_trail_pct: float = 10.0,
+    exclude_tickers: set[str] | None = None,
     signal_decay_z: float | None = None,
     signal_decay_days: int = 2,
     skew_direction: str = "bullish",
@@ -1476,7 +1507,20 @@ def run_replay(
     framework, and the discovery test confirmed the curation is doing real
     work. The replay tests the FULL composite over that universe.
     """
+    # Resolve continuation mode → boolean conditions
+    _exit_mode_extends, _exit_mode_requires_green, _exit_mode_rotates = _resolve_exit_mode(exit_mode)
+    # Diagnostic logs — populated only when _exit_mode_extends. Written to
+    # results/<run>/post90_extension_log.csv and missed_candidate_log.csv.
+    _post90_extension_log: list[dict] = []
+    _missed_candidate_log: list[dict] = []
+    # Universe blacklist (drop-one INTC sensitivity etc.)
+    _exclude_set: set[str] = set(exclude_tickers) if exclude_tickers else set()
+
     universe = build_universe()
+    if _exclude_set:
+        universe = [t for t in universe if t not in _exclude_set]
+        print(f"[replay] excluded {sorted(_exclude_set)} from universe; "
+              f"now {len(universe)}", file=sys.stderr)
     bars_by_ticker: dict[str, pd.DataFrame] = {}
     metadata_df: pd.DataFrame | None = None
 
@@ -1540,6 +1584,16 @@ def run_replay(
             bars_by_ticker["$SPX"] = bars_by_ticker["SPY"].copy()
     else:
         raise SystemExit(f"unknown source: {source}")
+
+    # Apply ticker blacklist (drop-one INTC sensitivity etc.) — we drop both
+    # bars and skew so the name is fully invisible to factor / flyer-rank /
+    # entry-pick stages. Benchmarks (SPY, QQQ, $SPX) are never in the list.
+    if _exclude_set:
+        for t in list(_exclude_set):
+            bars_by_ticker.pop(t, None)
+        if skew_lookup:
+            skew_lookup = {k: v for k, v in skew_lookup.items() if k not in _exclude_set}
+        print(f"[replay] excluded tickers: {sorted(_exclude_set)}", file=sys.stderr)
 
     spx_bars = bars_by_ticker.get("$SPX")
     if spx_bars is None or spx_bars.empty:
@@ -1696,11 +1750,92 @@ def run_replay(
 
             if not should_eject:
                 # Hard max-hold ceiling fires before the trailing/MA logic.
-                if (max_hold_days is not None and max_hold_days > 0
-                        and entry_date is not None
-                        and (today - entry_date).days >= max_hold_days):
+                past_max_hold = (
+                    max_hold_days is not None and max_hold_days > 0
+                    and entry_date is not None
+                    and (today - entry_date).days >= max_hold_days
+                )
+                if past_max_hold and not _exit_mode_extends:
+                    # baseline: forced exit at max-hold day
                     should_eject = True
                     exit_reason_label = f"MAX_HOLD_{max_hold_days}D"
+                elif past_max_hold and _exit_mode_extends:
+                    # Continuation modes — see EXIT_MODE_TABLE.
+                    # Three gates: green check → rotate check → tighter trail
+                    unrealized = (
+                        today_close / entry_price - 1.0
+                        if today_close is not None and entry_price else None
+                    )
+                    is_green = unrealized is not None and unrealized > 0
+
+                    if _exit_mode_requires_green and not is_green:
+                        # Gate 1 — loser at day 90, force out
+                        should_eject = True
+                        exit_reason_label = f"MAX_HOLD_RED_{max_hold_days}D"
+                    else:
+                        fresh_candidate = None
+                        if _exit_mode_rotates:
+                            # Gate 2 — does a fresh z>=3 candidate exist?
+                            # _path_s_skew_flip applies the trend filter, so
+                            # this is "fresh entry-eligible candidate".
+                            fresh_t, _, _ = _path_s_skew_flip(
+                                day_state, exclude=holding,
+                            )
+                            if fresh_t and fresh_t != holding:
+                                fresh_candidate = fresh_t
+                        if fresh_candidate:
+                            should_eject = True
+                            exit_reason_label = f"MAX_HOLD_ROTATE_TO_{fresh_candidate}"
+                        else:
+                            # Gate 3 — extend with tighter trail on peak_close
+                            tight_thresh = post90_trail_pct / 100.0
+                            if today_close is None or peak_close is None or peak_close <= 0:
+                                should_eject = False
+                                drawdown = None
+                            else:
+                                drawdown = today_close / peak_close - 1.0
+                                should_eject = drawdown <= -tight_thresh
+                            if should_eject:
+                                exit_reason_label = (
+                                    f"POST90_TRAIL_{int(post90_trail_pct)}PCT"
+                                )
+                            else:
+                                exit_reason_label = None
+                                # Log the extension day (one row per extension day per name)
+                                _post90_extension_log.append({
+                                    "date": str(today.date()) if hasattr(today, 'date') else str(today),
+                                    "ticker": holding,
+                                    "entry_date": str(entry_date.date()) if entry_date and hasattr(entry_date, 'date') else str(entry_date),
+                                    "hold_days": (today - entry_date).days if entry_date else None,
+                                    "unrealized_return": unrealized,
+                                    "peak_close_so_far": peak_close,
+                                    "today_close": today_close,
+                                    "post90_trail_pct": post90_trail_pct,
+                                    "drawdown_from_peak": drawdown,
+                                    "fresh_candidate_passed": (
+                                        # If rotate mode is OFF, log whether a
+                                        # fresh candidate WOULD have been available.
+                                        not _exit_mode_rotates
+                                    ),
+                                })
+                                # If rotate mode is OFF, separately log what
+                                # candidate we passed up (X2 diagnostic).
+                                if not _exit_mode_rotates:
+                                    fresh_t2, _, _ = _path_s_skew_flip(
+                                        day_state, exclude=holding,
+                                    )
+                                    if fresh_t2 and fresh_t2 != holding:
+                                        _missed_candidate_log.append({
+                                            "date": str(today.date()) if hasattr(today, 'date') else str(today),
+                                            "current_ticker": holding,
+                                            "current_unrealized": unrealized,
+                                            "current_hold_days": (today - entry_date).days if entry_date else None,
+                                            "missed_candidate": fresh_t2,
+                                            "missed_candidate_z": (
+                                                day_state.skew_z_by_ticker.get(fresh_t2)
+                                                if day_state.skew_z_by_ticker else None
+                                            ),
+                                        })
                 elif exit_rule == "trailing_pct":
                     # Eject when close drops > trailing_pct% from peak. Don't use
                     # trend_status at all — pure price-based stop.
@@ -1864,6 +1999,16 @@ def run_replay(
     equity_df["drawdown"] = equity_df["portfolio_value"] / equity_df["portfolio_value"].cummax() - 1.0
     equity_df.to_csv(out_dir / "daily_equity.csv", index=False)
 
+    # Post-90 continuation diagnostic logs (only populated when extends mode is on)
+    if _post90_extension_log:
+        pd.DataFrame(_post90_extension_log).to_csv(
+            out_dir / "post90_extension_log.csv", index=False
+        )
+    if _missed_candidate_log:
+        pd.DataFrame(_missed_candidate_log).to_csv(
+            out_dir / "missed_candidate_log.csv", index=False
+        )
+
     # Benchmarks
     def _bench_curve(sym: str) -> dict:
         bars = bars_by_ticker.get(sym)
@@ -1913,6 +2058,13 @@ def run_replay(
         "exit_rule": exit_rule,
         "trailing_pct": trailing_pct,
         "max_hold_days": max_hold_days,
+        "exit_mode": exit_mode,
+        "post90_trail_pct": post90_trail_pct,
+        "post90_extend_requires_green": _exit_mode_requires_green,
+        "post90_rotate_on_new_signal": _exit_mode_rotates,
+        "exclude_tickers": sorted(_exclude_set) if _exclude_set else [],
+        "post90_extension_count": len(_post90_extension_log),
+        "missed_candidate_count": len(_missed_candidate_log),
         "signal_decay_z": locals().get("signal_decay_z"),
         "signal_decay_days": locals().get("signal_decay_days", 2),
         "days": lookback_days,
@@ -2182,6 +2334,26 @@ def main():
     ap.add_argument("--max-hold-days", type=int, default=None,
                     help="hard ceiling on per-position holding period. Fires before "
                          "trailing/MA exits. Default: no max hold.")
+    ap.add_argument("--exit-mode", type=str, default="baseline",
+                    choices=sorted(EXIT_MODE_TABLE.keys()),
+                    help="Post-max-hold continuation mode (single-position only). "
+                         "baseline = forced exit at max-hold day (production). "
+                         "post90_green_no_candidate_trail10 = X1 primary candidate: "
+                         "extend if green and no fresh z>=3 candidate, switch to "
+                         "post90_trail_pct trailing stop. "
+                         "post90_green_always_trail10 = X2 diagnostic: extend if "
+                         "green, ignore fresh candidates. "
+                         "post90_any_no_candidate_trail10 = X3 diagnostic: extend "
+                         "regardless of return sign as long as no fresh candidate. "
+                         "no_max_hold_trail20 = X4 diagnostic: pass --max-hold-days 0 "
+                         "or omit; just standard 20%% trail forever.")
+    ap.add_argument("--post90-trail-pct", type=float, default=10.0,
+                    help="Tighter trailing-stop percentage active in extension modes "
+                         "(default 10). Trail is applied to peak_close since entry, "
+                         "not reset at day 90.")
+    ap.add_argument("--exclude-tickers", type=str, default="",
+                    help="Comma-separated tickers to drop from the universe (e.g. "
+                         "INTC,WOLF). Used for drop-one sensitivity tests.")
     ap.add_argument("--signal-decay-z", type=float, default=None,
                     help="Path S only: exit when skew_z drifts below +decay_z (bullish) "
                          "or above -decay_z (bearish) for N consecutive days. "
@@ -2344,6 +2516,12 @@ def main():
         refresh=args.refresh,
         skew_lookup=skew_lookup,
         max_hold_days=args.max_hold_days,
+        exit_mode=args.exit_mode,
+        post90_trail_pct=args.post90_trail_pct,
+        exclude_tickers=(
+            {t.strip().upper() for t in args.exclude_tickers.split(",") if t.strip()}
+            if args.exclude_tickers else None
+        ),
         signal_decay_z=args.signal_decay_z,
         signal_decay_days=args.signal_decay_days,
         skew_direction=args.skew_direction,

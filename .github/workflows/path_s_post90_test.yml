@@ -1,0 +1,158 @@
+name: Path-S Post-90 Continuation Test
+
+# Tests whether extending winners past day 90 (instead of forced exit)
+# improves the Path-S basket. 5 exit modes × 2 INTC drop-one variants
+# = 10 parallel runs on free GitHub-hosted runners.
+#
+# Spec: see scripts/conviction/backtest/PATH_S_POST90_TEST.md
+# Acceptance: X1 (post90_green_no_candidate_trail10) only promotes if
+#   - Sharpe stays close
+#   - MDD does not materially worsen
+#   - Calmar improves
+#   - total return improves WITHOUT being one-trade dependent
+#     (drop-one INTC sensitivity must show preservation of edge)
+#
+# Trigger:
+#   gh workflow run path_s_post90_test.yml -f end_date=2026-04-29
+#
+# Data must be pre-staged at s3://gamma-sim-cache/conviction-backtest-data/.
+# Re-sync after any local refresh of data_refresh.py outputs:
+#   aws s3 sync scripts/conviction/backtest/data/ \
+#     s3://gamma-sim-cache/conviction-backtest-data/ --exclude "day_aggs_raw/*"
+
+on:
+  workflow_dispatch:
+    inputs:
+      end_date:
+        description: "End date (YYYY-MM-DD)"
+        type: string
+        default: "2026-04-29"
+      days:
+        description: "Lookback window (--days)"
+        type: string
+        default: "1460"
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ---- Full universe (10 trades expected for X0 baseline) ----
+          - run_suffix: "X0_baseline"
+            exit_mode: "baseline"
+            exclude_tickers: ""
+            max_hold: "90"
+          - run_suffix: "X1_primary"
+            exit_mode: "post90_green_no_candidate_trail10"
+            exclude_tickers: ""
+            max_hold: "90"
+          - run_suffix: "X2_no_rotate"
+            exit_mode: "post90_green_always_trail10"
+            exclude_tickers: ""
+            max_hold: "90"
+          - run_suffix: "X3_no_green_gate"
+            exit_mode: "post90_any_no_candidate_trail10"
+            exclude_tickers: ""
+            max_hold: "90"
+          - run_suffix: "X4_no_max_hold"
+            exit_mode: "no_max_hold_trail20"
+            exclude_tickers: ""
+            max_hold: "0"
+          # ---- INTC-excluded (drop-one sensitivity) ----
+          - run_suffix: "X0_baseline_no_intc"
+            exit_mode: "baseline"
+            exclude_tickers: "INTC"
+            max_hold: "90"
+          - run_suffix: "X1_primary_no_intc"
+            exit_mode: "post90_green_no_candidate_trail10"
+            exclude_tickers: "INTC"
+            max_hold: "90"
+          - run_suffix: "X2_no_rotate_no_intc"
+            exit_mode: "post90_green_always_trail10"
+            exclude_tickers: "INTC"
+            max_hold: "90"
+          - run_suffix: "X3_no_green_gate_no_intc"
+            exit_mode: "post90_any_no_candidate_trail10"
+            exclude_tickers: "INTC"
+            max_hold: "90"
+          - run_suffix: "X4_no_max_hold_no_intc"
+            exit_mode: "no_max_hold_trail20"
+            exclude_tickers: "INTC"
+            max_hold: "0"
+    name: "${{ matrix.run_suffix }}"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Sync backtest data from S3
+        run: |
+          mkdir -p scripts/conviction/backtest/data
+          aws s3 sync s3://gamma-sim-cache/conviction-backtest-data/ scripts/conviction/backtest/data/ \
+            --exclude "day_aggs_raw/*" --no-progress
+          ls -lh scripts/conviction/backtest/data/
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            "pandas==3.0.2" \
+            "numpy==2.4.4" \
+            "pyarrow==24.0.0" \
+            "scipy==1.17.1" \
+            "boto3==1.43.1" \
+            "pyyaml==6.0.3" \
+            "requests==2.33.1" \
+            "schwab-py==1.5.1"
+
+      - name: Run replay
+        id: run
+        run: |
+          set -o pipefail
+          mkdir -p out
+          LOG="out/${{ matrix.run_suffix }}.log"
+          EXCL_FLAG=""
+          if [ -n "${{ matrix.exclude_tickers }}" ]; then
+            EXCL_FLAG="--exclude-tickers ${{ matrix.exclude_tickers }}"
+          fi
+          python scripts/conviction/backtest/replay.py \
+            --strategy pathS --skew-direction bullish --skew-z-min 3.0 \
+            --universe-top-n 2000 --positions 1 \
+            --regime-gate spy --trailing-pct 20 \
+            --max-hold-days ${{ matrix.max_hold }} \
+            --exit-mode ${{ matrix.exit_mode }} \
+            --post90-trail-pct 10 \
+            $EXCL_FLAG \
+            --source massive --ignore-themes --exit-rule trailing_pct \
+            --skew-z-window 60 \
+            --days ${{ inputs.days }} \
+            --end-date ${{ inputs.end_date }} \
+            --run-suffix ${{ matrix.run_suffix }} \
+            2>&1 | tee "$LOG"
+
+      - name: Collect results
+        if: always()
+        run: |
+          if [ -d scripts/conviction/backtest/results ]; then
+            cp -r scripts/conviction/backtest/results out/results || true
+          fi
+          ls -R out || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ matrix.run_suffix }}
+          path: out/
+          retention-days: 14
