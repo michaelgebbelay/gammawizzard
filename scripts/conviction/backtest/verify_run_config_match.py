@@ -36,6 +36,8 @@ from pathlib import Path
 CORE_FIELDS: list[str] = [
     "signal",
     "skew_z_min",
+    "skew_z_window",
+    "skew_z_rolling_min",
     "skew_z_persistence_days",
     "universe_top_n",
     "ignore_themes",
@@ -93,6 +95,9 @@ def load_run_config(run_dir: Path) -> dict:
                    if params.get("strategy") == "pathS"
                    else params.get("strategy")),
         "skew_z_min": path_s.get("abs_skew_z_min"),
+        # Legacy runs predate the explicit z_window capture; assume canonical 60.
+        "skew_z_window": 60,
+        "skew_z_rolling_min": 20,
         "skew_z_persistence_days": 1,
         "universe_top_n": None,  # not in legacy schema
         "ignore_themes": None,
