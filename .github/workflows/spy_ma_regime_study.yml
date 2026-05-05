@@ -1,0 +1,74 @@
+name: SPY/SPX MA regime study
+
+# Runs the full descriptive + conditional analysis of below-50d / below-200d
+# episodes for SPX from 1990 onward, with VIX/VIX3M and HYG/LQD overlays.
+# Pulls all data from yfinance at job start (no S3 sync).
+#
+# Trigger:
+#   gh workflow run spy_ma_regime_study.yml -f start=1990-01-01
+
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: "Panel start date (YYYY-MM-DD)"
+        type: string
+        default: "1990-01-01"
+      end:
+        description: "Panel end date (YYYY-MM-DD, blank = today)"
+        type: string
+        default: ""
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            "pandas==3.0.2" \
+            "numpy==2.4.4" \
+            "matplotlib==3.10.7" \
+            "yfinance==0.2.66"
+
+      - name: Run study
+        run: |
+          set -o pipefail
+          mkdir -p out
+          END_ARG=""
+          if [ -n "${{ inputs.end }}" ]; then
+            END_ARG="--end ${{ inputs.end }}"
+          fi
+          python scripts/research/spy_ma_regime_study.py \
+            --start ${{ inputs.start }} \
+            $END_ARG \
+            --out-dir out 2>&1 | tee out/run.log
+
+      - name: Show summary
+        if: always()
+        run: |
+          if [ -f out/summary.md ]; then
+            echo "=== summary.md ==="
+            cat out/summary.md
+          fi
+          echo ""
+          echo "=== yearly_descriptive.csv (head) ==="
+          head -25 out/yearly_descriptive.csv 2>/dev/null || true
+          echo ""
+          echo "=== conditional_probs.csv ==="
+          cat out/conditional_probs.csv 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: spy_ma_regime_study
+          path: out/
+          retention-days: 14
