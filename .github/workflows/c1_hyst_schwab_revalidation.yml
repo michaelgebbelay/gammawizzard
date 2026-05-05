@@ -1,0 +1,62 @@
+name: C1-HYST Schwab revalidation
+
+# Independent-data check using the production Schwab broker.
+# Schwab is split-adjusted (not dividend-adjusted), so absolute returns
+# differ from yfinance by the cumulative dividend yield. The verdict
+# focuses on whether the SIGNAL reproduces (flip count close, pass 2x SPY)
+# rather than exact total-return reproduction.
+#
+# Trigger: gh workflow run c1_hyst_schwab_revalidation.yml
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            "pandas==2.2.3" \
+            "numpy==1.26.4" \
+            "schwab-py==1.5.0"
+
+      - name: Materialize Schwab token
+        run: |
+          mkdir -p Token
+          printf '%s' "${{ secrets.SCHWAB_TOKEN_JSON }}" > Token/schwab_token.json
+
+      - name: Run revalidation
+        env:
+          SCHWAB_APP_KEY: ${{ secrets.SCHWAB_APP_KEY }}
+          SCHWAB_APP_SECRET: ${{ secrets.SCHWAB_APP_SECRET }}
+          SCHWAB_TOKEN_PATH: Token/schwab_token.json
+        run: |
+          set -o pipefail
+          mkdir -p out
+          python scripts/conviction/backtest/c1_hyst_schwab_revalidation.py \
+            --out-dir out 2>&1 | tee out/run.log
+
+      - name: Show summary
+        if: always()
+        run: |
+          if [ -f out/summary.txt ]; then
+            echo "=== summary.txt ==="
+            cat out/summary.txt
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: c1_hyst_schwab_revalidation
+          path: out/
+          retention-days: 14
