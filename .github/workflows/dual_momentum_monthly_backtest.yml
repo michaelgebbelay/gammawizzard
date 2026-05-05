@@ -1,0 +1,73 @@
+name: Dual Momentum Monthly Backtest
+
+# Single-strategy backtest: 6-month leveraged dual momentum with monthly
+# rotation. Runs both 2x (SSO/QLD) and 3x (UPRO/TQQQ) variants in one job.
+#
+# Trigger:
+#   gh workflow run dual_momentum_monthly_backtest.yml \
+#     -f start_date=2022-01-03 -f end_date=2026-05-01
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: "Backtest start date (YYYY-MM-DD)"
+        type: string
+        default: "2022-01-03"
+      end_date:
+        description: "Backtest end date (YYYY-MM-DD)"
+        type: string
+        default: "2026-05-01"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Sync ETF bars from S3
+        run: |
+          mkdir -p scripts/conviction/backtest/data
+          aws s3 cp s3://gamma-sim-cache/conviction-backtest-data/aggs_daily_adjusted.parquet \
+            scripts/conviction/backtest/data/aggs_daily_adjusted.parquet --no-progress
+          ls -lh scripts/conviction/backtest/data/
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            "pandas==3.0.2" \
+            "numpy==2.4.4" \
+            "pyarrow==24.0.0"
+
+      - name: Run backtest
+        run: |
+          set -o pipefail
+          mkdir -p out
+          python scripts/conviction/backtest/dual_momentum_monthly_backtest.py \
+            --start-date ${{ inputs.start_date }} \
+            --end-date ${{ inputs.end_date }} \
+            --out-dir out 2>&1 | tee out/run.log
+
+      - name: Show summary
+        if: always()
+        run: |
+          if [ -f out/summary.txt ]; then cat out/summary.txt; fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dual_momentum_monthly_backtest
+          path: out/
+          retention-days: 14
