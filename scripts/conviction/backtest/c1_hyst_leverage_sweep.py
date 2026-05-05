@@ -87,8 +87,10 @@ def compute_indicators(qqq: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def state_c1_hyst(ind: pd.DataFrame, risk_on: str) -> list:
-    """C1-HYST locked signal; emit risk_on (e.g. 'TQQQ' or 'QLD') or 'BIL'."""
+def state_c1_hyst(ind: pd.DataFrame) -> list:
+    """C1-HYST locked signal; emit canonical 'TQQQ'/'BIL' labels.
+    The actual sleeve is selected by which bars are mapped to the 'TQQQ' key
+    in bars_for_run."""
     out, s = [], None
     for _, r in ind.iterrows():
         if any(pd.isna(r[c]) for c in ("sma50","sma150","sma200","ret63")):
@@ -97,9 +99,9 @@ def state_c1_hyst(ind: pd.DataFrame, risk_on: str) -> list:
                + int(r["sma50"]  > r["sma200"])
                + int(r["ret63"]  > 0))
         if s is None:
-            s = risk_on if score == 3 else "BIL"
+            s = "TQQQ" if score == 3 else "BIL"
         else:
-            if score == 3: s = risk_on
+            if score == 3: s = "TQQQ"
             elif score <= 1: s = "BIL"
         out.append(s)
     return out
@@ -119,12 +121,13 @@ def main():
 
     rows = []
     full_results = {}
+    states = state_c1_hyst(ind)
     for variant in LEVERAGE_VARIANTS:
         full_results[variant] = {}
-        states = state_c1_hyst(ind, variant)
-        # simulate() uses bars["TQQQ"] hardcoded — patch by aliasing the bars dict
+        # simulate() uses bars["TQQQ"]/bars["BIL"] hardcoded — alias risk-on
+        # under the "TQQQ" key so the same state list works for both sleeves
         bars_for_run = dict(bars)
-        bars_for_run["TQQQ"] = bars[variant]   # alias risk-on under the key simulate expects
+        bars_for_run["TQQQ"] = bars[variant]
         for w_label, (s, e) in WINDOWS.items():
             full_results[variant][w_label] = {}
             start = max(pd.Timestamp(s), first_valid)
