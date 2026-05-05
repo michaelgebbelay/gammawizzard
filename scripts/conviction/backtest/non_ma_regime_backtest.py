@@ -563,8 +563,6 @@ def write_summary(out_dir: Path, results: dict) -> None:
     # main table per window: variant rows × slippage cols (total return)
     for w in WINDOWS.keys():
         lines.append(f"--- Window {w}: total return by variant × slippage ---")
-        header = f"  {'variant':<10}" + "".join(f"  {s:>2}bp:tot   DD     Sharpe  flips":>1
-                                                for s in SLIPPAGE_BPS)
         lines.append(f"  {'variant':<10}  {'3bp':>9} {'10bp':>9} {'25bp':>9} {'50bp':>9}  "
                      f"{'maxDD@3':>9} {'Sharpe@3':>9} {'flips@3':>8}  {'pass2x@10':>10}")
         for v in VARIANTS:
