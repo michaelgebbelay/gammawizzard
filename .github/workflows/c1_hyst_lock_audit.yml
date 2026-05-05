@@ -1,0 +1,50 @@
+name: C1-HYST Lock + Audit Backtest
+
+# Lock C1-HYST as primary; audit whether HYST's edge over NORETEXIT comes
+# from the hold zone or from the looser entry condition (close>SMA150 vs
+# close>SMA200) by running C1-HYST-STRICT-ENTRY alongside.
+#
+# Trigger:
+#   gh workflow run c1_hyst_lock_audit.yml
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            "pandas==3.0.2" \
+            "numpy==2.4.4" \
+            "pyarrow==24.0.0" \
+            "yfinance==0.2.65"
+
+      - name: Run backtest
+        run: |
+          set -o pipefail
+          mkdir -p out
+          python scripts/conviction/backtest/c1_hyst_lock_audit.py \
+            --out-dir out --no-cache 2>&1 | tee out/run.log
+
+      - name: Show summary
+        if: always()
+        run: |
+          if [ -f out/summary.txt ]; then cat out/summary.txt; fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: c1_hyst_lock_audit
+          path: out/
+          retention-days: 14
