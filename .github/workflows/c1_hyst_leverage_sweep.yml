@@ -1,0 +1,48 @@
+name: C1-HYST leverage sweep (TQQQ vs QLD)
+
+# Operationalization test: same locked C1-HYST signal, swap risk-on sleeve
+# between TQQQ (3x QQQ) and QLD (2x QQQ). Reports CAGR / DD / Sharpe /
+# Sortino / Calmar across windows L/A/B/C at 3/10/25/50bp.
+#
+# Trigger: gh workflow run c1_hyst_leverage_sweep.yml
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            "pandas==3.0.2" \
+            "numpy==2.4.4" \
+            "pyarrow==24.0.0" \
+            "yfinance==0.2.66"
+      - name: Run sweep
+        run: |
+          set -o pipefail
+          mkdir -p out
+          python scripts/conviction/backtest/c1_hyst_leverage_sweep.py \
+            --no-cache \
+            --out-dir out 2>&1 | tee out/run.log
+      - name: Show summary
+        if: always()
+        run: |
+          if [ -f out/summary.txt ]; then
+            echo "=== summary.txt ==="
+            cat out/summary.txt
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: c1_hyst_leverage_sweep
+          path: out/
+          retention-days: 14
