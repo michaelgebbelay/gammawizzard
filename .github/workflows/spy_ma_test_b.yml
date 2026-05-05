@@ -1,0 +1,63 @@
+name: SPY/SPX MA test (b) — backwardation-within-10td filter
+
+# Test (b) of the trend-filter doctrine: does VIX/VIX3M flipping above 1.0
+# within 10td post-200d-cross filter the false-positive rate of the cross
+# itself? Outputs a 2x2 contingency, precision/recall, and full daily
+# trajectories for every bear and every false positive.
+#
+# Trigger:
+#   gh workflow run spy_ma_test_b.yml
+
+on:
+  workflow_dispatch:
+    inputs:
+      end:
+        description: "End date (YYYY-MM-DD, blank = today)"
+        type: string
+        default: ""
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            "pandas==3.0.2" \
+            "numpy==2.4.4" \
+            "yfinance==0.2.66"
+
+      - name: Run test (b)
+        run: |
+          set -o pipefail
+          mkdir -p out
+          END_ARG=""
+          if [ -n "${{ inputs.end }}" ]; then
+            END_ARG="--end ${{ inputs.end }}"
+          fi
+          python scripts/research/spy_ma_test_b.py \
+            $END_ARG \
+            --out-dir out 2>&1 | tee out/run.log
+
+      - name: Show summary
+        if: always()
+        run: |
+          if [ -f out/summary.md ]; then
+            echo "=== summary.md ==="
+            cat out/summary.md
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: spy_ma_test_b
+          path: out/
+          retention-days: 14
