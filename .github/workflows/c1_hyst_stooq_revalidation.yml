@@ -1,0 +1,51 @@
+name: C1-HYST Stooq revalidation
+
+# Independent-data check: pull SPY/QQQ/TQQQ/BIL from Stooq (not yfinance),
+# run the locked C1-HYST signal + simulator, compare to yfinance reference.
+# Operational checklist item #2 from C1_HYST_LOCKED_SPEC.md.
+#
+# Trigger: gh workflow run c1_hyst_stooq_revalidation.yml
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            "pandas==3.0.2" \
+            "numpy==2.4.4" \
+            "yfinance==0.2.66"
+
+      - name: Run revalidation
+        run: |
+          set -o pipefail
+          mkdir -p out
+          python scripts/conviction/backtest/c1_hyst_stooq_revalidation.py \
+            --out-dir out 2>&1 | tee out/run.log
+
+      - name: Show summary
+        if: always()
+        run: |
+          if [ -f out/summary.txt ]; then
+            echo "=== summary.txt ==="
+            cat out/summary.txt
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: c1_hyst_stooq_revalidation
+          path: out/
+          retention-days: 14
