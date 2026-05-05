@@ -833,6 +833,11 @@ def run_replay_multi(
     end_date = pd.Timestamp(end_date).normalize()
     start_date = end_date - pd.Timedelta(days=lookback_days)
     trading_days = [d for d in spx_dates if start_date <= d <= end_date]
+    # Launch-date jitter (mirrors run_replay): trim trading_days to start at
+    # launch_date while keeping full pre-launch feature history intact.
+    if launch_date is not None:
+        ld = pd.Timestamp(launch_date).normalize()
+        trading_days = [d for d in trading_days if d >= ld]
     if len(trading_days) < 2:
         raise RuntimeError(f"too few trading days: {len(trading_days)}")
 
@@ -2532,6 +2537,7 @@ def main():
         refresh=args.refresh,
         skew_lookup=skew_lookup,
         max_hold_days=args.max_hold_days,
+        launch_date=args.launch_date,
         exit_mode=args.exit_mode,
         post90_trail_pct=args.post90_trail_pct,
         exclude_tickers=(

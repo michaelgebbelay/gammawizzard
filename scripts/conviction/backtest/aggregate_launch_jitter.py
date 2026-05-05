@@ -284,7 +284,7 @@ def main():
             "",
             "### Per-offset summary",
             "",
-            s.to_markdown(index=False, floatfmt=".4f"),
+            "```\n" + s.to_string(index=False, float_format=lambda x: f"{x:.4f}") + "\n```",
             "",
         ]
     (args.out / "report.md").write_text("\n".join(lines))
