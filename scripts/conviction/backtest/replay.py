@@ -716,6 +716,8 @@ def run_replay_multi(
     signal_decay_z: float | None = None,
     signal_decay_days: int = 2,
     skew_direction: str = "bullish",
+    skew_z_window: int = 60,
+    skew_z_rolling_min: int = 20,
     regime_lookup: dict | None = None,
     regime_gate: str = "none",
     run_suffix: str | None = None,
@@ -1277,6 +1279,8 @@ def run_replay_multi(
                    if strategy == "pathS" else strategy),
         "skew_z_min": (PATH_S_CONFIG.get("abs_skew_z_min")
                        if strategy == "pathS" else None),
+        "skew_z_window": skew_z_window,        # rolling lookback (trading days), CANONICAL = 60
+        "skew_z_rolling_min": skew_z_rolling_min,  # min_periods for rolling stat, CANONICAL = 20
         "skew_z_persistence_days": 1,  # baked into load_skew_lookup; captured at lookup build, not run time
         "universe_top_n": universe_top_n,
         "ignore_themes": ignore_themes,
@@ -1449,6 +1453,8 @@ def run_replay(
     signal_decay_z: float | None = None,
     signal_decay_days: int = 2,
     skew_direction: str = "bullish",
+    skew_z_window: int = 60,
+    skew_z_rolling_min: int = 20,
     regime_lookup: dict | None = None,
     regime_gate: str = "none",
     run_suffix: str | None = None,
@@ -2301,6 +2307,8 @@ def main():
             signal_decay_z=args.signal_decay_z,
             signal_decay_days=args.signal_decay_days,
             skew_direction=args.skew_direction,
+            skew_z_window=args.skew_z_window,
+            skew_z_rolling_min=20,
             regime_lookup=regime_lookup,
             regime_gate=args.regime_gate,
             run_suffix=args.run_suffix,
@@ -2335,6 +2343,8 @@ def main():
         signal_decay_z=args.signal_decay_z,
         signal_decay_days=args.signal_decay_days,
         skew_direction=args.skew_direction,
+        skew_z_window=args.skew_z_window,
+        skew_z_rolling_min=20,
         regime_lookup=regime_lookup,
         regime_gate=args.regime_gate,
         run_suffix=args.run_suffix,
