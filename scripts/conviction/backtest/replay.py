@@ -741,6 +741,7 @@ def run_replay_multi(
     strategy: str = "pathA",
     skew_lookup: dict | None = None,
     max_hold_days: int | None = None,
+    launch_date: pd.Timestamp | str | None = None,
     signal_decay_z: float | None = None,
     signal_decay_days: int = 2,
     skew_direction: str = "bullish",
@@ -1484,6 +1485,9 @@ def run_replay(
     exit_mode: str = "baseline",
     post90_trail_pct: float = 10.0,
     exclude_tickers: set[str] | None = None,
+    # Launch-date jitter: ignore trades before this date but keep full feature
+    # history (bars + skew) for canonical signal computation.
+    launch_date: pd.Timestamp | str | None = None,
     signal_decay_z: float | None = None,
     signal_decay_days: int = 2,
     skew_direction: str = "bullish",
@@ -1604,6 +1608,13 @@ def run_replay(
     end_date = pd.Timestamp(end_date).normalize()
     start_date = end_date - pd.Timedelta(days=lookback_days)
     trading_days = [d for d in spx_dates if start_date <= d <= end_date]
+    # Launch-date jitter: trim trading_days to start at launch_date, preserving
+    # ALL pre-launch bar/skew history for canonical feature computation. This is
+    # how we test "what if I started live on a different day" without contaminating
+    # the test by truncating the z-score window.
+    if launch_date is not None:
+        ld = pd.Timestamp(launch_date).normalize()
+        trading_days = [d for d in trading_days if d >= ld]
     if len(trading_days) < 2:
         raise RuntimeError(f"too few trading days in window: {len(trading_days)}")
 
@@ -2354,6 +2365,10 @@ def main():
     ap.add_argument("--exclude-tickers", type=str, default="",
                     help="Comma-separated tickers to drop from the universe (e.g. "
                          "INTC,WOLF). Used for drop-one sensitivity tests.")
+    ap.add_argument("--launch-date", type=str, default=None,
+                    help="YYYY-MM-DD. If set, no trades fire before this date — but "
+                         "feature/skew history is fully precomputed from --days bars. "
+                         "Used for launch-date jitter / start-date sensitivity tests.")
     ap.add_argument("--signal-decay-z", type=float, default=None,
                     help="Path S only: exit when skew_z drifts below +decay_z (bullish) "
                          "or above -decay_z (bearish) for N consecutive days. "
@@ -2480,6 +2495,7 @@ def main():
             strategy=args.strategy,
             skew_lookup=skew_lookup,
             max_hold_days=args.max_hold_days,
+            launch_date=args.launch_date,
             signal_decay_z=args.signal_decay_z,
             signal_decay_days=args.signal_decay_days,
             skew_direction=args.skew_direction,

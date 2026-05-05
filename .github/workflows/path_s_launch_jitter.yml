@@ -1,0 +1,128 @@
+name: Path-S Launch Date Jitter
+
+# Tests path-dependence of single-position Path S vs top-2 by re-running
+# the strategy from different cold-launch dates. Same end date (2026-04-29),
+# same FROZEN strategy spec, only the trading start date varies.
+#
+# Critical: replay.py uses the full precomputed skew/bar history regardless
+# of launch_date — only TRADING is blocked before launch_date. This avoids
+# contaminating the test with z-score window truncation.
+#
+# 12 strategic offsets × 2 modes (single + top-2) = 24 parallel jobs.
+#
+# Spec: see PATH_S_POST90_TEST.md companion (this is start-date sensitivity).
+#
+# Trigger:
+#   gh workflow run path_s_launch_jitter.yml -f end_date=2026-04-29
+
+on:
+  workflow_dispatch:
+    inputs:
+      end_date:
+        description: "End date (YYYY-MM-DD)"
+        type: string
+        default: "2026-04-29"
+
+jobs:
+  jitter:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Single-position (production candidate)
+          - { mode: "single", positions: "1", launch: "2022-05-02", offset: "000" }
+          - { mode: "single", positions: "1", launch: "2022-05-03", offset: "001" }
+          - { mode: "single", positions: "1", launch: "2022-05-04", offset: "002" }
+          - { mode: "single", positions: "1", launch: "2022-05-09", offset: "005" }
+          - { mode: "single", positions: "1", launch: "2022-05-16", offset: "010" }
+          - { mode: "single", positions: "1", launch: "2022-05-23", offset: "015" }
+          - { mode: "single", positions: "1", launch: "2022-06-01", offset: "020" }
+          - { mode: "single", positions: "1", launch: "2022-06-15", offset: "030" }
+          - { mode: "single", positions: "1", launch: "2022-07-08", offset: "045" }
+          - { mode: "single", positions: "1", launch: "2022-07-29", offset: "060" }
+          - { mode: "single", positions: "1", launch: "2022-09-12", offset: "090" }
+          - { mode: "single", positions: "1", launch: "2022-10-25", offset: "120" }
+          # Top-2 (smoother alternate)
+          - { mode: "top2",   positions: "2", launch: "2022-05-02", offset: "000" }
+          - { mode: "top2",   positions: "2", launch: "2022-05-03", offset: "001" }
+          - { mode: "top2",   positions: "2", launch: "2022-05-04", offset: "002" }
+          - { mode: "top2",   positions: "2", launch: "2022-05-09", offset: "005" }
+          - { mode: "top2",   positions: "2", launch: "2022-05-16", offset: "010" }
+          - { mode: "top2",   positions: "2", launch: "2022-05-23", offset: "015" }
+          - { mode: "top2",   positions: "2", launch: "2022-06-01", offset: "020" }
+          - { mode: "top2",   positions: "2", launch: "2022-06-15", offset: "030" }
+          - { mode: "top2",   positions: "2", launch: "2022-07-08", offset: "045" }
+          - { mode: "top2",   positions: "2", launch: "2022-07-29", offset: "060" }
+          - { mode: "top2",   positions: "2", launch: "2022-09-12", offset: "090" }
+          - { mode: "top2",   positions: "2", launch: "2022-10-25", offset: "120" }
+    name: "${{ matrix.mode }}_off${{ matrix.offset }}_${{ matrix.launch }}"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Sync backtest data from S3
+        run: |
+          mkdir -p scripts/conviction/backtest/data
+          aws s3 sync s3://gamma-sim-cache/conviction-backtest-data/ scripts/conviction/backtest/data/ \
+            --exclude "day_aggs_raw/*" --no-progress
+          ls -lh scripts/conviction/backtest/data/
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            "pandas==3.0.2" \
+            "numpy==2.4.4" \
+            "pyarrow==24.0.0" \
+            "scipy==1.17.1" \
+            "boto3==1.43.1" \
+            "pyyaml==6.0.3" \
+            "requests==2.33.1" \
+            "schwab-py==1.5.1"
+
+      - name: Run replay (jitter)
+        run: |
+          set -o pipefail
+          mkdir -p out
+          SUFFIX="${{ matrix.mode }}_off${{ matrix.offset }}"
+          LOG="out/$SUFFIX.log"
+          # Use the full 5y window (1825d) regardless of launch_date — bars/skew
+          # history is computed over full window; only TRADING starts at launch.
+          python scripts/conviction/backtest/replay.py \
+            --strategy pathS --skew-direction bullish --skew-z-min 3.0 \
+            --universe-top-n 2000 --positions ${{ matrix.positions }} \
+            --regime-gate spy --trailing-pct 20 --max-hold-days 90 \
+            --source massive --ignore-themes --exit-rule trailing_pct \
+            --skew-z-window 60 \
+            --days 1825 \
+            --launch-date ${{ matrix.launch }} \
+            --end-date ${{ inputs.end_date }} \
+            --run-suffix $SUFFIX \
+            2>&1 | tee "$LOG"
+
+      - name: Collect results
+        if: always()
+        run: |
+          if [ -d scripts/conviction/backtest/results ]; then
+            cp -r scripts/conviction/backtest/results out/results || true
+          fi
+          ls -R out || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ matrix.mode }}_off${{ matrix.offset }}
+          path: out/
+          retention-days: 14
