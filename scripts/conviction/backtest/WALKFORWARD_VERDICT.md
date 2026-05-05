@@ -882,3 +882,54 @@ REJECT:
 - combined-tail F3 as a production rule
 - SPY idle B2
 ```
+
+---
+
+## Rolling-Z Window Sweep (2026-05-04) — w=60 confirmed canonical
+
+**GHA run:** [25345947109](https://github.com/michaelgebbelay/gammawizzard/actions/runs/25345947109)
+**Trigger:** `path-s-doctrine` cited "252d rolling" but `replay.py` `load_skew_lookup`
+defaulted to `z_window=60` and the call site never overrode it. The live
+`data_refresh.py` had `ROLLING_DAYS=252`, meaning the live signal was being
+computed on a *different math* than the one that produced the +621% verdict.
+
+**Sweep config:** z=3.0, single position, 4y window, max-hold 90, trail 20%,
+SPY 200d gate, top-2000 universe, ignore-themes. Only axis: `--skew-z-window`.
+
+| z_window | total return | CAGR | Sharpe | MDD | trades |
+|---:|---:|---:|---:|---:|---:|
+| **60** | **+621.3%** | **+64.4%** | **1.32** | **-29.6%** | 17 |
+| 126 | -48.2% | -15.2% | -0.23 | -65.1% | 20 |
+| 189 | -31.4% | -9.0% | -0.04 | -61.4% | 20 |
+| 252 | +42.2% | +9.3% | +0.42 | -55.8% | 17 |
+| 378 | +52.2% | +11.1% | +0.46 | -42.9% | 17 |
+| SPY  | +71.7% |   —   |   —   | -19.0% | — |
+
+**Findings:**
+1. **w=60 reproduces the verdict exactly** (+621% / 1.32 / -30% / 17 trades).
+   Engine is not drifting; the canonical numbers are reproducible from S3-staged data.
+2. **w=126 (halved-window hypothesis) is catastrophic** — Sharpe goes negative,
+   MDD blows out to -65%. Shorter does *not* mean fresher.
+3. **w=252 (live `data_refresh.py` setting) underperforms SPY by 30pp** with
+   nearly 2× the drawdown of w=60. Same name (KIM) was rank-1 across all
+   windows, but ranks 2-12 reshuffle materially — future top-2 picks would
+   diverge from the verdict-validated signal.
+4. The win is not selectivity (trade counts roughly equal across windows) —
+   it's **identity**: which underlyings cross z>=3.0 changes when the
+   normalization horizon changes.
+
+**Action taken (2026-05-04):**
+- `data_refresh.py` ROLLING_DAYS 252 → 60, ROLLING_MIN 60 → 20.
+- `path-s-doctrine` and `PathS/PLAN.md` corrected: spec is **60-trading-day**
+  rolling z (min_periods=20), not 252d.
+- This entry added to the verdict memo so the discrepancy doesn't recur.
+
+**Prior live trade (KIM, entered 2026-05-04 at the open):** unaffected — KIM
+was rank-1 under every window tested (z=6.67 @ w=60, z=5.57 @ w=252). The
+trade matches what the canonical strategy would have picked. State file
+records the entry signal at z=5.57 (the buggy live value); under the
+corrected pipeline the same date's signal is z=6.67.
+
+**Window is now a frozen parameter.** Re-running this sweep is wasted compute
+unless something in the underlying skew distribution materially changes.
+
