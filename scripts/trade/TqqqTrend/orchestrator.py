@@ -262,6 +262,18 @@ def run(args) -> int:
         emit_log_and_notify(log, subject_tag="MIXED ERROR")
         return 2
 
+    if cur == "CASH":
+        # Refuse to auto-enter from cash. Initial position must be set manually
+        # (avoids double-positioning on Schwab settlement-propagation lag).
+        log.append("CASH state — no TQQQ or BIL position visible.")
+        log.append("Refusing to auto-enter from cash. Either:")
+        log.append("  (a) Wait for the manual TQQQ/BIL position to propagate (Schwab settlement lag)")
+        log.append("  (b) Place the initial position manually via Schwab UI or "
+                   "`scripts/trade/TqqqTrend/place.py --initial-usd N --live`")
+        log.append("Cron will not place orders until position is in TQQQ or BIL.")
+        emit_log_and_notify(log, subject_tag="CASH state — no trade")
+        return 0
+
     # Build the flip plan
     sell_sym = cur if cur in ("TQQQ", "BIL") else None
     buy_sym = tgt
