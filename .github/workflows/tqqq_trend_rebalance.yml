@@ -1,0 +1,106 @@
+name: TqqqTrend daily rebalance
+
+# C1-HYST signal (a.k.a. TQQQ Trend) — runs each weekday morning ~9:31 AM ET,
+# uses yesterday's QQQ close to compute the score, flips the Schwab position
+# if needed via a 3-step limit-chase ladder + market fallback.
+#
+# Idempotent: most days the position already matches target; the script is a
+# no-op and exits clean. Only fires actual orders on flip days.
+#
+# DST handling: two crons (one for EDT, one for EST). Script verifies it's
+# 9:30-10:30 ET before doing anything, so the off-DST cron exits cleanly.
+#
+# Manual: gh workflow run tqqq_trend_rebalance.yml [-f dry_run=true]
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry-run (no orders, just log intent)"
+        type: boolean
+        default: false
+      skip_window_check:
+        description: "Bypass the 9:30-10:30 ET time-of-day guard"
+        type: boolean
+        default: false
+  schedule:
+    - cron: "31 13 * * 1-5"  # 9:31 AM EDT (Mar-Nov)
+    - cron: "31 14 * * 1-5"  # 9:31 AM EST (Nov-Mar)
+
+concurrency:
+  group: tqqq-trend-rebalance
+  cancel-in-progress: false
+
+jobs:
+  rebalance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            "pandas==2.2.3" \
+            "numpy==1.26.4" \
+            "yfinance==0.2.66" \
+            "schwab-py==1.5.0"
+
+      - id: rebalance
+        name: Run rebalance
+        env:
+          SCHWAB_APP_KEY: ${{ secrets.SCHWAB_APP_KEY }}
+          SCHWAB_APP_SECRET: ${{ secrets.SCHWAB_APP_SECRET }}
+          SCHWAB_TOKEN_JSON: ${{ secrets.SCHWAB_TOKEN_JSON }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SMTP_TO: ${{ secrets.SMTP_TO }}
+        run: |
+          set -o pipefail
+          mkdir -p Token
+          ARGS=""
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          if [ "${{ github.event.inputs.skip_window_check }}" = "true" ]; then
+            ARGS="$ARGS --skip-window-check"
+          fi
+          python scripts/trade/TqqqTrend/orchestrator.py $ARGS 2>&1 | tee out.log
+
+      - name: Upload run log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tqqq-trend-rebalance-log
+          path: out.log
+          retention-days: 30
+
+      - name: Persist refreshed Schwab token
+        if: always() && !cancelled()
+        env:
+          GH_TOKEN: ${{ secrets.GH_SECRET_TOKEN }}
+        run: |
+          if [ -f Token/schwab_token.json ] && [ -n "$GH_TOKEN" ]; then
+            gh secret set SCHWAB_TOKEN_JSON \
+              -b "$(cat Token/schwab_token.json)" \
+              -R "$GITHUB_REPOSITORY" || true
+          fi
+
+      - name: Notify on failure
+        if: failure()
+        env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SMTP_TO: ${{ secrets.SMTP_TO }}
+          SMTP_SUBJECT: "TqqqTrend rebalance FAILED"
+          SMTP_BODY: |
+            Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            Event: ${{ github.event_name }}
+            Step rebalance outcome: ${{ steps.rebalance.outcome }}
+        run: |
+          python scripts/notify/smtp_notify.py || true
