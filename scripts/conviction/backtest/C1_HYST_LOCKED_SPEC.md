@@ -1,6 +1,11 @@
 # C1-HYST — Locked Strategy Specification
 
-**Status:** primary candidate, locked 2026-05-05.
+**Also known as: TQQQ Trend, 3xQQQ, QQQ 3x, HYST.** All names refer to the same
+strategy. User-facing name is "TQQQ Trend" (skill: `tqqq-trend`); internal/git
+codename is "C1-HYST". Live placement script: `scripts/trade/TqqqTrend/place.py`.
+
+**Status:** primary candidate, locked 2026-05-05. **Live on Schwab from 2026-05-05
+at $5k initial position.**
 **Reference implementation:** `c1_locked_baseline_backtest.py` (variant `C1-HYST`).
 **Attribution evidence:** GHA run 25358962345 (`entry_exit_attribution.yml`).
 **Non-MA confirmation:** GHA run 25358646580 (`non_ma_regime_backtest.yml`).
