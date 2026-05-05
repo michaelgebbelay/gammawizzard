@@ -74,6 +74,21 @@ def submit_order(c, acct_hash: str, payload: dict) -> dict:
     return {"ok": True, "status": r.status_code, "order_id": order_id}
 
 
+def get_cash_balance(c, acct_hash: str) -> float:
+    """Available cash for trading (Schwab calls this 'cashAvailableForTrading')."""
+    url = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}"
+    r = c.session.get(url, timeout=15)
+    if r.status_code != 200:
+        return 0.0
+    body = r.json() or {}
+    acc = body.get("securitiesAccount") or {}
+    bal = acc.get("currentBalances") or {}
+    cash = bal.get("cashAvailableForTrading")
+    if cash is None:
+        cash = bal.get("availableFunds") or bal.get("cashBalance") or 0.0
+    return float(cash)
+
+
 def get_order(c, acct_hash: str, order_id: str) -> dict:
     url = f"https://api.schwabapi.com/trader/v1/accounts/{acct_hash}/orders/{order_id}"
     r = c.session.get(url, timeout=15)
@@ -263,6 +278,8 @@ def run(args) -> int:
 
     # 2) determine buy quantity from cash + sell proceeds
     sell_proceeds = (sell_res["filled"] * sell_res["avg_px"]) if sell_sym and sell_qty > 0 else 0.0
+    cash_avail = get_cash_balance(c, acct_hash)
+    log.append(f"cash available: ${cash_avail:,.2f}  sell proceeds: ${sell_proceeds:,.2f}")
     buy_quote = get_quote(c, buy_sym)
     buy_ref = buy_quote["last"] or buy_quote["close_prev"] or buy_quote["ask"]
     if buy_ref <= 0:
@@ -271,7 +288,7 @@ def run(args) -> int:
         return 4
 
     # leave $5 buffer to avoid insufficient-funds rejection from price drift
-    budget = sell_proceeds - 5.0
+    budget = (sell_proceeds + cash_avail) - 5.0
     buy_qty = int(budget // buy_ref)
     if buy_qty <= 0:
         log.append(f"buy budget ${budget:.2f} too small at ${buy_ref:.2f}")
