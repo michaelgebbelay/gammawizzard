@@ -34,6 +34,7 @@ from pathlib import Path
 # the `canonical_config` dict written by replay.py — adding a new strategy
 # knob means adding it here too.
 CORE_FIELDS: list[str] = [
+    "canonical_config_hash",
     "signal",
     "skew_z_min",
     "skew_z_window",

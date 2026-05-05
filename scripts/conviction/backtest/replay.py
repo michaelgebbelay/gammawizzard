@@ -39,6 +39,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from canonical_config import CANONICAL_HASH as _CANONICAL_HASH  # noqa: E402
+
 # Allow direct import of the conviction modules.
 HERE = Path(__file__).resolve().parent
 CONVICTION_DIR = HERE.parent
@@ -1275,6 +1277,7 @@ def run_replay_multi(
     # When adding a new strategy knob, add it here AND update
     # verify_run_config_match.py CORE_FIELDS at the same time.
     canonical_config = {
+        "canonical_config_hash": _CANONICAL_HASH,
         "signal": (f"pathS_{PATH_S_CONFIG.get('direction', 'bullish')}_skew_flip"
                    if strategy == "pathS" else strategy),
         "skew_z_min": (PATH_S_CONFIG.get("abs_skew_z_min")
@@ -1896,6 +1899,7 @@ def run_replay(
 
     # Canonical config block — same schema as the single-position branch above.
     canonical_config = {
+        "canonical_config_hash": _CANONICAL_HASH,
         "signal": (f"pathS_{PATH_S_CONFIG.get('direction', 'bullish')}_skew_flip"
                    if strategy == "pathS" else strategy),
         "skew_z_min": (PATH_S_CONFIG.get("abs_skew_z_min")
