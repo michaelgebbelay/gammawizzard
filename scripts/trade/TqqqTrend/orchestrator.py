@@ -241,7 +241,14 @@ def run(args) -> int:
     pos = get_positions(c, acct_hash)
     cur = infer_current_state(pos)
     tgt = target_state(cur, sig["score"])
-    log.append(f"account ...{acct_hash[-6:]}  positions: TQQQ={pos.get('TQQQ',0):.0f}  "
+    log.append(f"account ...{acct_hash[-6:]}")
+    if pos:
+        log.append("all positions:")
+        for sym, qty in sorted(pos.items()):
+            log.append(f"  {sym:<6} qty={qty:.4f}")
+    else:
+        log.append("all positions: (none)")
+    log.append(f"strategy view: TQQQ={pos.get('TQQQ',0):.0f}  "
                f"BIL={pos.get('BIL',0):.0f}  current_state={cur}")
     log.append(f"target_state={tgt}")
 
