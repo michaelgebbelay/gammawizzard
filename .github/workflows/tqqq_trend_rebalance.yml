@@ -57,6 +57,8 @@ jobs:
           SCHWAB_APP_KEY: ${{ secrets.SCHWAB_APP_KEY }}
           SCHWAB_APP_SECRET: ${{ secrets.SCHWAB_APP_SECRET }}
           SCHWAB_TOKEN_JSON: ${{ secrets.SCHWAB_TOKEN_JSON }}
+          TQQQ_TS6_STATE_JSON: ${{ secrets.TQQQ_TS6_STATE_JSON }}
+          TQQQ_TS6_ENABLED: ${{ vars.TQQQ_TS6_ENABLED }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           SMTP_TO: ${{ secrets.SMTP_TO }}
@@ -80,7 +82,16 @@ jobs:
           path: out.log
           retention-days: 30
 
-      - name: Persist refreshed Schwab token
+      - name: Upload TS6 shadow state
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tqqq-trend-ts6-state
+          path: scripts/trade/TqqqTrend/state/ts6_overlay_state.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Persist refreshed Schwab token and TS6 shadow state
         if: always() && !cancelled()
         env:
           GH_TOKEN: ${{ secrets.GH_SECRET_TOKEN }}
@@ -88,6 +99,11 @@ jobs:
           if [ -f Token/schwab_token.json ] && [ -n "$GH_TOKEN" ]; then
             gh secret set SCHWAB_TOKEN_JSON \
               -b "$(cat Token/schwab_token.json)" \
+              -R "$GITHUB_REPOSITORY" || true
+          fi
+          if [ -f scripts/trade/TqqqTrend/state/ts6_overlay_state.json ] && [ -n "$GH_TOKEN" ]; then
+            gh secret set TQQQ_TS6_STATE_JSON \
+              -b "$(cat scripts/trade/TqqqTrend/state/ts6_overlay_state.json)" \
               -R "$GITHUB_REPOSITORY" || true
           fi
 

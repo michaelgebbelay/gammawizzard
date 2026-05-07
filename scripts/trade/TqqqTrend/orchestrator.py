@@ -35,7 +35,7 @@ if str(SCRIPTS_ROOT) not in sys.path:
 sys.path.insert(0, str(HERE))
 from place import (   # noqa: E402
     schwab, resolve_acct_hash, get_positions, get_quote,
-    compute_signal_today, target_state, infer_current_state,
+    compute_strategy_snapshot, infer_current_state,
     build_market_order,
 )
 
@@ -229,18 +229,28 @@ def run(args) -> int:
             print("\n".join(log))
             return 0
 
-    sig = compute_signal_today()
+    sig = compute_strategy_snapshot()
     log.append("")
     log.append(f"signal as_of_close={sig['as_of_close']}  "
                f"qqq=${sig['qqq_close']:.2f}  score={sig['score']}  "
                f"A={sig['A_close_gt_sma150']} B={sig['B_sma50_gt_sma200']} "
                f"C={sig['C_ret63_positive']}")
+    log.append(
+        f"baseline_state={sig['baseline_state']} baseline_target={sig['baseline_target_sleeve']} "
+        f"ts6_enabled={sig['overlay_enabled']} ts6_state={sig['overlay_state'].overlay_state} "
+        f"ts6_target={sig['overlay_target_sleeve']} effective_target={sig['target_sleeve']}"
+    )
+    log.append(f"ts6_state_path={sig['overlay_state_path']}")
+    if sig["overlay_warnings"]:
+        log.append("ts6_warnings:")
+        for warning in sig["overlay_warnings"]:
+            log.append(f"  - {warning}")
 
     c = schwab()
     acct_hash = resolve_acct_hash(c)
     pos = get_positions(c, acct_hash)
     cur = infer_current_state(pos)
-    tgt = target_state(cur, sig["score"])
+    tgt = sig["target_sleeve"]
     log.append(f"account ...{acct_hash[-6:]}")
     if pos:
         log.append("all positions:")

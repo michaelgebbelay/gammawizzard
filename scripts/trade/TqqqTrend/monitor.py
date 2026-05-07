@@ -40,7 +40,7 @@ if str(SCRIPTS_ROOT) not in sys.path:
 sys.path.insert(0, str(HERE))
 from place import (   # noqa: E402
     schwab, resolve_acct_hash, get_positions, get_quote,
-    compute_signal_today, target_state, infer_current_state,
+    compute_strategy_snapshot, infer_current_state,
 )
 
 
@@ -109,7 +109,7 @@ def get_qqq_bars(c, days: int = 400) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def cmd_daily(c, acct_hash: str) -> int:
-    sig = compute_signal_today()
+    sig = compute_strategy_snapshot()
     acct = get_account(c, acct_hash)
     positions = {(p.get("instrument") or {}).get("symbol", ""):
                  float(p.get("longQuantity", 0)) - float(p.get("shortQuantity", 0))
@@ -119,7 +119,7 @@ def cmd_daily(c, acct_hash: str) -> int:
     cash = float(bal.get("cashAvailableForTrading") or bal.get("cashBalance") or 0.0)
     total_value = float(bal.get("liquidationValue") or bal.get("equity") or 0.0)
     cur = infer_current_state(positions)
-    tgt = target_state(cur, sig["score"])
+    tgt = sig["target_sleeve"]
 
     held_sym = "TQQQ" if positions.get("TQQQ", 0) > 0 else ("BIL" if positions.get("BIL", 0) > 0 else None)
     held_qty = positions.get(held_sym, 0) if held_sym else 0
@@ -134,7 +134,14 @@ def cmd_daily(c, acct_hash: str) -> int:
     print(f"  A (close>SMA150) = {sig['A_close_gt_sma150']}")
     print(f"  B (SMA50>SMA200) = {sig['B_sma50_gt_sma200']}     ← entry gate")
     print(f"  C (ret63>0)      = {sig['C_ret63_positive']}")
-    print(f"  score = {sig['score']}    target_state = {tgt}")
+    print(f"  score = {sig['score']}    baseline_state = {sig['baseline_state']}")
+    print(f"  baseline_target = {sig['baseline_target_sleeve']}    effective_target = {tgt}")
+    print(f"  TS_6 enabled = {sig['overlay_enabled']}    shadow_state = {sig['overlay_state'].overlay_state}")
+    print(f"  TS_6 shadow_target = {sig['overlay_target_sleeve']}    peak = {sig['overlay_state'].qqq_peak_adj}")
+    if sig["overlay_warnings"]:
+        print("  TS_6 warnings:")
+        for warning in sig["overlay_warnings"]:
+            print(f"    - {warning}")
     print()
     print(f"Schwab account ...{acct_hash[-6:]}")
     print(f"  TQQQ qty: {positions.get('TQQQ', 0):>8,.0f}")
@@ -249,10 +256,12 @@ def cmd_health(c, acct_hash: str, since: str) -> int:
     if cur == "MIXED":
         issues.append("MIXED holdings — manual cleanup needed")
 
-    sig = compute_signal_today()
-    tgt = target_state(cur, sig["score"])
+    sig = compute_strategy_snapshot()
+    tgt = sig["target_sleeve"]
     if cur != tgt and cur not in ("CASH",):
         issues.append(f"DRIFT: held {cur} but signal target {tgt} (will flip at next cron)")
+    for warning in sig["overlay_warnings"]:
+        issues.append(f"TS_6 shadow warning: {warning}")
 
     # check for stuck working orders
     orders = get_orders(c, acct_hash, since)

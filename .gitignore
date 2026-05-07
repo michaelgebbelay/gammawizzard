@@ -14,3 +14,7 @@ scripts/conviction/tickers.yaml
 scripts/conviction/backtest/data/
 scripts/conviction/backtest/results/
 scripts/conviction/backtest/options/
+
+# TqqqTrend TS_6 shadow state — source of truth lives in the
+# GH secret TQQQ_TS6_STATE_JSON; this is only a per-run scratch file.
+scripts/trade/TqqqTrend/state/

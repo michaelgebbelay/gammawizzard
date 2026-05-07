@@ -39,6 +39,13 @@ SCRIPTS_ROOT = HERE.parent.parent   # repo/scripts
 if str(SCRIPTS_ROOT) not in sys.path:
     sys.path.append(str(SCRIPTS_ROOT))
 
+sys.path.insert(0, str(HERE))
+from overlay_state import (  # noqa: E402
+    compute_overlay_state,
+    effective_target_sleeve,
+    overlay_enabled_from_env,
+)
+
 # ---------------------------------------------------------------------------
 # Schwab client
 # ---------------------------------------------------------------------------
@@ -96,21 +103,57 @@ def get_quote(c, sym: str) -> dict:
 # Signal computation
 # ---------------------------------------------------------------------------
 
-def compute_signal_today() -> dict:
-    """Return the C1-HYST signal evaluated on the most recent QQQ close."""
+def load_adjusted_qqq_history() -> pd.Series:
+    """Adjusted QQQ close series used by the locked live signal and TS overlay."""
     import yfinance as yf
+
+    # Live C1-HYST uses adjusted QQQ closes. Any TS overlay must use this same
+    # adjusted series unless we intentionally switch basis and revalidate.
     qqq = yf.Ticker("QQQ").history(start="2024-06-01", auto_adjust=True)["Close"].astype(float)
     qqq.index = pd.to_datetime(qqq.index).tz_localize(None).normalize()
+    if qqq.empty:
+        raise RuntimeError("adjusted QQQ close history is unavailable")
+    return qqq
+
+
+def _baseline_state_series(df: pd.DataFrame) -> list[str | None]:
+    states: list[str | None] = []
+    state: str | None = None
+    for _, row in df.iterrows():
+        if any(pd.isna(row[col]) for col in ("sma50", "sma150", "sma200", "ret63")):
+            states.append(None)
+            continue
+        score = int(row["score"])
+        if state is None:
+            state = "RISKON" if score == 3 else "BIL"
+        elif score == 3:
+            state = "RISKON"
+        elif score <= 1:
+            state = "BIL"
+        states.append(state)
+    return states
+
+
+def compute_signal_today() -> dict:
+    """Return the locked C1-HYST signal evaluated on the most recent QQQ close."""
+    qqq = load_adjusted_qqq_history()
     df = pd.DataFrame({"close": qqq})
     df["sma50"]  = df["close"].rolling(50).mean()
     df["sma150"] = df["close"].rolling(150).mean()
     df["sma200"] = df["close"].rolling(200).mean()
     df["ret63"]  = df["close"].pct_change(63)
-    last = df.dropna().iloc[-1]
+    df["score"] = (
+        (df["close"] > df["sma150"]).astype(int)
+        + (df["sma50"] > df["sma200"]).astype(int)
+        + (df["ret63"] > 0).astype(int)
+    )
+    df["baseline_state"] = _baseline_state_series(df)
+    last = df.dropna(subset=["sma50", "sma150", "sma200", "ret63", "baseline_state"]).iloc[-1]
     A = bool(last["close"] > last["sma150"])
     B = bool(last["sma50"]  > last["sma200"])
     C = bool(last["ret63"]  > 0)
-    score = int(A) + int(B) + int(C)
+    score = int(last["score"])
+    baseline_state = str(last["baseline_state"])
     return {
         "as_of_close": df.index[-1].date().isoformat(),
         "qqq_close":   float(last["close"]),
@@ -122,6 +165,8 @@ def compute_signal_today() -> dict:
         "B_sma50_gt_sma200": B,
         "C_ret63_positive":  C,
         "score": score,
+        "baseline_state": baseline_state,
+        "baseline_target_sleeve": "TQQQ" if baseline_state == "RISKON" else "BIL",
     }
 
 
@@ -144,6 +189,30 @@ def infer_current_state(positions: dict[str, float]) -> str:
     if tqqq > 0 and bil > 0:
         return "MIXED"
     return "CASH"
+
+
+def compute_strategy_snapshot(*, persist_overlay_state: bool = True) -> dict:
+    """Compute the live baseline signal plus the shadow TS_6 overlay state."""
+    sig = compute_signal_today()
+    overlay, warnings, degraded, state_path = compute_overlay_state(
+        signal_date=sig["as_of_close"],
+        baseline_state=sig["baseline_state"],
+        adj_close=sig["qqq_close"],
+        enabled=overlay_enabled_from_env(default=False),
+        persist=persist_overlay_state,
+    )
+    overlay_target = overlay.target_sleeve()
+    effective_target = effective_target_sleeve(overlay)
+    return {
+        **sig,
+        "overlay_enabled": overlay.enabled,
+        "overlay_warnings": warnings,
+        "overlay_state_degraded": degraded,
+        "overlay_state_path": str(state_path),
+        "overlay_state": overlay,
+        "overlay_target_sleeve": overlay_target,
+        "target_sleeve": effective_target,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -180,7 +249,9 @@ def submit_order(c, acct_hash: str, payload: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 def cmd_status(args) -> int:
-    sig = compute_signal_today()
+    snap = compute_strategy_snapshot()
+    sig = snap
+    overlay = snap["overlay_state"]
     print(f"\n=== TQQQ Trend signal as of QQQ close {sig['as_of_close']} ===")
     print(f"  QQQ close:  ${sig['qqq_close']:.2f}")
     print(f"  SMA50:      ${sig['sma50']:.2f}")
@@ -191,6 +262,19 @@ def cmd_status(args) -> int:
     print(f"  B (SMA50 > SMA200)    : {sig['B_sma50_gt_sma200']}     ← load-bearing gate")
     print(f"  C (ret63 > 0)         : {sig['C_ret63_positive']}")
     print(f"  score = {sig['score']}")
+    print(f"  baseline_state        : {sig['baseline_state']}")
+    print(f"  baseline_target       : {sig['baseline_target_sleeve']}")
+    print(f"  TS_6 enabled          : {snap['overlay_enabled']}")
+    print(f"  TS_6 shadow state     : {overlay.overlay_state}")
+    print(f"  TS_6 shadow target    : {snap['overlay_target_sleeve']}")
+    print(f"  TS_6 peak adj close   : {overlay.qqq_peak_adj}")
+    print(f"  TS_6 stopped_on       : {overlay.stopped_on_date}")
+    print(f"  effective target      : {snap['target_sleeve']}")
+    print(f"  state file            : {snap['overlay_state_path']}")
+    if snap["overlay_warnings"]:
+        print("  TS_6 warnings         :")
+        for warning in snap["overlay_warnings"]:
+            print(f"    - {warning}")
     print()
     if args.no_schwab:
         print("(--no-schwab: skipped account lookup)")
@@ -199,13 +283,13 @@ def cmd_status(args) -> int:
     acct_hash = resolve_acct_hash(c)
     pos = get_positions(c, acct_hash)
     cur = infer_current_state(pos)
-    tgt = target_state(cur, sig["score"])
+    tgt = snap["target_sleeve"]
     print(f"=== Schwab account ===")
     print(f"  acct hash (last 6): ...{acct_hash[-6:]}")
     print(f"  TQQQ qty: {pos.get('TQQQ', 0):.0f}")
     print(f"  BIL  qty: {pos.get('BIL', 0):.0f}")
     print(f"  inferred current state: {cur}")
-    print(f"  target state per spec:  {tgt}")
+    print(f"  effective target state: {tgt}")
     if cur == tgt:
         print(f"  ACTION: HOLD (no flip needed)")
     elif cur == "CASH":
@@ -218,16 +302,19 @@ def cmd_status(args) -> int:
 def cmd_initial(args) -> int:
     if args.initial_usd <= 0:
         raise SystemExit("--initial-usd must be > 0")
-    sig = compute_signal_today()
-    target = target_state("CASH", sig["score"])
+    sig = compute_strategy_snapshot()
+    if sig["overlay_warnings"]:
+        print("\nTS_6 shadow warnings:")
+        for warning in sig["overlay_warnings"]:
+            print(f"  - {warning}")
+    target = sig["target_sleeve"]
     if target == "TQQQ":
         symbol = "TQQQ"
     else:
-        # score < 3 today: do NOT open a TQQQ position. Stay in cash (or BIL).
+        # Initial BIL parking still requires explicit opt-in.
         if not args.force_bil:
-            print(f"\nScore = {sig['score']} (need 3 to enter TQQQ). "
-                  f"Initial entry into TQQQ is NOT allowed by spec right now.")
-            print("To park initial $ in BIL until next score==3, re-run with --force-bil.")
+            print(f"\nEffective target is {target} as of {sig['as_of_close']} close.")
+            print("Initial entry into BIL still requires explicit --force-bil.")
             return 1
         symbol = "BIL"
 
@@ -273,15 +360,21 @@ def cmd_initial(args) -> int:
 
 
 def cmd_rebalance(args) -> int:
-    sig = compute_signal_today()
+    sig = compute_strategy_snapshot()
     c = schwab()
     acct_hash = resolve_acct_hash(c)
     pos = get_positions(c, acct_hash)
     cur = infer_current_state(pos)
-    tgt = target_state(cur, sig["score"])
+    tgt = sig["target_sleeve"]
 
     print(f"\n=== Rebalance check  (signal as of {sig['as_of_close']} close) ===")
-    print(f"  score = {sig['score']}    current={cur}    target={tgt}")
+    print(f"  score = {sig['score']}    baseline={sig['baseline_state']}    current={cur}    target={tgt}")
+    print(f"  TS_6 enabled={sig['overlay_enabled']}  shadow_state={sig['overlay_state'].overlay_state}  "
+          f"shadow_target={sig['overlay_target_sleeve']}")
+    if sig["overlay_warnings"]:
+        print("  TS_6 warnings:")
+        for warning in sig["overlay_warnings"]:
+            print(f"    - {warning}")
     if cur == tgt:
         print("  no flip needed.")
         return 0
