@@ -1,0 +1,49 @@
+name: DD reduction research sweep
+
+# Research-only sweep of DD-reduction tactics on the locked C1-HYST signal.
+# Tests 13 variants across exit logic, asset choice (TQQQ vs UPRO vs blend),
+# and overlay tactics (vol-target, VIX cuts, gap-day cuts).
+#
+# This is research; none of these variants are production-eligible without
+# going through the locked spec's replacement bar.
+#
+# Trigger: gh workflow run dd_reduction_research.yml
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            "pandas==3.0.2" \
+            "numpy==2.4.4" \
+            "yfinance==0.2.66"
+      - name: Run sweep
+        run: |
+          set -o pipefail
+          mkdir -p out
+          python scripts/conviction/backtest/dd_reduction_research.py \
+            --out-dir out 2>&1 | tee out/run.log
+      - name: Show summary
+        if: always()
+        run: |
+          if [ -f out/summary.txt ]; then
+            echo "=== summary.txt ==="
+            cat out/summary.txt
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dd_reduction_research
+          path: out/
+          retention-days: 14
