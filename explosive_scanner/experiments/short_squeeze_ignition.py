@@ -241,7 +241,7 @@ def main() -> None:
     summary_path = OUT / f"{args.out_prefix}_summary.csv"
     summary.to_csv(summary_path, index=False)
 
-    json_path = OUT / f"{args.out-prefix}_summary.json"
+    json_path = OUT / f"{args.out_prefix}_summary.json"
     json_payload = {
         "analysis_start": args.analysis_start,
         "analysis_end": args.analysis_end,
