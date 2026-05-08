@@ -101,6 +101,40 @@ def _write_report(
     out_path.write_text("\n".join(lines))
 
 
+def _empty_variant_result(name: str, candidates: pd.DataFrame) -> dict[str, object]:
+    empty_curve = curve_metrics(pd.Series(dtype=float))
+    return {
+        "variant": name,
+        "candidates": candidates,
+        "raw_ledger": pd.DataFrame(),
+        "baseline_ledger": pd.DataFrame(),
+        "stress_150_ledger": pd.DataFrame(),
+        "stress_200_ledger": pd.DataFrame(),
+        "portfolio": pd.DataFrame(),
+        "accepted": pd.DataFrame(),
+        "baseline_metrics": dict(empty_curve),
+        "stress_150_metrics": dict(empty_curve),
+        "stress_200_metrics": dict(empty_curve),
+        "trade_metrics": {
+            "n_trades": 0,
+            "avg_return": float("nan"),
+            "median_return": float("nan"),
+            "win_rate": float("nan"),
+            "avg_winner": float("nan"),
+            "avg_loser": float("nan"),
+            "payoff_ratio": float("nan"),
+        },
+        "top5_metrics": {
+            "return_ex_top_winners": float("nan"),
+            "top_winner_contribution": float("nan"),
+        },
+        "monthly_corr_to_path_s": float("nan"),
+        "sleeve_20_metrics": dict(empty_curve),
+        "sleeve_30_metrics": dict(empty_curve),
+        "sleeve_50_metrics": dict(empty_curve),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--analysis-start", default="2022-05-02")
@@ -165,16 +199,20 @@ def main() -> None:
 
     for name in variant_order:
         print(f"\n=== {name} ===", flush=True)
-        result = evaluate_variant(
-            name,
-            candidates.get(name, pd.DataFrame()),
-            bars,
-            trading_dates,
-            path_s,
-            hold_days=args.hold_days,
-            max_positions=args.max_positions,
-            max_exit_date=path_s["date"].max(),
-        )
+        variant_candidates = candidates.get(name, pd.DataFrame())
+        if variant_candidates.empty:
+            result = _empty_variant_result(name, variant_candidates)
+        else:
+            result = evaluate_variant(
+                name,
+                variant_candidates,
+                bars,
+                trading_dates,
+                path_s,
+                hold_days=args.hold_days,
+                max_positions=args.max_positions,
+                max_exit_date=path_s["date"].max(),
+            )
         results[name] = result
         summary_rows.append(variant_summary_row(result, path_s_metrics))
         accepted = result["accepted"]
@@ -203,7 +241,7 @@ def main() -> None:
     summary_path = OUT / f"{args.out_prefix}_summary.csv"
     summary.to_csv(summary_path, index=False)
 
-    json_path = OUT / f"{args.out_prefix}_summary.json"
+    json_path = OUT / f"{args.out-prefix}_summary.json"
     json_payload = {
         "analysis_start": args.analysis_start,
         "analysis_end": args.analysis_end,
