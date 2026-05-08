@@ -45,6 +45,20 @@ def test_settlement_dates_use_last_trading_day_before_15th_and_month_end():
     assert got == [pd.Timestamp("2021-05-14"), pd.Timestamp("2021-05-28")]
 
 
+def test_settlement_dates_skip_terminal_partial_month_end():
+    trading_dates = pd.to_datetime(
+        [
+            "2026-04-01",
+            "2026-04-02",
+            "2026-04-15",
+            "2026-04-16",
+            "2026-04-29",
+        ]
+    )
+    got = settlement_dates_from_calendar(trading_dates)
+    assert got == [pd.Timestamp("2026-04-15")]
+
+
 def test_attach_short_interest_uses_availability_date_not_settlement_date():
     trading_dates = pd.to_datetime(
         [
@@ -125,4 +139,3 @@ def test_catalyst_match_detects_user_requested_terms():
     assert catalyst_match({"title": "Company raises outlook after earnings beat", "body": "", "channels": [], "tags": []})
     assert catalyst_match({"title": "", "body": "Strategic review follows debt refinancing news", "channels": [], "tags": []})
     assert not catalyst_match({"title": "Quiet technical bounce", "body": "No obvious catalyst here", "channels": [], "tags": []})
-
