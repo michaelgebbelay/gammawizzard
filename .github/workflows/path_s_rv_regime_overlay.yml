@@ -246,7 +246,11 @@ jobs:
           mkdir -p scripts/conviction/backtest/results
           aws s3 sync s3://gamma-sim-cache/conviction-backtest-trade-logs/ scripts/conviction/backtest/results/ \
             --no-progress || echo "[trade-logs] none staged"
-          ls -lh scripts/conviction/backtest/results/${BASELINE_RUN}/daily_equity.csv
+          if [ -f "scripts/conviction/backtest/results/${BASELINE_RUN}/daily_equity.csv" ]; then
+            ls -lh "scripts/conviction/backtest/results/${BASELINE_RUN}/daily_equity.csv"
+          else
+            echo "[trade-logs] baseline cache ${BASELINE_RUN} not present after sync"
+          fi
 
       - uses: actions/setup-python@v5
         with:
@@ -355,7 +359,11 @@ jobs:
           mkdir -p scripts/conviction/backtest/results
           aws s3 sync s3://gamma-sim-cache/conviction-backtest-trade-logs/ scripts/conviction/backtest/results/ \
             --no-progress || echo "[trade-logs] none staged"
-          ls -lh scripts/conviction/backtest/results/${BASELINE_RUN}/daily_equity.csv
+          if [ -f "scripts/conviction/backtest/results/${BASELINE_RUN}/daily_equity.csv" ]; then
+            ls -lh "scripts/conviction/backtest/results/${BASELINE_RUN}/daily_equity.csv"
+          else
+            echo "[trade-logs] baseline cache ${BASELINE_RUN} not present after sync"
+          fi
 
       - uses: actions/setup-python@v5
         with:

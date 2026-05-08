@@ -1,0 +1,71 @@
+{
+  "run_name": "2026-05-05_replay_1460d_massive_n1_baseline_repro",
+  "window": {
+    "start": "2022-05-02",
+    "end": "2026-04-29",
+    "n_sessions": 1002
+  },
+  "config": {
+    "canonical_config_hash": "505bfb240fc9937685bda986993127282265a635f89fa2108c18cc0ef0cb0c91",
+    "signal": "pathS_bullish_skew_flip",
+    "skew_z_min": 3.0,
+    "skew_z_persistence_days": 1,
+    "universe_top_n": 2000,
+    "ignore_themes": true,
+    "dynamic_themes": false,
+    "positions": 1,
+    "regime_gate": "spy",
+    "exit_rule": "trailing_pct",
+    "trailing_pct": 20.0,
+    "max_hold_days": 90,
+    "signal_decay_z": null,
+    "signal_decay_days": 2,
+    "days": 1460,
+    "window_start": "2022-05-02",
+    "window_end": "2026-04-29",
+    "cost_bps": 15.0,
+    "initial_capital": 100000.0,
+    "earnings_blackout_before": null,
+    "earnings_blackout_after": null,
+    "earnings_blackout_mode": null,
+    "speculative_only": false,
+    "trend_floor_pct_above_200d": null,
+    "trend_floor_min_ret_60d": null,
+    "displacement_enabled": false,
+    "displacement_min_hold": null,
+    "displacement_max_return": null,
+    "displacement_z_min": null,
+    "displacement_max_swaps_per_day": null
+  },
+  "params": {
+    "slippage_bps": 15.0,
+    "initial_capital": 100000.0
+  },
+  "performance": {
+    "final_equity": 721330.82,
+    "total_return": 6.21331,
+    "cagr": 0.64368,
+    "max_drawdown": -0.29625,
+    "sharpe": 1.323
+  },
+  "activity": {
+    "n_trades": 17,
+    "avg_holding_days": 60.9,
+    "pct_time_invested": 0.7086,
+    "same_theme_rotations": 0,
+    "cross_theme_rotations": 0,
+    "displacements": 0
+  },
+  "benchmarks": {
+    "SPY": {
+      "total_return": 0.7168,
+      "cagr": 0.1456,
+      "max_drawdown": -0.18999
+    },
+    "QQQ": {
+      "total_return": 1.07727,
+      "cagr": 0.20185,
+      "max_drawdown": -0.22883
+    }
+  }
+}
