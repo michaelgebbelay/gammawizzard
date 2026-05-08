@@ -9,6 +9,13 @@ name: Short Squeeze Ignition
 #   Run manually from Actions and choose the target branch.
 
 on:
+  push:
+    branches:
+      - codex/short-squeeze-ignition-gha
+    paths:
+      - .github/workflows/short_squeeze_ignition.yml
+      - explosive_scanner/**
+      - scripts/conviction/backtest/results/2026-05-05_replay_1460d_massive_n1_baseline_repro/daily_equity.csv
   workflow_dispatch:
     inputs:
       analysis_start:
