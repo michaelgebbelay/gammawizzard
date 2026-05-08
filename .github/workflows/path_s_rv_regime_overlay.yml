@@ -15,6 +15,13 @@ name: Path-S RV Regime Overlay
 #     -f variants=RV_HYST_12_20,RV_SCALE_10
 
 "on":
+  push:
+    branches:
+      - codex/path-s-rv-regime-overlay
+    paths:
+      - .github/workflows/path_s_rv_regime_overlay.yml
+      - scripts/conviction/backtest/rv_regime_overlay.py
+      - scripts/conviction/backtest/data/spx_intraday_rv.csv
   workflow_dispatch:
     inputs:
       mode:
