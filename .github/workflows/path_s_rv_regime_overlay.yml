@@ -1,0 +1,172 @@
+name: Path-S RV Regime Overlay
+
+# Heavy exact-mode runs belong in GitHub Actions, not on the laptop.
+#
+# Trigger examples:
+#   gh workflow run path_s_rv_regime_overlay.yml \
+#     -f mode=exact \
+#     -f days=1460 \
+#     -f end_date=2026-04-29 \
+#     -f variants=RV_HARD_10,RV_HYST_10_12,RV_HYST_10_15,RV_HYST_12_20,RV_RATIO_20,RV_SCALE_10
+#
+#   gh workflow run path_s_rv_regime_overlay.yml \
+#     -f mode=fast \
+#     -f baseline_run=2026-05-05_replay_1460d_massive_n1_baseline_repro \
+#     -f variants=RV_HYST_12_20,RV_SCALE_10
+
+"on":
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "fast = overlay on saved Path S path, exact = rerun replay with binary RV gates"
+        type: choice
+        options:
+          - fast
+          - exact
+        default: exact
+      baseline_run:
+        description: "Existing Path S baseline run dir (fast mode only)"
+        type: string
+        default: "2026-05-05_replay_1460d_massive_n1_baseline_repro"
+      days:
+        description: "Replay lookback in calendar days (exact mode)"
+        type: string
+        default: "1460"
+      end_date:
+        description: "Replay end date (YYYY-MM-DD, exact mode)"
+        type: string
+        default: "2026-04-29"
+      variants:
+        description: "Comma-separated variants"
+        type: string
+        default: "RV_HARD_10,RV_HYST_10_12,RV_HYST_10_15,RV_HYST_12_20,RV_RATIO_20,RV_SCALE_10"
+      study_name:
+        description: "Optional study suffix; blank auto-generates a unique one"
+        type: string
+        default: ""
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      MODE: ${{ github.event.inputs.mode || 'exact' }}
+      BASELINE_RUN: ${{ github.event.inputs.baseline_run || '2026-05-05_replay_1460d_massive_n1_baseline_repro' }}
+      DAYS: ${{ github.event.inputs.days || '1460' }}
+      END_DATE: ${{ github.event.inputs.end_date || '2026-04-29' }}
+      VARIANTS: ${{ github.event.inputs.variants || 'RV_HARD_10,RV_HYST_10_12,RV_HYST_10_15,RV_HYST_12_20,RV_RATIO_20,RV_SCALE_10' }}
+      STUDY_NAME_INPUT: ${{ github.event.inputs.study_name || '' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Sync backtest data from S3
+        run: |
+          mkdir -p scripts/conviction/backtest/data
+          aws s3 sync s3://gamma-sim-cache/conviction-backtest-data/ scripts/conviction/backtest/data/ \
+            --exclude "day_aggs_raw/*" --no-progress
+          ls -lh scripts/conviction/backtest/data/
+
+      - name: Sync Path S result cache from S3
+        run: |
+          mkdir -p scripts/conviction/backtest/results
+          aws s3 sync s3://gamma-sim-cache/conviction-backtest-trade-logs/ scripts/conviction/backtest/results/ \
+            --no-progress || echo "[trade-logs] none staged"
+          ls -lh scripts/conviction/backtest/results/${BASELINE_RUN}/daily_equity.csv || true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            "pandas==3.0.2" \
+            "numpy==2.4.4" \
+            "pyarrow==24.0.0" \
+            "scipy==1.17.1" \
+            "boto3==1.43.1" \
+            "pyyaml==6.0.3" \
+            "requests==2.33.1" \
+            "schwab-py==1.5.1"
+
+      - name: Resolve study name
+        id: names
+        run: |
+          if [ -n "$STUDY_NAME_INPUT" ]; then
+            STUDY_NAME="$STUDY_NAME_INPUT"
+          else
+            STUDY_NAME="rv_regime_overlay_${MODE}_${GITHUB_RUN_ID}"
+          fi
+          echo "study_name=$STUDY_NAME" >> "$GITHUB_OUTPUT"
+          echo "Using study name: $STUDY_NAME"
+
+      - name: Run RV regime overlay
+        run: |
+          set -o pipefail
+          mkdir -p out
+          LOG="out/path_s_rv_regime_overlay.log"
+          CMD=(
+            python scripts/conviction/backtest/rv_regime_overlay.py
+            --mode "$MODE"
+            --rv-file scripts/conviction/backtest/data/spx_intraday_rv.csv
+            --variants "$VARIANTS"
+            --study-name "${{ steps.names.outputs.study_name }}"
+          )
+          if [ "$MODE" = "fast" ]; then
+            CMD+=(--baseline-run "$BASELINE_RUN")
+          else
+            CMD+=(--days "$DAYS" --end-date "$END_DATE")
+          fi
+          "${CMD[@]}" 2>&1 | tee "$LOG"
+
+      - name: Collect outputs
+        if: always()
+        run: |
+          mkdir -p out/study out/replay_runs
+          STUDY_DIR=$(find scripts/conviction/backtest/results -maxdepth 1 -type d -name "*_${{ steps.names.outputs.study_name }}" | sort | tail -n 1)
+          if [ -n "$STUDY_DIR" ] && [ -d "$STUDY_DIR" ]; then
+            cp -r "$STUDY_DIR" out/study/
+            export STUDY_DIR
+          fi
+          if [ -n "$STUDY_DIR" ] && [ -f "$STUDY_DIR/run_map.json" ]; then
+            python - <<'PY'
+            import json
+            import os
+            import shutil
+            from pathlib import Path
+
+            study_dir = Path(os.environ["STUDY_DIR"])
+            out_dir = Path("out/replay_runs")
+            run_map = json.loads((study_dir / "run_map.json").read_text())
+            results_root = Path("scripts/conviction/backtest/results")
+            for run_name in sorted(set(run_map.values())):
+              run_dir = results_root / run_name
+              if run_dir.is_dir():
+                target = out_dir / run_dir.name
+                if target.exists():
+                  shutil.rmtree(target)
+                shutil.copytree(run_dir, target)
+            PY
+          fi
+          if [ -n "$STUDY_DIR" ] && [ -f "$STUDY_DIR/report.md" ]; then
+            cat "$STUDY_DIR/report.md"
+          fi
+          if [ -n "$STUDY_DIR" ] && [ -f "$STUDY_DIR/variant_summary.csv" ]; then
+            cat "$STUDY_DIR/variant_summary.csv"
+          fi
+          ls -R out || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: path_s_rv_regime_overlay_${{ steps.names.outputs.study_name }}
+          path: out/
+          retention-days: 14
