@@ -314,7 +314,7 @@ def run_path_s_variant(
 ) -> dict:
     import replay
 
-    return replay.run_replay(
+    result = replay.run_replay(
         end_date=pd.Timestamp(end_date),
         lookback_days=days,
         source="massive",
@@ -348,6 +348,15 @@ def run_path_s_variant(
         displacement_max_return=0.0,
         displacement_z_min=3.0,
     )
+    if "run_name" not in result:
+        summary = result.get("summary")
+        if isinstance(summary, dict) and summary.get("run_name"):
+            result["run_name"] = summary["run_name"]
+        elif result.get("out_dir") is not None:
+            result["run_name"] = Path(result["out_dir"]).name
+        else:
+            raise KeyError("run_name")
+    return result
 
 
 def load_run_artifacts(run_name: str) -> tuple[Path, dict, pd.DataFrame, pd.DataFrame]:
@@ -661,7 +670,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--baseline-run",
         default=DEFAULT_BASELINE_RUN,
-        help="Existing canonical Path S run directory name under results/ (fast mode)",
+        help="Existing canonical Path S run directory name under results/ (fast mode, and exact mode baseline reuse)",
     )
     parser.add_argument("--days", type=int, default=DEFAULT_DAYS, help="Replay lookback in calendar days (exact mode)")
     parser.add_argument("--end-date", default=DEFAULT_END_DATE, help="Replay end date (exact mode)")
@@ -669,6 +678,11 @@ def parse_args() -> argparse.Namespace:
         "--variants",
         default=",".join([variant.name for variant in BINARY_VARIANTS] + [SCALE_VARIANT_NAME]),
         help="Comma-separated variant list",
+    )
+    parser.add_argument(
+        "--rerun-baseline",
+        action="store_true",
+        help="In exact mode, rebuild the baseline replay instead of reusing --baseline-run when it exists",
     )
     parser.add_argument("--study-name", default=None, help="Override comparison output directory suffix")
     return parser.parse_args()
@@ -702,20 +716,24 @@ def main() -> int:
         spy_lookup = build_regime_lookup("spy")
         state_calendar = build_state_calendar(rv_df, spy_lookup)
         skew_lookup = prepare_path_s_config()
-        baseline_run = run_path_s_variant(
-            regime_lookup=spy_lookup,
-            regime_gate="spy",
-            run_suffix=f"{study_slug}_baseline",
-            end_date=args.end_date,
-            days=args.days,
-            skew_lookup=skew_lookup,
-        )
+        baseline_run_name = args.baseline_run
+        baseline_cached = (RESULTS_DIR / baseline_run_name / "summary.json").exists()
+        if args.rerun_baseline or not baseline_cached:
+            baseline_run = run_path_s_variant(
+                regime_lookup=spy_lookup,
+                regime_gate="spy",
+                run_suffix=f"{study_slug}_baseline",
+                end_date=args.end_date,
+                days=args.days,
+                skew_lookup=skew_lookup,
+            )
+            baseline_run_name = baseline_run["run_name"]
         baseline_run_dir, baseline_summary_json, baseline_daily, _baseline_trades = load_run_artifacts(
-            baseline_run["run_name"]
+            baseline_run_name
         )
         baseline_dates = set(baseline_daily["date"])
         state_calendar = state_calendar[state_calendar["date"].isin(baseline_dates)].copy().reset_index(drop=True)
-        run_map = {"PATH_S_ALONE": baseline_run["run_name"]}
+        run_map = {"PATH_S_ALONE": baseline_run_name}
 
     state_calendar.to_csv(study_dir / "rv_state_daily.csv", index=False)
     (study_dir / "rv_meta.json").write_text(json.dumps(rv_meta, indent=2))
