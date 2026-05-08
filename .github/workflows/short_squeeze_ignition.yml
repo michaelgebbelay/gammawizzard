@@ -52,7 +52,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 240
     env:
+      ANALYSIS_START: ${{ github.event.inputs.analysis_start || '2022-05-02' }}
+      ANALYSIS_END: ${{ github.event.inputs.analysis_end || '2026-04-29' }}
+      HOLD_DAYS: ${{ github.event.inputs.hold_days || '10' }}
+      MAX_POSITIONS: ${{ github.event.inputs.max_positions || '2' }}
       MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}
+      OUT_PREFIX: ${{ github.event.inputs.out_prefix || 'gha_short_squeeze_ignition' }}
+      REFRESH_SHORT_INTEREST: ${{ github.event.inputs.refresh_short_interest || 'false' }}
+      SKIP_NEWS: ${{ github.event.inputs.skip_news || 'false' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -95,31 +102,31 @@ jobs:
           set -o pipefail
           mkdir -p out
           EXTRA_ARGS=()
-          if [ "${{ inputs.refresh_short_interest }}" = "true" ]; then
+          if [ "$REFRESH_SHORT_INTEREST" = "true" ]; then
             EXTRA_ARGS+=(--refresh-short-interest)
           fi
-          if [ "${{ inputs.skip_news }}" = "true" ]; then
+          if [ "$SKIP_NEWS" = "true" ]; then
             EXTRA_ARGS+=(--skip-news)
           fi
           python explosive_scanner/experiments/short_squeeze_ignition.py \
-            --analysis-start "${{ inputs.analysis_start }}" \
-            --analysis-end "${{ inputs.analysis_end }}" \
-            --hold-days "${{ inputs.hold_days }}" \
-            --max-positions "${{ inputs.max_positions }}" \
-            --out-prefix "${{ inputs.out_prefix }}" \
+            --analysis-start "$ANALYSIS_START" \
+            --analysis-end "$ANALYSIS_END" \
+            --hold-days "$HOLD_DAYS" \
+            --max-positions "$MAX_POSITIONS" \
+            --out-prefix "$OUT_PREFIX" \
             "${EXTRA_ARGS[@]}" 2>&1 | tee out/short_squeeze_ignition.log
 
       - name: Collect outputs
         if: always()
         run: |
           mkdir -p out/reports
-          cp explosive_scanner/reports/${{ inputs.out_prefix }}* out/reports/ || true
+          cp explosive_scanner/reports/${OUT_PREFIX}* out/reports/ || true
           ls -R out || true
-          if [ -f out/reports/${{ inputs.out_prefix }}_report.md ]; then
-            cat out/reports/${{ inputs.out_prefix }}_report.md
+          if [ -f out/reports/${OUT_PREFIX}_report.md ]; then
+            cat out/reports/${OUT_PREFIX}_report.md
           fi
-          if [ -f out/reports/${{ inputs.out_prefix }}_summary.csv ]; then
-            cat out/reports/${{ inputs.out_prefix }}_summary.csv
+          if [ -f out/reports/${OUT_PREFIX}_summary.csv ]; then
+            cat out/reports/${OUT_PREFIX}_summary.csv
           fi
 
       - uses: actions/upload-artifact@v4
