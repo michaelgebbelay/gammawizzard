@@ -1,0 +1,123 @@
+name: Short Squeeze Ignition
+
+# Runs the five short-squeeze ignition variants on a GitHub-hosted runner.
+# Pulls staged parquet data from S3, uses public FINRA short-interest files,
+# and optionally uses Massive Benzinga news if the MASSIVE_API_KEY secret is
+# configured. Uploads the generated reports and per-variant ledgers.
+#
+# Trigger:
+#   Run manually from Actions and choose the target branch.
+
+on:
+  workflow_dispatch:
+    inputs:
+      analysis_start:
+        description: "Analysis start date (YYYY-MM-DD)"
+        type: string
+        default: "2022-05-02"
+      analysis_end:
+        description: "Analysis end date (YYYY-MM-DD)"
+        type: string
+        default: "2026-04-29"
+      hold_days:
+        description: "Fixed holding period in trading days"
+        type: string
+        default: "10"
+      max_positions:
+        description: "Maximum concurrent positions"
+        type: string
+        default: "2"
+      refresh_short_interest:
+        description: "Refresh FINRA files instead of reusing any local cache"
+        type: boolean
+        default: false
+      skip_news:
+        description: "Skip Benzinga catalyst filtering"
+        type: boolean
+        default: false
+      out_prefix:
+        description: "Report/output filename prefix"
+        type: string
+        default: "gha_short_squeeze_ignition"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    env:
+      MASSIVE_API_KEY: ${{ secrets.MASSIVE_API_KEY }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Sync backtest data from S3
+        run: |
+          mkdir -p scripts/conviction/backtest/data
+          aws s3 sync s3://gamma-sim-cache/conviction-backtest-data/ scripts/conviction/backtest/data/ \
+            --exclude "day_aggs_raw/*" --no-progress
+          ls -lh scripts/conviction/backtest/data/
+
+      - name: Sync Path S baseline results from S3 (optional)
+        run: |
+          mkdir -p scripts/conviction/backtest/results
+          aws s3 sync s3://gamma-sim-cache/conviction-backtest-trade-logs/ scripts/conviction/backtest/results/ \
+            --no-progress || echo "[trade-logs] none staged"
+          ls -lh scripts/conviction/backtest/results/2026-05-05_replay_1460d_massive_n1_baseline_repro/daily_equity.csv || true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            "pandas==3.0.2" \
+            "numpy==2.4.4" \
+            "pyarrow==24.0.0" \
+            "requests==2.33.1"
+
+      - name: Run short-squeeze ignition study
+        run: |
+          set -o pipefail
+          mkdir -p out
+          EXTRA_ARGS=()
+          if [ "${{ inputs.refresh_short_interest }}" = "true" ]; then
+            EXTRA_ARGS+=(--refresh-short-interest)
+          fi
+          if [ "${{ inputs.skip_news }}" = "true" ]; then
+            EXTRA_ARGS+=(--skip-news)
+          fi
+          python explosive_scanner/experiments/short_squeeze_ignition.py \
+            --analysis-start "${{ inputs.analysis_start }}" \
+            --analysis-end "${{ inputs.analysis_end }}" \
+            --hold-days "${{ inputs.hold_days }}" \
+            --max-positions "${{ inputs.max_positions }}" \
+            --out-prefix "${{ inputs.out_prefix }}" \
+            "${EXTRA_ARGS[@]}" 2>&1 | tee out/short_squeeze_ignition.log
+
+      - name: Collect outputs
+        if: always()
+        run: |
+          mkdir -p out/reports
+          cp explosive_scanner/reports/${{ inputs.out_prefix }}* out/reports/ || true
+          ls -R out || true
+          if [ -f out/reports/${{ inputs.out_prefix }}_report.md ]; then
+            cat out/reports/${{ inputs.out_prefix }}_report.md
+          fi
+          if [ -f out/reports/${{ inputs.out_prefix }}_summary.csv ]; then
+            cat out/reports/${{ inputs.out_prefix }}_summary.csv
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: short_squeeze_ignition
+          path: out/
+          retention-days: 14
