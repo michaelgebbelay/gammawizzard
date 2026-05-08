@@ -23,6 +23,18 @@ from typing import Iterable, Optional
 import numpy as np
 import pandas as pd
 import requests
+from pandas.tseries.holiday import (
+    AbstractHolidayCalendar,
+    GoodFriday,
+    Holiday,
+    USLaborDay,
+    USMartinLutherKingJr,
+    USMemorialDay,
+    USPresidentsDay,
+    USThanksgivingDay,
+    nearest_workday,
+)
+from pandas.tseries.offsets import CustomBusinessDay
 
 from explosive_scanner.features import build_features
 from explosive_scanner.io import load_massive_bars
@@ -64,6 +76,30 @@ CATALYST_REGEX = re.compile(
     r")",
     re.IGNORECASE,
 )
+
+
+class _NYSEHolidayCalendar(AbstractHolidayCalendar):
+    rules = [
+        Holiday("NewYearsDay", month=1, day=1, observance=nearest_workday),
+        USMartinLutherKingJr,
+        USPresidentsDay,
+        GoodFriday,
+        USMemorialDay,
+        Holiday(
+            "JuneteenthNationalIndependenceDay",
+            month=6,
+            day=19,
+            start_date="2021-06-19",
+            observance=nearest_workday,
+        ),
+        Holiday("IndependenceDay", month=7, day=4, observance=nearest_workday),
+        USLaborDay,
+        USThanksgivingDay,
+        Holiday("ChristmasDay", month=12, day=25, observance=nearest_workday),
+    ]
+
+
+NYSE_BDAY = CustomBusinessDay(calendar=_NYSEHolidayCalendar())
 
 
 @dataclass(frozen=True)
@@ -200,7 +236,15 @@ def settlement_dates_from_calendar(
         mid = in_month[in_month.day <= 15]
         if len(mid) > 0:
             settlements.append(pd.Timestamp(mid.max()).normalize())
-        settlements.append(pd.Timestamp(in_month.max()).normalize())
+        month_end = pd.Timestamp(in_month.max()).normalize()
+        # Only infer a month-end settlement once we have seen at least one
+        # trading day in the following month. Otherwise a truncated terminal
+        # month can fabricate a bogus settlement file like shrt20260429.csv.
+        has_following_month = bool(
+            ((all_dates.year > period.year) | ((all_dates.year == period.year) & (all_dates.month > period.month))).any()
+        )
+        if has_following_month or (month_end + NYSE_BDAY).month != month_end.month:
+            settlements.append(month_end)
     out = pd.DatetimeIndex(settlements).unique().sort_values()
     if start_date is not None:
         out = out[out >= pd.Timestamp(start_date).normalize()]
@@ -246,6 +290,9 @@ def load_finra_short_interest(
         if refresh or not raw_path.exists():
             url = FINRA_URL_TEMPLATE.format(stamp=stamp)
             resp = session.get(url, timeout=60)
+            if resp.status_code == 403:
+                print(f"[finra] skipping unavailable file shrt{stamp}.csv", flush=True)
+                continue
             resp.raise_for_status()
             raw_path.write_bytes(resp.content)
             time.sleep(0.02)
