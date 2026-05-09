@@ -1,0 +1,224 @@
+name: Path-S Universe Variants
+
+"on":
+  push:
+    branches:
+      - codex/path-s-universe-variants
+    paths:
+      - .github/workflows/path_s_universe_variants.yml
+      - scripts/conviction/backtest/path_s_universe_variants.py
+      - scripts/conviction/backtest/aggregate_path_s_universe_variants.py
+  pull_request:
+    branches:
+      - main
+    paths:
+      - .github/workflows/path_s_universe_variants.yml
+      - scripts/conviction/backtest/path_s_universe_variants.py
+      - scripts/conviction/backtest/aggregate_path_s_universe_variants.py
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "Replay lookback in calendar days"
+        type: string
+        default: "1825"
+      end_date:
+        description: "Replay end date (YYYY-MM-DD)"
+        type: string
+        default: "2026-04-29"
+      variants:
+        description: "Comma-separated variants"
+        type: string
+        default: "CORE_2000,SP500_OR_LARGECAP500_PROXY,NDX100,R1000_PROXY,R2000_PROXY,OPTION_LIQ_1000,OPTION_LIQ_750,OPTION_LIQ_500,DYNAMIC_SECTOR_TOP4,DYNAMIC_SECTOR_TOP6"
+      positions:
+        description: "Comma-separated position modes"
+        type: string
+        default: "1,2"
+      study_name:
+        description: "Optional study suffix; blank auto-generates"
+        type: string
+        default: ""
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.build.outputs.matrix }}
+      study_name: ${{ steps.build.outputs.study_name }}
+    env:
+      VARIANTS_INPUT: ${{ github.event.inputs.variants || 'CORE_2000,SP500_OR_LARGECAP500_PROXY,NDX100,R1000_PROXY,R2000_PROXY,OPTION_LIQ_1000,OPTION_LIQ_750,OPTION_LIQ_500,DYNAMIC_SECTOR_TOP4,DYNAMIC_SECTOR_TOP6' }}
+      POSITIONS_INPUT: ${{ github.event.inputs.positions || '1,2' }}
+      STUDY_NAME_INPUT: ${{ github.event.inputs.study_name || '' }}
+    steps:
+      - id: build
+        run: |
+          python - <<'PY'
+          import json
+          import os
+
+          valid_variants = [
+              "CORE_2000",
+              "SP500_OR_LARGECAP500_PROXY",
+              "NDX100",
+              "R1000_PROXY",
+              "R2000_PROXY",
+              "OPTION_LIQ_1000",
+              "OPTION_LIQ_750",
+              "OPTION_LIQ_500",
+              "DYNAMIC_SECTOR_TOP4",
+              "DYNAMIC_SECTOR_TOP6",
+          ]
+          requested_variants = [
+              item.strip()
+              for item in os.environ["VARIANTS_INPUT"].split(",")
+              if item.strip()
+          ]
+          if not requested_variants:
+              requested_variants = valid_variants
+          invalid = sorted(set(requested_variants) - set(valid_variants))
+          if invalid:
+              raise SystemExit("Unknown variants: " + ", ".join(invalid))
+          requested_positions = [
+              int(item.strip())
+              for item in os.environ["POSITIONS_INPUT"].split(",")
+              if item.strip()
+          ]
+          if not requested_positions:
+              requested_positions = [1, 2]
+          invalid_pos = sorted(set(requested_positions) - {1, 2})
+          if invalid_pos:
+              raise SystemExit("Invalid positions: " + ", ".join(map(str, invalid_pos)))
+          include = []
+          for variant in requested_variants:
+              for pos in requested_positions:
+                  include.append({"variant": variant, "positions": pos})
+          study_name = os.environ["STUDY_NAME_INPUT"].strip() or f"path_s_universe_variants_{os.environ['GITHUB_RUN_ID']}"
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"matrix={json.dumps({'include': include})}\n")
+              fh.write(f"study_name={study_name}\n")
+          print(json.dumps({"include": include}, indent=2))
+          print(f"study_name={study_name}")
+          PY
+
+  run:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    env:
+      DAYS: ${{ github.event.inputs.days || '1825' }}
+      END_DATE: ${{ github.event.inputs.end_date || '2026-04-29' }}
+      STUDY_NAME: ${{ needs.prepare.outputs.study_name }}
+    name: "${{ matrix.variant }}_p${{ matrix.positions }}"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Sync backtest data from S3
+        run: |
+          mkdir -p scripts/conviction/backtest/data
+          aws s3 sync s3://gamma-sim-cache/conviction-backtest-data/ scripts/conviction/backtest/data/ \
+            --exclude "day_aggs_raw/*" --no-progress
+          ls -lh scripts/conviction/backtest/data/
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            "pandas==3.0.2" \
+            "numpy==2.4.4" \
+            "pyarrow==24.0.0" \
+            "scipy==1.17.1" \
+            "boto3==1.43.1" \
+            "pyyaml==6.0.3" \
+            "requests==2.33.1" \
+            "schwab-py==1.5.1" \
+            "yfinance==0.2.66"
+
+      - name: Run variant
+        run: |
+          set -o pipefail
+          mkdir -p out/package
+          LOG="out/${{ matrix.variant }}_p${{ matrix.positions }}.log"
+          python scripts/conviction/backtest/path_s_universe_variants.py \
+            --variant "${{ matrix.variant }}" \
+            --positions "${{ matrix.positions }}" \
+            --days "$DAYS" \
+            --end-date "$END_DATE" \
+            --study-name "$STUDY_NAME" \
+            --export-dir out/package \
+            2>&1 | tee "$LOG"
+
+      - name: Collect outputs
+        if: always()
+        run: |
+          ls -R out || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ matrix.variant }}_p${{ matrix.positions }}
+          path: out/
+          retention-days: 14
+
+  aggregate:
+    needs: [prepare, run]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Sync backtest data from S3
+        run: |
+          mkdir -p scripts/conviction/backtest/data
+          aws s3 sync s3://gamma-sim-cache/conviction-backtest-data/ scripts/conviction/backtest/data/ \
+            --exclude "day_aggs_raw/*" --no-progress
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            "pandas==3.0.2" \
+            "numpy==2.4.4" \
+            "pyarrow==24.0.0"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: out/downloaded
+
+      - name: Aggregate variant outputs
+        run: |
+          mkdir -p out/aggregate
+          python scripts/conviction/backtest/aggregate_path_s_universe_variants.py \
+            --artifacts out/downloaded \
+            --out out/aggregate
+          cat out/aggregate/report.md
+          cat out/aggregate/variant_summary_all.csv
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: path_s_universe_variants_aggregate_${{ needs.prepare.outputs.study_name }}
+          path: out/aggregate
+          retention-days: 14
