@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from pandas.errors import EmptyDataError
 
 
 HERE = Path(__file__).resolve().parent
@@ -31,7 +32,13 @@ def _load_packages(artifacts_dir: Path) -> list[dict]:
         meta = json.loads(meta_path.read_text())
         replay_dir = pkg_dir / "replay_run"
         summary = json.loads((replay_dir / "summary.json").read_text())
-        trades = pd.read_csv(replay_dir / "trade_log.csv") if (replay_dir / "trade_log.csv").exists() else pd.DataFrame()
+        if (replay_dir / "trade_log.csv").exists():
+            try:
+                trades = pd.read_csv(replay_dir / "trade_log.csv")
+            except EmptyDataError:
+                trades = pd.DataFrame()
+        else:
+            trades = pd.DataFrame()
         daily = pd.read_csv(replay_dir / "daily_equity.csv") if (replay_dir / "daily_equity.csv").exists() else pd.DataFrame()
         diag = pd.read_csv(pkg_dir / "daily_signal_diagnostics.csv") if (pkg_dir / "daily_signal_diagnostics.csv").exists() else pd.DataFrame()
         packages.append(

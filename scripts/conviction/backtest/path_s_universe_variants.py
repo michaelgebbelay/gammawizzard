@@ -306,7 +306,10 @@ def prepare_universe_context(*, start_date: pd.Timestamp, end_date: pd.Timestamp
         if _sic_to_theme_name(row.sic_description) is not None
     }
 
-    core_df = eligible_df[eligible_df["ticker"].isin(set(core2000) | {"SPY"})].copy()
+    # Build the stock-only heat inputs from the core universe plus SPY. SPY is
+    # intentionally outside the eligible common-stock universe filter, so we
+    # must source it from the full bars panel rather than eligible_df.
+    core_df = bars_df[bars_df["ticker"].isin(set(core2000) | {"SPY"})].copy()
     core_df = core_df.sort_values(["ticker", "date"]).reset_index(drop=True)
     core_df["ret20"] = core_df.groupby("ticker")["close"].pct_change(20)
     spy_df = core_df[core_df["ticker"] == "SPY"][["date", "ret20"]].copy()
