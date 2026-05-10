@@ -230,6 +230,29 @@ def build_rows(packages: list[dict]) -> pd.DataFrame:
 
 def add_baseline_deltas(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
+    default_false_cols = [
+        "pass_runtime_reduction_25pct",
+        "pass_contracts_reduction_25pct",
+        "pass_cagr_within_2pp",
+        "pass_sharpe_within_0_05",
+        "pass_mdd_within_2pp",
+        "pass_baseline_winners_preserved",
+        "pass_top5_contributors_preserved",
+        "pass_all_thresholds",
+    ]
+    default_nan_cols = [
+        "delta_TR_vs_core",
+        "delta_CAGR_vs_core",
+        "delta_Sharpe_vs_core",
+        "delta_MDD_vs_core",
+        "delta_runtime_seconds_vs_core",
+        "delta_contracts_processed_vs_core",
+    ]
+    for col in default_false_cols:
+        out[col] = False
+    for col in default_nan_cols:
+        out[col] = np.nan
+
     for pos, sub in out.groupby("positions"):
         baseline = sub[sub["variant"] == "CORE_2000"]
         if baseline.empty:
