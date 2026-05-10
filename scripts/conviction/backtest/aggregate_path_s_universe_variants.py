@@ -191,6 +191,7 @@ def build_rows(packages: list[dict]) -> pd.DataFrame:
             {
                 "variant": meta["variant"],
                 "positions": pos,
+                "diagnostic_only": bool(meta.get("diagnostic_only", False)),
                 "universe_type": meta["universe_type"],
                 "benchmark_symbol": meta["benchmark_symbol"],
                 "implemented_universe_size": meta["implemented_universe_size"],
@@ -243,15 +244,35 @@ def add_baseline_deltas(df: pd.DataFrame) -> pd.DataFrame:
         out.loc[mask, "delta_contracts_processed_vs_core"] = (
             out.loc[mask, "contracts_processed_est"] - base["contracts_processed_est"]
         )
-        out.loc[mask, "pass_runtime_reduction"] = (
-            out.loc[mask, "contracts_processed_est"] < base["contracts_processed_est"]
+        out.loc[mask, "pass_runtime_reduction_25pct"] = (
+            out.loc[mask, "runtime_seconds"] <= (0.75 * base["runtime_seconds"])
         )
-        out.loc[mask, "pass_sharpe_or_mdd"] = (
-            (out.loc[mask, "Sharpe"] > base["Sharpe"])
-            | (out.loc[mask, "MDD"] > base["MDD"])
+        out.loc[mask, "pass_contracts_reduction_25pct"] = (
+            out.loc[mask, "contracts_processed_est"] <= (0.75 * base["contracts_processed_est"])
         )
-        out.loc[mask, "pass_cagr_retention_90pct"] = (
-            out.loc[mask, "CAGR"] >= (0.90 * base["CAGR"])
+        out.loc[mask, "pass_cagr_within_2pp"] = (
+            out.loc[mask, "CAGR"] >= (base["CAGR"] - 0.02)
+        )
+        out.loc[mask, "pass_sharpe_within_0_05"] = (
+            out.loc[mask, "Sharpe"] >= (base["Sharpe"] - 0.05)
+        )
+        out.loc[mask, "pass_mdd_within_2pp"] = (
+            out.loc[mask, "MDD"] >= (base["MDD"] - 0.02)
+        )
+        out.loc[mask, "pass_baseline_winners_preserved"] = (
+            out.loc[mask, "baseline_winners_missed"] <= 0
+        )
+        out.loc[mask, "pass_top5_contributors_preserved"] = (
+            out.loc[mask, "baseline_top5_winners_missed"] <= 0
+        )
+        out.loc[mask, "pass_all_thresholds"] = (
+            out.loc[mask, "pass_runtime_reduction_25pct"].fillna(False)
+            & out.loc[mask, "pass_contracts_reduction_25pct"].fillna(False)
+            & out.loc[mask, "pass_cagr_within_2pp"].fillna(False)
+            & out.loc[mask, "pass_sharpe_within_0_05"].fillna(False)
+            & out.loc[mask, "pass_mdd_within_2pp"].fillna(False)
+            & out.loc[mask, "pass_baseline_winners_preserved"].fillna(False)
+            & out.loc[mask, "pass_top5_contributors_preserved"].fillna(False)
         )
     return out
 
@@ -285,6 +306,10 @@ def write_report(out_dir: Path, df: pd.DataFrame) -> None:
                         "contracts_processed_est",
                         "baseline_winners_preserved",
                         "baseline_winners_missed",
+                        "baseline_top5_winners_captured",
+                        "baseline_top5_winners_missed",
+                        "diagnostic_only",
+                        "pass_all_thresholds",
                     ]
                 ].to_string(index=False),
                 "```",
@@ -293,29 +318,30 @@ def write_report(out_dir: Path, df: pd.DataFrame) -> None:
         )
         contenders = sub[
             (sub["variant"] != "CORE_2000")
-            & sub["pass_runtime_reduction"].fillna(False)
-            & sub["pass_cagr_retention_90pct"].fillna(False)
-            & sub["pass_sharpe_or_mdd"].fillna(False)
+            & ~sub["diagnostic_only"].fillna(False)
+            & sub["pass_all_thresholds"].fillna(False)
         ].copy()
         if not contenders.empty:
             best = contenders.sort_values(
-                ["delta_Sharpe_vs_core", "delta_MDD_vs_core"],
-                ascending=[False, False],
+                ["delta_contracts_processed_vs_core", "delta_runtime_seconds_vs_core"],
+                ascending=[True, True],
                 na_position="last",
             ).iloc[0]
             lines.extend(
                 [
                     f"- First read: best contender for p{pos} is `{best['variant']}`.",
-                    f"- Delta Sharpe vs CORE_2000: {best['delta_Sharpe_vs_core']:+.3f}",
-                    f"- Delta MDD vs CORE_2000: {best['delta_MDD_vs_core']:+.3f}",
-                    f"- Contract-scope reduction vs CORE_2000: {int(best['delta_contracts_processed_vs_core']):,}",
+                    f"- Contracts vs CORE_2000: {int(best['delta_contracts_processed_vs_core']):,}",
+                    f"- Runtime vs CORE_2000: {best['delta_runtime_seconds_vs_core']:+.2f}s",
+                    f"- CAGR vs CORE_2000: {best['delta_CAGR_vs_core']:+.4f}",
+                    f"- Sharpe vs CORE_2000: {best['delta_Sharpe_vs_core']:+.3f}",
+                    f"- MDD vs CORE_2000: {best['delta_MDD_vs_core']:+.3f}",
                     "",
                 ]
             )
         else:
             lines.extend(
                 [
-                    f"- First read: no p{pos} contender cleared the runtime + CAGR-retention screen yet.",
+                    f"- First read: no p{pos} non-diagnostic contender cleared the PIT pass bar yet.",
                     "",
                 ]
             )
@@ -338,9 +364,8 @@ def main() -> int:
         sub.to_csv(args.out / f"variant_summary_p{pos}.csv", index=False)
     shortlist = df[
         (df["variant"] != "CORE_2000")
-        & df["pass_runtime_reduction"].fillna(False)
-        & df["pass_cagr_retention_90pct"].fillna(False)
-        & df["pass_sharpe_or_mdd"].fillna(False)
+        & ~df["diagnostic_only"].fillna(False)
+        & df["pass_all_thresholds"].fillna(False)
     ].copy()
     shortlist.to_csv(args.out / "jitter_shortlist.csv", index=False)
     write_report(args.out, df)

@@ -64,6 +64,9 @@ jobs:
               "OPTION_LIQ_1000",
               "OPTION_LIQ_750",
               "OPTION_LIQ_500",
+              "PIT_OPTION_LIQ_1000_60d",
+              "PIT_OPTION_LIQ_1000_126d",
+              "PIT_OPTION_LIQ_750_126d",
               "DYNAMIC_SECTOR_TOP4",
               "DYNAMIC_SECTOR_TOP6",
           ]
