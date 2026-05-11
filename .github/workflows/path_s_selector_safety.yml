@@ -1,0 +1,78 @@
+name: Path-S Selector Safety
+
+"on":
+  pull_request:
+    branches:
+      - main
+      - codex/path-s-universe-variants
+    paths:
+      - .github/workflows/path_s_selector_safety.yml
+      - scripts/trade/PathS/data_refresh.py
+      - scripts/trade/PathS/selector_safety_check.py
+      - scripts/conviction/backtest/path_s_pit_universe.py
+  push:
+    branches:
+      - codex/path-s-selector-safety
+    paths:
+      - .github/workflows/path_s_selector_safety.yml
+      - scripts/trade/PathS/data_refresh.py
+      - scripts/trade/PathS/selector_safety_check.py
+      - scripts/conviction/backtest/path_s_pit_universe.py
+  workflow_dispatch:
+
+concurrency:
+  group: path-s-selector-safety-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  selector-safety:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Sync backtest data from S3
+        run: |
+          mkdir -p scripts/conviction/backtest/data
+          aws s3 sync s3://gamma-sim-cache/conviction-backtest-data/ scripts/conviction/backtest/data/ \
+            --exclude "day_aggs_raw/*" --no-progress
+          ls -lh scripts/conviction/backtest/data/
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            "pandas==3.0.2" \
+            "numpy==2.4.4" \
+            "pyarrow==24.0.0" \
+            "scipy==1.17.1" \
+            "boto3==1.43.1" \
+            "pyyaml==6.0.3" \
+            "requests==2.33.1" \
+            "schwab-py==1.5.1" \
+            "yfinance==0.2.66"
+
+      - name: Run selector safety check
+        run: |
+          python scripts/trade/PathS/selector_safety_check.py
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: path_s_selector_safety
+          path: scripts/trade/PathS/state/selector_safety/
+          retention-days: 14
