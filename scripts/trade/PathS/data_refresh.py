@@ -46,17 +46,6 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 # Reuse the cold-run scripts' helpers (no modifications to those files)
 sys.path.insert(0, str(BACKTEST_DIR))
 sys.path.insert(0, str(REPO / "scripts" / "conviction"))
-from massive_options_ingest import (  # noqa: E402
-    download_window,
-    parse_opra_ticker,
-    EXPECTED_COLUMNS,
-    PARQUET_PATH as OPTIONS_PARQUET,
-    RAW_DIR as OPT_RAW_DIR,
-)
-from iv_compute import (  # noqa: E402
-    compute_skew_for_underlying,
-    SKEW_PATH as SKEW_PARQUET,
-)
 from dynamic_themes import build_static_universe_top_n  # noqa: E402
 from massive_reference import allowed_ticker_set  # noqa: E402
 from path_s_pit_universe import build_or_load_pit_universe_table  # noqa: E402
@@ -67,6 +56,9 @@ RAW_BARS_PARQUET   = DATA_DIR / "aggs_daily.parquet"
 SPLITS_PARQUET     = DATA_DIR / "splits.parquet"
 META_PARQUET       = DATA_DIR / "ticker_metadata.parquet"
 TOP2000_CACHE      = DATA_DIR / "top2000_universe.parquet"
+OPTIONS_PARQUET    = DATA_DIR / "options_daily.parquet"
+OPT_RAW_DIR        = DATA_DIR / "options_day_aggs_raw"
+SKEW_PARQUET       = DATA_DIR / "skew_daily.parquet"
 SIGNAL_OUT         = OUT_DIR / "signal_today.json"
 STATE_PATH         = OUT_DIR / "path_s_state.json"
 
@@ -102,6 +94,28 @@ UNIVERSE_SELECTOR_PIT_PARAMS = {
     UNIVERSE_SELECTOR_PIT_60: {"target_n": 1000, "window_sessions": 60},
     UNIVERSE_SELECTOR_PIT_126: {"target_n": 1000, "window_sessions": 126},
 }
+
+
+def _load_options_ingest_helpers():
+    from massive_options_ingest import (  # noqa: E402
+        EXPECTED_COLUMNS,
+        download_window,
+        parse_opra_ticker,
+    )
+
+    return {
+        "EXPECTED_COLUMNS": EXPECTED_COLUMNS,
+        "download_window": download_window,
+        "parse_opra_ticker": parse_opra_ticker,
+    }
+
+
+def _load_iv_compute_helpers():
+    from iv_compute import compute_skew_for_underlying  # noqa: E402
+
+    return {
+        "compute_skew_for_underlying": compute_skew_for_underlying,
+    }
 
 
 def assert_signal_config_canonical() -> None:
@@ -442,9 +456,12 @@ def _parse_one_options_file(
 ) -> pd.DataFrame | tuple[pd.DataFrame, dict]:
     """Same logic as massive_options_ingest.merge_to_parquet, applied to one
     daily file. Returns the filtered + normalized rows for that day."""
+    options_helpers = _load_options_ingest_helpers()
+    expected_columns = options_helpers["EXPECTED_COLUMNS"]
+    parse_opra_ticker = options_helpers["parse_opra_ticker"]
     df = pd.read_csv(path, compression="gzip")
     raw_rows = int(len(df))
-    if not EXPECTED_COLUMNS.issubset(df.columns):
+    if not expected_columns.issubset(df.columns):
         empty = pd.DataFrame()
         metrics = {
             "raw_rows": raw_rows,
@@ -528,7 +545,8 @@ def refresh_options(
     start = (last + timedelta(days=1)) if last else (target - timedelta(days=400))
     print(f"[opt] downloading {start} → {target}")
     t0 = time.time()
-    download_window(start, target, max_workers=10)
+    options_helpers = _load_options_ingest_helpers()
+    options_helpers["download_window"](start, target, max_workers=10)
     download_seconds = time.time() - t0
     print(f"[opt] download in {download_seconds:.1f}s")
 
@@ -680,6 +698,8 @@ def _compute_skew_rows_for_options_df(opts_new: pd.DataFrame) -> tuple[pd.DataFr
     print(f"[skew] {len(stocks):,} stock rows for these underlyings")
 
     t0 = time.time()
+    iv_helpers = _load_iv_compute_helpers()
+    compute_skew_for_underlying = iv_helpers["compute_skew_for_underlying"]
     new_rows = []
     for u, g in opts_new.groupby("underlying", sort=False):
         try:
@@ -970,10 +990,12 @@ def compute_signal(
         cand_bars = pd.DataFrame()
     phase_metrics["phase_load_trend_inputs_seconds"] = round(time.time() - t0, 3)
 
-    eligible_trend_status = set(CANONICAL["filter_eligible_trend_status_in"])
-    min_dvol  = CANONICAL["filter_eligible_min_dollar_vol"]
-    min_r12m  = CANONICAL["filter_eligible_min_ret_12m"]
-    max_r12m  = CANONICAL["filter_eligible_max_ret_12m"]
+    eligible_trend_status = set(
+        CANONICAL.get("filter_eligible_trend_status_in", ["INTACT", "PULLBACK"])
+    )
+    min_dvol  = CANONICAL.get("filter_eligible_min_dollar_vol", 25_000_000)
+    min_r12m  = CANONICAL.get("filter_eligible_min_ret_12m", 0.0)
+    max_r12m  = CANONICAL.get("filter_eligible_max_ret_12m", 5.0)
 
     def _filter_one(ticker: str) -> tuple[bool, str | None, dict]:
         """Returns (passes, reject_reason, factor_trace)."""
@@ -988,12 +1010,12 @@ def compute_signal(
             "dollar_vol_20d":    None if f.dollar_vol_20d is None else round(float(f.dollar_vol_20d), 0),
             "trend_status":      f.trend_status,
         }
-        if CANONICAL["filter_require_above_50d_sma"] and not f.above_50d_sma:
+        if CANONICAL.get("filter_require_above_50d_sma", True) and not f.above_50d_sma:
             return False, "below_50d_sma", trace
-        if CANONICAL["filter_require_ret_60d_positive"]:
+        if CANONICAL.get("filter_require_ret_60d_positive", True):
             if f.recent_60d_ret is None or f.recent_60d_ret <= 0:
                 return False, "ret_60d_not_positive", trace
-        if CANONICAL["filter_require_eligible_flyer"]:
+        if CANONICAL.get("filter_require_eligible_flyer", True):
             if f.dollar_vol_20d is None or f.dollar_vol_20d < min_dvol:
                 return False, "dollar_vol_below_floor", trace
             if f.ret_12m is None or f.ret_12m < min_r12m or f.ret_12m > max_r12m:

@@ -24,11 +24,9 @@ import pandas as pd
 
 from data_refresh import (
     OUT_DIR,
-    STATE_PATH,
     UNIVERSE_SELECTOR_CORE,
     UNIVERSE_SELECTOR_PIT_126,
     _build_selector_parity,
-    _load_current_position_context,
     _load_dotenv,
     _signal_fast_path_status,
     _resolve_universe_selector,
@@ -45,6 +43,15 @@ def _flat_held_context() -> dict:
         "held_qty": 0,
         "held_force_include_reason": None,
         "state_as_of": None,
+    }
+
+
+def _held_kim_context() -> dict:
+    return {
+        "held_ticker": "KIM",
+        "held_qty": 430,
+        "held_force_include_reason": "current_position",
+        "state_as_of": "2026-05-04",
     }
 
 
@@ -220,7 +227,7 @@ def main() -> int:
     )
 
     # Case 3: held-name force-include on 2026-05-04..2026-05-06.
-    held = _load_current_position_context()
+    held = _held_kim_context()
     held_dates = [date(2026, 5, 4), date(2026, 5, 5), date(2026, 5, 6)]
     held_allowed_by_date, held_meta = _resolve_universe_selector(
         UNIVERSE_SELECTOR_PIT_126,
