@@ -191,11 +191,11 @@ def build_rows(packages: list[dict]) -> pd.DataFrame:
             {
                 "variant": meta["variant"],
                 "positions": pos,
-                "diagnostic_only": bool(meta.get("diagnostic_only", False)),
                 "universe_type": meta["universe_type"],
                 "benchmark_symbol": meta["benchmark_symbol"],
                 "implemented_universe_size": meta["implemented_universe_size"],
                 "base_universe_size": meta["base_universe_size"],
+                "diagnostic_only": bool(meta.get("diagnostic_only", False)),
                 "TR": perf.get("total_return"),
                 "CAGR": perf.get("cagr"),
                 "Sharpe": perf.get("sharpe"),
@@ -230,29 +230,6 @@ def build_rows(packages: list[dict]) -> pd.DataFrame:
 
 def add_baseline_deltas(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    default_false_cols = [
-        "pass_runtime_reduction_25pct",
-        "pass_contracts_reduction_25pct",
-        "pass_cagr_within_2pp",
-        "pass_sharpe_within_0_05",
-        "pass_mdd_within_2pp",
-        "pass_baseline_winners_preserved",
-        "pass_top5_contributors_preserved",
-        "pass_all_thresholds",
-    ]
-    default_nan_cols = [
-        "delta_TR_vs_core",
-        "delta_CAGR_vs_core",
-        "delta_Sharpe_vs_core",
-        "delta_MDD_vs_core",
-        "delta_runtime_seconds_vs_core",
-        "delta_contracts_processed_vs_core",
-    ]
-    for col in default_false_cols:
-        out[col] = False
-    for col in default_nan_cols:
-        out[col] = np.nan
-
     for pos, sub in out.groupby("positions"):
         baseline = sub[sub["variant"] == "CORE_2000"]
         if baseline.empty:
@@ -285,17 +262,24 @@ def add_baseline_deltas(df: pd.DataFrame) -> pd.DataFrame:
         out.loc[mask, "pass_baseline_winners_preserved"] = (
             out.loc[mask, "baseline_winners_missed"] <= 0
         )
-        out.loc[mask, "pass_top5_contributors_preserved"] = (
+        out.loc[mask, "pass_top_contributors_preserved"] = (
             out.loc[mask, "baseline_top5_winners_missed"] <= 0
         )
-        out.loc[mask, "pass_all_thresholds"] = (
-            out.loc[mask, "pass_runtime_reduction_25pct"].fillna(False)
-            & out.loc[mask, "pass_contracts_reduction_25pct"].fillna(False)
-            & out.loc[mask, "pass_cagr_within_2pp"].fillna(False)
+        out.loc[mask, "pass_strategy_gate"] = (
+            out.loc[mask, "pass_cagr_within_2pp"].fillna(False)
             & out.loc[mask, "pass_sharpe_within_0_05"].fillna(False)
             & out.loc[mask, "pass_mdd_within_2pp"].fillna(False)
             & out.loc[mask, "pass_baseline_winners_preserved"].fillna(False)
-            & out.loc[mask, "pass_top5_contributors_preserved"].fillna(False)
+            & out.loc[mask, "pass_top_contributors_preserved"].fillna(False)
+        )
+        out.loc[mask, "pass_engineering_gate"] = (
+            out.loc[mask, "pass_runtime_reduction_25pct"].fillna(False)
+            & out.loc[mask, "pass_contracts_reduction_25pct"].fillna(False)
+        )
+        out.loc[mask, "pass_all_thresholds"] = (
+            out.loc[mask, "pass_strategy_gate"].fillna(False)
+            & out.loc[mask, "pass_engineering_gate"].fillna(False)
+            & ~out.loc[mask, "diagnostic_only"].fillna(False)
         )
     return out
 
@@ -326,45 +310,58 @@ def write_report(out_dir: Path, df: pd.DataFrame) -> None:
                         "Calmar",
                         "trades",
                         "valid_signal_days",
+                        "implemented_universe_size",
                         "contracts_processed_est",
+                        "diagnostic_only",
+                        "pass_strategy_gate",
+                        "pass_engineering_gate",
+                        "pass_all_thresholds",
                         "baseline_winners_preserved",
                         "baseline_winners_missed",
-                        "baseline_top5_winners_captured",
-                        "baseline_top5_winners_missed",
-                        "diagnostic_only",
-                        "pass_all_thresholds",
                     ]
                 ].to_string(index=False),
                 "```",
                 "",
             ]
         )
-        contenders = sub[
-            (sub["variant"] != "CORE_2000")
-            & ~sub["diagnostic_only"].fillna(False)
-            & sub["pass_all_thresholds"].fillna(False)
+        contenders = sub[(sub["variant"] != "CORE_2000") & ~sub["diagnostic_only"].fillna(False)].copy()
+        full_pass = contenders[contenders["pass_all_thresholds"].fillna(False)].copy()
+        strategy_only = contenders[
+            contenders["pass_strategy_gate"].fillna(False)
+            & ~contenders["pass_engineering_gate"].fillna(False)
         ].copy()
-        if not contenders.empty:
-            best = contenders.sort_values(
+        if not full_pass.empty:
+            best = full_pass.sort_values(
+                ["delta_runtime_seconds_vs_core", "delta_contracts_processed_vs_core"],
+                ascending=[True, True],
+                na_position="last",
+            ).iloc[0]
+            lines.extend(
+                [
+                    f"- First read: `{best['variant']}` cleared both the strategy and engineering gates for p{pos}.",
+                    f"- Runtime delta vs CORE_2000: {best['delta_runtime_seconds_vs_core']:+.2f}s",
+                    f"- Contract-scope delta vs CORE_2000: {int(best['delta_contracts_processed_vs_core']):,}",
+                    "",
+                ]
+            )
+        elif not strategy_only.empty:
+            best = strategy_only.sort_values(
                 ["delta_contracts_processed_vs_core", "delta_runtime_seconds_vs_core"],
                 ascending=[True, True],
                 na_position="last",
             ).iloc[0]
             lines.extend(
                 [
-                    f"- First read: best contender for p{pos} is `{best['variant']}`.",
-                    f"- Contracts vs CORE_2000: {int(best['delta_contracts_processed_vs_core']):,}",
-                    f"- Runtime vs CORE_2000: {best['delta_runtime_seconds_vs_core']:+.2f}s",
-                    f"- CAGR vs CORE_2000: {best['delta_CAGR_vs_core']:+.4f}",
-                    f"- Sharpe vs CORE_2000: {best['delta_Sharpe_vs_core']:+.3f}",
-                    f"- MDD vs CORE_2000: {best['delta_MDD_vs_core']:+.3f}",
+                    f"- First read: `{best['variant']}` preserved the Path S trade path for p{pos}, but missed the engineering gate.",
+                    f"- Runtime delta vs CORE_2000: {best['delta_runtime_seconds_vs_core']:+.2f}s",
+                    f"- Contract-scope delta vs CORE_2000: {int(best['delta_contracts_processed_vs_core']):,}",
                     "",
                 ]
             )
         else:
             lines.extend(
                 [
-                    f"- First read: no p{pos} non-diagnostic contender cleared the PIT pass bar yet.",
+                    f"- First read: no non-diagnostic p{pos} contender preserved the strategy path closely enough yet.",
                     "",
                 ]
             )
@@ -388,7 +385,7 @@ def main() -> int:
     shortlist = df[
         (df["variant"] != "CORE_2000")
         & ~df["diagnostic_only"].fillna(False)
-        & df["pass_all_thresholds"].fillna(False)
+        & df["pass_strategy_gate"].fillna(False)
     ].copy()
     shortlist.to_csv(args.out / "jitter_shortlist.csv", index=False)
     write_report(args.out, df)

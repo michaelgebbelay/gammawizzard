@@ -41,6 +41,7 @@ import pandas as pd
 HERE = Path(__file__).resolve().parent
 RESULTS_DIR = HERE / "results"
 DATA_DIR = HERE / "data"
+PIT_CACHE_DIR = DATA_DIR / "pit_cache"
 CONVICTION_DIR = HERE.parent
 sys.path.insert(0, str(CONVICTION_DIR))
 
@@ -70,6 +71,7 @@ DEFAULT_DAYS = 1825
 DEFAULT_CAPITAL = 100_000.0
 DEFAULT_SLIPPAGE_BPS = 15.0
 MIN_THEME_MEMBERS = 4
+PIT_MIN_TRAILING_SESSIONS = 20
 
 
 @dataclass(frozen=True)
@@ -82,8 +84,8 @@ class VariantSpec:
     selection_note: str
     sector_top_n: int | None = None
     use_canonical_core_loading: bool = False
-    pit_lookback_sessions: int | None = None
-    pit_target_size: int | None = None
+    pit_window_sessions: int | None = None
+    pit_target_n: int | None = None
     diagnostic_only: bool = False
 
 
@@ -96,8 +98,12 @@ class UniverseContext:
     ret20_lookup: pd.Series
     spy_ret20: dict[pd.Timestamp, float]
     spy_ret60: dict[pd.Timestamp, float]
+    session_dates: pd.DatetimeIndex
+    skew_df: pd.DataFrame
     skew_window_df: pd.DataFrame
-    pit_option_liq_tables: dict[int, pd.DataFrame]
+    pit_table_by_variant: dict[str, pd.DataFrame]
+    pit_members_by_variant: dict[str, dict[pd.Timestamp, list[str]]]
+    phase_timings: dict[str, float]
 
 
 VARIANT_SPECS: dict[str, VariantSpec] = {
@@ -170,31 +176,31 @@ VARIANT_SPECS: dict[str, VariantSpec] = {
         name="PIT_OPTION_LIQ_1000_60d",
         universe_type="pit_option_liquidity_proxy",
         benchmark_symbol="SPY",
-        description="Point-in-time top 1000 by trailing 60-session skew coverage.",
+        description="Point-in-time top 1000 by trailing 60-session valid skew coverage.",
         base_universe_key="CORE_2000",
-        selection_note="Implemented inside the core-2000 pond using only trailing data available before each signal date: 60-session valid 5%-OTM skew coverage, then trailing median stock dollar volume as the tiebreaker. Raw option dollar-volume is not yet cached in skew_daily.parquet.",
-        pit_lookback_sessions=60,
-        pit_target_size=1000,
+        selection_note="Ranks the core 2000 pond using only trailing pre-date valid 5%-OTM skew coverage over 60 sessions, with trailing median stock dollar volume as a tiebreaker.",
+        pit_window_sessions=60,
+        pit_target_n=1000,
     ),
     "PIT_OPTION_LIQ_1000_126d": VariantSpec(
         name="PIT_OPTION_LIQ_1000_126d",
         universe_type="pit_option_liquidity_proxy",
         benchmark_symbol="SPY",
-        description="Point-in-time top 1000 by trailing 126-session skew coverage.",
+        description="Point-in-time top 1000 by trailing 126-session valid skew coverage.",
         base_universe_key="CORE_2000",
-        selection_note="Implemented inside the core-2000 pond using only trailing data available before each signal date: 126-session valid 5%-OTM skew coverage, then trailing median stock dollar volume as the tiebreaker. Raw option dollar-volume is not yet cached in skew_daily.parquet.",
-        pit_lookback_sessions=126,
-        pit_target_size=1000,
+        selection_note="Ranks the core 2000 pond using only trailing pre-date valid 5%-OTM skew coverage over 126 sessions, with trailing median stock dollar volume as a tiebreaker.",
+        pit_window_sessions=126,
+        pit_target_n=1000,
     ),
     "PIT_OPTION_LIQ_750_126d": VariantSpec(
         name="PIT_OPTION_LIQ_750_126d",
         universe_type="pit_option_liquidity_proxy",
         benchmark_symbol="SPY",
-        description="Point-in-time top 750 by trailing 126-session skew coverage.",
+        description="Point-in-time top 750 by trailing 126-session valid skew coverage.",
         base_universe_key="CORE_2000",
-        selection_note="Diagnostic-only PIT variant inside the core-2000 pond using only trailing data available before each signal date: 126-session valid 5%-OTM skew coverage, then trailing median stock dollar volume as the tiebreaker. Raw option dollar-volume is not yet cached in skew_daily.parquet.",
-        pit_lookback_sessions=126,
-        pit_target_size=750,
+        selection_note="Diagnostic-only narrower PIT option-liquidity universe using trailing 126-session valid skew coverage and trailing median stock dollar volume.",
+        pit_window_sessions=126,
+        pit_target_n=750,
         diagnostic_only=True,
     ),
     "DYNAMIC_SECTOR_TOP4": VariantSpec(
@@ -259,94 +265,154 @@ def _safe_get(series: pd.Series, key) -> float | None:
     return float(val)
 
 
-def _load_window_skew_df(start_date: pd.Timestamp, end_date: pd.Timestamp) -> pd.DataFrame:
+def _load_skew_df() -> pd.DataFrame:
     skew_path = DATA_DIR / "skew_daily.parquet"
     if not skew_path.exists():
         return pd.DataFrame(columns=["underlying", "date"])
     df = pd.read_parquet(skew_path, columns=["underlying", "date"])
     df["date"] = pd.to_datetime(df["date"]).dt.normalize()
     df["underlying"] = df["underlying"].astype(str).str.upper()
-    return df[(df["date"] >= start_date) & (df["date"] <= end_date)].copy()
+    return df
 
 
-def _load_skew_history_df(end_date: pd.Timestamp) -> pd.DataFrame:
-    skew_path = DATA_DIR / "skew_daily.parquet"
-    if not skew_path.exists():
-        return pd.DataFrame(columns=["underlying", "date"])
-    df = pd.read_parquet(skew_path, columns=["underlying", "date"])
-    df["date"] = pd.to_datetime(df["date"]).dt.normalize()
-    df["underlying"] = df["underlying"].astype(str).str.upper()
-    return df[df["date"] <= end_date].copy()
+def _pit_cache_path(*, target_n: int, window_sessions: int) -> Path:
+    return PIT_CACHE_DIR / f"pit_option_liq_{target_n}_{window_sessions}d.parquet"
 
 
-def _prepare_pit_option_liq_tables(
+def _build_or_load_pit_universe_table(
     *,
-    bars_df: pd.DataFrame,
-    skew_history_df: pd.DataFrame,
-    tickers: list[str],
-    start_date: pd.Timestamp,
-    end_date: pd.Timestamp,
-    windows: set[int],
-) -> dict[int, pd.DataFrame]:
-    if not windows:
-        return {}
+    core_tickers: list[str],
+    eligible_df: pd.DataFrame,
+    session_dates: pd.DatetimeIndex,
+    skew_df: pd.DataFrame,
+    target_n: int,
+    window_sessions: int,
+    rebuild: bool = False,
+) -> tuple[pd.DataFrame, dict]:
+    cache_path = _pit_cache_path(target_n=target_n, window_sessions=window_sessions)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    required_cols = {
+        "date",
+        "ticker",
+        "rank",
+        "score",
+        "valid_skew_coverage",
+        "option_liquidity_metric",
+        "stock_liquidity_metric",
+    }
+    if cache_path.exists() and not rebuild:
+        cached = pd.read_parquet(cache_path)
+        if required_cols.issubset(cached.columns):
+            cached["date"] = pd.to_datetime(cached["date"]).dt.normalize()
+            cached["ticker"] = cached["ticker"].astype(str).str.upper()
+            return cached, {
+                "cache_path": str(cache_path),
+                "cache_hit": True,
+                "rows": int(len(cached)),
+            }
 
-    base = bars_df[bars_df["ticker"].isin(tickers)].copy()
-    if base.empty:
-        return {}
-    base = base[base["date"] <= end_date].copy()
-    base["stock_dollar_vol"] = (
-        base["close"].astype(float) * base["volume"].astype(float)
+    core = [str(t).upper() for t in core_tickers]
+    core_set = set(core)
+    skew_core = (
+        skew_df[skew_df["underlying"].isin(core_set)][["date", "underlying"]]
+        .drop_duplicates()
+        .assign(valid_skew=1)
     )
-    base = base[["date", "ticker", "stock_dollar_vol"]].sort_values(
-        ["ticker", "date"]
-    ).reset_index(drop=True)
+    skew_presence = (
+        skew_core.pivot(index="date", columns="underlying", values="valid_skew")
+        .reindex(index=session_dates, columns=core)
+        .fillna(0.0)
+    )
+    skew_coverage = skew_presence.shift(1, fill_value=0.0).rolling(
+        window_sessions,
+        min_periods=1,
+    ).sum()
 
-    skew_valid = skew_history_df[
-        skew_history_df["underlying"].isin(tickers)
-    ][["date", "underlying"]].copy()
-    skew_valid = skew_valid.rename(columns={"underlying": "ticker"})
-    skew_valid["has_skew"] = 1.0
+    core_bars = eligible_df[eligible_df["ticker"].isin(core_set)][
+        ["date", "ticker", "dollar_vol"]
+    ].copy()
+    dollar_vol = (
+        core_bars.pivot(index="date", columns="ticker", values="dollar_vol")
+        .reindex(index=session_dates, columns=core)
+    )
+    stock_liq = dollar_vol.shift(1).rolling(
+        window_sessions,
+        min_periods=min(PIT_MIN_TRAILING_SESSIONS, window_sessions),
+    ).median()
 
-    panel = base.merge(skew_valid, on=["date", "ticker"], how="left")
-    panel["has_skew"] = panel["has_skew"].fillna(0.0)
-    panel = panel.sort_values(["ticker", "date"]).reset_index(drop=True)
-
-    out: dict[int, pd.DataFrame] = {}
-    ticker_key = panel["ticker"]
-    shifted_has_skew = panel.groupby("ticker", sort=False)["has_skew"].shift(1)
-    shifted_stock_dv = panel.groupby("ticker", sort=False)["stock_dollar_vol"].shift(1)
-    for window in sorted(windows):
-        metrics = panel[["date", "ticker"]].copy()
-        metrics["pit_valid_skew_days"] = (
-            shifted_has_skew.groupby(ticker_key, sort=False)
-            .rolling(window=window, min_periods=1)
-            .sum()
-            .reset_index(level=0, drop=True)
-            .fillna(0.0)
+    rows: list[pd.DataFrame] = []
+    for dt in session_dates:
+        coverage = skew_coverage.loc[dt]
+        liq = stock_liq.loc[dt].fillna(0.0)
+        day = pd.DataFrame(
+            {
+                "ticker": core,
+                "valid_skew_coverage": coverage.to_numpy(dtype=float),
+                "option_liquidity_metric": coverage.to_numpy(dtype=float),
+                "stock_liquidity_metric": liq.to_numpy(dtype=float),
+            }
         )
-        metrics["pit_stock_dollar_vol_median"] = (
-            shifted_stock_dv.groupby(ticker_key, sort=False)
-            .rolling(window=window, min_periods=1)
-            .median()
-            .reset_index(level=0, drop=True)
+        day = day.sort_values(
+            ["valid_skew_coverage", "stock_liquidity_metric", "ticker"],
+            ascending=[False, False, True],
+        ).head(target_n).reset_index(drop=True)
+        day["rank"] = np.arange(1, len(day) + 1, dtype=int)
+        stock_rank = day["stock_liquidity_metric"].rank(
+            pct=True, method="average"
+        ).fillna(0.0)
+        day["score"] = (
+            day["valid_skew_coverage"].astype(float)
+            + stock_rank.astype(float) / 10_000.0
         )
-        metrics = metrics[
-            (metrics["date"] >= start_date) & (metrics["date"] <= end_date)
-        ].copy()
-        out[window] = metrics.set_index(["date", "ticker"]).sort_index()
-    return out
+        day["date"] = dt
+        rows.append(
+            day[
+                [
+                    "date",
+                    "ticker",
+                    "rank",
+                    "score",
+                    "valid_skew_coverage",
+                    "option_liquidity_metric",
+                    "stock_liquidity_metric",
+                ]
+            ]
+        )
+
+    out = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(
+        columns=[
+            "date",
+            "ticker",
+            "rank",
+            "score",
+            "valid_skew_coverage",
+            "option_liquidity_metric",
+            "stock_liquidity_metric",
+        ]
+    )
+    out.to_parquet(cache_path, index=False)
+    return out, {
+        "cache_path": str(cache_path),
+        "cache_hit": False,
+        "rows": int(len(out)),
+    }
 
 
 def prepare_universe_context(
     *,
     start_date: pd.Timestamp,
     end_date: pd.Timestamp,
-    pit_windows: set[int] | None = None,
+    requested_variants: list[str],
+    rebuild_pit_cache: bool = False,
 ) -> UniverseContext:
+    phase_timings: dict[str, float] = {}
+
+    t0 = time.perf_counter()
     metadata_df = load_metadata()
     metadata_df["ticker"] = metadata_df["ticker"].astype(str).str.upper()
+    phase_timings["load_metadata_seconds"] = round(time.perf_counter() - t0, 3)
 
+    t0 = time.perf_counter()
     allowed = allowed_ticker_set(
         require_type="CS",
         exclude_pharma_biotech=True,
@@ -359,7 +425,9 @@ def prepare_universe_context(
     eligible_df["dollar_vol"] = (
         eligible_df["close"].astype(float) * eligible_df["volume"].astype(float)
     )
+    phase_timings["load_bars_seconds"] = round(time.perf_counter() - t0, 3)
 
+    t0 = time.perf_counter()
     ranking_df = (
         eligible_df.groupby("ticker", as_index=False)
         .agg(
@@ -383,14 +451,20 @@ def prepare_universe_context(
     ranking_df = ranking_df.sort_values(
         ["median_dollar_vol", "ticker"], ascending=[False, True]
     ).reset_index(drop=True)
+    phase_timings["build_ranking_seconds"] = round(time.perf_counter() - t0, 3)
 
-    skew_window_df = _load_window_skew_df(start_date, end_date)
+    t0 = time.perf_counter()
+    skew_df = _load_skew_df()
+    skew_window_df = skew_df[
+        (skew_df["date"] >= start_date) & (skew_df["date"] <= end_date)
+    ].copy()
     skew_coverage = (
         skew_window_df.groupby("underlying").size().rename("valid_skew_days").reset_index()
         .rename(columns={"underlying": "ticker"})
     )
     ranking_df = ranking_df.merge(skew_coverage, on="ticker", how="left")
     ranking_df["valid_skew_days"] = ranking_df["valid_skew_days"].fillna(0).astype(int)
+    phase_timings["load_skew_seconds"] = round(time.perf_counter() - t0, 3)
 
     core2000 = ranking_df["ticker"].head(2000).tolist()
     sp500_proxy = ranking_df["ticker"].head(500).tolist()
@@ -403,14 +477,6 @@ def prepare_universe_context(
         ["valid_skew_days", "median_dollar_vol", "ticker"],
         ascending=[False, False, True],
     ).reset_index(drop=True)
-    pit_option_liq_tables = _prepare_pit_option_liq_tables(
-        bars_df=bars_df,
-        skew_history_df=_load_skew_history_df(end_date),
-        tickers=core2000,
-        start_date=start_date,
-        end_date=end_date,
-        windows=pit_windows or set(),
-    )
 
     variant_universes = {
         "CORE_2000": core2000,
@@ -422,6 +488,46 @@ def prepare_universe_context(
         "OPTION_LIQ_750": option_liq["ticker"].head(750).tolist(),
         "OPTION_LIQ_500": option_liq["ticker"].head(500).tolist(),
     }
+
+    session_dates = pd.DatetimeIndex(
+        sorted(
+            bars_df.loc[bars_df["ticker"] == "SPY", "date"]
+            .dropna()
+            .dt.normalize()
+            .unique()
+        )
+    )
+    pit_table_by_variant: dict[str, pd.DataFrame] = {}
+    pit_members_by_variant: dict[str, dict[pd.Timestamp, list[str]]] = {}
+    requested_specs = [VARIANT_SPECS[name] for name in requested_variants]
+    pit_specs = [spec for spec in requested_specs if spec.pit_window_sessions is not None]
+    if pit_specs:
+        pit_elapsed = 0.0
+        for spec in pit_specs:
+            t0 = time.perf_counter()
+            full_table, cache_meta = _build_or_load_pit_universe_table(
+                core_tickers=core2000,
+                eligible_df=eligible_df,
+                session_dates=session_dates,
+                skew_df=skew_df,
+                target_n=int(spec.pit_target_n or 0),
+                window_sessions=int(spec.pit_window_sessions or 0),
+                rebuild=rebuild_pit_cache,
+            )
+            pit_elapsed += time.perf_counter() - t0
+            table = full_table[
+                (full_table["date"] >= start_date) & (full_table["date"] <= end_date)
+            ].copy()
+            pit_table_by_variant[spec.name] = table
+            members = {
+                pd.Timestamp(dt).normalize(): grp.sort_values("rank")["ticker"].tolist()
+                for dt, grp in table.groupby("date")
+            }
+            pit_members_by_variant[spec.name] = members
+            variant_universes[spec.name] = sorted(table["ticker"].dropna().astype(str).str.upper().unique().tolist())
+            phase_timings[f"{_slug(spec.name)}_cache_hit"] = 1.0 if cache_meta["cache_hit"] else 0.0
+            phase_timings[f"{_slug(spec.name)}_table_rows"] = float(cache_meta["rows"])
+        phase_timings["build_pit_tables_seconds"] = round(pit_elapsed, 3)
 
     industry_by_ticker = {
         row.ticker: _sic_to_theme_name(row.sic_description)
@@ -457,8 +563,12 @@ def prepare_universe_context(
         ret20_lookup=ret20_lookup,
         spy_ret20=spy_ret20,
         spy_ret60=spy_ret60,
+        session_dates=session_dates,
+        skew_df=skew_df,
         skew_window_df=skew_window_df,
-        pit_option_liq_tables=pit_option_liq_tables,
+        pit_table_by_variant=pit_table_by_variant,
+        pit_members_by_variant=pit_members_by_variant,
+        phase_timings=phase_timings,
     )
 
 
@@ -467,7 +577,7 @@ def _variant_selector(
     ctx: UniverseContext,
     day_state: replay.DayState,
     *,
-    held_ticker: str | None = None,
+    held_tickers: set[str] | None = None,
 ) -> tuple[set[str] | None, dict]:
     if spec.name == "CORE_2000":
         allowed_count = len(day_state.factors_by_ticker)
@@ -477,69 +587,21 @@ def _variant_selector(
             "sector_heat_debug": "",
         }
 
-    if spec.pit_lookback_sessions is not None and spec.pit_target_size is not None:
+    if spec.pit_window_sessions is not None:
         date_key = pd.Timestamp(day_state.date).normalize()
-        score_table = ctx.pit_option_liq_tables.get(spec.pit_lookback_sessions)
-        if score_table is None:
-            return set(), {
-                "allowed_universe_size": 0,
-                "selected_industries": "",
-                "sector_heat_debug": "",
-                "pit_rank_debug": "",
-                "held_force_included": False,
-            }
-        try:
-            day_scores = score_table.xs(date_key).copy()
-        except KeyError:
-            return set(), {
-                "allowed_universe_size": 0,
-                "selected_industries": "",
-                "sector_heat_debug": "",
-                "pit_rank_debug": "",
-                "held_force_included": False,
-            }
-        available = set(day_state.factors_by_ticker)
-        day_scores = day_scores[day_scores.index.isin(available)].copy()
-        if day_scores.empty:
-            return set(), {
-                "allowed_universe_size": 0,
-                "selected_industries": "",
-                "sector_heat_debug": "",
-                "pit_rank_debug": "",
-                "held_force_included": False,
-            }
-        day_scores = day_scores.reset_index()
-        day_scores["ticker"] = day_scores["ticker"].astype(str)
-        day_scores = day_scores.sort_values(
-            ["pit_valid_skew_days", "pit_stock_dollar_vol_median", "ticker"],
-            ascending=[False, False, True],
-            na_position="last",
-        )
-        chosen = day_scores.head(spec.pit_target_size).copy()
-        held_force_included = False
-        held_norm = held_ticker.upper() if isinstance(held_ticker, str) else None
-        if held_norm and held_norm in set(day_scores["ticker"]) and held_norm not in set(chosen["ticker"]):
-            held_force_included = True
-            held_row = day_scores[day_scores["ticker"] == held_norm].head(1).copy()
-            if len(chosen) >= spec.pit_target_size:
-                chosen = pd.concat([chosen.iloc[:-1], held_row], axis=0)
-            else:
-                chosen = pd.concat([chosen, held_row], axis=0)
-        allowed = set(chosen["ticker"].astype(str).tolist())
-        debug = ", ".join(
-            f"{row.ticker}:{int(row.pit_valid_skew_days)}"
-            for row in chosen.head(5).itertuples()
-        )
+        allowed = set(ctx.pit_members_by_variant.get(spec.name, {}).get(date_key, []))
+        if held_tickers:
+            allowed.update(str(t).upper() for t in held_tickers if t)
         return allowed, {
             "allowed_universe_size": int(len(allowed)),
             "selected_industries": "",
             "sector_heat_debug": "",
-            "pit_rank_debug": debug,
-            "held_force_included": held_force_included,
         }
 
     if spec.sector_top_n is None:
         base = set(ctx.variant_universes[spec.base_universe_key])
+        if held_tickers:
+            base.update(str(t).upper() for t in held_tickers if t)
         return base, {
             "allowed_universe_size": int(len(base)),
             "selected_industries": "",
@@ -628,6 +690,8 @@ def _variant_selector(
     ).head(spec.sector_top_n)
     industries = chosen["industry"].tolist()
     allowed = set(df[df["industry"].isin(industries)]["ticker"].tolist())
+    if held_tickers:
+        allowed.update(str(t).upper() for t in held_tickers if t)
     debug = "; ".join(
         f"{row.industry}:{row.heat_score:.3f}"
         for row in chosen.itertuples()
@@ -785,8 +849,8 @@ def _build_variant_row(
         "valid_signal_days": valid_signal_days,
         "runtime_seconds": round(runtime_seconds, 2),
         "contracts_processed_est": int(contracts_processed_est),
+        "diagnostic_only": bool(spec.diagnostic_only),
         "selection_note": spec.selection_note,
-        "diagnostic_only": spec.diagnostic_only,
         "run_name": summary["run_name"],
     }
 
@@ -811,8 +875,23 @@ def run_variant(
     )
     daily_diag: dict[pd.Timestamp, dict] = {}
     cached_candidates: dict[pd.Timestamp, list[tuple[str, float]]] = {}
+    variant_phase_timings: dict[str, float] = {}
 
-    def diagnose_day(day_state: replay.DayState, *, held_ticker: str | None = None) -> None:
+    t0 = time.perf_counter()
+    if spec.use_canonical_core_loading:
+        variant_skew_lookup = skew_lookup
+    else:
+        keep = set(implemented_universe)
+        variant_skew_lookup = {k: v for k, v in skew_lookup.items() if k in keep}
+    variant_phase_timings["filter_skew_lookup_seconds"] = round(
+        time.perf_counter() - t0, 3
+    )
+
+    def diagnose_day(
+        day_state: replay.DayState,
+        *,
+        held_tickers: set[str] | None = None,
+    ) -> None:
         date_key = pd.Timestamp(day_state.date).normalize()
         if date_key in daily_diag:
             return
@@ -820,7 +899,7 @@ def run_variant(
             spec,
             ctx,
             day_state,
-            held_ticker=held_ticker,
+            held_tickers=held_tickers,
         )
         candidates = _path_s_candidates(day_state, allowed_tickers=allowed, exclude=None)
         cached_candidates[date_key] = candidates
@@ -832,30 +911,30 @@ def run_variant(
             "top_candidate": candidates[0][0] if candidates else "",
             "selected_industries": str(extra.get("selected_industries", "")),
             "sector_heat_debug": str(extra.get("sector_heat_debug", "")),
-            "pit_rank_debug": str(extra.get("pit_rank_debug", "")),
-            "held_force_included": bool(extra.get("held_force_included", False)),
         }
 
     orig_reconstruct_day = replay.reconstruct_day
 
     def wrapped_reconstruct_day(*args, **kwargs):
         state = orig_reconstruct_day(*args, **kwargs)
-        diagnose_day(state, held_ticker=kwargs.get("held_ticker"))
+        held = kwargs.get("held_ticker")
+        held_set = {str(held).upper()} if held else set()
+        diagnose_day(state, held_tickers=held_set)
         return state
 
     def variant_path_s_picker(day_state: replay.DayState, *, exclude=None):
         date_key = pd.Timestamp(day_state.date).normalize()
+        excl: set[str]
+        if isinstance(exclude, str):
+            excl = {exclude}
+        elif isinstance(exclude, (set, frozenset, list, tuple)):
+            excl = {str(item) for item in exclude}
+        else:
+            excl = set()
         if date_key not in daily_diag:
-            diagnose_day(day_state)
+            diagnose_day(day_state, held_tickers=excl)
         candidates = list(cached_candidates.get(date_key, []))
         if exclude is not None:
-            excl: set[str]
-            if isinstance(exclude, str):
-                excl = {exclude}
-            elif isinstance(exclude, (set, frozenset, list, tuple)):
-                excl = {str(item) for item in exclude}
-            else:
-                excl = set()
             candidates = [item for item in candidates if item[0] not in excl]
         if not candidates:
             return None, None, "none"
@@ -892,7 +971,7 @@ def run_variant(
                 universe_top_n=2000,
                 ignore_themes=spec.use_canonical_core_loading,
                 strategy="pathS",
-                skew_lookup=skew_lookup,
+                skew_lookup=variant_skew_lookup,
                 max_hold_days=90,
                 exit_mode="baseline",
                 post90_trail_pct=10.0,
@@ -928,7 +1007,7 @@ def run_variant(
                 ignore_themes=spec.use_canonical_core_loading,
                 n_positions=positions,
                 strategy="pathS",
-                skew_lookup=skew_lookup,
+                skew_lookup=variant_skew_lookup,
                 max_hold_days=90,
                 launch_date=None,
                 signal_decay_z=None,
@@ -946,6 +1025,7 @@ def run_variant(
                 displacement_max_swaps_per_day=1,
             )
     runtime_seconds = time.perf_counter() - run_started
+    variant_phase_timings["replay_seconds"] = round(runtime_seconds, 3)
 
     result_dir = Path(result["out_dir"])
     summary = result["summary"]
@@ -975,9 +1055,10 @@ def run_variant(
         "base_universe_size": len(base_universe),
         "implemented_universe_size": len(implemented_universe) if implemented_universe else len(base_universe),
         "use_canonical_core_loading": spec.use_canonical_core_loading,
-        "diagnostic_only": spec.diagnostic_only,
+        "diagnostic_only": bool(spec.diagnostic_only),
         "runtime_seconds": round(runtime_seconds, 2),
         "contracts_processed_est": contracts_processed_est,
+        "phase_timings": {**ctx.phase_timings, **variant_phase_timings},
         "summary_row": variant_row,
         "run_name": summary["run_name"],
     }
@@ -1017,6 +1098,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--end-date", default=DEFAULT_END_DATE)
     parser.add_argument("--study-name", default=None)
     parser.add_argument(
+        "--rebuild-pit-cache",
+        action="store_true",
+        help="Force PIT universe-table regeneration instead of reusing cached parquet files.",
+    )
+    parser.add_argument(
         "--export-dir",
         type=Path,
         default=None,
@@ -1045,20 +1131,19 @@ def main() -> int:
     study_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[variants] preparing context for {start_date.date()} -> {end_date.date()}...", file=sys.stderr)
-    pit_windows = {
-        int(spec.pit_lookback_sessions)
-        for name, spec in VARIANT_SPECS.items()
-        if name in requested and spec.pit_lookback_sessions is not None
-    }
     ctx = prepare_universe_context(
         start_date=start_date,
         end_date=end_date,
-        pit_windows=pit_windows,
+        requested_variants=requested,
+        rebuild_pit_cache=args.rebuild_pit_cache,
     )
     print(
         f"[variants] eligible universe rows={len(ctx.core_ranking_df):,}  core2000={len(ctx.variant_universes['CORE_2000']):,}",
         file=sys.stderr,
     )
+    if ctx.phase_timings:
+        timing_bits = ", ".join(f"{k}={v}" for k, v in sorted(ctx.phase_timings.items()))
+        print(f"[variants] context timings: {timing_bits}", file=sys.stderr)
     skew_lookup = _prepare_path_s_config()
     regime_lookup = build_regime_lookup("spy")
 

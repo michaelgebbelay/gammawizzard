@@ -28,7 +28,7 @@ name: Path-S Universe Variants
       variants:
         description: "Comma-separated variants"
         type: string
-        default: "CORE_2000,SP500_OR_LARGECAP500_PROXY,NDX100,R1000_PROXY,R2000_PROXY,OPTION_LIQ_1000,OPTION_LIQ_750,OPTION_LIQ_500,DYNAMIC_SECTOR_TOP4,DYNAMIC_SECTOR_TOP6"
+        default: "CORE_2000,PIT_OPTION_LIQ_1000_60d,PIT_OPTION_LIQ_1000_126d,PIT_OPTION_LIQ_750_126d"
       positions:
         description: "Comma-separated position modes"
         type: string
@@ -45,7 +45,7 @@ jobs:
       matrix: ${{ steps.build.outputs.matrix }}
       study_name: ${{ steps.build.outputs.study_name }}
     env:
-      VARIANTS_INPUT: ${{ github.event.inputs.variants || 'CORE_2000,SP500_OR_LARGECAP500_PROXY,NDX100,R1000_PROXY,R2000_PROXY,OPTION_LIQ_1000,OPTION_LIQ_750,OPTION_LIQ_500,DYNAMIC_SECTOR_TOP4,DYNAMIC_SECTOR_TOP6' }}
+      VARIANTS_INPUT: ${{ github.event.inputs.variants || 'CORE_2000,PIT_OPTION_LIQ_1000_60d,PIT_OPTION_LIQ_1000_126d,PIT_OPTION_LIQ_750_126d' }}
       POSITIONS_INPUT: ${{ github.event.inputs.positions || '1,2' }}
       STUDY_NAME_INPUT: ${{ github.event.inputs.study_name || '' }}
     steps:
