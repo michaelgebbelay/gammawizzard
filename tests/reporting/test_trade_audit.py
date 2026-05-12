@@ -169,6 +169,19 @@ class TestTriggerAudit:
         assert evening["trade_status"] == "TAKEN"
         assert evening["taken_groups"] == 1
 
+    def test_tt_ira_window_switches_from_constantstable_to_leoprofit(self, db):
+        before = get_trigger_audit(date(2026, 4, 27), strategy="constantstable", account="tt-ira", con=db)
+        assert len(before) == 1
+        assert before.iloc[0]["trigger_rule"] == "cs_daily_trigger"
+
+        old_after = get_trigger_audit(date(2026, 4, 28), strategy="constantstable", account="tt-ira", con=db)
+        assert old_after.empty
+
+        new_after = get_trigger_audit(date(2026, 4, 28), strategy="leoprofit", account="tt-ira", con=db)
+        assert len(new_after) == 1
+        assert new_after.iloc[0]["trigger_rule"] == "leo_daily_trigger"
+        assert new_after.iloc[0]["trade_status"] == "MISSED_RUN"
+
     def test_daily_report_includes_trigger_audit_section(self, db):
         report = generate_report(date(2026, 3, 13), con=db)
         assert "## Trigger Audit" in report

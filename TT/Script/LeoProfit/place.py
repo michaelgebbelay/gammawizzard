@@ -12,6 +12,7 @@ import os
 import sys
 import time
 import random
+import json
 
 import requests
 
@@ -137,6 +138,43 @@ def order_payload_ic(side: str, legs, price: float, qty: int, call_mult: int = 1
     }
 
 
+def _env_price(name: str):
+    raw = (os.environ.get(name, "") or "").strip()
+    if not raw:
+        return None
+    try:
+        return clamp_tick(float(raw))
+    except Exception:
+        print(f"LEO PLACE WARN: invalid {name}={raw!r} — ignoring")
+        return None
+
+
+def build_debit_rungs(mid: float, ask: float | None, max_debit: float | None, step: float) -> tuple[list[float], float]:
+    """Build a debit ladder that walks toward the best allowed price cap."""
+    rung0 = clamp_tick(mid)
+    if max_debit is not None:
+        rung0 = min(rung0, clamp_tick(max_debit))
+
+    cap_candidates = [val for val in (ask, max_debit) if val is not None]
+    cap = clamp_tick(min(cap_candidates)) if cap_candidates else rung0
+    if cap < rung0:
+        rung0 = cap
+
+    prices = [rung0]
+    cur = rung0
+    while cur + step <= cap + 1e-9:
+        nxt = clamp_tick(cur + step)
+        if nxt <= prices[-1]:
+            break
+        prices.append(nxt)
+        cur = nxt
+
+    if prices[-1] != cap:
+        prices.append(cap)
+
+    return prices, cap
+
+
 # ---------------- main ----------------
 
 def main():
@@ -182,7 +220,9 @@ def main():
         return 0
 
     # ---- Build a small ladder ----
+    step = max(TICK, clamp_tick(float(os.environ.get("LEO_LADDER_STEP", "0.05"))))
     ladder: list[float] = []
+    max_debit = _env_price("LEO_MAX_DEBIT") if side == "DEBIT" else None
     if side == "CREDIT":
         # Start at mid, walk down to widen credit collected
         ladder = [mid]
@@ -191,11 +231,11 @@ def main():
         if bid is not None:
             ladder = [max(p, bid) for p in ladder]
     else:
-        ladder = [mid]
-        if mid is not None:
-            ladder += [clamp_tick(mid + 0.05), clamp_tick(mid + 0.10)]
-        if ask is not None:
-            ladder = [min(p, ask) for p in ladder]
+        ladder, debit_cap = build_debit_rungs(mid, ask, max_debit=max_debit, step=step)
+        print(
+            f"LEO PLACE DEBIT_CAP: max={max_debit if max_debit is not None else 'ask'} "
+            f"ask={ask} effective={debit_cap:.2f} step={step:.2f}"
+        )
 
     # Dedup, preserve order
     seen = set()
@@ -218,10 +258,13 @@ def main():
     step_wait = float(os.environ.get("LEO_STEP_WAIT", "8"))
     cancel_settle_secs = float(os.environ.get("LEO_CANCEL_SETTLE", "1.0"))
     max_cycles = int(os.environ.get("LEO_MAX_LADDER", "2"))
+    result_path = (os.environ.get("LEO_RESULT_PATH") or "").strip()
 
     url_post = f"/accounts/{acct}/orders"
     filled = 0
     active_oid = ""
+    active_attempt = None
+    attempts = []
 
     for cycle in range(1, max_cycles + 1):
         print(f"LEO PLACE CYCLE {cycle} ladder: {rungs}")
@@ -235,18 +278,35 @@ def main():
                 url_del = f"/accounts/{acct}/orders/{active_oid}"
                 ok = delete_with_retry(None, url_del, tag=f"CANCEL {active_oid}", tries=3)
                 print(f"LEO PLACE CANCEL {active_oid} -> {'OK' if ok else 'FAIL'}")
+                if active_attempt is not None:
+                    active_attempt["status"] = "CANCELLED" if ok else (active_attempt.get("status") or "UNKNOWN")
+                    attempts.append(active_attempt)
+                    active_attempt = None
                 time.sleep(cancel_settle_secs)
                 active_oid = ""
 
             payload = order_payload_ic(side, legs, price, to_place, call_mult=call_mult)
             print(f"LEO PLACE RUNG -> price={price:.2f} qty={to_place} call_mult={call_mult}")
+            active_attempt = {
+                "cycle": cycle,
+                "price": price,
+                "qty": to_place,
+                "order_id": "",
+                "filled_qty": 0,
+                "status": "SUBMITTED",
+            }
 
             try:
                 r = post_with_retry(None, url_post, payload, tag=f"PLACE@{price:.2f}x{to_place}")
                 active_oid = parse_order_id(r)
                 print(f"LEO PLACE OID={active_oid}")
+                active_attempt["order_id"] = active_oid
             except Exception as e:
                 print(f"LEO PLACE FAIL: {str(e)[:300]}")
+                if active_attempt is not None:
+                    active_attempt["status"] = "POST_FAILED"
+                    attempts.append(active_attempt)
+                    active_attempt = None
                 continue
 
             t_end = time.time() + step_wait
@@ -256,12 +316,24 @@ def main():
                 fq = extract_filled_quantity(st)
                 if fq > filled:
                     filled = fq
+                if active_attempt is not None and s:
+                    active_attempt["status"] = s
+                    active_attempt["filled_qty"] = fq
                 if s == "FILLED" or filled >= qty:
                     break
                 time.sleep(0.30)
 
             if filled >= qty:
+                if active_attempt is not None:
+                    active_attempt["status"] = "FILLED"
+                    attempts.append(active_attempt)
+                    active_attempt = None
                 break
+
+            if active_attempt is not None and active_attempt.get("status") in {"CANCELLED", "REJECTED", "EXPIRED"}:
+                attempts.append(active_attempt)
+                active_attempt = None
+                active_oid = ""
 
         if filled >= qty:
             break
@@ -271,9 +343,37 @@ def main():
         url_del = f"/accounts/{acct}/orders/{active_oid}"
         ok = delete_with_retry(None, url_del, tag=f"FINAL_CANCEL {active_oid}", tries=3)
         print(f"LEO PLACE FINAL_CANCEL {active_oid} -> {'OK' if ok else 'FAIL'}")
+        if active_attempt is not None:
+            active_attempt["status"] = "CANCELLED" if ok else (active_attempt.get("status") or "UNKNOWN")
+            attempts.append(active_attempt)
+            active_attempt = None
         time.sleep(cancel_settle_secs)
 
     print(f"LEO PLACE DONE filled={filled}/{qty}")
+
+    if result_path:
+        try:
+            with open(result_path, "w") as fh:
+                json.dump(
+                    {
+                        "side": side,
+                        "qty": qty,
+                        "call_mult": call_mult,
+                        "filled_quantity": filled,
+                        "nbbo_bid": bid,
+                        "nbbo_ask": ask,
+                        "nbbo_mid": mid,
+                        "rungs": rungs,
+                        "attempts": attempts,
+                        "max_debit": max_debit,
+                    },
+                    fh,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+        except Exception as e:
+            print(f"LEO PLACE WARN: could not write result file {result_path}: {e}")
+
     goutput("placed", "1" if filled > 0 else "0")
     goutput("filled_quantity", str(filled))
     return 0

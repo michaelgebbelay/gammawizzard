@@ -31,8 +31,20 @@ def _ensure_date(value: date | str) -> date:
 def _expected_triggers(report_date: date, strategy: str | None = None, account: str | None = None) -> pd.DataFrame:
     weekday = report_date.weekday()
     rows: list[dict] = []
-    for win_strategy, win_account, weekdays, start_et, end_et, rule_name in WINDOWS:
+    for window in WINDOWS:
+        win_strategy = window["strategy"]
+        win_account = window["account"]
+        weekdays = window["weekdays"]
+        start_et = window["start_et"]
+        end_et = window["end_et"]
+        rule_name = window["rule_name"]
+        start_date = date.fromisoformat(window["start_date"]) if window.get("start_date") else None
+        end_date = date.fromisoformat(window["end_date"]) if window.get("end_date") else None
         if weekday not in weekdays:
+            continue
+        if start_date and report_date < start_date:
+            continue
+        if end_date and report_date > end_date:
             continue
         if strategy and win_strategy != strategy:
             continue

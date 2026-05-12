@@ -17,9 +17,11 @@ import os
 import sys
 import re
 import math
+import json
 import subprocess
 import time
 from datetime import date
+from pathlib import Path
 
 import requests
 
@@ -40,8 +42,54 @@ def _add_scripts_root():
 _add_scripts_root()
 from tt_client import request as tt_request
 
+_ew = None
+try:
+    _repo_root = str(Path(__file__).resolve().parent.parent.parent.parent)
+    if _repo_root not in sys.path:
+        sys.path.insert(0, _repo_root)
+    from reporting.events import EventWriter
+    _EVENTS_AVAILABLE = True
+except ImportError:
+    _EVENTS_AVAILABLE = False
+
 
 # ---------------- helpers ----------------
+
+def _event_strategy() -> str:
+    return (os.environ.get("LEO_REPORT_STRATEGY") or "leoprofit").strip()
+
+
+def _event_account() -> str:
+    return (os.environ.get("LEO_REPORT_ACCOUNT") or os.environ.get("CS_ACCOUNT_LABEL") or "tt-ira").strip()
+
+
+def _init_events(today: date):
+    global _ew
+    if not _EVENTS_AVAILABLE:
+        return None
+    try:
+        _ew = EventWriter(strategy=_event_strategy(), account=_event_account(), trade_date=today)
+        return _ew
+    except Exception as e:
+        print(f"LEO ORCH WARN: EventWriter init failed: {e}")
+        return None
+
+
+def _emit(method: str, **kwargs):
+    if _ew is None:
+        return
+    try:
+        getattr(_ew, method)(**kwargs)
+    except Exception as e:
+        print(f"LEO ORCH WARN: event emit failed ({method}): {e}")
+
+
+def _close_events():
+    if _ew is not None:
+        try:
+            _ew.close()
+        except Exception:
+            pass
 
 def yymmdd(iso: str) -> str:
     d = date.fromisoformat((iso or "")[:10])
@@ -64,6 +112,21 @@ def to_osi(sym: str) -> str:
 
 def strike_from_osi(osi: str) -> float:
     return int(osi[-8:]) / 1000.0
+
+
+def option_type_from_osi(osi: str) -> str:
+    return "PUT" if len(osi) > 12 and osi[12] == "P" else "CALL"
+
+
+def event_legs(legs, qty: int, call_mult: int):
+    bp, sp, sc, bc = legs
+    call_qty = qty * call_mult
+    return [
+        {"osi": bp, "strike": strike_from_osi(bp), "option_type": option_type_from_osi(bp), "action": "BUY_TO_OPEN", "qty": qty},
+        {"osi": sp, "strike": strike_from_osi(sp), "option_type": option_type_from_osi(sp), "action": "SELL_TO_OPEN", "qty": qty},
+        {"osi": sc, "strike": strike_from_osi(sc), "option_type": option_type_from_osi(sc), "action": "SELL_TO_OPEN", "qty": call_qty},
+        {"osi": bc, "strike": strike_from_osi(bc), "option_type": option_type_from_osi(bc), "action": "BUY_TO_OPEN", "qty": call_qty},
+    ]
 
 
 def orient_credit(bp, sp, sc, bc):
@@ -190,6 +253,34 @@ def opening_cash_for_account():
     return None, "none", acct_num
 
 
+def load_place_result(path: Path):
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except Exception as e:
+        print(f"LEO ORCH WARN: could not read place result {path}: {e}")
+        return {}
+
+
+def emit_place_events(summary: dict, legs, qty: int, call_mult: int):
+    if not summary:
+        return
+    leg_payload = event_legs(legs, qty, call_mult)
+    for attempt in summary.get("attempts", []):
+        oid = str(attempt.get("order_id") or "")
+        if not oid:
+            continue
+        limit_price = float(attempt.get("price") or 0)
+        filled_qty = int(attempt.get("filled_qty") or 0)
+        status = str(attempt.get("status") or "UNKNOWN")
+        remaining = max(0, qty - filled_qty)
+        _emit("order_submitted", order_id=oid, legs=leg_payload, limit_price=limit_price, order_type="LIMIT")
+        _emit("order_update", order_id=oid, status=status, filled_qty=filled_qty, remaining_qty=remaining)
+        if filled_qty > 0:
+            _emit("fill", order_id=oid, fill_qty=filled_qty, fill_price=limit_price, legs=leg_payload)
+
+
 # ---------------- Wait for GW signal to be ready ----------------
 
 def _wait_for_gw_ready():
@@ -216,6 +307,14 @@ def _wait_for_gw_ready():
 
 def main():
     dry_run = (os.environ.get("VERT_DRY_RUN", "false") or "false").lower() in ("1", "true", "yes")
+    today = date.today()
+    result_path = Path(os.environ.get("LEO_RESULT_PATH", "/tmp/leo_place_result.json"))
+    _init_events(today)
+    try:
+        if result_path.exists():
+            result_path.unlink()
+    except Exception:
+        pass
 
     _wait_for_gw_ready()
 
@@ -223,10 +322,16 @@ def main():
     try:
         tr = extract_trade(gw_fetch())
     except Exception as e:
+        _emit("strategy_run", signal="SKIP", config="", reason=f"GW_FETCH_FAILED: {e}")
+        _emit("error", message=str(e), stage="gw_fetch")
+        _close_events()
         print(f"LEO ORCH FATAL: GW fetch failed: {e}")
         return 1
 
     if not tr:
+        _emit("strategy_run", signal="SKIP", config="", reason="NO_TRADE_PAYLOAD")
+        _emit("skip", reason="NO_TRADE_PAYLOAD", signal="SKIP")
+        _close_events()
         print("LEO ORCH FATAL: empty Trade payload")
         return 1
 
@@ -235,6 +340,9 @@ def main():
         inner_put = int(float(tr.get("Limit")))
         inner_call = int(float(tr.get("CLimit")))
     except Exception as e:
+        _emit("strategy_run", signal="SKIP", config="", reason=f"BAD_SIGNAL_FIELDS: {e}")
+        _emit("error", message=str(e), stage="signal_parse")
+        _close_events()
         print(f"LEO ORCH FATAL: bad signal fields ({e}): {tr}")
         return 1
 
@@ -300,6 +408,35 @@ def main():
           f"src={oc_src} acct={acct_num} dry_run={dry_run}")
     print(f"LEO ORCH LEGS: bp={legs[0]} sp={legs[1]} sc={legs[2]} bc={legs[3]}")
 
+    direction = "LONG" if side_txt == "DEBIT" else "SHORT"
+    tdate = str(tr.get("TDate") or "")[:10]
+    _emit(
+        "strategy_run",
+        signal=side_txt,
+        config=struct,
+        reason="OK",
+        vix=float(fnum(tr.get("VIX")) or 0),
+        vix1d=float(fnum(tr.get("VixOne")) or 0),
+        extra={
+            "trade_date": today.isoformat(),
+            "tdate": tdate,
+            "inner_put": inner_put,
+            "inner_call": inner_call,
+            "call_mult": m,
+            "qty": qty,
+            "model": "leoprofit",
+        },
+    )
+    _emit(
+        "trade_intent",
+        side=side_txt,
+        direction=direction,
+        legs=event_legs(legs, qty, m),
+        target_qty=qty,
+        limit_price=0.0,
+        extra={"tdate": tdate, "model": "leoprofit"},
+    )
+
     # ---- 5) Hand off to placer ----
     env = dict(os.environ)
     env.update({
@@ -314,10 +451,19 @@ def main():
         "LEO_OCC_SELL_CALL": legs[2],
         "LEO_OCC_BUY_CALL": legs[3],
         "LEO_DRY_RUN": "true" if dry_run else "false",
+        "LEO_RESULT_PATH": str(result_path),
     })
 
     placer = os.path.join(os.path.dirname(__file__), "place.py")
     rc = subprocess.call([sys.executable, placer], env=env)
+    if rc != 0:
+        _emit("error", message=f"placer rc={rc}", stage="placement")
+    else:
+        summary = load_place_result(result_path)
+        emit_place_events(summary, legs, qty, m)
+        outcome = "FILLED" if int(summary.get("filled_quantity") or 0) > 0 else "NO_FILL"
+        _emit("post_step_result", step_name="placement", outcome=outcome)
+    _close_events()
     return rc
 
 
