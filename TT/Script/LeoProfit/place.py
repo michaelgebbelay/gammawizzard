@@ -175,6 +175,29 @@ def build_debit_rungs(mid: float, ask: float | None, max_debit: float | None, st
     return prices, cap
 
 
+def build_credit_rungs(mid: float, bid: float | None, min_credit: float | None, step: float) -> tuple[list[float], float]:
+    """Build a credit ladder that walks down to the lowest acceptable credit floor."""
+    rung0 = clamp_tick(mid)
+    floor_candidates = [val for val in (bid, min_credit) if val is not None]
+    floor = clamp_tick(max(floor_candidates)) if floor_candidates else rung0
+    if rung0 < floor:
+        rung0 = floor
+
+    prices = [rung0]
+    cur = rung0
+    while cur - step >= floor - 1e-9:
+        nxt = clamp_tick(cur - step)
+        if nxt >= prices[-1]:
+            break
+        prices.append(nxt)
+        cur = nxt
+
+    if prices[-1] != floor:
+        prices.append(floor)
+
+    return prices, floor
+
+
 # ---------------- main ----------------
 
 def main():
@@ -223,13 +246,13 @@ def main():
     step = max(TICK, clamp_tick(float(os.environ.get("LEO_LADDER_STEP", "0.05"))))
     ladder: list[float] = []
     max_debit = _env_price("LEO_MAX_DEBIT") if side == "DEBIT" else None
+    min_credit = _env_price("LEO_MIN_CREDIT") if side == "CREDIT" else None
     if side == "CREDIT":
-        # Start at mid, walk down to widen credit collected
-        ladder = [mid]
-        if mid is not None:
-            ladder += [clamp_tick(mid - 0.05), clamp_tick(mid - 0.10)]
-        if bid is not None:
-            ladder = [max(p, bid) for p in ladder]
+        ladder, credit_floor = build_credit_rungs(mid, bid, min_credit=min_credit, step=step)
+        print(
+            f"LEO PLACE CREDIT_FLOOR: min={min_credit if min_credit is not None else 'bid'} "
+            f"bid={bid} effective={credit_floor:.2f} step={step:.2f}"
+        )
     else:
         ladder, debit_cap = build_debit_rungs(mid, ask, max_debit=max_debit, step=step)
         print(
@@ -366,6 +389,7 @@ def main():
                         "rungs": rungs,
                         "attempts": attempts,
                         "max_debit": max_debit,
+                        "min_credit": min_credit,
                     },
                     fh,
                     separators=(",", ":"),

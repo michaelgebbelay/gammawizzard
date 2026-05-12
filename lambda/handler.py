@@ -99,6 +99,7 @@ ACCOUNTS = {
             "LEO_CALL_MULT": "1",
             "LEO_CREDIT_SPREAD_WIDTH": "5",
             "LEO_MAX_DEBIT": "2.20",
+            "LEO_MIN_CREDIT": "1.80",
             "LEO_REPORT_ACCOUNT": "tt-ira",
             "LEO_REPORT_STRATEGY": "leoprofit",
         },
