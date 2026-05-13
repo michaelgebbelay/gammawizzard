@@ -49,6 +49,8 @@ from ConstantStable.place import (  # type: ignore
     cancel_all_working_orders,
 )
 
+FINAL_ORDER_STATUSES = {"FILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED"}
+
 
 def goutput(name: str, val: str):
     p = os.environ.get("GITHUB_OUTPUT")
@@ -147,6 +149,15 @@ def _env_price(name: str):
     except Exception:
         print(f"LEO PLACE WARN: invalid {name}={raw!r} — ignoring")
         return None
+
+
+def resolved_filled_quantity(st: dict, requested_qty: int) -> int:
+    """Treat TT FILLED-without-qty as a full fill for this order."""
+    qty = max(0, int(requested_qty or 0))
+    filled = max(0, int(extract_filled_quantity(st) or 0))
+    if status_upper(st) == "FILLED" and filled <= 0:
+        filled = qty
+    return min(qty, filled)
 
 
 def build_debit_rungs(mid: float, ask: float | None, max_debit: float | None, step: float) -> tuple[list[float], float]:
@@ -284,15 +295,16 @@ def main():
     result_path = (os.environ.get("LEO_RESULT_PATH") or "").strip()
 
     url_post = f"/accounts/{acct}/orders"
-    filled = 0
+    filled_total = 0
     active_oid = ""
     active_attempt = None
     attempts = []
+    halt_reason = ""
 
     for cycle in range(1, max_cycles + 1):
         print(f"LEO PLACE CYCLE {cycle} ladder: {rungs}")
         for price in rungs:
-            to_place = max(0, qty - filled)
+            to_place = max(0, qty - filled_total)
             if to_place == 0:
                 break
 
@@ -301,12 +313,47 @@ def main():
                 url_del = f"/accounts/{acct}/orders/{active_oid}"
                 ok = delete_with_retry(None, url_del, tag=f"CANCEL {active_oid}", tries=3)
                 print(f"LEO PLACE CANCEL {active_oid} -> {'OK' if ok else 'FAIL'}")
-                if active_attempt is not None:
-                    active_attempt["status"] = "CANCELLED" if ok else (active_attempt.get("status") or "UNKNOWN")
-                    attempts.append(active_attempt)
-                    active_attempt = None
-                time.sleep(cancel_settle_secs)
-                active_oid = ""
+                if ok:
+                    if active_attempt is not None:
+                        active_attempt["status"] = "CANCELLED"
+                        attempts.append(active_attempt)
+                        active_attempt = None
+                    time.sleep(cancel_settle_secs)
+                    active_oid = ""
+                else:
+                    prior_filled = int(active_attempt.get("filled_qty") or 0) if active_attempt is not None else 0
+                    final_status = ""
+                    for j in range(6):
+                        st = get_status(None, acct, active_oid, tries=3)
+                        final_status = status_upper(st)
+                        fq = resolved_filled_quantity(
+                            st,
+                            int(active_attempt.get("qty") or to_place) if active_attempt is not None else to_place,
+                        )
+                        if fq > prior_filled:
+                            filled_total += (fq - prior_filled)
+                            prior_filled = fq
+                        if active_attempt is not None:
+                            if final_status:
+                                active_attempt["status"] = final_status
+                            active_attempt["filled_qty"] = prior_filled
+                        if final_status in FINAL_ORDER_STATUSES:
+                            break
+                        time.sleep(min(4.0, 0.6 * (2 ** j)) + random.uniform(0.0, 0.2))
+
+                    if active_attempt is not None:
+                        attempts.append(active_attempt)
+                        active_attempt = None
+                    active_oid = ""
+
+                    if final_status == "FILLED" or prior_filled > 0:
+                        halt_reason = "PARTIAL_AFTER_CANCEL_FAIL" if filled_total < qty else "FILLED_AFTER_CANCEL_FAIL"
+                        break
+                    if final_status in {"CANCELED", "CANCELLED", "REJECTED", "EXPIRED"}:
+                        time.sleep(cancel_settle_secs)
+                    else:
+                        halt_reason = f"CANCEL_FAILED_STATUS_{final_status or 'UNKNOWN'}"
+                        break
 
             payload = order_payload_ic(side, legs, price, to_place, call_mult=call_mult)
             print(f"LEO PLACE RUNG -> price={price:.2f} qty={to_place} call_mult={call_mult}")
@@ -332,33 +379,38 @@ def main():
                     active_attempt = None
                 continue
 
+            this_order_filled = 0
             t_end = time.time() + step_wait
             while time.time() < t_end:
                 st = get_status(None, acct, active_oid, tries=3)
                 s = status_upper(st)
-                fq = extract_filled_quantity(st)
-                if fq > filled:
-                    filled = fq
-                if active_attempt is not None and s:
-                    active_attempt["status"] = s
-                    active_attempt["filled_qty"] = fq
-                if s == "FILLED" or filled >= qty:
+                fq = resolved_filled_quantity(st, to_place)
+                if fq > this_order_filled:
+                    filled_total += (fq - this_order_filled)
+                    this_order_filled = fq
+                if active_attempt is not None:
+                    if s:
+                        active_attempt["status"] = s
+                    active_attempt["filled_qty"] = this_order_filled
+                if s in FINAL_ORDER_STATUSES or filled_total >= qty:
                     break
                 time.sleep(0.30)
 
-            if filled >= qty:
+            if filled_total >= qty:
                 if active_attempt is not None:
                     active_attempt["status"] = "FILLED"
+                    active_attempt["filled_qty"] = max(this_order_filled, int(active_attempt.get("qty") or 0))
                     attempts.append(active_attempt)
                     active_attempt = None
+                active_oid = ""
                 break
 
-            if active_attempt is not None and active_attempt.get("status") in {"CANCELLED", "REJECTED", "EXPIRED"}:
+            if active_attempt is not None and active_attempt.get("status") in {"CANCELED", "CANCELLED", "REJECTED", "EXPIRED"}:
                 attempts.append(active_attempt)
                 active_attempt = None
                 active_oid = ""
 
-        if filled >= qty:
+        if filled_total >= qty or halt_reason:
             break
 
     # ---- Final cleanup: cancel anything still working ----
@@ -372,7 +424,9 @@ def main():
             active_attempt = None
         time.sleep(cancel_settle_secs)
 
-    print(f"LEO PLACE DONE filled={filled}/{qty}")
+    print(f"LEO PLACE DONE filled={filled_total}/{qty}")
+    if halt_reason:
+        print(f"LEO PLACE HALT: {halt_reason}")
 
     if result_path:
         try:
@@ -382,7 +436,7 @@ def main():
                         "side": side,
                         "qty": qty,
                         "call_mult": call_mult,
-                        "filled_quantity": filled,
+                        "filled_quantity": filled_total,
                         "nbbo_bid": bid,
                         "nbbo_ask": ask,
                         "nbbo_mid": mid,
@@ -390,6 +444,7 @@ def main():
                         "attempts": attempts,
                         "max_debit": max_debit,
                         "min_credit": min_credit,
+                        "halt_reason": halt_reason,
                     },
                     fh,
                     separators=(",", ":"),
@@ -398,8 +453,8 @@ def main():
         except Exception as e:
             print(f"LEO PLACE WARN: could not write result file {result_path}: {e}")
 
-    goutput("placed", "1" if filled > 0 else "0")
-    goutput("filled_quantity", str(filled))
+    goutput("placed", "1" if filled_total > 0 else "0")
+    goutput("filled_quantity", str(filled_total))
     return 0
 
 
